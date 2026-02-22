@@ -1,8 +1,7 @@
 """
 Scrape hourly NOx emissions data from the EPA CAMPD/EASEY API
-(sequential version for benchmarking against the parallelized script).
 
-Output: campd_nox_all_states.csv
+Output: nox_emissions_all.csv
 """
 
 import os
