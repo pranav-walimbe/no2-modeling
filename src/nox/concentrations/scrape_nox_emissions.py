@@ -23,6 +23,7 @@ OUTPUT_CSV = "/global/scratch/projects/fc_nitrates/pranavwalimbe/nox_emissions_1
 START_DATE = date(2023, 8, 1)
 END_DATE = date(2025, 12, 30)
 
+# states to include in requests
 STATE_CODES = [
     "AL", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL",
     "GA", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME",
@@ -32,22 +33,11 @@ STATE_CODES = [
     "WY",
 ]
 
+# fields to keep from API response
 NOX_COLS = [
-    "stateCode",
-    "facilityName",
-    "facilityId",
-    "unitId",
-    "date",
-    "hour",
-    "opTime",
-    "noxMass",
-    "noxMassUom",
-    "noxRate",
-    "noxRateUom",
-    "grossLoad",
-    "grossLoadUom",
-    "primaryFuelInfo",
-    "unitType",
+    "stateCode", "facilityName", "facilityId", "unitId", "date",
+    "hour", "opTime", "noxMass", "noxMassUom", "noxRate", "noxRateUom",
+    "grossLoad", "grossLoadUom", "primaryFuelInfo", "unitType",
 ]
 
 def month_ranges(start: date, end: date):
@@ -69,7 +59,7 @@ def month_ranges(start: date, end: date):
     return ranges 
 
 def fetch_chunk(state: str, begin: str, end: str, retries: int = 3):
-    """Fetch one state/month chunk from the API with exponential backoff."""
+    """Fetch one state/month chunk from the API"""
     params = {
         "api_key": API_KEY,
         "beginDate": begin,
@@ -77,6 +67,7 @@ def fetch_chunk(state: str, begin: str, end: str, retries: int = 3):
         "stateCode": state,
         "operatingHoursOnly": True,
     }
+    # make requests with exponential backoff
     for attempt in range(1, retries + 1):
         try:
             print(f"Fetching {state} {begin} to {end} (attempt {attempt}/{retries})")
