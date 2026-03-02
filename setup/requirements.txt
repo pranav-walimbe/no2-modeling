@@ -1,0 +1,11 @@
+numpy 
+pandas 
+requests
+xarray
+netcdf4
+matplotlib
+scipy
+earthaccess
+python-dotenv
+geopandas
+collections
