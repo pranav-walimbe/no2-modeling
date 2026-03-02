@@ -64,13 +64,11 @@ def validate_record(row: pd.Series, tempo_by_date: dict):
     )
     dlat = 24 / 111.0
     dlon = 24 / (111.0 * np.cos(np.radians(target_lat)))
-    best_fname = None
-    best_dt_diff = pd.Timedelta(minutes=MINS_FILTER)
 
-    # iterate through tempo mapping to find 'closest' tile
+    # iterate through tempo mapping to find first valid tile
     for curr_dt, locations in tempo_by_date.get(target_dt.date(), []):
         dt_diff = abs(target_dt - curr_dt)
-        if dt_diff <= best_dt_diff:
+        if dt_diff <= pd.Timedelta(minutes=MINS_FILTER):
             for loc in locations:
                 lat_min, lat_max = loc['lat']
                 lon_min, lon_max = loc['lon']
@@ -80,10 +78,8 @@ def validate_record(row: pd.Series, tempo_by_date: dict):
                     lat_max >= target_lat + dlat and
                     lon_min <= target_lon - dlon and
                     lon_max >= target_lon + dlon):
-                    best_fname = loc['fname']
-                    best_dt_diff = dt_diff
-                    break
-    return best_fname
+                    return loc['fname']
+    return None
 
 def validate_chunk(chunk: pd.DataFrame, tempo_by_date: dict):
     """pickleable helper function to validate a chunk of records against the tempo mapping"""

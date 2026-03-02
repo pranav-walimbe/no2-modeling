@@ -1,7 +1,7 @@
 # define path in which to create venv
 VENV_PATH=<PATH> # example: /global/home/users/pranavwalimbe/conus_co2/setup/venv
 
-# instantiate virtual environment named venv
+# instantiate virtual environment
 python -m venv $VENV_PATH
 
 # activate venv
