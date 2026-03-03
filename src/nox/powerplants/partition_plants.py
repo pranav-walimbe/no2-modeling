@@ -16,8 +16,8 @@ import pandas as pd
 from datetime import datetime
 import pickle
 import numpy as np
-import xarray as xr
 import os
+import xarray as xr
 
 # configuration
 VIS_PATH = "/global/home/users/pranavwalimbe/vis/strat_vis.png" # visualization of plant partitioning 
@@ -30,14 +30,15 @@ TEST_PATH = os.path.join(BASE_DIR, "nox_powerplant_data", "test.csv")
 VAL_PATH = os.path.join(BASE_DIR, "nox_powerplant_data", "val.csv")
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK"))
 NUM_SAMPLES = 10000 # desired dataset size
-MINS_FILTER = 30 # filtering parameter for time difference between emissions record and tempo tile
+MINS_FILTER = 60 # filtering parameter for time difference between emissions record and tempo tile
+PATCH_RADIUS = 24 # desired image radius in km
 
 # helper functions
 def read_tempo_file(fname: str):
     """parse spatial range from tempo tile"""
-    if not fname.endswith(".nc"):
+    if not fname.endswith(".nc"):                                                                                                               
         return None
-    try:
+    try:                                                                                                                                        
         ds = xr.open_dataset(os.path.join(TEMPO_PATH, fname), engine="netcdf4")
         lat = ds.latitude.values
         lon = ds.longitude.values
@@ -54,31 +55,29 @@ def read_tempo_file(fname: str):
 
 def validate_record(row: pd.Series, tempo_by_date: dict):
     """check whether a given emissions record has valid corresponding tempo data"""
-    target_lat = row['lat']
-    target_lon = row['lon']
-    target_dt = datetime(
+    target_dt = datetime(                                                                                                                       
         year=row['date'].year,
-        month=row['date'].month,
+        month=row['date'].month,                                                                                                                
         day=row['date'].day,
         hour=row['hour']
     )
-    dlat = 24 / 111.0
-    dlon = 24 / (111.0 * np.cos(np.radians(target_lat)))
+    lat_min_bound, lat_max_bound, lon_min_bound, lon_max_bound = row['bounds']
 
     # iterate through tempo mapping to find first valid tile
     for curr_dt, locations in tempo_by_date.get(target_dt.date(), []):
-        dt_diff = abs(target_dt - curr_dt)
-        if dt_diff <= pd.Timedelta(minutes=MINS_FILTER):
-            for loc in locations:
-                lat_min, lat_max = loc['lat']
-                lon_min, lon_max = loc['lon']
+        dt_diff = target_dt - curr_dt
+        if not (pd.Timedelta(0) <= dt_diff < pd.Timedelta(minutes=MINS_FILTER)):
+            continue
+        for loc in locations:
+            lat_min, lat_max = loc['lat']
+            lon_min, lon_max = loc['lon']
 
-                # require valid spatial range + ability to derive 48kmx48km slice for modeling 
-                if (lat_min <= target_lat - dlat and
-                    lat_max >= target_lat + dlat and
-                    lon_min <= target_lon - dlon and
-                    lon_max >= target_lon + dlon):
-                    return loc['fname']
+            # require valid spatial range + ability to derive 48kmx48km slice for modeling
+            if (lat_min <= lat_min_bound and
+                lat_max >= lat_max_bound and
+                lon_min <= lon_min_bound and
+                lon_max >= lon_max_bound):
+                return loc['fname']
     return None
 
 def validate_chunk(chunk: pd.DataFrame, tempo_by_date: dict):
@@ -95,7 +94,7 @@ def build_tempo_mapping():
     fnames = os.listdir(TEMPO_PATH)
     tempo_mapping = {}
     with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
-        for result in executor.map(read_tempo_file, fnames, chunksize=125):
+        for result in executor.map(read_tempo_file, fnames, chunksize=150):
             if result is not None:
                 dt, entry = result
                 tempo_mapping.setdefault(dt, []).append(entry)
@@ -123,19 +122,34 @@ def filter_plant_data(df: pd.DataFrame):
 
 def cluster_plants(df: pd.DataFrame):
     """assign plants with overlapping 48km x 48km boxes to same cluster"""
-    plants = df[["facilityId", "lat", "lon"]].drop_duplicates("facilityId").reset_index(drop=True)
+    plants = df[["facilityId", "x_proj", "y_proj"]].drop_duplicates("facilityId").reset_index(drop=True)
+    x = plants["x_proj"].values
+    y = plants["y_proj"].values
 
-    # apply lat, lon -> km conversion
-    lat_km = plants["lat"].values * 111.0
-    lon_km = plants["lon"].values * 111.0 * np.cos(np.radians(plants["lat"].values))
-
-    # construct adjacency matrix to derive distinct clusters
-    dx = np.abs(lon_km[:, None] - lon_km[None, :])
-    dy = np.abs(lat_km[:, None] - lat_km[None, :])
-    adjacency = ((dx < 48) & (dy < 48)).astype(int)
+    # construct adjaecny matrix to derive cluster values
+    dx = np.abs(x[:, None] - x[None, :])
+    dy = np.abs(y[:, None] - y[None, :])
+    adjacency = ((dx < PATCH_RADIUS * 2 * 1000) & (dy < PATCH_RADIUS * 2 * 1000)).astype(int)
     n_components, labels = connected_components(csr_matrix(adjacency))
     plants["cluster"] = labels
     return plants[["facilityId", "cluster"]]
+
+def compute_bounds(df: pd.DataFrame):
+    """compute lat, lon -> km conversion for spatial computations"""
+    plants = df[["facilityId", "lat", "lon"]].drop_duplicates("facilityId").reset_index(drop=True)
+    gdf = gpd.GeoDataFrame(
+        plants,
+        geometry=gpd.points_from_xy(plants["lon"], plants["lat"]),
+        crs="EPSG:4326"
+    )
+
+    # derive 48kmx48km bound for each plant
+    gdf_proj = gdf.to_crs("EPSG:5070")
+    bounds = gdf_proj.buffer(PATCH_RADIUS * 1000).to_crs("EPSG:4326").bounds
+    plants["bounds"] = list(zip(bounds.miny, bounds.maxy, bounds.minx, bounds.maxx))
+    plants["x_proj"] = [geom.x for geom in gdf_proj.geometry]
+    plants["y_proj"] = [geom.y for geom in gdf_proj.geometry]
+    return df.merge(plants[["facilityId", "bounds", "x_proj", "y_proj"]], on="facilityId")
 
 def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame):
     """visualize stratification in terms of geography and nox emissions"""
@@ -170,8 +184,9 @@ def main():
     # filter emissions records
     df = pd.read_csv(INPUT_CSV)
     df['date'] = pd.to_datetime(df['date'])
+    df = compute_bounds(df)                                                                                                                      
     df = filter_plant_data(df)
-    print(f"post-filter dataset size: {df.shape}")
+    print(f"post-filter dataset size: {df.shape}")                                                                                                  
     df = df.sample(min(NUM_SAMPLES, len(df)), random_state=42)
 
     # apply clustering and stratify on EPA region
