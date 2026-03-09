@@ -4,59 +4,52 @@ Scrape hourly NOx emissions data from the EPA CAMPD/EASEY API
 Output: nox_emissions_all.csv
 """
 
-import os
-import sys
+from config import * 
 import csv
 import time
-from datetime import date, timedelta
+from datetime import timedelta
 import requests
 import pandas as pd
-from dotenv import load_dotenv
-
-# Configuration
-load_dotenv()
-API_KEY = os.getenv("CAMPD_API_KEY")
-if not API_KEY:
-    sys.exit("ERROR: CAMPD_API_KEY not found in .env file.")
-STREAMING_URL = "https://api.epa.gov/easey/streaming-services/emissions/apportioned/hourly"
-OUTPUT_CSV = "/global/scratch/projects/fc_nitrates/pranavwalimbe/nox_emissions_1/nox_emissions_all.csv"
-START_DATE = date(2023, 8, 1)
-END_DATE = date(2025, 12, 30)
+import calendar
 
 # states to include in requests
 STATE_CODES = [
-    "AL", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL",
-    "GA", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME",
-    "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH",
-    "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI",
-    "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI",
-    "WY",
+    "AL", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA", "ID", 
+    "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", 
+    "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", 
+    "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", 
+    "VA", "WA", "WV", "WI", "WY",
 ]
 
 # fields to keep from API response
 NOX_COLS = [
-    "stateCode", "facilityName", "facilityId", "unitId", "date",
-    "hour", "opTime", "noxMass", "noxMassUom", "noxRate", "noxRateUom",
-    "grossLoad", "grossLoadUom", "primaryFuelInfo", "unitType",
+    "stateCode", # state abbreviation
+    "facilityName", # power plant name
+    "facilityId", # EPA facility ID (ORISPL code)
+    "unitId", # generating unit ID within the facility
+    "date", # date of measurement (YYYY-MM-DD)
+    "hour", # hour of measurement (0–23)
+    "opTime", # % of hour in active operation 
+    "noxMass", # NOx emissions mass
+    "noxMassUom", # emissions amount measurement unit
+    "noxRate", # NOx emissions rate
+    "noxRateUom", # emissions rate measurement unit
+    "grossLoad", # gross electrical output
+    "grossLoadUom", # grossload measurement unit
+    "primaryFuelInfo", # fuel type (e.g. natural gas, coal)
+    "unitType", # generating unit type (e.g. tangentially-fired, combined cycle)
 ]
 
 def month_ranges(start: date, end: date):
     """Return list of (begin_date, end_date) strings for each month in the range."""
-    ranges = []                                                                                   
-    current = start.replace(day=1)                                                                
-    while current <= end:                                                                         
-        if current.month == 12:                                                               
-            month_end = current.replace(day=31)                                               
-        else:                                                                                 
-            month_end = current.replace(month=current.month + 1, day=1) - timedelta(days=1)   
-        if month_end > end:                                                                   
-            month_end = end                                                                   
-        ranges.append((current.strftime("%Y-%m-%d"), month_end.strftime("%Y-%m-%d")))         
-        if current.month == 12:                                                               
-            current = date(current.year + 1, 1, 1)                                            
-        else:                                                                                 
-            current = date(current.year, current.month + 1, 1)                                
-    return ranges 
+    ranges = []                                                                                                                                 
+    current = start.replace(day=1)                                                                                                              
+    while current <= end:                                                                                                                       
+        last_day = calendar.monthrange(current.year, current.month)[1]                                                                          
+        month_end = min(current.replace(day=last_day), end)                                                                                     
+        ranges.append((current.strftime("%Y-%m-%d"), month_end.strftime("%Y-%m-%d")))                                                           
+        current = month_end + timedelta(days=1)                                                                                                 
+    return ranges
 
 def fetch_chunk(state: str, begin: str, end: str, retries: int = 3):
     """Fetch one state/month chunk from the API"""
@@ -83,8 +76,8 @@ def fetch_chunk(state: str, begin: str, end: str, retries: int = 3):
 
 def main():
     # replace existing file if present
-    if os.path.exists(OUTPUT_CSV):
-        os.remove(OUTPUT_CSV)
+    if os.path.exists(EMISSIONS_RECORDS_CSV):
+        os.remove(EMISSIONS_RECORDS_CSV)
     months = list(month_ranges(START_DATE, END_DATE))
     header_written = False
 
@@ -107,7 +100,7 @@ def main():
             if df.empty:
                 continue
 
-            df.to_csv(OUTPUT_CSV, mode="a", index=False, header=not header_written,
+            df.to_csv(EMISSIONS_RECORDS_CSV, mode="a", index=False, header=not header_written,
                        quoting=csv.QUOTE_NONNUMERIC)
             header_written = True
 

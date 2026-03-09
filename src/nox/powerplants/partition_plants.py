@@ -1,61 +1,82 @@
 """                                                                                                                                             
-Script to stratify power plant emission records into train/test/val splits      
+Script to stratify power plant emission records into train/test/val splits        
 
 Output: train.csv, test.csv, val.csv located in output directory                                                                                
-"""
+"""                                                                                                                                             
 
+from config import *                                                                                                                                    
 from sklearn.model_selection import train_test_split                                                                                            
 import geopandas as gpd                                                                                                                         
-import matplotlib.pyplot as plt
-from scipy.sparse.csgraph import connected_components                                                                                           
+import matplotlib.pyplot as plt                                                                                                                 
+from scipy.sparse.csgraph import connected_components
 from scipy.sparse import csr_matrix
 from collections import defaultdict
 import pandas as pd
 from datetime import datetime
 import numpy as np
-import os
-
-# configuration
-VIS_PATH = "/global/home/users/pranavwalimbe/vis/strat_vis.png"
-TEMPO_PATH = "/global/scratch/projects/fc_nitrates/pranavwalimbe/TEMPO/V03/tmp"
-BASE_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe"
-INPUT_CSV = os.path.join(BASE_DIR, "nox_emissions_1", "nox_emissions_full2.csv")
-TRAIN_PATH = os.path.join(BASE_DIR, "nox_powerplant_data", "train.csv")
-TEST_PATH = os.path.join(BASE_DIR, "nox_powerplant_data", "test.csv")
-VAL_PATH = os.path.join(BASE_DIR, "nox_powerplant_data", "val.csv")
-NUM_SAMPLES = 10000
-MINS_FILTER = 60
-PATCH_SIZE = 48
+import xarray as xr
+from concurrent.futures import ProcessPoolExecutor
 
 # helper functions
+def parse_tile(fname):
+    """return (dt, fname) if tile meets filtering conditions"""
+    try:                                    
+        fpath = os.path.join(TEMPO_DIR, fname)
+        ds = xr.open_dataset(fpath, engine="netcdf4")
+
+        # require minimum duration to be met
+        start = pd.Timestamp(ds.attrs["time_coverage_start"])                                                                                   
+        end = pd.Timestamp(ds.attrs["time_coverage_end"])
+        ds.close()                                                                                              
+        if (end - start).total_seconds() / 60 < MIN_DURATION_MINS:
+            return None
+        
+        # require minimum pixel quality threshold to be met
+        ds_prod = xr.open_dataset(fpath, engine="netcdf4", group="product")
+        no2 = np.squeeze(ds_prod["vertical_column_troposphere"].values)
+        qa = np.squeeze(ds_prod["main_data_quality_flag"].values)
+        ds_prod.close()
+        valid = ~np.isnan(no2)
+        if not valid.any() or np.mean(qa[valid] == 0) < MIN_PIXEL_QUALITY_AVG:
+            return None
+
+        dt = pd.to_datetime(fname.split("_")[4], format="%Y%m%dT%H%M%SZ")
+        return (dt, fname)
+    except Exception as e:
+        print(f"WARNING: skipping {fname}: {e}")
+        return None
+
 def build_tempo_mapping():
-    """generate dict mapping dates to (timestamp, file)"""
+    """generate dict mapping dates to (timestamp, file), filtered to full CONUS composites only"""
+    fnames = [f for f in os.listdir(TEMPO_DIR) if f.endswith(".nc")]
+    with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
+        results = list(executor.map(parse_tile, fnames))
     tempo_by_date = defaultdict(list)
-    for fname in os.listdir(TEMPO_PATH):
-        if not fname.endswith(".nc"):
-            continue
-        try:
-            dt = pd.to_datetime(fname.split("_")[4], format="%Y%m%dT%H%M%SZ")
+    for result in results:
+        if result is not None:
+            dt, fname = result
             tempo_by_date[dt.date()].append((dt, fname))
-        except Exception as e:
-            print(f"WARNING: skipping {fname}: {e}")
     return tempo_by_date
 
 def map_to_tempo(row: pd.Series, tempo_by_date: dict):
-    """Return the first TEMPO filename captured within MINS_FILTER minutes after the record"""
-    target_dt = datetime(year=row['date'].year, month=row['date'].month,
-                        day=row['date'].day, hour=row['hour'])
+    """Return the first TEMPO filename captured within MINS_FILTER minutes before the record"""
+    target_dt = datetime(year=row['date'].year, month=row['date'].month, day=row['date'].day, hour=row['hour'])
     for curr_dt, fname in tempo_by_date.get(row['date'].date(), []):
         dt_diff = curr_dt - target_dt
         if pd.Timedelta(0) < dt_diff <= pd.Timedelta(minutes=MINS_FILTER):
             return fname
     return None
 
+def map_chunk(args):
+    """pickleable helper function for parallelized record-tempo mapping"""
+    chunk, tempo_by_date = args
+    return chunk.assign(tempo=chunk.apply(lambda row: map_to_tempo(row, tempo_by_date), axis=1))
+
 def cluster_plants(df: pd.DataFrame):
     """check for intersecting PATCH_SIZE x PATCH_SIZE bounding boxes before stratifying"""
     plants = df[["facilityId", "lat", "lon"]].drop_duplicates("facilityId").reset_index(drop=True)
 
-    # apply lat, lon -> km conversion
+    # convert from lat/lon (WGS84) format to meters format (NAD83 Conus Albers)
     gdf = gpd.GeoDataFrame(plants, geometry=gpd.points_from_xy(plants["lon"], plants["lat"]), crs="EPSG:4326")
     gdf_proj = gdf.to_crs("EPSG:5070")
     x = np.array([geom.x for geom in gdf_proj.geometry])
@@ -72,9 +93,9 @@ def cluster_plants(df: pd.DataFrame):
 def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame):
     """Visualize stratification in terms of geography and nox emissions"""
     url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
-    us = gpd.read_file(url)                                                                                                                     
+    us = gpd.read_file(url)
     us = us[us.NAME == "United States of America"]
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))                                                                                            
+    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
     splits = [("Train", train), ("Val", val), ("Test", test)]
 
     # spatial visualization of stratification
@@ -95,37 +116,60 @@ def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.Da
         ax.set_ylabel("Count")
 
     plt.tight_layout()
-    os.makedirs(os.path.dirname(VIS_PATH), exist_ok=True)
-    plt.savefig(VIS_PATH, dpi=150)
+    os.makedirs(os.path.dirname(VIS_PNG), exist_ok=True)
+    plt.savefig(VIS_PNG, dpi=150)
     plt.close()
 
-def main():         
-    # sample desired dataset size from all records                                                                                                           
+def main():
     df = pd.read_csv(INPUT_CSV)
-    df['date'] = pd.to_datetime(df['date'])                                                                                 
-    df = df.sample(NUM_SAMPLES, random_state=42).reset_index(drop=True)
+    df['date'] = pd.to_datetime(df['date'])
 
-    # build TEMPO mapping and map each record to a tile
+    # build TEMPO mapping (60-min composites only) and run parallelized record-tempo mapping
     tempo_by_date = build_tempo_mapping()
-    df['tempo'] = df.apply(lambda row: map_to_tempo(row, tempo_by_date), axis=1)
-    df = df[df['tempo'].notna()] 
+    chunks = [df.iloc[idx] for idx in np.array_split(np.arange(len(df)), NUM_CORES) if len(idx) > 0]
+    with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
+        results = list(executor.map(map_chunk, [(c, tempo_by_date) for c in chunks]))
+    df = pd.concat(results).reset_index(drop=True)
+    df = df[df['tempo'].notna()].reset_index(drop=True)
 
-    # cluster spatially-proximate plants and stratify using EPA region
+    # sample desired dataset size with sampling weights inversely proportional to EPA region prevalence
+    region_freq = df["epaRegion"].value_counts(normalize=True)                                                                                      
+    weights = (df["epaRegion"].map(lambda r: 1.0 / region_freq[r]))**2                                                                       
+    df = df.sample(min(NUM_SAMPLES, len(df)), random_state=42, weights=weights).reset_index(drop=True)   
+
+    # aggregate cluster features for stratification   
     cluster_map = cluster_plants(df)
-    df = df.merge(cluster_map, on="facilityId")
-    cluster_features = df.groupby("cluster").agg(epaRegion=("epaRegion", "first")).reset_index()
+    df = df.merge(cluster_map, on="facilityId")                                                                                          
+    cluster_features = df.groupby("cluster").agg(epaRegion= ("epaRegion", "first")).reset_index()
     cluster_features["strat_key"] = cluster_features["epaRegion"].astype(str)
-    train_c, temp_c = train_test_split(cluster_features, test_size=0.30, random_state=42, stratify=cluster_features["strat_key"])
+
+    # merge strat keys to meet count >= 2 requirement 
+    while True:
+        counts = cluster_features["strat_key"].value_counts().sort_values()                                                                         
+        if counts.iloc[0] >= 2:
+            break                                                                                                                                   
+        g1, g2 = counts.index[0], counts.index[1]
+        cluster_features["strat_key"] = cluster_features["strat_key"].replace({g2: g1})
+    train_c, temp_c = train_test_split(cluster_features, test_size=0.35, random_state=42, stratify=cluster_features["strat_key"])
+
+    # merge strat keys to meet count >= 2 requirement 
+    while True:                                 
+        counts = temp_c["strat_key"].value_counts().sort_values()
+        if counts.iloc[0] >= 2:
+            break                                                                                                                                   
+        g1, g2 = counts.index[0], counts.index[1]
+        temp_c["strat_key"] = temp_c["strat_key"].replace({g2: g1})                                                                                 
     val_c, test_c = train_test_split(temp_c, test_size=0.50, random_state=42, stratify=temp_c["strat_key"])
+
     train = df[df["cluster"].isin(train_c["cluster"])].drop(columns=["cluster"])
-    val = df[df["cluster"].isin(val_c["cluster"])].drop(columns=["cluster"])
-    test = df[df["cluster"].isin(test_c["cluster"])].drop(columns=["cluster"])
+    val   = df[df["cluster"].isin(val_c["cluster"])].drop(columns=["cluster"])
+    test  = df[df["cluster"].isin(test_c["cluster"])].drop(columns=["cluster"])
 
     # save splits and generate visualization
-    os.makedirs(os.path.dirname(TRAIN_PATH), exist_ok=True)
-    train.to_csv(TRAIN_PATH, index=False)
-    val.to_csv(VAL_PATH, index=False)
-    test.to_csv(TEST_PATH, index=False)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    train.to_csv(TRAIN_CSV, index=False)
+    val.to_csv(VAL_CSV, index=False)
+    test.to_csv(TEST_CSV, index=False)
     plot_split_distributions(train, val, test)
 
 if __name__ == "__main__":
