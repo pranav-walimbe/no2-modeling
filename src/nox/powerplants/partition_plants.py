@@ -4,9 +4,12 @@ Script to stratify power plant emission records into train/test/val splits
 Output: train.csv, test.csv, val.csv located in output directory                                                                                
 """                                                                                                                                             
 
-from config import *                                                                                                                                    
+import sys                                                                                                                                      
+import os                                                                                                                                       
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config                                                                                                                                                                                                
+from config import *                                                                                                                            
 from sklearn.model_selection import train_test_split                                                                                            
-import geopandas as gpd                                                                                                                         
+import geopandas as gpd
 import matplotlib.pyplot as plt                                                                                                                 
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse import csr_matrix
@@ -18,28 +21,16 @@ import xarray as xr
 from concurrent.futures import ProcessPoolExecutor
 
 # helper functions
-def parse_tile(fname):
-    """return (dt, fname) if tile meets filtering conditions"""
+def parse_tile(fname: str):
+    """Return (dt, fname) if tile meets duration requirement"""
     try:                                    
         fpath = os.path.join(TEMPO_DIR, fname)
         ds = xr.open_dataset(fpath, engine="netcdf4")
-
-        # require minimum duration to be met
         start = pd.Timestamp(ds.attrs["time_coverage_start"])                                                                                   
-        end = pd.Timestamp(ds.attrs["time_coverage_end"])
-        ds.close()                                                                                              
-        if (end - start).total_seconds() / 60 < MIN_DURATION_MINS:
+        end   = pd.Timestamp(ds.attrs["time_coverage_end"])
+        ds.close()                                                                                                                              
+        if (end - start).total_seconds() / 60 < MIN_TEMPO_DURATION:
             return None
-        
-        # require minimum pixel quality threshold to be met
-        ds_prod = xr.open_dataset(fpath, engine="netcdf4", group="product")
-        no2 = np.squeeze(ds_prod["vertical_column_troposphere"].values)
-        qa = np.squeeze(ds_prod["main_data_quality_flag"].values)
-        ds_prod.close()
-        valid = ~np.isnan(no2)
-        if not valid.any() or np.mean(qa[valid] == 0) < MIN_PIXEL_QUALITY_AVG:
-            return None
-
         dt = pd.to_datetime(fname.split("_")[4], format="%Y%m%dT%H%M%SZ")
         return (dt, fname)
     except Exception as e:
@@ -47,7 +38,7 @@ def parse_tile(fname):
         return None
 
 def build_tempo_mapping():
-    """generate dict mapping dates to (timestamp, file), filtered to full CONUS composites only"""
+    """Return dict mapping dates to (timestamp, fname) for tiles meeting duration requirement"""
     fnames = [f for f in os.listdir(TEMPO_DIR) if f.endswith(".nc")]
     with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
         results = list(executor.map(parse_tile, fnames))
@@ -73,7 +64,7 @@ def map_chunk(args):
     return chunk.assign(tempo=chunk.apply(lambda row: map_to_tempo(row, tempo_by_date), axis=1))
 
 def cluster_plants(df: pd.DataFrame):
-    """check for intersecting PATCH_SIZE x PATCH_SIZE bounding boxes before stratifying"""
+    """check for intersecting IMG_SIZE x IMG_SIZE bounding boxes before stratifying"""
     plants = df[["facilityId", "lat", "lon"]].drop_duplicates("facilityId").reset_index(drop=True)
 
     # convert from lat/lon (WGS84) format to meters format (NAD83 Conus Albers)
@@ -85,7 +76,7 @@ def cluster_plants(df: pd.DataFrame):
     # construct adjacency matrix to derive cluster values
     dx = np.abs(x[:, None] - x[None, :])
     dy = np.abs(y[:, None] - y[None, :])
-    adjacency = ((dx < PATCH_SIZE * 1000) & (dy < PATCH_SIZE * 1000)).astype(int)
+    adjacency = ((dx < IMG_SIZE * 1000) & (dy < IMG_SIZE * 1000)).astype(int)
     n_components, labels = connected_components(csr_matrix(adjacency))
     plants["cluster"] = labels
     return plants[["facilityId", "cluster"]]
@@ -116,12 +107,12 @@ def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.Da
         ax.set_ylabel("Count")
 
     plt.tight_layout()
-    os.makedirs(os.path.dirname(VIS_PNG), exist_ok=True)
-    plt.savefig(VIS_PNG, dpi=150)
+    os.makedirs(os.path.dirname(STRAT_VIS_PNG), exist_ok=True)
+    plt.savefig(STRAT_VIS_PNG, dpi=150)
     plt.close()
 
 def main():
-    df = pd.read_csv(INPUT_CSV)
+    df = pd.read_csv(STRAT_INPUT_CSV)
     df['date'] = pd.to_datetime(df['date'])
 
     # build TEMPO mapping (60-min composites only) and run parallelized record-tempo mapping
@@ -135,12 +126,12 @@ def main():
     # sample desired dataset size with sampling weights inversely proportional to EPA region prevalence
     region_freq = df["epaRegion"].value_counts(normalize=True)                                                                                      
     weights = (df["epaRegion"].map(lambda r: 1.0 / region_freq[r]))**2                                                                       
-    df = df.sample(min(NUM_SAMPLES, len(df)), random_state=42, weights=weights).reset_index(drop=True)   
+    df = df.sample(min(DATASET_SIZE, len(df)), random_state=42, weights=weights).reset_index(drop=True)   
 
     # aggregate cluster features for stratification   
     cluster_map = cluster_plants(df)
     df = df.merge(cluster_map, on="facilityId")                                                                                          
-    cluster_features = df.groupby("cluster").agg(epaRegion= ("epaRegion", "first")).reset_index()
+    cluster_features = df.groupby("cluster").agg(epaRegion=("epaRegion", "first")).reset_index()
     cluster_features["strat_key"] = cluster_features["epaRegion"].astype(str)
 
     # merge strat keys to meet count >= 2 requirement 
@@ -150,7 +141,7 @@ def main():
             break                                                                                                                                   
         g1, g2 = counts.index[0], counts.index[1]
         cluster_features["strat_key"] = cluster_features["strat_key"].replace({g2: g1})
-    train_c, temp_c = train_test_split(cluster_features, test_size=0.35, random_state=42, stratify=cluster_features["strat_key"])
+    train_c, temp_c = train_test_split(cluster_features, test_size=0.30, random_state=42, stratify=cluster_features["strat_key"])
 
     # merge strat keys to meet count >= 2 requirement 
     while True:                                 
@@ -166,7 +157,7 @@ def main():
     test = df[df["cluster"].isin(test_c["cluster"])].drop(columns=["cluster"])
 
     # save splits and generate visualization
-    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     train.to_csv(TRAIN_CSV, index=False)
     val.to_csv(VAL_CSV, index=False)
     test.to_csv(TEST_CSV, index=False)

@@ -4,7 +4,10 @@ Scrape hourly NOx emissions data from the EPA CAMPD/EASEY API
 Output: nox_emissions_all.csv
 """
 
-from config import * 
+import sys
+import os                                                                                                                                       
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config                                                                                                                                             
+from config import *
 import csv
 import time
 from datetime import timedelta
@@ -53,6 +56,7 @@ def month_ranges(start: date, end: date):
 
 def fetch_chunk(state: str, begin: str, end: str, retries: int = 3):
     """Fetch one state/month chunk from the API"""
+    url = "https://api.epa.gov/easey/streaming-services/emissions/apportioned/hourly"
     params = {
         "api_key": API_KEY,
         "beginDate": begin,
@@ -64,7 +68,7 @@ def fetch_chunk(state: str, begin: str, end: str, retries: int = 3):
     for attempt in range(1, retries + 1):
         try:
             print(f"Fetching {state} {begin} to {end} (attempt {attempt}/{retries})")
-            resp = requests.get(STREAMING_URL, params=params, timeout=120)
+            resp = requests.get(url, params=params, timeout=120)
             if resp.status_code == 200:
                 return resp.json()
             print(f"ERROR: API {resp.status_code} for {state} {begin}: {resp.text[:200]}")
@@ -78,7 +82,7 @@ def main():
     # replace existing file if present
     if os.path.exists(EMISSIONS_RECORDS_CSV):
         os.remove(EMISSIONS_RECORDS_CSV)
-    months = list(month_ranges(START_DATE, END_DATE))
+    months = list(month_ranges(EMISSIONS_START_DATE, EMISSIONS_END_DATE))
     header_written = False
 
     for state in STATE_CODES:
