@@ -6,14 +6,14 @@ Output: nox_emissions_all.csv
 
 import sys
 import os                                                                                                                                       
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config                                                                                                                                             
-from config import *
 import csv
 import time
 from datetime import timedelta
 import requests
 import pandas as pd
 import calendar
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config                                                                                                                                             
+from config import *
 
 # states to include in requests
 STATE_CODES = [

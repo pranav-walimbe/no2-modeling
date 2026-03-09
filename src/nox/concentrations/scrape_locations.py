@@ -6,11 +6,11 @@ Output: nox_emissions_full.csv in output directory
 
 import sys
 import os                                                                                                                                       
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config                                                                                                                                    
-from config import *
 import pandas as pd
 import requests
 import time
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config                                                                                                                                    
+from config import *
 
 # helper functions
 def get_facility_location(facility_id: int, year: int = 2023, retries: int = 3):

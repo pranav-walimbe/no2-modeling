@@ -5,9 +5,7 @@ Output: train.csv, test.csv, val.csv located in output directory
 """                                                                                                                                             
 
 import sys                                                                                                                                      
-import os                                                                                                                                       
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config                                                                                                                                                                                                
-from config import *                                                                                                                            
+import os                                                                                                                                                                                                                                                                 
 from sklearn.model_selection import train_test_split                                                                                            
 import geopandas as gpd
 import matplotlib.pyplot as plt                                                                                                                 
@@ -19,6 +17,8 @@ from datetime import datetime
 import numpy as np
 import xarray as xr
 from concurrent.futures import ProcessPoolExecutor
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config                                                                                                                                                                                                
+from config import *  
 
 # helper functions
 def parse_tile(fname: str):
