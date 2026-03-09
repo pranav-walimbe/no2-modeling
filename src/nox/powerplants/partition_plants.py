@@ -162,8 +162,8 @@ def main():
     val_c, test_c = train_test_split(temp_c, test_size=0.50, random_state=42, stratify=temp_c["strat_key"])
 
     train = df[df["cluster"].isin(train_c["cluster"])].drop(columns=["cluster"])
-    val   = df[df["cluster"].isin(val_c["cluster"])].drop(columns=["cluster"])
-    test  = df[df["cluster"].isin(test_c["cluster"])].drop(columns=["cluster"])
+    val = df[df["cluster"].isin(val_c["cluster"])].drop(columns=["cluster"])
+    test = df[df["cluster"].isin(test_c["cluster"])].drop(columns=["cluster"])
 
     # save splits and generate visualization
     os.makedirs(OUT_DIR, exist_ok=True)
