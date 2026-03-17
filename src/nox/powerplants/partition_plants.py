@@ -27,7 +27,7 @@ def parse_tile(fname: str):
         fpath = os.path.join(TEMPO_DIR, fname)
         ds = xr.open_dataset(fpath, engine="netcdf4")
         start = pd.Timestamp(ds.attrs["time_coverage_start"])                                                                                   
-        end   = pd.Timestamp(ds.attrs["time_coverage_end"])
+        end = pd.Timestamp(ds.attrs["time_coverage_end"])
         ds.close()                                                                                                                              
         if (end - start).total_seconds() / 60 < MIN_TEMPO_DURATION:
             return None
@@ -64,7 +64,7 @@ def map_chunk(args):
     return chunk.assign(tempo=chunk.apply(lambda row: map_to_tempo(row, tempo_by_date), axis=1))
 
 def cluster_plants(df: pd.DataFrame):
-    """check for intersecting IMG_SIZE x IMG_SIZE bounding boxes before stratifying"""
+    """check for intersecting IMG_RANGE x IMG_RANGE bounding boxes before stratifying"""
     plants = df[["facilityId", "lat", "lon"]].drop_duplicates("facilityId").reset_index(drop=True)
 
     # convert from lat/lon (WGS84) format to meters format (NAD83 Conus Albers)
@@ -76,7 +76,7 @@ def cluster_plants(df: pd.DataFrame):
     # construct adjacency matrix to derive cluster values
     dx = np.abs(x[:, None] - x[None, :])
     dy = np.abs(y[:, None] - y[None, :])
-    adjacency = ((dx < IMG_SIZE * 1000) & (dy < IMG_SIZE * 1000)).astype(int)
+    adjacency = ((dx < IMG_RANGE * 1000) & (dy < IMG_RANGE * 1000)).astype(int)
     n_components, labels = connected_components(csr_matrix(adjacency))
     plants["cluster"] = labels
     return plants[["facilityId", "cluster"]]
@@ -150,7 +150,7 @@ def main():
             break                                                                                                                                   
         g1, g2 = counts.index[0], counts.index[1]
         temp_c["strat_key"] = temp_c["strat_key"].replace({g2: g1})                                                                                 
-    val_c, test_c = train_test_split(temp_c, test_size=0.50, random_state=42, stratify=temp_c["strat_key"])
+    test_c, val_c = train_test_split(temp_c, test_size=0.50, random_state=42, stratify=temp_c["strat_key"])
 
     train = df[df["cluster"].isin(train_c["cluster"])].drop(columns=["cluster"])
     val = df[df["cluster"].isin(val_c["cluster"])].drop(columns=["cluster"])
