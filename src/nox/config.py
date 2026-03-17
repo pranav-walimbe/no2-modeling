@@ -35,7 +35,3 @@ NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK"))
 # --- ERA5 extraction ---
 ERA5_DIR     = "/global/scratch/projects/fc_nitrates/pranavwalimbe/era5"
 ERA5_OUT_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/nox_powerplant_data"
-
-# --- ERA5 extraction ---
-ERA5_DIR     = "/global/scratch/projects/fc_nitrates/pranavwalimbe/era5"
-ERA5_OUT_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/nox_powerplant_data"
