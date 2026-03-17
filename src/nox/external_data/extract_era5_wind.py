@@ -1,24 +1,20 @@
 """
 Extracts ERA5 u10/v10 wind components at each power plant location and hour.
-Outputs train_era5.csv, val_era5.csv, test_era5.csv to ERA5_OUT_DIR.
+Outputs train_era5.csv, val_era5.csv, test_era5.csv to ERA5_OUT_DIR (defined in config).
+Each output file contains the original split columns plus era5_u10, era5_v10,
+era5_wind_speed, and era5_wind_dir for each (plant, date, hour) observation.
 """
 
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../.."))
 
-from src.nox.config import TRAIN_CSV, VAL_CSV, TEST_CSV, NUM_CORES
+from src.nox.config import TRAIN_CSV, VAL_CSV, TEST_CSV, NUM_CORES, ERA5_DIR, ERA5_OUT_DIR
 import pandas as pd
 import xarray as xr
 import numpy as np
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
-import warnings
-warnings.filterwarnings('ignore')
-
-# ── Config ─────────────────────────────────────────────────────────────────────
-ERA5_DIR     = Path("/global/scratch/projects/fc_nitrates/pranavwalimbe/era5")
-ERA5_OUT_DIR = Path("/global/scratch/projects/fc_nitrates/pranavwalimbe/nox_powerplant_data")
 
 SPLITS = {
     "train": TRAIN_CSV,
@@ -26,12 +22,11 @@ SPLITS = {
     "test":  TEST_CSV,
 }
 
-# ── ERA5 extraction for a single row ──────────────────────────────────────────
 def extract_era5_row(lat, lon, date_str, hour):
     """Extract ERA5 u10/v10 at nearest grid point and hour for a single observation."""
     try:
         dt = pd.to_datetime(date_str)
-        path = ERA5_DIR / f"era5_{dt.year}_{dt.month:02d}.nc"
+        path = Path(ERA5_DIR) / f"era5_{dt.year}_{dt.month:02d}.nc"
         if not path.exists():
             raise FileNotFoundError(f"Missing {path}")
 
@@ -53,19 +48,18 @@ def extract_era5_row(lat, lon, date_str, hour):
         return {'era5_u10': np.nan, 'era5_v10': np.nan,
                 'era5_wind_speed': np.nan, 'era5_wind_dir': np.nan}
 
-# ── Chunk worker — must be at module level to be pickleable ───────────────────
 def map_chunk(chunk):
-    """Process one chunk of rows in parallel — mirrors Pranav's map_chunk pattern."""
+    """Process one chunk of rows in parallel."""
     records = [
         extract_era5_row(row['lat'], row['lon'], row['date'], row['hour'])
         for _, row in chunk.iterrows()
     ]
     return pd.concat([chunk, pd.DataFrame(records, index=chunk.index)], axis=1)
 
-# ── Main ───────────────────────────────────────────────────────────────────────
 def main():
+    """Extract ERA5 wind variables for all splits and save to ERA5_OUT_DIR."""
     for split, in_csv in SPLITS.items():
-        out_path = ERA5_OUT_DIR / f"{split}_era5.csv"
+        out_path = Path(ERA5_OUT_DIR) / f"{split}_era5.csv"
 
         df = pd.read_csv(in_csv)
         chunks = [df.iloc[idx] for idx in np.array_split(np.arange(len(df)), NUM_CORES)
