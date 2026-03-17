@@ -74,17 +74,17 @@ def extract_tempo_patch(args):
         # require valid cloud fraction threshold
         valid = ~np.isnan(cloud)
         if not valid.any():
-            print(f"SKIP [{orig_idx}]: {fname} — cloud array is all NaN", flush=True)
+            print(f"SKIP [{orig_idx}]: {fname} — cloud array is all NaN")
             return None                         
         if np.mean(cloud[valid] <= MIN_PIXEL_CLOUD) < MIN_IMG_CLOUD:
             frac_clean = np.mean(cloud[valid] <= MIN_PIXEL_CLOUD)                                                                                       
-            print(f"SKIP [{orig_idx}]: {fname} — only {frac_clean:.1%} pixels below cloud threshold", flush=True)
+            print(f"SKIP [{orig_idx}]: {fname} — only {frac_clean:.1%} pixels below cloud threshold")
             return None     
 
         # require pixel quality = 0                                                                                                                            
         if not np.all(qa == 0):
             frac_bad = np.mean(qa != 0)
-            print(f"SKIP [{orig_idx}]: {fname} — {frac_bad:.1%} pixels have QA != 0", flush=True)
+            print(f"SKIP [{orig_idx}]: {fname} — {frac_bad:.1%} pixels have QA != 0")
             return None
 
         # resize image to IMG_SIZE x IMG_SIZE
@@ -92,7 +92,7 @@ def extract_tempo_patch(args):
         return (orig_idx, no2[np.newaxis, ...].astype(np.float32))
 
     except Exception as e:
-        print(f"ERROR [{orig_idx}]: {fname}: {e}", flush=True)
+        print(f"ERROR [{orig_idx}]: {fname}: {e}")
         return None
 
 def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
