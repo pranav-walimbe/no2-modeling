@@ -6,10 +6,13 @@ from dotenv import load_dotenv
 # ============================================================================
 # API
 # ============================================================================                                                                                                                                   
-load_dotenv()   
-API_KEY = os.getenv("CAMPD_API_KEY") # API key for government CAMPD API                                                                                                    
-if not API_KEY: 
+load_dotenv()                                                                                                   
+if not os.getenv("CAMPD_API_KEY"): # API key for CAMPD API (emissions data) 
     sys.exit("ERROR: CAMPD_API_KEY not found in .env file.")
+if not os.getenv("EARTHDATA_USERNAME") or not os.getenv("EARTHDATA_PASSWORD"): # API key for EarthData API (tempo data)
+    sys.exit("ERROR: EARTHDATA_USERNAME or EARTHDATA_PASSWORD not found in .env file")
+if not os.path.exists(os.path.expanduser("~/.cdsapirc")): # API key for CDS API (wind data)
+    sys.exit("ERROR: ~/.cdsapirc not found. Configure CDS API credentials first")
 
 # ============================================================================
 # Emissions scraping
@@ -34,7 +37,8 @@ STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/nox_powerpl
 TRAIN_CSV = os.path.join(STRAT_BASE_DIR, "train.csv")
 VAL_CSV = os.path.join(STRAT_BASE_DIR, "val.csv")
 TEST_CSV = os.path.join(STRAT_BASE_DIR, "test.csv")
-STRAT_VIS_PNG = "/global/home/users/pranavwalimbe/vis/strat_vis.png"
+VIS_DIR = "/global/home/users/pranavwalimbe/vis"
+STRAT_VIS_PNG = os.path.join(VIS_DIR, "strat_vis.png")
 
 # ============================================================================
 # Wind data scraping
@@ -44,18 +48,12 @@ WIND_START_MONTH = 8
 WIND_START_YEAR = 2023
 WIND_END_MONTH = 9
 WIND_END_YEAR = 2025
-if not os.path.exists(os.path.expanduser("~/.cdsapirc")):
-    sys.exit("ERROR: ~/.cdsapirc not found. Configure CDS API credentials first")
 
 # ============================================================================
 # TEMPO data scraping
 # ============================================================================
 TEMPO_START_DATE = "2025-01-24 00:00:00"
 TEMPO_END_DATE = "2025-09-16 23:59:59"
-EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
-EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
-if not EARTHDATA_USERNAME or not EARTHDATA_PASSWORD:
-    sys.exit("ERROR: EARTHDATA_USERNAME or EARTHDATA_PASSWORD not found in .env file")
 
 # ============================================================================
 # Dataset generation
@@ -65,12 +63,12 @@ IMAGES_DIR = os.path.join(DATASET_DIR, "images")
 LABELS_DIR = os.path.join(DATASET_DIR, "labels")
 WIND_DIR = os.path.join(DATASET_DIR, "wind")
 IMG_SIZE = 64 # image size in pixels
-MIN_PIXEL_CLOUD = 0.2 # tempo cloud threshold for pixel quality filtering 
-MIN_IMG_CLOUD = 0.75 # percent of image pixels with valid cloud fraction
+MIN_PIXEL_CLOUD = 0.2 # tempo cloud fraction for pixel quality filtering 
+MIN_IMG_CLOUD = 0.75 # percent of image pixels that meet MIN_PIXEL_CLOUD fraction
 LABEL_COL = "noxMass" # emissions variable to predict
 WIND_COLS = ["era5_u10", "era5_v10"] # wind variables to include in dataset
-MIN_CITY_PROXIMITY = 100 # minimum distance to nearby major city
-SPLIT_SIZES = {"train": 6000, "val": 1000, "test": 1000} # split size mapping (undersampling)
+MIN_CITY_PROXIMITY = 100 # minimum distance to nearby major city (km)
+SPLIT_SIZES = {"train": 6000, "val": 1000, "test": 1000} # size of each dataset split
 
 # ============================================================================
 # System

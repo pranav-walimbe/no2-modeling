@@ -83,6 +83,8 @@ def cluster_plants(df: pd.DataFrame):
 
 def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame):
     """Visualize stratification in terms of geography and nox emissions"""
+
+    # get US outline for geographic visualization
     url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
     us = gpd.read_file(url)
     us = us[us.NAME == "United States of America"]

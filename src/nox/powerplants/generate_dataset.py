@@ -4,16 +4,17 @@ Script to splice satellite images and generate modeling dataset
 Output: train/val/test tempo zarr stores, label numpy arrays, and wind numpy arrays in DATASET_DIR
 """
                                                                                                                                                 
-import sys
-import os                                                                                                                                       
-import zarr     
+import sys                                                                                                                  
+import os                                                                                                                   
+import zarr                                                                                                                 
+import netCDF4 as nc                                                                                                        
 import numpy as np
 import pandas as pd
-import xarray as xr
 import geopandas as gpd
+import matplotlib.pyplot as plt
 from scipy.ndimage import zoom
 from scipy.spatial import cKDTree
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor                                                                          
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import *
 
@@ -42,58 +43,83 @@ def filter_by_city_proximity(df: pd.DataFrame, cities_gdf: gpd.GeoDataFrame):
     mask = dists_km >= MIN_CITY_PROXIMITY
     return df[mask].reset_index(drop=True)
 
-def extract_tempo_patch(args):
-    """perform TEMPO patch extraction with pixel quality filtering"""
-    orig_idx, row = args
-    fname = row["tempo"]
-    try:
+def extract_tempo_patch(args):                                                                                              
+    """perform TEMPO patch extraction with pixel quality filtering"""                                                       
+    orig_idx, row = args                                                                                                    
+    fname = row["tempo"]                                                                                                    
+    try:                                                                                                                    
         fpath = os.path.join(TEMPO_DIR, fname)
-        ds = xr.open_dataset(fpath, engine="netcdf4")
-        lats = ds["latitude"].values
-        lons = ds["longitude"].values
-        ds.close()
+        with nc.Dataset(fpath) as root: 
+            lats = root["latitude"][:]
+            lons = root["longitude"][:]    
 
-        # find IMG_RANGE x IMG_RANGE patch bounds 
-        lat_idx = np.where((lats >= row["lat_min"]) & (lats <= row["lat_max"]))[0]
-        lon_idx = np.where((lons >= row["lon_min"]) & (lons <= row["lon_max"]))[0]
-        if lat_idx.size == 0 or lon_idx.size == 0:
-            print(f"SKIP [{orig_idx}]: {fname} — no pixels in range around ({row['lat']:.2f}, {row['lon']:.2f})")
-            return None
-        r0, r1 = lat_idx.min(), lat_idx.max() + 1
-        c0, c1 = lon_idx.min(), lon_idx.max() + 1
+            # compute patch bound index values                                                                                  
+            lat_idx = np.where((lats >= row["lat_min"]) & (lats <= row["lat_max"]))[0]
+            lon_idx = np.where((lons >= row["lon_min"]) & (lons <= row["lon_max"]))[0]                                                                                                            
+            if lat_idx.size == 0 or lon_idx.size == 0:
+                print(f"SKIP [{orig_idx}]: {fname} — no pixels in range around ({row['lat']:.2f}, {row['lon']:.2f})")       
+                return None
+            r0, r1 = lat_idx.min(), lat_idx.max() + 1
+            c0, c1 = lon_idx.min(), lon_idx.max() + 1
 
-        # access tempo data: cloud fraction, pixel quality, no2 concentration
-        ds = xr.open_dataset(fpath, engine="netcdf4", group="support_data")                                                                             
-        cloud = ds["eff_cloud_fraction"].squeeze().isel(latitude=slice(r0, r1), longitude=slice(c0, c1)).values                                       
-        ds.close()                                                                
-        ds = xr.open_dataset(fpath, engine="netcdf4", group="product")
-        qa  = ds["main_data_quality_flag"].squeeze().isel(latitude=slice(r0, r1), longitude=slice(c0, c1)).values                                       
-        no2 = ds["vertical_column_troposphere"].squeeze().isel(latitude=slice(r0, r1), longitude=slice(c0, c1)).values.astype(np.float32)
-        ds.close()   
+            # require cloud quality to meet quality checks
+            cloud = root["support_data"]["eff_cloud_fraction"][0, r0:r1, c0:c1]
+            valid = ~np.isnan(cloud)                                                                                        
+            if not valid.any():
+                print(f"SKIP [{orig_idx}]: {fname} — cloud array is all NaN")                                               
+                return None
+            frac_clean = np.mean(cloud[valid] <= MIN_PIXEL_CLOUD)
+            if frac_clean < MIN_IMG_CLOUD:                                                                                  
+                print(f"SKIP [{orig_idx}]: {fname} — only {frac_clean:.1%} pixels below cloud threshold")
+                return None                                                                                                 
+                
+            # require QA values = 0                                                                                   
+            qa = root["product"]["main_data_quality_flag"][0, r0:r1, c0:c1]
+            if not np.all(qa == 0):                                                                                         
+                frac_bad = np.mean(qa != 0)
+                print(f"SKIP [{orig_idx}]: {fname} — {frac_bad:.1%} pixels have QA != 0")
+                return None                                                                                                 
+                                                                       
+            no2 = root["product"]["vertical_column_troposphere"][0, r0:r1, c0:c1].astype(np.float32)
 
-        # require valid cloud fraction threshold
-        valid = ~np.isnan(cloud)
-        if not valid.any():
-            print(f"SKIP [{orig_idx}]: {fname} — cloud array is all NaN")
-            return None                         
-        if np.mean(cloud[valid] <= MIN_PIXEL_CLOUD) < MIN_IMG_CLOUD:
-            frac_clean = np.mean(cloud[valid] <= MIN_PIXEL_CLOUD)                                                                                       
-            print(f"SKIP [{orig_idx}]: {fname} — only {frac_clean:.1%} pixels below cloud threshold")
-            return None     
-
-        # require pixel quality = 0                                                                                                                            
-        if not np.all(qa == 0):
-            frac_bad = np.mean(qa != 0)
-            print(f"SKIP [{orig_idx}]: {fname} — {frac_bad:.1%} pixels have QA != 0")
-            return None
-
-        # resize image to IMG_SIZE x IMG_SIZE
+        # resize patch to IMG_SIZE x IMG_SIZE                                                                                            
         no2 = zoom(no2, (IMG_SIZE / no2.shape[0], IMG_SIZE / no2.shape[1]), order=1)
-        return (orig_idx, no2[np.newaxis, ...].astype(np.float32))
-
+        return (orig_idx, no2[np.newaxis, ...].astype(np.float32))                                                          
+                                                                                                                            
     except Exception as e:
-        print(f"ERROR [{orig_idx}]: {fname}: {e}")
+        print(f"ERROR [{orig_idx}]: {fname}: {e}")                                                                          
         return None
+
+def visualize_split(df: pd.DataFrame, valid_idxs: list, split: str):
+    """Visualize geographic distribution and label distribution for a split"""
+    valid_df = df.loc[valid_idxs]                                                                                           
+
+    # get US outline for geographic visualization                                                                                                       
+    url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"                                   
+    us = gpd.read_file(url)                                                                                                 
+    us = us[us.NAME == "United States of America"]                                                                                                                
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle(f"{split} (n={len(valid_df)})", fontsize=14)                                                               
+                                                                                                                            
+    # geographic distribution
+    us.plot(ax=axes[0], color="lightgray", edgecolor="black")                                                               
+    axes[0].scatter(valid_df["lon"], valid_df["lat"], s=5, alpha=0.3)
+    axes[0].set_xlim(-130, -65)                                                                                             
+    axes[0].set_ylim(24, 50)
+    axes[0].set_xlabel("Longitude")                                                                                         
+    axes[0].set_ylabel("Latitude")
+    axes[0].set_title("Geographic Distribution")
+                                                                                                                            
+    # log label distribution
+    axes[1].hist(np.log1p(valid_df[LABEL_COL]), bins=50, alpha=0.7)                                                         
+    axes[1].set_xlabel(f"log({LABEL_COL} + 1)")
+    axes[1].set_ylabel("Count")                                                                                             
+    axes[1].set_title("Label Distribution (log scale)")
+                                                                                                                            
+    plt.tight_layout()
+    os.makedirs(VIS_DIR, exist_ok=True)
+    plt.savefig(os.path.join(VIS_DIR, f"dataset_vis_{split}.png"), dpi=150)                                                 
+    plt.close()
 
 def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
     """Parallel patch extraction, zarr write, and label save for a given split"""
@@ -107,7 +133,7 @@ def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
 
     valid = [r for r in results if r is not None]
     n_valid = len(valid)
-    print(f"  {n_valid} / {len(df)} patches passed filtering")
+    print(f"{n_valid} / {len(df)} patches passed filtering")
     if n_valid == 0:
         return
 
@@ -138,11 +164,15 @@ def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
     wind = df.loc[valid_idxs, WIND_COLS].values.astype(np.float32)
     np.save(wind_path, wind) 
 
+    # visualize split distribution
+    visualize_split(df, valid_idxs, split)
+
 def main():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     os.makedirs(LABELS_DIR, exist_ok=True)
     os.makedirs(WIND_DIR, exist_ok=True)
 
+    # city locations dataset for proximity filtering
     CITIES_URL = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_populated_places_simple.zip"
     cities_gdf = gpd.read_file(CITIES_URL).to_crs("EPSG:5070")
 
