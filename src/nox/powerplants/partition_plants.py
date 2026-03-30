@@ -85,8 +85,7 @@ def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.Da
     """Visualize stratification in terms of geography and nox emissions"""
 
     # get US outline for geographic visualization
-    url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
-    us = gpd.read_file(url)
+    us = gpd.read_file(COUNTRIES_URL)
     us = us[us.NAME == "United States of America"]
     fig, axes = plt.subplots(2, 3, figsize=(20, 12))
     splits = [("Train", train), ("Val", val), ("Test", test)]
