@@ -151,7 +151,7 @@ def main():
             break                                                                                                                                   
         g1, g2 = counts.index[0], counts.index[1]
         temp_c["strat_key"] = temp_c["strat_key"].replace({g2: g1})                                                                                 
-    test_c, val_c = train_test_split(temp_c, test_size=0.50, random_state=42, stratify=temp_c["strat_key"])
+    val_c, test_c = train_test_split(temp_c, test_size=0.50, random_state=42, stratify=temp_c["strat_key"])
 
     train = df[df["cluster"].isin(train_c["cluster"])].drop(columns=["cluster"])
     val = df[df["cluster"].isin(val_c["cluster"])].drop(columns=["cluster"])

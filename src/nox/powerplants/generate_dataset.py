@@ -122,8 +122,11 @@ def visualize_split(df: pd.DataFrame, valid_idxs: list, split: str):
     plt.close()                                                                                                             
 
 def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):                                              
-    """Parallel patch extraction, zarr write, and dataset DataFrame save for a given split"""
-    df = filter_by_city_proximity(df, cities_gdf)                                                                           
+    """Parallel patch extraction, zarr write, and dataset DataFrame save for a given split"""                                                                          
+    # pre-filtering based on emmissons outliers + city proximity 
+    df = filter_by_city_proximity(df, cities_gdf)                                                                          
+    label_threshold = df[LABEL_COL].quantile(LABEL_FILTER_PERCENTILE)                                                                                
+    df = df[df[LABEL_COL] <= label_threshold].reset_index(drop=True)
     df = compute_bounds(df)
 
     # parallelized tempo patch extraction                                                                                   

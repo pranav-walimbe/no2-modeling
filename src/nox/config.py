@@ -26,7 +26,7 @@ FULL_DATA_CSV = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.csv")
 # ============================================================================
 # Stratification
 # ============================================================================
-DATASET_SIZE = 35000 # desired dataset size
+DATASET_SIZE = 50000 # desired dataset size
 MINS_FILTER = 60 # time window between emissions record and TEMPO image (minutes)
 IMG_RANGE = 72  # km range captured by image
 MIN_TEMPO_DURATION = 58 # min TEMPO image duration (minutes)
@@ -62,30 +62,32 @@ TEMPO_END_DATE = "2025-09-16 23:59:59"
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/dataset"
 IMAGES_DIR = os.path.join(DATASET_DIR, "images")
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")
-IMG_SIZE = 64 # image size in pixels
+IMG_SIZE = 56 # image size in pixels
+LABEL_FILTER_PERCENTILE = 0.90 # top % of label values to filter
 MIN_PIXEL_CLOUD = 0.2 # tempo cloud fraction for pixel quality filtering 
 MIN_IMG_CLOUD = 0.75 # percent of image pixels that meet MIN_PIXEL_CLOUD fraction
 LABEL_COL = "noxMass" # emissions variable to predict
 WIND_COLS = ["era5_u10", "era5_v10"] # wind variables to include in dataset
 MIN_CITY_PROXIMITY = 100 # minimum distance to nearby major city (km)
-SPLIT_SIZES = {"train": 6000, "val": 1000, "test": 1000} # size of each dataset split
+SPLIT_SIZES = {"train": 10000, "val": 2000, "test": 2000} # size of each dataset split
 
 # ============================================================================
 # ML modeling
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"
+MAX_IMG_VAL = 1e16
 BATCH_SIZE = 128
 RESNET_HEAD_DIM = 256
-LR = 1e-5
-NUM_EPOCHS = 2
-SCHEDULER_PATIENCE = 5
+LR = 1e-4
+NUM_EPOCHS = 50
+SCHEDULER_PATIENCE = 3
 SCHEDULER_FACTOR = 0.5
-EARLY_STOP_PATIENCE = 3
+EARLY_STOP_PATIENCE = 5
 KERNEL_SIZE = 3
 STRIDE = 1
 PADDING = 1
 WEIGHT_DECAY = 1e-4
-DROPOUT = 0.3
+DROPOUT = 0.2
 
 # ============================================================================
 # System
