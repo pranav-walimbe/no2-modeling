@@ -31,7 +31,7 @@ class NOxDataset(Dataset):
         u, v = self.wind[idx, WIND_COLS.index("era5_u10")], self.wind[idx, WIND_COLS.index("era5_v10")]
                                                                                                                                                                                                                                                                                                      
         wind = torch.tensor([np.sqrt(u**2 + v**2)]).float() # compute wind speed                                                                                                                                                           
-        image = image.clamp(max=MAX_IMG_VAL) # apply windsoring on image concentrations
+        image = image.clamp(max=MAX_IMG_VAL) # apply clipping on image concentrations
                                                                                                                                                                             
         if self.stats is not None:
             image = (image - self.stats["image_mean"]) / self.stats["image_std"]                                                                                             
