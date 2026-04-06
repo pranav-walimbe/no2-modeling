@@ -81,6 +81,28 @@ def cluster_plants(df: pd.DataFrame):
     plants["cluster"] = labels
     return plants[["facilityId", "cluster"]]
 
+def rebalance_splits(val: pd.DataFrame, test: pd.DataFrame, other_df: pd.DataFrame):
+    """Rebalance val and test split to equal sizes using weighted sampling from unused rows"""
+    target_size = max(len(val), len(test))
+
+    if len(other_df) < target_size:
+        sys.exit(f"ERROR: other_df (size={len(other_df)}) is smaller than target_size ({target_size}), cannot rebalance")
+
+    region_freq = other_df["epaRegion"].value_counts(normalize=True)
+    weights = other_df["epaRegion"].map(lambda r: 1.0 / region_freq[r]).fillna(1.0 / region_freq.mean())
+
+    if len(val) < target_size:
+        extra = other_df.sample(target_size - len(val), random_state=42, weights=weights)
+        other_df = other_df.drop(extra.index)
+        val = pd.concat([val, extra]).reset_index(drop=True)
+
+    if len(test) < target_size:
+        extra = other_df.sample(target_size - len(test), random_state=42, weights=weights)
+        other_df = other_df.drop(extra.index)
+        test = pd.concat([test, extra]).reset_index(drop=True)
+
+    return val, test
+
 def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame):
     """Visualize stratification in terms of geography and nox emissions"""
 
@@ -94,7 +116,7 @@ def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.Da
     for ax, (label, split_df) in zip(axes[0], splits):
         us.plot(ax=ax, color="lightgray", edgecolor="black")
         ax.scatter(split_df["lon"], split_df["lat"], s=5, alpha=0.3)
-        ax.set_title(label)
+        ax.set_title(f"{label} : n = {split_df.shape[0]}")
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
         ax.set_xlim(-130, -65)
@@ -116,7 +138,7 @@ def main():
     df = pd.read_csv(STRAT_INPUT_CSV)
     df['date'] = pd.to_datetime(df['date'])
 
-    # build TEMPO mapping (60-min composites only) and run parallelized record-tempo mapping
+    # build TEMPO mapping and run parallelized record-tempo mapping
     tempo_by_date = build_tempo_mapping()
     chunks = [df.iloc[idx] for idx in np.array_split(np.arange(len(df)), NUM_CORES) if len(idx) > 0]
     with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
@@ -124,38 +146,27 @@ def main():
     df = pd.concat(results).reset_index(drop=True)
     df = df[df['tempo'].notna()].reset_index(drop=True)
 
-    # sample desired dataset size with sampling weights inversely proportional to EPA region prevalence
-    region_freq = df["epaRegion"].value_counts(normalize=True)                                                                                      
-    weights = (df["epaRegion"].map(lambda r: 1.0 / region_freq[r]))**2                                                                       
-    df = df.sample(min(DATASET_SIZE, len(df)), random_state=42, weights=weights).reset_index(drop=True)   
+    # sample desired dataset size with weighted sampling (inversely proportional to EPA region)
+    region_freq = df["epaRegion"].value_counts(normalize=True)
+    weights = (df["epaRegion"].map(lambda r: 1.0 / region_freq[r]))
+    df = df.sample(min(SAMPLE_SIZE, len(df)), random_state=42, weights=weights).reset_index(drop=True)
 
-    # aggregate cluster features for stratification   
+    # stratify clusters and map back to split dataframes
     cluster_map = cluster_plants(df)
-    df = df.merge(cluster_map, on="facilityId")                                                                                          
-    cluster_features = df.groupby("cluster").agg(epaRegion=("epaRegion", "first")).reset_index()
-    cluster_features["strat_key"] = cluster_features["epaRegion"].astype(str)
+    df = df.merge(cluster_map, on="facilityId")
+    cluster_ids = pd.Series(df["cluster"].unique())
 
-    # merge strat keys to meet count >= 2 requirement 
-    while True:
-        counts = cluster_features["strat_key"].value_counts().sort_values()                                                                         
-        if counts.iloc[0] >= 2:
-            break                                                                                                                                   
-        g1, g2 = counts.index[0], counts.index[1]
-        cluster_features["strat_key"] = cluster_features["strat_key"].replace({g2: g1})
-    train_c, temp_c = train_test_split(cluster_features, test_size=0.30, random_state=42, stratify=cluster_features["strat_key"])
+    strat_clusters, other_clusters = train_test_split(cluster_ids, test_size=0.50, random_state=42)
+    train_c, temp_c = train_test_split(cluster_ids, test_size=0.30, random_state=42)
+    val_c, test_c = train_test_split(temp_c, test_size=0.50, random_state=42)
 
-    # merge strat keys to meet count >= 2 requirement 
-    while True:                                 
-        counts = temp_c["strat_key"].value_counts().sort_values()
-        if counts.iloc[0] >= 2:
-            break                                                                                                                                   
-        g1, g2 = counts.index[0], counts.index[1]
-        temp_c["strat_key"] = temp_c["strat_key"].replace({g2: g1})                                                                                 
-    val_c, test_c = train_test_split(temp_c, test_size=0.50, random_state=42, stratify=temp_c["strat_key"])
+    train = df[df["cluster"].isin(train_c)]
+    val = df[df["cluster"].isin(val_c)]
+    test = df[df["cluster"].isin(test_c)]
+    other_df = df[df["cluster"].isin(other_clusters)]
 
-    train = df[df["cluster"].isin(train_c["cluster"])].drop(columns=["cluster"])
-    val = df[df["cluster"].isin(val_c["cluster"])].drop(columns=["cluster"])
-    test = df[df["cluster"].isin(test_c["cluster"])].drop(columns=["cluster"])
+    # rebalance val and test to equal sizes
+    val, test = rebalance_splits(val, test, other_df)
 
     # save splits and generate visualization
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)

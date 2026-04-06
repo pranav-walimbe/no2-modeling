@@ -26,13 +26,13 @@ FULL_DATA_CSV = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.csv")
 # ============================================================================
 # Stratification
 # ============================================================================
-DATASET_SIZE = 50000 # desired dataset size
+SAMPLE_SIZE = 50000 # subset count of rows to run stratification on
 MINS_FILTER = 60 # time window between emissions record and TEMPO image (minutes)
 IMG_RANGE = 72  # km range captured by image
 MIN_TEMPO_DURATION = 58 # min TEMPO image duration (minutes)
 COUNTRIES_URL = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip" # US map shapefile
 
-TEMPO_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/TEMPO/V03/tmp"
+TEMPO_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/TEMPO/V04"
 STRAT_INPUT_CSV = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full2.csv")
 STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/nox_powerplant_data"
 TRAIN_CSV = os.path.join(STRAT_BASE_DIR, "train.csv")
@@ -47,14 +47,15 @@ STRAT_VIS_PNG = os.path.join(VIS_DIR, "strat_vis.png")
 ERA5_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/era5"
 WIND_START_MONTH = 8
 WIND_START_YEAR = 2023
-WIND_END_MONTH = 9
+WIND_END_MONTH = 12
 WIND_END_YEAR = 2025
 
 # ============================================================================
 # TEMPO data scraping
 # ============================================================================
-TEMPO_START_DATE = "2025-01-24 00:00:00"
-TEMPO_END_DATE = "2025-09-16 23:59:59"
+TEMPO_START_DATE = "2025-09-18 00:00:00"
+TEMPO_END_DATE = "2025-12-31 23:59:59"
+TEMPO_VERSION = "V04"
 
 # ============================================================================
 # Dataset generation
@@ -63,31 +64,32 @@ DATASET_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/dataset"
 IMAGES_DIR = os.path.join(DATASET_DIR, "images")
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")
 IMG_SIZE = 56 # image size in pixels
-LABEL_FILTER_PERCENTILE = 0.90 # top % of label values to filter
-MIN_PIXEL_CLOUD = 0.2 # tempo cloud fraction for pixel quality filtering 
-MIN_IMG_CLOUD = 0.75 # percent of image pixels that meet MIN_PIXEL_CLOUD fraction
+LABEL_FILTER_PERCENTILE = 0.90 # fraction of label values to keep
+MAX_IMG_VAL = 1e16 # maximum concentration value in images
+IMG_VAL_FILTER = 0.50 # max percent of image pixels >= MAX_IMG_VAL
+MIN_PIXEL_CLOUD = 0.20 # tempo cloud fraction for pixel quality filtering 
+IMG_CLOUD_FILTER = 0.75 # percent of image pixels that meet MIN_PIXEL_CLOUD fraction
 LABEL_COL = "noxMass" # emissions variable to predict
 WIND_COLS = ["era5_u10", "era5_v10"] # wind variables to include in dataset
 MIN_CITY_PROXIMITY = 100 # minimum distance to nearby major city (km)
-SPLIT_SIZES = {"train": 10000, "val": 2000, "test": 2000} # size of each dataset split
+SPLIT_SIZES = {"train": 12000, "val": 4000, "test": 4000} # size of each dataset split
 
 # ============================================================================
 # ML modeling
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"
-MAX_IMG_VAL = 1e16
 BATCH_SIZE = 128
 RESNET_HEAD_DIM = 256
 LR = 1e-4
 NUM_EPOCHS = 50
 SCHEDULER_PATIENCE = 3
-SCHEDULER_FACTOR = 0.5
-EARLY_STOP_PATIENCE = 5
+SCHEDULER_FACTOR = 0.50
+EARLY_STOP_PATIENCE = 4
 KERNEL_SIZE = 3
 STRIDE = 1
 PADDING = 1
 WEIGHT_DECAY = 1e-4
-DROPOUT = 0.2
+DROPOUT = 0.40
 
 # ============================================================================
 # System
