@@ -1,5 +1,5 @@
 """
-Script to store TEMPO V04 L3 tiles for a provided date range
+Script to store TEMPO V03 L4 tiles for a provided date range
 
 Output: TEMPO level3 images stored in TEMPO_DIR
 """
@@ -16,7 +16,7 @@ def main():
         earthaccess.login(strategy="environment")
         results = earthaccess.search_data(
           short_name="TEMPO_NO2_L3",
-          version="V03",
+          version=TEMPO_VERSION,
           temporal=(TEMPO_START_DATE, TEMPO_END_DATE),
         )
         if not results:

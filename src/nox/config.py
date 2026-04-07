@@ -66,6 +66,7 @@ DATASET_DF = os.path.join(DATASET_DIR, "dataframes")
 IMG_SIZE = 56 # image size in pixels
 LABEL_FILTER_PERCENTILE = 0.90 # fraction of label values to keep
 MAX_IMG_VAL = 1e16 # maximum concentration value in images
+MIN_IMG_VAL = -1e16 # minimum concentration value in images
 IMG_VAL_FILTER = 0.50 # max percent of image pixels >= MAX_IMG_VAL
 MIN_PIXEL_CLOUD = 0.20 # tempo cloud fraction for pixel quality filtering 
 IMG_CLOUD_FILTER = 0.75 # percent of image pixels that meet MIN_PIXEL_CLOUD fraction
@@ -84,12 +85,12 @@ LR = 1e-4
 NUM_EPOCHS = 50
 SCHEDULER_PATIENCE = 3
 SCHEDULER_FACTOR = 0.50
-EARLY_STOP_PATIENCE = 4
+EARLY_STOP_PATIENCE = 5
 KERNEL_SIZE = 3
 STRIDE = 1
 PADDING = 1
 WEIGHT_DECAY = 1e-4
-DROPOUT = 0.40
+DROPOUT = 0.50
 
 # ============================================================================
 # System
