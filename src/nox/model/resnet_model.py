@@ -17,12 +17,12 @@ class NOxResNet(nn.Module):
         # resnet18 backbone modified for single-channel input                                 
         backbone = resnet18(weights=None)
         backbone.conv1 = nn.Conv2d(1, 64, kernel_size=KERNEL_SIZE, stride=STRIDE, padding=PADDING, bias=False)              
-        backbone.maxpool = nn.Identity() # avoid aggressive pooling / convolution on small input images to preserve resolution                                                                                  
+        backbone.maxpool = nn.Identity() # avoid aggressive pooling on small input images                                                                                
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])                                                      
                 
         # regression head: image features + wind features -> scalar                                                    
         self.head = nn.Sequential(                                                                                                                                               
-            nn.Linear(513, RESNET_HEAD_DIM), # RESNET_HEAD_DIM + len(wind_scalar)
+            nn.Linear(513, RESNET_HEAD_DIM), # 512 ResNet features + wind scalar
             nn.BatchNorm1d(RESNET_HEAD_DIM),                                                                                                                                     
             nn.ReLU(),                      
             nn.Dropout(p=DROPOUT),

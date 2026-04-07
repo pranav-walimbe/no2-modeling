@@ -46,7 +46,7 @@ def compute_stats(split, batch_size=512):
         "image_std": float(std),
         "wind_mean": float(wind_speed.mean()),
         "wind_std": float(wind_speed.std()),
-    }                                                                                                                                                                    
+    }                                                                                                                                                                 
                                                                                                     
 def _save(fig, run_dir, plot_name):                                                                                         
     """Save figure to run directory and close it"""
@@ -63,7 +63,40 @@ def _plant_metrics(df):
             "mae": (g["y_pred"] - g["y_true"]).abs().mean(),                                                                
             "mean_y_true": g["y_true"].mean(),                                                                              
         })).reset_index()                                                                                                      
-    )           
+    )    
+
+def plot_extreme_predictions(train_df, test_df, val_df, run_dir, threshold=1000):
+    """Visualize images and row info for predictions above threshold in a single PNG"""
+    splits_data = []                                                                                                                                                     
+    for name, df in [("train", train_df), ("test", test_df), ("val", val_df)]:                                                                                           
+        extreme = df[df["y_pred"] >= threshold].reset_index()                                                                                                            
+        if len(extreme) > 0:                                                                                                                                             
+            print(f"\n{name} predictions >= {threshold}:")
+            print(extreme[["facilityId", "facilityName", "y_true", "y_pred"]].to_string())                                                                               
+            images = zarr.open(os.path.join(IMAGES_DIR, f"{name}_tempo.zarr"), mode="r")                                                                                 
+            splits_data.append((name, extreme, images))
+                                                                                                                                                                        
+    if not splits_data:
+        print(f"no predictions >= {threshold} in any split")                                                                                                             
+        return  
+
+    n_cols = max(len(extreme) for _, extreme, _ in splits_data)                                                                                                          
+    n_rows = len(splits_data)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))                                                                                           
+    axes = np.array(axes).reshape(n_rows, n_cols)
+                                                                                                                                                                        
+    for row_idx, (name, extreme, images) in enumerate(splits_data):
+        for col_idx in range(n_cols):                                                                                                                                    
+            ax = axes[row_idx, col_idx]
+            if col_idx < len(extreme):                                                                                                                                   
+                row = extreme.iloc[col_idx]
+                img = images[int(row["index"])][0]                                                                                                                       
+                ax.imshow(img, cmap="viridis", interpolation="nearest")
+                ax.set_title(f"{name} — {row['facilityName']}\npred={row['y_pred']:.1f} true={row['y_true']:.1f}", fontsize=7)                                           
+            ax.axis("off")                                                                                                                                               
+                                                                                                                                                                        
+    plt.tight_layout()                                                                                                                                                   
+    _save(fig, run_dir, "extreme_predictions")         
 
 def plot_loss_curve(train_losses, val_losses, run_dir):                                                                     
     """Plot training and validation loss across epochs"""                                                                   
@@ -86,7 +119,7 @@ def plot_pred_vs_true(train_df, test_df, val_df, run_dir):
     run_name = os.path.basename(run_dir)                                                                                                                                 
     sns.set_theme(style="whitegrid", font_scale=1.1)
     fig, axes = plt.subplots(1, 3, figsize=(21, 7))                                                                                                                      
-    for ax, (df, split) in zip(axes, [(train_df, "train"), (test_df, "test"), (val_df, "val")]): # temporary fix: exclude train                                                              
+    for ax, (df, split) in zip(axes, [(train_df, "train"), (test_df, "test"), (val_df, "val")]):                                                            
         ax.scatter(df["y_true"], df["y_pred"], alpha=0.4, s=8, linewidth=0, color="#4C9BE8")                                                                                    
         lims = [min(df["y_true"].min(), df["y_pred"].min()),                                                                                                                     
                 max(df["y_true"].max(), df["y_pred"].max())]

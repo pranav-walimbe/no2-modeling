@@ -54,7 +54,7 @@ def run_inference(model, loader, device):
                 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")                                                                                      
-    print(f"device: {device}")
+
     # create run directory                                                                                                  
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
     run_dir = os.path.join(RUNS_DIR, run_name)                                                                              
@@ -67,16 +67,16 @@ def main():
                 
     # initialize datasets and dataloaders                                                                                   
     train_dataset = NOxDataset("train", stats=stats)                                                                                                                         
-    val_dataset = NOxDataset("val",   stats=stats)                                                                                                                         
-    test_dataset = NOxDataset("test",  stats=stats)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)                                           
+    val_dataset = NOxDataset("val", stats=stats)                                                                                                                         
+    test_dataset = NOxDataset("test", stats=stats)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)                                           
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)                                            
                 
     # initialize model, optimizer, loss, scheduler                                                                          
     model = NOxResNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)                                                                 
-    criterion = nn.L1Loss() # MAE loss: mitigate heavy-tailed distribution                                                                                            
+    criterion = nn.MSELoss()                                                                                            
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=SCHEDULER_PATIENCE,              
         factor=SCHEDULER_FACTOR)                                                                                                                                                                                                                
     best_val_loss = float("inf")                                                                                            
@@ -128,17 +128,7 @@ def main():
     test_df["y_pred"] = run_inference(model, test_loader, device)                                                                                          
     val_df = pd.read_csv(os.path.join(DATASET_DF, "val_df.csv"))                                                                                                             
     val_df["y_true"] = val_df[LABEL_COL].values
-    val_df["y_pred"] = run_inference(model, val_loader, device)
-    
-    # ***temporary fix: deal with outlier predictions***  
-    for name, df in [("train", train_df), ("test", test_df), ("val", val_df)]:
-        print(f"\n{name} y_pred summary:")                                                                                                                                   
-        print(df["y_pred"].describe())                                                                                                                                       
-        print(f"predictions >= 1000: {(df['y_pred'] >= 1000).sum()}")                                                                                                        
-                                                                                                                                                                            
-    train_df = train_df[train_df["y_pred"] < 1000]
-    test_df = test_df[test_df["y_pred"] < 1000]                                                                                                                              
-    val_df = val_df[val_df["y_pred"] < 1000]                                                                                                       
+    val_df["y_pred"] = run_inference(model, val_loader, device)                                                                                                 
     generate_eval_plots(train_df, test_df, val_df, run_dir)                                                                                                                                                                                                                     
 
 if __name__ == "__main__":                                                                                                  

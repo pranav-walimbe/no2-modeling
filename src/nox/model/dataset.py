@@ -20,7 +20,7 @@ class NOxDataset(Dataset):
         self.images = zarr.open(os.path.join(IMAGES_DIR, f"{split}_tempo.zarr"), mode="r")                                                                               
         self.labels = df[LABEL_COL].values.astype(np.float32)                                                                                                            
         self.wind = df[WIND_COLS].values.astype(np.float32)
-        self.stats = stats                                                                                                                                               
+        self.stats = stats                                                                                                                                              
                 
     def __len__(self):                                                                                                                                                   
         return len(self.labels)
