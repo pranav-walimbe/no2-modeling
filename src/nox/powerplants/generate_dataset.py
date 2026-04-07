@@ -84,15 +84,13 @@ def extract_tempo_patch(args):
                 frac_bad = np.mean(qa != 0)                                                                      
                 print(f"SKIP [{orig_idx}]: {fname} — {frac_bad:.1%} pixels have QA != 0")
                 return None  
-                                                                                                                            
-            no2 = np.array(root["product"]["vertical_column_troposphere"][0, r0:r1, c0:c1]).astype(np.float32)  
 
             # filter out images based on outlier concentration values
             no2_ma = root["product"]["vertical_column_troposphere"][0, r0:r1, c0:c1]
             if np.ma.getmaskarray(no2_ma).any():        
                 print(f"SKIP [{orig_idx}]: {fname} — no2 patch contains masked pixels")                                      
                 return None                             
-            no2 = np.array(no2_ma).astype(np.float32)                                                                        
+            no2 = np.array(no2_ma)                                                                     
                                                                     
             if no2.min() < MIN_IMG_VAL:                                                                                      
                 print(f"SKIP [{orig_idx}]: {fname} — min pixel value {no2.min():.2e} < {MIN_IMG_VAL:.2e}")
