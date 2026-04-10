@@ -90,6 +90,7 @@ def rebalance_splits(val: pd.DataFrame, test: pd.DataFrame, other_df: pd.DataFra
 
     region_freq = other_df["epaRegion"].value_counts(normalize=True)
     weights = other_df["epaRegion"].map(lambda r: 1.0 / region_freq[r]).fillna(1.0 / region_freq.mean())
+    weights /= weights.sum()
 
     if len(val) < target_size:
         extra = other_df.sample(target_size - len(val), random_state=42, weights=weights)
@@ -149,6 +150,7 @@ def main():
     # sample desired dataset size with weighted sampling (inversely proportional to EPA region)
     region_freq = df["epaRegion"].value_counts(normalize=True)
     weights = (df["epaRegion"].map(lambda r: 1.0 / region_freq[r]))
+    weights /= weights.sum()
     df = df.sample(min(SAMPLE_SIZE, len(df)), random_state=42, weights=weights).reset_index(drop=True)
 
     # stratify clusters and map back to split dataframes
@@ -156,8 +158,8 @@ def main():
     df = df.merge(cluster_map, on="facilityId")
     cluster_ids = pd.Series(df["cluster"].unique())
 
-    strat_clusters, other_clusters = train_test_split(cluster_ids, test_size=0.50, random_state=42)
-    train_c, temp_c = train_test_split(cluster_ids, test_size=0.30, random_state=42)
+    strat_clusters, other_clusters = train_test_split(cluster_ids, test_size=0.30, random_state=42)
+    train_c, temp_c = train_test_split(strat_clusters, test_size=0.40, random_state=42)
     val_c, test_c = train_test_split(temp_c, test_size=0.50, random_state=42)
 
     train = df[df["cluster"].isin(train_c)]
