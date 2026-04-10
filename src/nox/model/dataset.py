@@ -27,18 +27,18 @@ class NOxDataset(Dataset):
 
     def __getitem__(self, idx):
         image = torch.tensor(self.images[idx]).float()
-        label = torch.tensor(self.labels[idx]).float()                                                                                                                       
-        u, v = self.wind[idx, WIND_COLS.index("era5_u10")], self.wind[idx, WIND_COLS.index("era5_v10")]
-                                                                                                                                                                                                                                                                                                     
-        wind = torch.tensor([np.sqrt(u**2 + v**2)]).float() # compute wind speed                                                                                                                                                           
-        image = image.clamp(max=MAX_IMG_VAL) # apply clipping on image concentrations
-                                                                                                                                                                            
-        if self.stats is not None:
-            image = (image - self.stats["image_mean"]) / self.stats["image_std"]                                                                                             
-            wind = (wind - self.stats["wind_mean"]) / self.stats["wind_std"]
-                                                                                                                                                                            
+        label = torch.tensor(self.labels[idx]).float()                                                                                                        
+        u, v = self.wind[idx, WIND_COLS.index("era5_u10")], self.wind[idx, WIND_COLS.index("era5_v10")]                                                       
+                                                                                                                                                                
+        wind = torch.tensor([np.sqrt(u**2 + v**2)]).float()                                                                                                   
+        image = image.clamp(max=MAX_IMG_VAL)                                                                                                                  
+                                                                                                                                                                
         # align wind direction across images
-        angle_deg = math.degrees(math.atan2(float(v), float(u)))                                                                                                             
+        angle_deg = math.degrees(math.atan2(float(v), float(u)))
         image = TF.rotate(image, angle=-angle_deg, fill=0.0)
-                                                                                                                                                                            
+                                                                                                                                                                
+        if self.stats is not None:
+            image = (image - self.stats["image_mean"]) / self.stats["image_std"]                                                                              
+            wind = (wind - self.stats["wind_mean"]) / self.stats["wind_std"]
+                                                                                                                                                                
         return image, wind, label

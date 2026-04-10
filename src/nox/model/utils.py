@@ -54,49 +54,17 @@ def _save(fig, run_dir, plot_name):
     fig.savefig(path, dpi=150, bbox_inches="tight")                                                                         
     plt.close(fig)                                                                                               
                                                                                                                                       
-def _plant_metrics(df):                                                                                                     
-    """Compute per-plant RMSE, MAE, and mean true emissions"""
-    return (                                                                                                                
+def _plant_metrics(df):
+    """Compute per-plant RMSE, MAE, MAPE, and mean true emissions"""                                                                                      
+    return (                                                                                                                                              
         df.groupby(["facilityId", "facilityName", "lon", "lat"])
-        .apply(lambda g: pd.Series({                                                                                        
+        .apply(lambda g: pd.Series({                                                                                                                      
             "rmse": np.sqrt(((g["y_pred"] - g["y_true"]) ** 2).mean()),
-            "mae": (g["y_pred"] - g["y_true"]).abs().mean(),                                                                
-            "mean_y_true": g["y_true"].mean(),                                                                              
-        })).reset_index()                                                                                                      
-    )    
-
-def plot_extreme_predictions(train_df, test_df, val_df, run_dir, threshold=1000):
-    """Visualize images and row info for predictions above threshold in a single PNG"""
-    splits_data = []                                                                                                                                                     
-    for name, df in [("train", train_df), ("test", test_df), ("val", val_df)]:                                                                                           
-        extreme = df[df["y_pred"] >= threshold].reset_index()                                                                                                            
-        if len(extreme) > 0:                                                                                                                                             
-            print(f"\n{name} predictions >= {threshold}:")
-            print(extreme[["facilityId", "facilityName", "y_true", "y_pred"]].to_string())                                                                               
-            images = zarr.open(os.path.join(IMAGES_DIR, f"{name}_tempo.zarr"), mode="r")                                                                                 
-            splits_data.append((name, extreme, images))
-                                                                                                                                                                        
-    if not splits_data:
-        print(f"no predictions >= {threshold} in any split")                                                                                                             
-        return  
-
-    n_cols = max(len(extreme) for _, extreme, _ in splits_data)                                                                                                          
-    n_rows = len(splits_data)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows))                                                                                           
-    axes = np.array(axes).reshape(n_rows, n_cols)
-                                                                                                                                                                        
-    for row_idx, (name, extreme, images) in enumerate(splits_data):
-        for col_idx in range(n_cols):                                                                                                                                    
-            ax = axes[row_idx, col_idx]
-            if col_idx < len(extreme):                                                                                                                                   
-                row = extreme.iloc[col_idx]
-                img = images[int(row["index"])][0]                                                                                                                       
-                ax.imshow(img, cmap="viridis", interpolation="nearest")
-                ax.set_title(f"{name} — {row['facilityName']}\npred={row['y_pred']:.1f} true={row['y_true']:.1f}", fontsize=7)                                           
-            ax.axis("off")                                                                                                                                               
-                                                                                                                                                                        
-    plt.tight_layout()                                                                                                                                                   
-    _save(fig, run_dir, "extreme_predictions")         
+            "mae": (g["y_pred"] - g["y_true"]).abs().mean(),                                                                                              
+            "mape": ((g["y_pred"] - g["y_true"]).abs() / g["y_true"].replace(0, np.nan)).mean() * 100,                                                    
+            "mean_y_true": g["y_true"].mean(),                                                                                                            
+        })).reset_index()                                                                                                                                 
+    )            
 
 def plot_loss_curve(train_losses, val_losses, run_dir):                                                                     
     """Plot training and validation loss across epochs"""                                                                   
@@ -179,31 +147,33 @@ def plot_spatial_error(train_df, test_df, val_df, run_dir):
     plt.tight_layout()                                                                                                                                                   
     _save(fig, run_dir, "spatial_error")
 
-def plot_residual_examples(test_df, run_dir, n=10):                                                                                                                      
-    """Plot the n lowest and n highest residual examples from the test set as a single PNG"""                                                                            
-    run_name = os.path.basename(run_dir)                                                                                                                                 
-    df = test_df.copy().reset_index(drop=True)
-    df["abs_residual"] = (df["y_pred"] - df["y_true"]).abs()                                                                                                             
-    lowest = df.nsmallest(n, "abs_residual")                                                                                                                             
-    highest = df.nlargest(n, "abs_residual")                                                                                                                             
-    images = zarr.open(os.path.join(IMAGES_DIR, "test_tempo.zarr"), mode="r")                                                                                            
-                                                                                                                                                                        
-    fig, axes = plt.subplots(2, n, figsize=(3 * n, 7))                                                                                                                   
-    fig.suptitle(f"Residual Examples (test set — {run_name})", fontweight="bold", fontsize=14)                                                                           
-                                                                                                                                                                        
-    for row_axes, subset, row_label in [                                                                                                                                 
-        (axes[0], lowest,  "Low residual"),
-        (axes[1], highest, "High residual"),                                                                                                                             
-    ]:                                                                                                                                                                   
-        for ax, (_, row) in zip(row_axes, subset.iterrows()):
-            img = images[int(row.name)][0]                                                                                                                                                                                                                                                                                                                                                                                                            
-            ax.imshow(img, cmap="viridis", interpolation="nearest")
-            ax.set_title(f"residual={row['abs_residual']:.2f}\ntrue={row['y_true']:.2f}", fontsize=7)                                                                    
-            ax.axis("off")                                                                                                                                               
-        row_axes[0].set_ylabel(row_label, fontsize=10, labelpad=8)
-                                                                                                                                                                        
+def plot_residual_examples(test_df, run_dir, n=10):                                                                                                       
+    """For n random plants, plot their lowest and highest residual prediction"""                                                                          
+    run_name = os.path.basename(run_dir)                                                                                                                  
+    df = test_df.copy().reset_index(drop=True)                                                                                                            
+    df["abs_residual"] = (df["y_pred"] - df["y_true"]).abs()                                                                                              
+    images = zarr.open(os.path.join(IMAGES_DIR, "test_tempo.zarr"), mode="r")                                                                             
+                                                                                                                                                        
+    plants = df["facilityId"].drop_duplicates().sample(n=min(n, df["facilityId"].nunique()), random_state=42)                                             
+                                                                                                                                                        
+    fig, axes = plt.subplots(2, len(plants), figsize=(3 * len(plants), 7))
+    fig.suptitle(f"Per-plant residual examples (test set — {run_name})", fontweight="bold", fontsize=14)                                                  
+    axes[0, 0].set_ylabel("Low residual", fontsize=10, labelpad=8)
+    axes[1, 0].set_ylabel("High residual", fontsize=10, labelpad=8)                                                                                       
+                                            
+    for i, facility_id in enumerate(plants):                                                                                                              
+        plant_df = df[df["facilityId"] == facility_id]
+        low_row  = plant_df.loc[plant_df["abs_residual"].idxmin()]                                                                                        
+        high_row = plant_df.loc[plant_df["abs_residual"].idxmax()]
+                                                                                                                                                        
+        for ax, row in [(axes[0, i], low_row), (axes[1, i], high_row)]:                                                                                   
+            img = images[int(row["zarr_idx"])][0]
+            ax.imshow(img, cmap="viridis", interpolation="nearest")                                                                                       
+            ax.set_title(f"{row['facilityName']}\nresidual={row['abs_residual']:.2f}\ntrue={row['y_true']:.2f}", fontsize=6)                              
+            ax.axis("off")                                                                                                                                
+                                                                                                                                                        
     plt.tight_layout()
-    _save(fig, run_dir, "residual_examples")
+    _save(fig, run_dir, "residual_examples")  
                                                                                                                                                                         
 def generate_eval_plots(train_df, test_df, val_df, run_dir):                                                                                                             
     """Generate all inference evaluation plots for a completed training run"""

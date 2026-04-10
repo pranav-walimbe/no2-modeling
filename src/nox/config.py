@@ -64,8 +64,8 @@ DATASET_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/dataset"
 IMAGES_DIR = os.path.join(DATASET_DIR, "images")
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")
 IMG_SIZE = 56 # image size in pixels
-LABEL_FILTER_PERCENTILE = 0.90 # fraction of label values to keep
-MAX_IMG_VAL = 1e16 # maximum concentration value in images
+LABEL_FILTER_PERCENTILE = 0.10 # upper and lower filter bound for label values
+MAX_IMG_VAL = 3e16 # maximum concentration value in images
 MIN_IMG_VAL = -1e16 # minimum concentration value in images
 IMG_VAL_FILTER = 0.50 # max percent of image pixels >= MAX_IMG_VAL
 MIN_PIXEL_CLOUD = 0.20 # tempo cloud fraction for pixel quality filtering 
@@ -79,18 +79,18 @@ SPLIT_SIZES = {"train": 12000, "val": 4000, "test": 4000} # size of each dataset
 # ML modeling
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 RESNET_HEAD_DIM = 256
 LR = 1e-4
-NUM_EPOCHS = 50
+NUM_EPOCHS = 100
 SCHEDULER_PATIENCE = 3
-SCHEDULER_FACTOR = 0.50
+SCHEDULER_FACTOR = 0.75
 EARLY_STOP_PATIENCE = 5
 KERNEL_SIZE = 3
 STRIDE = 1
 PADDING = 1
 WEIGHT_DECAY = 1e-4
-DROPOUT = 0.50
+USE_PRETRAINED = True
 
 # ============================================================================
 # System

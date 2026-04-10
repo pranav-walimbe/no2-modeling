@@ -69,14 +69,15 @@ def main():
     train_dataset = NOxDataset("train", stats=stats)                                                                                                                         
     val_dataset = NOxDataset("val", stats=stats)                                                                                                                         
     test_dataset = NOxDataset("test", stats=stats)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)                                           
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)                                            
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+    train_eval_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)                                           
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)                                            
                 
     # initialize model, optimizer, loss, scheduler                                                                          
     model = NOxResNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)                                                                 
-    criterion = nn.MSELoss()                                                                                            
+    criterion = nn.L1Loss()                                                                                        
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=SCHEDULER_PATIENCE,              
         factor=SCHEDULER_FACTOR)                                                                                                                                                                                                                
     best_val_loss = float("inf")                                                                                            
@@ -120,15 +121,21 @@ def main():
     model.load_state_dict(ckpt["model_state_dict"])     
 
     # run inference on all splits and generate eval visualizations                                                                                                           
-    train_df = pd.read_csv(os.path.join(DATASET_DF, "train_df.csv"))                                                                                                         
-    train_df["y_true"] = train_df[LABEL_COL].values                                                                                                                          
-    train_df["y_pred"] = run_inference(model, train_loader, device)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
-    test_df = pd.read_csv(os.path.join(DATASET_DF, "test_df.csv"))
-    test_df["y_true"] = test_df[LABEL_COL].values                                                                                                                            
-    test_df["y_pred"] = run_inference(model, test_loader, device)                                                                                          
-    val_df = pd.read_csv(os.path.join(DATASET_DF, "val_df.csv"))                                                                                                             
-    val_df["y_true"] = val_df[LABEL_COL].values
-    val_df["y_pred"] = run_inference(model, val_loader, device)                                                                                                 
+    train_df = pd.read_csv(os.path.join(DATASET_DF, "train_df.csv"))                                                                                          
+    train_preds = run_inference(model, train_eval_loader, device)                                                                                                  
+    train_df = train_df.iloc[:len(train_preds)]                                                                                                        
+    train_df["y_true"] = train_df[LABEL_COL].values                                                                                                           
+    train_df["y_pred"] = train_preds                                                                                                                                                           
+    test_df = pd.read_csv(os.path.join(DATASET_DF, "test_df.csv"))                                                                                            
+    test_preds = run_inference(model, test_loader, device)                                                                                                    
+    test_df = test_df.iloc[:len(test_preds)]
+    test_df["y_true"] = test_df[LABEL_COL].values                                                                                                             
+    test_df["y_pred"] = test_preds                                                                                                                                              
+    val_df = pd.read_csv(os.path.join(DATASET_DF, "val_df.csv"))
+    val_preds = run_inference(model, val_loader, device)                                                                                                      
+    val_df = val_df.iloc[:len(val_preds)]                                                                                                              
+    val_df["y_true"] = val_df[LABEL_COL].values 
+    val_df["y_pred"] = val_preds                                                                                                                                                                                                             
     generate_eval_plots(train_df, test_df, val_df, run_dir)                                                                                                                                                                                                                     
 
 if __name__ == "__main__":                                                                                                  
