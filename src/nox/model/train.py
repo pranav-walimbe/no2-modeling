@@ -17,40 +17,40 @@ from model.resnet_model import NOxResNet
 from model.utils import *                                                  
 
 def train_epoch(model, loader, optimizer, criterion, device):
-    """Run one training epoch and return mean loss over the dataset"""                                                            
-    model.train()
+    """Run one training epoch and return mean loss over the dataset"""
+    model.train()                                                                                                             
     total_loss = 0.0
-    for image, wind, label in loader:                                                                                      
-        image, wind, label = image.to(device), wind.to(device), label.to(device)
-        optimizer.zero_grad()                                                                                               
-        pred = model(image, wind)
-        loss = criterion(pred, label)                                                                                       
+    for image, wind, label, loss_weight in loader:                                                                            
+        image, wind, label, loss_weight = image.to(device), wind.to(device), label.to(device), loss_weight.to(device)       
+        optimizer.zero_grad()                                                                                                 
+        pred = model(image, wind)           
+        loss = (loss_weight * criterion(pred, label, reduction="none")).mean()                                                
         loss.backward()
-        optimizer.step()                                                                                                    
+        optimizer.step()                                                                                                      
         total_loss += loss.item() * len(label)
-    return total_loss / len(loader.dataset)                                                                                 
+    return total_loss / len(loader.dataset)                                                                                
                                                                                                                             
 def val_epoch(model, loader, criterion, device):
-    """Run one validation epoch and return mean loss over the dataset"""
+    """Run one validation epoch and return mean loss over the dataset"""                                                      
     model.eval()
-    total_loss = 0.0
-    with torch.no_grad():                                                                                                   
-        for image, wind, label in loader:
-            image, wind, label = image.to(device), wind.to(device), label.to(device)                                        
-            pred = model(image, wind)
-            loss = criterion(pred, label)                                                                                   
-            total_loss += loss.item() * len(label)
+    total_loss = 0.0                                                                                                          
+    with torch.no_grad():                   
+        for image, wind, label, _ in loader:
+            image, wind, label = image.to(device), wind.to(device), label.to(device)
+            pred = model(image, wind)                                                                                         
+            loss = criterion(pred, label)   
+            total_loss += loss.item() * len(label)                                                                            
     return total_loss / len(loader.dataset)                                                                                                                                                                                                      
 
-def run_inference(model, loader, device):                                                                                   
-    """Run model inference on a dataloader and return predictions as a numpy array"""
-    model.eval()                                                                                                            
-    preds = []
-    with torch.no_grad():                                                                                                   
-        for image, wind, _ in loader:
+def run_inference(model, loader, device):
+    """Run model inference on a dataloader and return predictions as a numpy array"""                                         
+    model.eval()                            
+    preds = []                          
+    with torch.no_grad():
+        for image, wind, _, __ in loader:                                                                                     
             image, wind = image.to(device), wind.to(device)
-            preds.append(model(image, wind).cpu().numpy())                                                                  
-    return np.concatenate(preds)                                                                                                                 
+            preds.append(model(image, wind).cpu().numpy())                                                                    
+    return np.concatenate(preds)                                                                                                                  
                 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")                                                                                      
@@ -77,7 +77,7 @@ def main():
     # initialize model, optimizer, loss, scheduler                                                                          
     model = NOxResNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)                                                                 
-    criterion = nn.L1Loss()                                                                                        
+    criterion = msle_loss                                                                             
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=SCHEDULER_PATIENCE,              
         factor=SCHEDULER_FACTOR)                                                                                                                                                                                                                
     best_val_loss = float("inf")                                                                                            
@@ -125,18 +125,22 @@ def main():
     train_preds = run_inference(model, train_eval_loader, device)                                                                                                  
     train_df = train_df.iloc[:len(train_preds)]                                                                                                        
     train_df["y_true"] = train_df[LABEL_COL].values                                                                                                           
-    train_df["y_pred"] = train_preds                                                                                                                                                           
+    train_df["y_pred"] = train_preds   
+
     test_df = pd.read_csv(os.path.join(DATASET_DF, "test_df.csv"))                                                                                            
     test_preds = run_inference(model, test_loader, device)                                                                                                    
     test_df = test_df.iloc[:len(test_preds)]
     test_df["y_true"] = test_df[LABEL_COL].values                                                                                                             
-    test_df["y_pred"] = test_preds                                                                                                                                              
+    test_df["y_pred"] = test_preds          
+
     val_df = pd.read_csv(os.path.join(DATASET_DF, "val_df.csv"))
     val_preds = run_inference(model, val_loader, device)                                                                                                      
     val_df = val_df.iloc[:len(val_preds)]                                                                                                              
     val_df["y_true"] = val_df[LABEL_COL].values 
-    val_df["y_pred"] = val_preds                                                                                                                                                                                                             
-    generate_eval_plots(train_df, test_df, val_df, run_dir)                                                                                                                                                                                                                     
+    val_df["y_pred"] = val_preds
+                                                                                                                                                                                                                 
+    generate_eval_plots(train_df, test_df, val_df, run_dir) 
+    print_mae_summary(train_df, test_df, val_df)                                                                                                                                                                                                                    
 
 if __name__ == "__main__":                                                                                                  
     main() 

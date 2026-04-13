@@ -98,16 +98,28 @@ def extract_tempo_patch(args):
             frac_clipped = np.mean(no2 >= MAX_IMG_VAL)                                                                       
             if frac_clipped > IMG_VAL_FILTER:           
                 print(f"SKIP [{orig_idx}]: {fname} — {frac_clipped:.1%} pixels at max value")                                
-                return None       
+                return None    
+
+            # extract no2 uncertainty values for loss weights
+            unc_ma = root["product"]["vertical_column_troposphere_uncertainty"][0, r0:r1, c0:c1]                              
+            if np.ma.getmaskarray(unc_ma).any():
+                print(f"SKIP [{orig_idx}]: {fname} — uncertainty patch contains masked pixels")                               
+                return None             
+            unc = np.array(unc_ma)
+
+            # compute loss weight using uncertainty
+            loss_weight = np.mean(np.abs(no2) / (np.abs(unc) + 1e-10))
             
         # resize patch to IMG_SIZE x IMG_SIZE                                                                           
         no2 = zoom(no2, (IMG_SIZE / no2.shape[0], IMG_SIZE / no2.shape[1]), order=1) 
 
         # compute heuristic for plume quality in image
-        background = np.median(no2)                                                                                                                       
-        score = np.mean(no2 > background + 2 * np.std(no2)) 
+        p99 = np.percentile(no2, 99)                                                                                                                      
+        p50 = np.percentile(no2, 50)                                                                                                                      
+        p10 = np.percentile(no2, 10)                                                                                                                      
+        plume_score = (p99 - p50) / (p50 - p10 + 1e-10) 
                                                                                                       
-        return (orig_idx, no2[np.newaxis, ...].astype(np.float32), score)                                       
+        return (orig_idx, no2[np.newaxis, ...].astype(np.float32), plume_score, loss_weight)                                       
                                                                                                                             
     except Exception as e:                                                                                                  
         print(f"ERROR [{orig_idx}]: {fname}: {e}")                                                                          
@@ -162,59 +174,64 @@ def visualize_split(df: pd.DataFrame, valid_idxs: list, split: str):
     plt.savefig(os.path.join(VIS_DIR, f"dataset_vis_{split}.png"), dpi=150)
     plt.close()
                                                                                                           
-def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):                                              
-    """Parallel patch extraction, zarr write, and dataset DataFrame save for a given split"""                                                                          
-    # pre-filtering based on emissions outliers + city proximity                                                                                          
-    df = filter_by_city_proximity(df, cities_gdf)                                                                                                         
-    lower_threshold = df[LABEL_COL].quantile(LABEL_FILTER_PERCENTILE)                                                                                     
-    upper_threshold = df[LABEL_COL].quantile(1 - LABEL_FILTER_PERCENTILE)                                                                                 
-    df = df[(df[LABEL_COL] >= lower_threshold) & (df[LABEL_COL] <= upper_threshold)].reset_index(drop=True)                                               
-    df = compute_bounds(df)                                                                                                                               
-                                                                                                                                                        
-    # parallelized tempo patch extraction   
-    args = [(orig_idx, row) for orig_idx, row in df.iterrows()]                                                                                           
-    with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
-        results = list(executor.map(extract_tempo_patch, args))                                                                                           
-                                        
-    valid = [r for r in results if r is not None]                                                                                                         
-    n_valid = len(valid)                                                                                                                                  
-    print(f"{n_valid} / {len(df)} patches passed filtering")
-    if n_valid == 0:                                                                                                                                      
-        return                          
-                                                                                                                                                        
-    # filter by plume score — drop samples below split average                                                                                            
-    scores = np.array([r[2] for r in valid])                                                                                                              
-    avg_score = scores.mean()                                                                                                                             
-    print(f"[{split}] avg plume score: {avg_score:.4f}, filtering below average...")
-    valid = [r for r, s in zip(valid, scores) if s >= avg_score]
-    print(f"[{split}] {len(valid)} samples retained after plume score filter")
-    if not valid:                                                                                                                                         
-        return                          
-                                                                                                                                                        
-    # undersample image count for given split                                                                                                             
-    n_store = min(SPLIT_SIZES[split], len(valid))
-    valid = valid[:n_store]                                                                                                                               
-                                                                                                                                                        
-    # store image data in zarr
-    tempo_path = os.path.join(IMAGES_DIR, f"{split}_tempo.zarr")                                                                                          
-    tempo_store = zarr.open(tempo_path, mode="w",
-        shape=(n_store, 1, IMG_SIZE, IMG_SIZE),                                                                                                           
-        chunks=(1, 1, IMG_SIZE, IMG_SIZE),
-        dtype="float32"                                                                                                                                   
-    )                                                                                                                                                     
-                                                                                                                                                        
-    valid_idxs = []                                                                                                                                       
-    for i, (orig_idx, patch, _) in enumerate(valid):                                                                                                      
-        tempo_store[i] = patch
-        valid_idxs.append(orig_idx)    
+def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):                                                
+    """Parallel patch extraction, zarr write, and dataset DataFrame save for a given split"""
+    # prefiltering by city proximity                                                                                          
+    df = filter_by_city_proximity(df, cities_gdf)                                                                             
+    df = compute_bounds(df)             
                                                                                                                             
-    # store dataset DataFrame with original columns, label, wind, and zarr index                                            
-    out_df = df.loc[valid_idxs].drop(columns=["lat_min", "lat_max", "lon_min", "lon_max"]).copy()
-    out_df["zarr_idx"] = range(n_store)                                                                                     
-    out_df["split"] = split
-    out_df.to_csv(os.path.join(DATASET_DF, f"{split}_df.csv"), index=False)                                                 
+    # parallelized tempo patch extraction                                                                                     
+    args = [(orig_idx, row) for orig_idx, row in df.iterrows()]                                                               
+    with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:                                                              
+        results = list(executor.map(extract_tempo_patch, args))                                                               
+                                            
+    valid = [r for r in results if r is not None]                                                                             
+    n_valid = len(valid)
+    print(f"{n_valid} / {len(df)} patches passed filtering")                                                                  
+    if n_valid == 0:
+        return                                                                                                                
+                                        
+    # filter by plume score — drop samples below percentile threshold
+    plume_scores = np.array([r[2] for r in valid])                                                                            
+    threshold = np.percentile(plume_scores, PLUME_FILTER_PERCENTILE * 100)
+    valid = [r for r, s in zip(valid, plume_scores) if s >= threshold]                                                        
+    print(f"[{split}] {len(valid)} samples retained after plume score filter (threshold={threshold:.4f})")
+    if not valid:                                                                                                             
+        return                          
+                                                                                                                            
+    # undersample image count for given split                                                                                 
+    n_store = min(SPLIT_SIZES[split], len(valid))
+    valid = valid[:n_store]                                                                                                   
+                                                                                                                            
+    # store image data in zarr              
+    tempo_path = os.path.join(IMAGES_DIR, f"{split}_tempo.zarr")                                                              
+    tempo_store = zarr.open(tempo_path, mode="w",
+        shape=(n_store, 1, IMG_SIZE, IMG_SIZE),                                                                               
+        chunks=(1, 1, IMG_SIZE, IMG_SIZE),  
+        dtype="float32"                                                                                                       
+    )           
+                                                                                                                            
+    valid_idxs = []
+    plume_scores = []                                                                                                         
+    loss_weights = []                       
+    for i, (orig_idx, patch, plume_score, loss_weight) in enumerate(valid):
+        tempo_store[i] = patch
+        valid_idxs.append(orig_idx)                                                                                           
+        plume_scores.append(plume_score)
+        loss_weights.append(loss_weight)                                                                                      
+                                                                                                                            
+    # normalize loss weights so mean weight = 1 to keep loss scale stable
+    loss_weights = np.array(loss_weights) / np.mean(loss_weights)                                                             
                 
-    # visualize split distribution                                                                                          
+    # store dataset DataFrame with original columns, label, wind, and zarr index                                              
+    out_df = df.loc[valid_idxs].drop(columns=["lat_min", "lat_max", "lon_min", "lon_max"]).copy()
+    out_df["zarr_idx"] = range(n_store)                                                                                       
+    out_df["split"] = split                                                                                                   
+    out_df["plume_score"] = plume_scores
+    out_df["loss_weight"] = loss_weights                                                                                      
+    out_df.to_csv(os.path.join(DATASET_DF, f"{split}_df.csv"), index=False)
+                                                                                                                            
+    # visualize split distribution                                                                                            
     visualize_split(df, valid_idxs, split)
                                                                                                                             
 def main():

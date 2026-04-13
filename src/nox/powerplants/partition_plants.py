@@ -82,28 +82,29 @@ def cluster_plants(df: pd.DataFrame):
     return plants[["facilityId", "cluster"]]
 
 def rebalance_splits(val: pd.DataFrame, test: pd.DataFrame, other_df: pd.DataFrame):
-    """Rebalance val and test split to equal sizes using weighted sampling from unused rows"""
-    target_size = max(len(val), len(test))
-
-    if len(other_df) < target_size:
-        sys.exit(f"ERROR: other_df (size={len(other_df)}) is smaller than target_size ({target_size}), cannot rebalance")
-
-    region_freq = other_df["epaRegion"].value_counts(normalize=True)
-    weights = other_df["epaRegion"].map(lambda r: 1.0 / region_freq[r]).fillna(1.0 / region_freq.mean())
-    weights /= weights.sum()
-
-    if len(val) < target_size:
-        extra = other_df.sample(target_size - len(val), random_state=42, weights=weights)
-        other_df = other_df.drop(extra.index)
-        val = pd.concat([val, extra]).reset_index(drop=True)
-
-    if len(test) < target_size:
-        extra = other_df.sample(target_size - len(test), random_state=42, weights=weights)
-        other_df = other_df.drop(extra.index)
+    """Rebalance val and test split to equal sizes using label-similarity weighted sampling"""
+    target_size = max(len(val), len(test))  
+                                            
+    if len(other_df) < target_size:     
+        sys.exit(f"ERROR: other_df (size={len(other_df)}) is smaller than target_size ({target_size}), cannot rebalance")                                 
+                                                                                                                                                        
+    def get_weights(target_df):                                                                                                                               
+        z_scores = ((other_df[LABEL_COL] - target_df[LABEL_COL].mean()) / (target_df[LABEL_COL].std() + 1e-10)).abs()                                         
+        weights = np.exp(-z_scores)                                                                                                                           
+        return weights / weights.sum()
+                                                                                                                                                        
+    if len(val) < target_size:                                                                                                                            
+        extra = other_df.sample(target_size - len(val), random_state=42, weights=get_weights(val))
+        other_df = other_df.drop(extra.index)                                                                                                             
+        val = pd.concat([val, extra]).reset_index(drop=True)                                                                                              
+                                            
+    if len(test) < target_size:                                                                                                                           
+        extra = other_df.sample(target_size - len(test), random_state=42, weights=get_weights(test))                                                    
+        other_df = other_df.drop(extra.index)                                                                                                             
         test = pd.concat([test, extra]).reset_index(drop=True)
-
-    return val, test
-
+                                                                                                                                                        
+    return val, test                                                                                                                                    
+                       
 def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame):
     """Visualize stratification in terms of geography and nox emissions"""
 
@@ -123,12 +124,12 @@ def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.Da
         ax.set_xlim(-130, -65)
         ax.set_ylim(24, 50)
 
-    # histogram of log-scale noxMass distribution
+    # histogram of noxMass distribution
     for ax, (label, split_df) in zip(axes[1], splits):
-        ax.hist(np.log1p(split_df["noxMass"]), bins=50, alpha=0.7)
-        ax.set_title(label)
-        ax.set_xlabel("log(noxMass + 1)")
-        ax.set_ylabel("Count")
+        ax.hist(split_df["noxMass"], bins=50, alpha=0.7)                                                                                                      
+        ax.set_title(label)                 
+        ax.set_xlabel("noxMass")                                                                                                                              
+        ax.set_ylabel("Count") 
 
     plt.tight_layout()
     os.makedirs(os.path.dirname(STRAT_VIS_PNG), exist_ok=True)
@@ -139,6 +140,10 @@ def main():
     df = pd.read_csv(STRAT_INPUT_CSV)
     df['date'] = pd.to_datetime(df['date'])
 
+    # prefilter extreme label values
+    low, high = df[LABEL_COL].quantile(0.05), df[LABEL_COL].quantile(0.95)                                                                                    
+    df = df[(df[LABEL_COL] >= low) & (df[LABEL_COL] <= high)].reset_index(drop=True)  
+
     # build TEMPO mapping and run parallelized record-tempo mapping
     tempo_by_date = build_tempo_mapping()
     chunks = [df.iloc[idx] for idx in np.array_split(np.arange(len(df)), NUM_CORES) if len(idx) > 0]
@@ -147,25 +152,28 @@ def main():
     df = pd.concat(results).reset_index(drop=True)
     df = df[df['tempo'].notna()].reset_index(drop=True)
 
-    # sample desired dataset size with weighted sampling (inversely proportional to EPA region)
-    region_freq = df["epaRegion"].value_counts(normalize=True)
-    weights = (df["epaRegion"].map(lambda r: 1.0 / region_freq[r]))
-    weights /= weights.sum()
-    df = df.sample(min(SAMPLE_SIZE, len(df)), random_state=42, weights=weights).reset_index(drop=True)
+    # sample desired dataset size
+    df = df.sample(min(SAMPLE_SIZE, len(df)), random_state=42).reset_index(drop=True)
 
-    # stratify clusters and map back to split dataframes
+    # cluster plants and compute per-cluster mean emission for stratification
     cluster_map = cluster_plants(df)
     df = df.merge(cluster_map, on="facilityId")
-    cluster_ids = pd.Series(df["cluster"].unique())
+    cluster_emissions = df.groupby("cluster")[LABEL_COL].mean()                                                                                         
+    cluster_df = pd.DataFrame({"cluster": df["cluster"].unique()})
+    cluster_df["emission_bin"] = pd.qcut(                                                                                                                 
+        cluster_df["cluster"].map(cluster_emissions),                                                                                                     
+        q=3, labels=False, duplicates="drop"
+    )  
 
-    strat_clusters, other_clusters = train_test_split(cluster_ids, test_size=0.30, random_state=42)
-    train_c, temp_c = train_test_split(strat_clusters, test_size=0.40, random_state=42)
-    val_c, test_c = train_test_split(temp_c, test_size=0.50, random_state=42)
+    # stratify clusters based on n=3 quantile binning on label
+    strat_clusters, other_clusters = train_test_split(cluster_df, test_size=0.30, random_state=42)
+    train_c, temp_c = train_test_split(strat_clusters, test_size=0.30, stratify=strat_clusters["emission_bin"], random_state=42)
+    val_c, test_c = train_test_split(temp_c, test_size=0.50, stratify=temp_c["emission_bin"], random_state=42)  
 
-    train = df[df["cluster"].isin(train_c)]
-    val = df[df["cluster"].isin(val_c)]
-    test = df[df["cluster"].isin(test_c)]
-    other_df = df[df["cluster"].isin(other_clusters)]
+    train = df[df["cluster"].isin(train_c["cluster"])]                                                                                                        
+    val = df[df["cluster"].isin(val_c["cluster"])]                                                                                                          
+    test = df[df["cluster"].isin(test_c["cluster"])]                                                                                                       
+    other_df = df[df["cluster"].isin(other_clusters["cluster"])]
 
     # rebalance val and test to equal sizes
     val, test = rebalance_splits(val, test, other_df)

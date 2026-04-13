@@ -23,12 +23,12 @@ class NOxResNet(nn.Module):
         backbone.maxpool = nn.Identity()    
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])                                                                                    
 
-        self.head = nn.Sequential(                                                                                                                        
-            nn.Linear(513, RESNET_HEAD_DIM),
-            nn.BatchNorm1d(RESNET_HEAD_DIM),                                                                                                              
-            nn.ReLU(),                  
-            nn.Linear(RESNET_HEAD_DIM, 1)
-        )                                                                                                                                                
+        self.head = nn.Sequential(                                                                                                                                
+            nn.Linear(513, RESNET_HEAD_DIM),                                                                                                                      
+            nn.BatchNorm1d(RESNET_HEAD_DIM),                                                                                                                      
+            nn.ReLU(),                                                                                                                                            
+            nn.Linear(RESNET_HEAD_DIM, 1),                                                                                                                                                                                                                      
+        )                                                                                                                              
 
     def forward(self, image, wind):                                                                                                                       
         x = self.backbone(image).flatten(1)

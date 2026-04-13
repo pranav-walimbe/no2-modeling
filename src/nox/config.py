@@ -26,7 +26,7 @@ FULL_DATA_CSV = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.csv")
 # ============================================================================
 # Stratification
 # ============================================================================
-SAMPLE_SIZE = 50000 # subset count of rows to run stratification on
+SAMPLE_SIZE = 200000 # subset count of rows to run stratification on
 MINS_FILTER = 60 # time window between emissions record and TEMPO image (minutes)
 IMG_RANGE = 72  # km range captured by image
 MIN_TEMPO_DURATION = 58 # min TEMPO image duration (minutes)
@@ -64,8 +64,8 @@ DATASET_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/dataset"
 IMAGES_DIR = os.path.join(DATASET_DIR, "images")
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")
 IMG_SIZE = 56 # image size in pixels
-LABEL_FILTER_PERCENTILE = 0.10 # upper and lower filter bound for label values
-MAX_IMG_VAL = 3e16 # maximum concentration value in images
+PLUME_FILTER_PERCENTILE = 0.50 # drop samples with plume heuristic below this percentile 
+MAX_IMG_VAL = 4e16 # maximum concentration value in images
 MIN_IMG_VAL = -1e16 # minimum concentration value in images
 IMG_VAL_FILTER = 0.50 # max percent of image pixels >= MAX_IMG_VAL
 MIN_PIXEL_CLOUD = 0.20 # tempo cloud fraction for pixel quality filtering 
@@ -73,24 +73,24 @@ IMG_CLOUD_FILTER = 0.75 # percent of image pixels that meet MIN_PIXEL_CLOUD frac
 LABEL_COL = "noxMass" # emissions variable to predict
 WIND_COLS = ["era5_u10", "era5_v10"] # wind variables to include in dataset
 MIN_CITY_PROXIMITY = 100 # minimum distance to nearby major city (km)
-SPLIT_SIZES = {"train": 12000, "val": 4000, "test": 4000} # size of each dataset split
+SPLIT_SIZES = {"train": 15000, "val": 5000, "test": 5000} # size of each dataset split
 
 # ============================================================================
 # ML modeling
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 RESNET_HEAD_DIM = 256
 LR = 1e-4
 NUM_EPOCHS = 100
-SCHEDULER_PATIENCE = 3
-SCHEDULER_FACTOR = 0.75
-EARLY_STOP_PATIENCE = 5
+SCHEDULER_PATIENCE = 5
+SCHEDULER_FACTOR = 0.50
+EARLY_STOP_PATIENCE = 10
 KERNEL_SIZE = 3
 STRIDE = 1
 PADDING = 1
 WEIGHT_DECAY = 1e-4
-USE_PRETRAINED = True
+USE_PRETRAINED = False
 
 # ============================================================================
 # System

@@ -1,5 +1,5 @@
 """                                                                                                                         
-Define utility functions (normalization, plotting) for ML pipeline                                                                                    
+Define utility functions (normalization, plotting, loss) for ML pipeline                                                                                    
 """                                                                                                                         
 
 import sys                                                                                                                  
@@ -11,8 +11,23 @@ import matplotlib.colors as mcolors
 import pandas as pd                                                                                                         
 import geopandas as gpd
 import seaborn as sns
+import torch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from config import *                                                                                                        
+from config import *  
+
+def msle_loss(pred, target, reduction="mean"):
+    """MSLE loss: compares predictions in log-space to reduce sensitivity to large label values"""                            
+    per_sample = (torch.log1p(pred.clamp(min=0)) - torch.log1p(target.clamp(min=0))) ** 2
+    if reduction == "none":                                                                                                   
+        return per_sample                   
+    return per_sample.mean() 
+
+def mse_loss(pred, target, reduction="mean"):                                                                                 
+    """Mean squared error loss"""                                                                                             
+    per_sample = (pred - target) ** 2                                                                                         
+    if reduction == "none":                                                                                                   
+        return per_sample                                                                                                     
+    return per_sample.mean() 
                                                                                                     
 def compute_stats(split, batch_size=512):                                                                                                                                
     """Compute mean/std normalization stats from training images and wind data"""
@@ -173,7 +188,13 @@ def plot_residual_examples(test_df, run_dir, n=10):
             ax.axis("off")                                                                                                                                
                                                                                                                                                         
     plt.tight_layout()
-    _save(fig, run_dir, "residual_examples")  
+    _save(fig, run_dir, "residual_examples") 
+
+def print_mae_summary(train_df, val_df, test_df):
+    """Print MAE summary statistics across all splits"""
+    for split, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
+        mae = np.abs(df["y_true"].values - df["y_pred"].values).mean()
+        print(f"{split:<6} MAE: {mae:.4f}") 
                                                                                                                                                                         
 def generate_eval_plots(train_df, test_df, val_df, run_dir):                                                                                                             
     """Generate all inference evaluation plots for a completed training run"""
