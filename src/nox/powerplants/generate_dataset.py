@@ -13,7 +13,8 @@ import pandas as pd
 import geopandas as gpd
 import matplotlib.pyplot as plt
 from scipy.ndimage import zoom
-from scipy.spatial import cKDTree                                                                                           
+from scipy.spatial import cKDTree
+from scipy.stats import gaussian_kde                                                                                            
 from concurrent.futures import ProcessPoolExecutor
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))                                          
 from config import *                                                                                                        
@@ -107,8 +108,8 @@ def extract_tempo_patch(args):
                 return None             
             unc = np.array(unc_ma)
 
-            # compute loss weight using uncertainty
-            loss_weight = np.mean(np.abs(no2) / (np.abs(unc) + 1e-10))
+            # compute relative uncertainty loss weight
+            unc_weight = np.mean(np.abs(no2) / (np.abs(unc) + 1e-10))
             
         # resize patch to IMG_SIZE x IMG_SIZE                                                                           
         no2 = zoom(no2, (IMG_SIZE / no2.shape[0], IMG_SIZE / no2.shape[1]), order=1) 
@@ -119,60 +120,63 @@ def extract_tempo_patch(args):
         p10 = np.percentile(no2, 10)                                                                                                                      
         plume_score = (p99 - p50) / (p50 - p10 + 1e-10) 
                                                                                                       
-        return (orig_idx, no2[np.newaxis, ...].astype(np.float32), plume_score, loss_weight)                                       
+        return (orig_idx, no2[np.newaxis, ...].astype(np.float32), plume_score, unc_weight)                                       
                                                                                                                             
     except Exception as e:                                                                                                  
         print(f"ERROR [{orig_idx}]: {fname}: {e}")                                                                          
         return None                                                                                                         
                 
-def visualize_split(df: pd.DataFrame, valid_idxs: list, split: str):
+def visualize_split(df: pd.DataFrame, split: str):
     """Visualize geographic distribution, label distribution, and image value distributions for a split"""
-    valid_df = df.loc[valid_idxs]
-
     # get US outline for geographic visualization
     us = gpd.read_file(COUNTRIES_URL)
-    us = us[us.NAME == "United States of America"]
-
-    # load zarr images for this split
-    images = zarr.open(os.path.join(IMAGES_DIR, f"{split}_tempo.zarr"), mode="r")
+    us = us[us.NAME == "United States of America"]                                                                            
+                                        
+    # load zarr images for this split                                                                                         
+    images = zarr.open(os.path.join(IMAGES_DIR, f"{split}_tempo.zarr"), mode="r")                                             
     image_values = np.array(images[:]).flatten()
-
-    fig, axes = plt.subplots(1, 4, figsize=(32, 5))
-    fig.suptitle(f"{split} (n={len(valid_df)})", fontsize=14)
-
-    # geographic distribution
-    us.plot(ax=axes[0], color="lightgray", edgecolor="black")
-    axes[0].scatter(valid_df["lon"], valid_df["lat"], s=5, alpha=0.3)
-    axes[0].set_xlim(-130, -65)
-    axes[0].set_ylim(24, 50)
-    axes[0].set_xlabel("Longitude")
+                                                                                                                            
+    fig, axes = plt.subplots(1, 5, figsize=(42, 5))
+    fig.suptitle(f"{split} (n={len(df)})", fontsize=14)
+                                                                                                                            
+    # geographic distribution               
+    us.plot(ax=axes[0], color="lightgray", edgecolor="black")                                                                 
+    axes[0].scatter(df["lon"], df["lat"], s=5, alpha=0.3)
+    axes[0].set_xlim(-130, -65)                                                                                               
+    axes[0].set_ylim(24, 50)                
+    axes[0].set_xlabel("Longitude")                                                                                           
     axes[0].set_ylabel("Latitude")
-    axes[0].set_title("Geographic Distribution")
+    axes[0].set_title("Geographic Distribution")                                                                              
 
-    # label boxplot
-    axes[1].boxplot(valid_df[LABEL_COL], vert=True)
-    axes[1].set_ylabel(LABEL_COL)
-    axes[1].set_title("Label Boxplot")
-    axes[1].set_xticks([])
-
-    # image values boxplot
-    axes[2].boxplot(image_values, vert=True)
-    axes[2].set_ylabel("pixel value")
-    axes[2].set_title("Image Value Boxplot")
-    axes[2].ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
-    axes[2].set_xticks([])
-
-    # image values histogram
-    axes[3].hist(image_values, bins=50, color="#4C9BE8", alpha=0.8, edgecolor="none")       
-    axes[3].set_xlabel("pixel value")           
-    axes[3].set_ylabel("count")                                                                                      
-    axes[3].set_title("Image Value Histogram")            
-    axes[3].ticklabel_format(style="sci", axis="x", scilimits=(0, 0))
-
+    # image values histogram                                                                                                  
+    axes[1].hist(image_values, bins=50, color="#4C9BE8", alpha=0.8, edgecolor="none")
+    axes[1].set_xlabel("pixel value")
+    axes[1].set_ylabel("count")                                                                                               
+    axes[1].set_title("Image Value Histogram")
+    axes[1].ticklabel_format(style="sci", axis="x", scilimits=(0, 0))                                                         
+                                        
+    # label histogram
+    axes[2].hist(df[LABEL_COL], bins=50, color="#E87B4C", alpha=0.8, edgecolor="none")                                        
+    axes[2].set_xlabel(LABEL_COL)           
+    axes[2].set_ylabel("count")                                                                                               
+    axes[2].set_title("Label Histogram")
+                                                                                                                            
+    # freq_weights histogram            
+    axes[3].hist(df["freq_weight"], bins=50, color="#4CE87B", alpha=0.8, edgecolor="none")                                    
+    axes[3].set_xlabel("freq_weight")                                                                                         
+    axes[3].set_ylabel("count")
+    axes[3].set_title("Frequency Weight Histogram")                                                                           
+                                        
+    # unc_weights histogram
+    axes[4].hist(df["unc_weight"], bins=50, color="#E84C9B", alpha=0.8, edgecolor="none")                                     
+    axes[4].set_xlabel("unc_weight")        
+    axes[4].set_ylabel("count")                                                                                               
+    axes[4].set_title("Uncertainty Weight Histogram")
+                                                                                                                            
     plt.tight_layout()
-    os.makedirs(VIS_DIR, exist_ok=True)
+    os.makedirs(VIS_DIR, exist_ok=True)                                                                                       
     plt.savefig(os.path.join(VIS_DIR, f"dataset_vis_{split}.png"), dpi=150)
-    plt.close()
+    plt.close()   
                                                                                                           
 def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):                                                
     """Parallel patch extraction, zarr write, and dataset DataFrame save for a given split"""
@@ -213,26 +217,34 @@ def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
                                                                                                                             
     valid_idxs = []
     plume_scores = []                                                                                                         
-    loss_weights = []                       
-    for i, (orig_idx, patch, plume_score, loss_weight) in enumerate(valid):
+    unc_weights = []                       
+    for i, (orig_idx, patch, plume_score, unc_weight) in enumerate(valid):
         tempo_store[i] = patch
         valid_idxs.append(orig_idx)                                                                                           
         plume_scores.append(plume_score)
-        loss_weights.append(loss_weight)                                                                                      
+        unc_weights.append(unc_weight)                                                                                      
                                                                                                                             
     # normalize loss weights so mean weight = 1 to keep loss scale stable
-    loss_weights = np.array(loss_weights) / np.mean(loss_weights)                                                             
+    unc_weights = np.array(unc_weights) / np.mean(unc_weights)
+
+    # compute inverse frequency weight according to label bin                                         
+    labels = df.loc[valid_idxs][LABEL_COL].values.astype(float)
+    counts, bin_edges = np.histogram(labels, bins=50)
+    bin_idx  = np.clip(np.digitize(labels, bin_edges[:-1]) - 1, 0, 49)
+    freq_weights = (1.0 / (counts[bin_idx] + 1e-10))**0.5
+    freq_weights = freq_weights / freq_weights.mean()                                                           
                 
     # store dataset DataFrame with original columns, label, wind, and zarr index                                              
     out_df = df.loc[valid_idxs].drop(columns=["lat_min", "lat_max", "lon_min", "lon_max"]).copy()
     out_df["zarr_idx"] = range(n_store)                                                                                       
     out_df["split"] = split                                                                                                   
     out_df["plume_score"] = plume_scores
-    out_df["loss_weight"] = loss_weights                                                                                      
+    out_df["unc_weight"] = unc_weights
+    out_df["freq_weight"] = freq_weights                                                                                      
     out_df.to_csv(os.path.join(DATASET_DF, f"{split}_df.csv"), index=False)
                                                                                                                             
     # visualize split distribution                                                                                            
-    visualize_split(df, valid_idxs, split)
+    visualize_split(out_df, split)
                                                                                                                             
 def main():
     os.makedirs(IMAGES_DIR, exist_ok=True)                                                                                  

@@ -88,21 +88,25 @@ def rebalance_splits(val: pd.DataFrame, test: pd.DataFrame, other_df: pd.DataFra
     if len(other_df) < target_size:     
         sys.exit(f"ERROR: other_df (size={len(other_df)}) is smaller than target_size ({target_size}), cannot rebalance")                                 
                                                                                                                                                         
-    def get_weights(target_df):                                                                                                                               
-        z_scores = ((other_df[LABEL_COL] - target_df[LABEL_COL].mean()) / (target_df[LABEL_COL].std() + 1e-10)).abs()                                         
-        weights = np.exp(-z_scores)                                                                                                                           
-        return weights / weights.sum()
-                                                                                                                                                        
-    if len(val) < target_size:                                                                                                                            
-        extra = other_df.sample(target_size - len(val), random_state=42, weights=get_weights(val))
-        other_df = other_df.drop(extra.index)                                                                                                             
-        val = pd.concat([val, extra]).reset_index(drop=True)                                                                                              
-                                            
-    if len(test) < target_size:                                                                                                                           
-        extra = other_df.sample(target_size - len(test), random_state=42, weights=get_weights(test))                                                    
-        other_df = other_df.drop(extra.index)                                                                                                             
+    def get_weights(target_df):                                                                                                   
+        z_scores = ((other_df[LABEL_COL] - target_df[LABEL_COL].mean()) / (target_df[LABEL_COL].std() + 1e-10)).abs()             
+        weights = np.exp(-z_scores)                                                                                               
+        return weights / weights.sum()                                                                                            
+                                                                                                                                
+    if len(val) < target_size:                                                                                                    
+        w = get_weights(val).values
+        chosen = np.random.choice(len(other_df), size=target_size - len(val), replace=False, p=w)                                 
+        extra = other_df.iloc[chosen]           
+        other_df = other_df.drop(extra.index)
+        val = pd.concat([val, extra]).reset_index(drop=True)                                                                      
+                                                                                                                                    
+    if len(test) < target_size:                                                                                                   
+        w = get_weights(test).values                                                                                              
+        chosen = np.random.choice(len(other_df), size=target_size - len(test), replace=False, p=w)                                
+        extra = other_df.iloc[chosen]           
+        other_df = other_df.drop(extra.index)                                                                                     
         test = pd.concat([test, extra]).reset_index(drop=True)
-                                                                                                                                                        
+                                                                                                                                                                                                   
     return val, test                                                                                                                                    
                        
 def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame):
@@ -152,8 +156,15 @@ def main():
     df = pd.concat(results).reset_index(drop=True)
     df = df[df['tempo'].notna()].reset_index(drop=True)
 
-    # sample desired dataset size
-    df = df.sample(min(SAMPLE_SIZE, len(df)), random_state=42).reset_index(drop=True)
+    # sample desired dataset size with inverse label frequency weights
+    counts, bin_edges = np.histogram(df[LABEL_COL], bins=50)                                                                      
+    bin_idx = np.clip(np.digitize(df[LABEL_COL], bin_edges[:-1]) - 1, 0, 49)                                                      
+    sample_weights = 1.0 / (counts[bin_idx] + 1e-10)
+    sample_weights = sample_weights / sample_weights.sum()                                                                        
+                                                
+    n = min(SAMPLE_SIZE, len(df))                                                                                                 
+    sampled_idx = np.random.choice(len(df), size=n, replace=False, p=sample_weights)
+    df = df.iloc[sampled_idx].reset_index(drop=True) 
 
     # cluster plants and compute per-cluster mean emission for stratification
     cluster_map = cluster_plants(df)

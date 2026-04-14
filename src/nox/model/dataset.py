@@ -20,7 +20,8 @@ class NOxDataset(Dataset):
         self.images = zarr.open(os.path.join(IMAGES_DIR, f"{split}_tempo.zarr"), mode="r")                              
         self.labels = df[LABEL_COL].values.astype(np.float32)
         self.wind = df[WIND_COLS].values.astype(np.float32)                                                           
-        self.loss_weights = df["loss_weight"].values.astype(np.float32)                                                       
+        self.unc_weights = df["unc_weight"].values.astype(np.float32) 
+        self.freq_weights = df["freq_weight"].values.astype(np.float32)                                                  
         self.stats = stats           
                                                                                                                             
     def __len__(self):                                                                                                      
@@ -29,7 +30,8 @@ class NOxDataset(Dataset):
     def __getitem__(self, idx):                                                                                               
         image = torch.tensor(self.images[idx]).float()                                                                      
         label = torch.tensor(self.labels[idx]).float()
-        loss_weight = torch.tensor(self.loss_weights[idx]).float()
+        unc_weight = torch.tensor(self.unc_weights[idx]).float()
+        freq_weight = torch.tensor(self.freq_weights[idx]).float()
         u, v = self.wind[idx, WIND_COLS.index("era5_u10")], self.wind[idx, WIND_COLS.index("era5_v10")]
                                             
         wind = torch.tensor([np.sqrt(u**2 + v**2)]).float()                                                                   
@@ -43,4 +45,4 @@ class NOxDataset(Dataset):
             image = (image - self.stats["image_mean"]) / self.stats["image_std"]                                            
             wind = (wind  - self.stats["wind_mean"])  / self.stats["wind_std"]
                                                                                                                             
-        return image, wind, label, loss_weight
+        return image, wind, label, unc_weight, freq_weight

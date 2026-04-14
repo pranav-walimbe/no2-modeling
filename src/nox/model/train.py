@@ -13,18 +13,18 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))                            
 from config import *                                                                                                        
 from model.dataset import NOxDataset                                                                                          
-from model.resnet_model import NOxResNet                                                                                             
+from model.resnet18_model import NOxResNet                                                                                             
 from model.utils import *                                                  
 
 def train_epoch(model, loader, optimizer, criterion, device):
     """Run one training epoch and return mean loss over the dataset"""
     model.train()                                                                                                             
     total_loss = 0.0
-    for image, wind, label, loss_weight in loader:                                                                            
-        image, wind, label, loss_weight = image.to(device), wind.to(device), label.to(device), loss_weight.to(device)       
+    for image, wind, label, unc_weight, freq_weight in loader:                                                                            
+        image, wind, label, unc_weight, freq_weight = image.to(device), wind.to(device), label.to(device), unc_weight.to(device), freq_weight.to(device)   
         optimizer.zero_grad()                                                                                                 
         pred = model(image, wind)           
-        loss = (loss_weight * criterion(pred, label, reduction="none")).mean()                                                
+        loss = criterion(pred, label, reduction="none").mean()                                             
         loss.backward()
         optimizer.step()                                                                                                      
         total_loss += loss.item() * len(label)
@@ -35,7 +35,7 @@ def val_epoch(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0                                                                                                          
     with torch.no_grad():                   
-        for image, wind, label, _ in loader:
+        for image, wind, label, *_ in loader:
             image, wind, label = image.to(device), wind.to(device), label.to(device)
             pred = model(image, wind)                                                                                         
             loss = criterion(pred, label)   
@@ -47,7 +47,7 @@ def run_inference(model, loader, device):
     model.eval()                            
     preds = []                          
     with torch.no_grad():
-        for image, wind, _, __ in loader:                                                                                     
+        for image, wind, *_  in loader:                                                                                     
             image, wind = image.to(device), wind.to(device)
             preds.append(model(image, wind).cpu().numpy())                                                                    
     return np.concatenate(preds)                                                                                                                  
@@ -77,7 +77,7 @@ def main():
     # initialize model, optimizer, loss, scheduler                                                                          
     model = NOxResNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)                                                                 
-    criterion = msle_loss                                                                             
+    criterion = mae_loss                                                                             
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=SCHEDULER_PATIENCE,              
         factor=SCHEDULER_FACTOR)                                                                                                                                                                                                                
     best_val_loss = float("inf")                                                                                            

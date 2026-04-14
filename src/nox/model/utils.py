@@ -28,6 +28,13 @@ def mse_loss(pred, target, reduction="mean"):
     if reduction == "none":                                                                                                   
         return per_sample                                                                                                     
     return per_sample.mean() 
+
+def mae_loss(pred, target, reduction="mean"):
+    """Mean absolute error loss"""
+    per_sample = torch.abs(pred - target)   
+    if reduction == "none":             
+        return per_sample
+    return per_sample.mean() 
                                                                                                     
 def compute_stats(split, batch_size=512):                                                                                                                                
     """Compute mean/std normalization stats from training images and wind data"""
@@ -191,10 +198,23 @@ def plot_residual_examples(test_df, run_dir, n=10):
     _save(fig, run_dir, "residual_examples") 
 
 def print_mae_summary(train_df, val_df, test_df):
-    """Print MAE summary statistics across all splits"""
+    """Print MAE summary statistics across all splits""" 
+    print("\n--- MAE by split ---")                                                                        
     for split, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
         mae = np.abs(df["y_true"].values - df["y_pred"].values).mean()
-        print(f"{split:<6} MAE: {mae:.4f}") 
+        print(f"  {split:<6} MAE: {mae:.4f}")
+                                                                                                                            
+    # stratified MAE on test set by label tertile                                                                             
+    print("\n--- Test MAE by emission tertile ---")                                                                         
+    t33, t66 = np.percentile(test_df["y_true"], [33, 66])                                                                     
+    low = test_df[test_df["y_true"] <  t33]                                                                                  
+    mid = test_df[(test_df["y_true"] >= t33) & (test_df["y_true"] < t66)]
+    high = test_df[test_df["y_true"] >= t66]                                                                                  
+                                                                                                                            
+    for name, subset in [("low", low), ("mid", mid), ("high", high)]:                                                         
+        mae = np.abs(subset["y_true"].values - subset["y_pred"].values).mean()                                                
+        label_range = f"[{subset['y_true'].min():.1f}, {subset['y_true'].max():.1f}]"                                                 
+        print(f"  {name:<6} MAE: {mae:.4f}  (n={len(subset)}, label range {label_range})") 
                                                                                                                                                                         
 def generate_eval_plots(train_df, test_df, val_df, run_dir):                                                                                                             
     """Generate all inference evaluation plots for a completed training run"""

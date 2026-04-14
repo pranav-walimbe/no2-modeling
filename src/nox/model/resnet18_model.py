@@ -26,7 +26,8 @@ class NOxResNet(nn.Module):
         self.head = nn.Sequential(                                                                                                                                
             nn.Linear(513, RESNET_HEAD_DIM),                                                                                                                      
             nn.BatchNorm1d(RESNET_HEAD_DIM),                                                                                                                      
-            nn.ReLU(),                                                                                                                                            
+            nn.ReLU(), 
+            nn.Dropout(0.3),                                                                                                                                           
             nn.Linear(RESNET_HEAD_DIM, 1),                                                                                                                                                                                                                      
         )                                                                                                                              
 
