@@ -8,6 +8,8 @@
 #SBATCH --ntasks=1                                                                                                          
 #SBATCH --cpus-per-task=8                                                                                                  
 #SBATCH --time=00:30:00
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=<YOUR EMAIL>
 #SBATCH --output=/global/home/users/<USERNAME>/job_logs/<JOB NAME>_%j.out                                                    
 #SBATCH --error=/global/home/users/<USERNAME>/job_logs/<JOB NAME>_%j.err 
 

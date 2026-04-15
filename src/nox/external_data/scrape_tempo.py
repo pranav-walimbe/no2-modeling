@@ -1,7 +1,7 @@
 """
-Script to store TEMPO V03 L4 tiles for a provided date range
+Script to store TEMPO images for a provided date range
 
-Output: TEMPO level3 images stored in TEMPO_DIR
+Output: TEMPO images stored in TEMPO_DIR
 """
 
 import earthaccess

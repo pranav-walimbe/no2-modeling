@@ -38,7 +38,7 @@ def main():
                         "month": f"{month:02d}",
                         "day": [f"{d:02d}" for d in range(1, 32)],
                         "time": [f"{h:02d}:00" for h in range(24)],
-                        "area": [50, -130, 24, -65],
+                        "area": [50, -130, 26, -67],
                         "format": "netcdf",
                     },
                     output_file)
