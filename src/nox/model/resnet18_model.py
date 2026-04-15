@@ -24,10 +24,10 @@ class NOxResNet(nn.Module):
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])                                                                                    
 
         self.head = nn.Sequential(                                                                                                                                
-            nn.Linear(513, RESNET_HEAD_DIM),                                                                                                                      
+            nn.Linear(512 + 1, RESNET_HEAD_DIM),                                                                                                                      
             nn.BatchNorm1d(RESNET_HEAD_DIM),                                                                                                                      
             nn.ReLU(), 
-            nn.Dropout(0.3),                                                                                                                                           
+            nn.Dropout(DROPOUT),                                                                                                                                           
             nn.Linear(RESNET_HEAD_DIM, 1),                                                                                                                                                                                                                      
         )                                                                                                                              
 

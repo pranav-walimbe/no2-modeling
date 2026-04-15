@@ -91,6 +91,7 @@ STRIDE = 1
 PADDING = 1
 WEIGHT_DECAY = 1e-4
 USE_PRETRAINED = False
+DROPOUT = 0.3
 
 # ============================================================================
 # System
