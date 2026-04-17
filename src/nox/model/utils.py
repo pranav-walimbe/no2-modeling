@@ -36,39 +36,40 @@ def mae_loss(pred, target, reduction="mean"):
         return per_sample
     return per_sample.mean() 
                                                                                                     
-def compute_stats(split, batch_size=512):                                                                                                                                
-    """Compute mean/std normalization stats from training images and wind data"""
-    images = zarr.open(os.path.join(IMAGES_DIR, f"{split}_tempo.zarr"), mode="r")                                                                                        
+def compute_stats(split, batch_size=512):
+    """Compute mean/std normalization stats from training images and wind data"""                                                
+    images = np.load(os.path.join(IMAGES_DIR, f"{split}_tempo.npy"), mmap_mode="r")
     df = pd.read_csv(os.path.join(DATASET_DF, f"{split}_df.csv"))
-    wind = df[WIND_COLS].values.astype(np.float32)                                                                                                                       
-    wind_speed = np.sqrt(wind[:, WIND_COLS.index("era5_u10")]**2 + wind[:, WIND_COLS.index("era5_v10")]**2)                                                              
-    n = images.shape[0]                                                                                                                                                  
-                                                                                                                                                                        
-    # first pass: compute mean                                                                                                                                           
-    total, sum_ = 0, 0.0
-    for i in range(0, n, batch_size):
+    wind_speed = df["wind_speed"].values.astype(np.float32)
+    num_adj = df["num_adj_units"].values.astype(np.float32)
+    n = images.shape[0]                                                                                                          
+    # first pass: compute mean                                                                                                   
+    total, sum_ = 0, 0.0                                                                                                         
+    for i in range(0, n, batch_size):                                                                                            
         batch = images[i:i+batch_size].ravel()
-        batch = batch[~np.isnan(batch)].astype(np.float64)                                                                                                               
-        batch = np.clip(batch, None, MAX_IMG_VAL)
-        total += len(batch)                                                                                                                                              
-        sum_ += batch.sum()
-    mean = sum_ / total                                                                                                                                                  
-
-    # second pass: compute std                                                                                                                                           
-    sum_sq_diff = 0.0
+        batch = batch[~np.isnan(batch)].astype(np.float64)                                                                       
+        batch = np.clip(batch, None, MAX_IMG_VAL)         
+        total += len(batch)                                                                                                      
+        sum_ += batch.sum()             
+    mean = sum_ / total    
+                                                                                                                                
+    # second pass: compute std
+    sum_sq_diff = 0.0                                                                                                            
     for i in range(0, n, batch_size):
         batch = images[i:i+batch_size].ravel()
         batch = batch[~np.isnan(batch)].astype(np.float64)
-        batch = np.clip(batch, None, MAX_IMG_VAL)                                                                                                                        
-        sum_sq_diff += ((batch - mean) ** 2).sum()
-    std = np.sqrt(sum_sq_diff / total)                                                                                                                                   
-                                                                                                                                                                        
-    return {
-        "image_mean": float(mean),                                                                                                                                       
-        "image_std": float(std),
+        batch = np.clip(batch, None, MAX_IMG_VAL)         
+        sum_sq_diff += ((batch - mean) ** 2).sum()                                                                               
+    std = np.sqrt(sum_sq_diff / total)            
+                                                                                                                                
+    return {                                                                                                                     
+        "image_mean": float(mean),
+        "image_std": float(std),                                                                                                 
         "wind_mean": float(wind_speed.mean()),
-        "wind_std": float(wind_speed.std()),
-    }                                                                                                                                                                 
+        "wind_std": float(wind_speed.std()),  
+        "num_adj_mean": float(num_adj.mean()),
+        "num_adj_std": float(num_adj.std()),                                                                                     
+    }                                                                                                                                                                
                                                                                                     
 def _save(fig, run_dir, plot_name):                                                                                         
     """Save figure to run directory and close it"""
@@ -169,32 +170,33 @@ def plot_spatial_error(train_df, test_df, val_df, run_dir):
     plt.tight_layout()                                                                                                                                                   
     _save(fig, run_dir, "spatial_error")
 
-def plot_residual_examples(test_df, run_dir, n=10):                                                                                                       
-    """For n random plants, plot their lowest and highest residual prediction"""                                                                          
-    run_name = os.path.basename(run_dir)                                                                                                                  
-    df = test_df.copy().reset_index(drop=True)                                                                                                            
-    df["abs_residual"] = (df["y_pred"] - df["y_true"]).abs()                                                                                              
-    images = zarr.open(os.path.join(IMAGES_DIR, "test_tempo.zarr"), mode="r")                                                                             
-                                                                                                                                                        
-    plants = df["facilityId"].drop_duplicates().sample(n=min(n, df["facilityId"].nunique()), random_state=42)                                             
-                                                                                                                                                        
-    fig, axes = plt.subplots(2, len(plants), figsize=(3 * len(plants), 7))
-    fig.suptitle(f"Per-plant residual examples (test set — {run_name})", fontweight="bold", fontsize=14)                                                  
-    axes[0, 0].set_ylabel("Low residual", fontsize=10, labelpad=8)
-    axes[1, 0].set_ylabel("High residual", fontsize=10, labelpad=8)                                                                                       
-                                            
-    for i, facility_id in enumerate(plants):                                                                                                              
-        plant_df = df[df["facilityId"] == facility_id]
-        low_row  = plant_df.loc[plant_df["abs_residual"].idxmin()]                                                                                        
-        high_row = plant_df.loc[plant_df["abs_residual"].idxmax()]
-                                                                                                                                                        
-        for ax, row in [(axes[0, i], low_row), (axes[1, i], high_row)]:                                                                                   
-            img = images[int(row["zarr_idx"])][0]
-            ax.imshow(img, cmap="viridis", interpolation="nearest")                                                                                       
-            ax.set_title(f"{row['facilityName']}\nresidual={row['abs_residual']:.2f}\ntrue={row['y_true']:.2f}", fontsize=6)                              
-            ax.axis("off")                                                                                                                                
-                                                                                                                                                        
-    plt.tight_layout()
+def plot_residual_examples(test_df, run_dir, n=10):                                                                              
+    """For n random plants, plot their lowest and highest residual prediction"""                                                 
+    run_name = os.path.basename(run_dir)                                                                                         
+    df = test_df.copy().reset_index(drop=True)                                                                                   
+    df["abs_residual"] = (df["y_pred"] - df["y_true"]).abs()                                                                     
+    images = np.load(os.path.join(IMAGES_DIR, "test_tempo.npy"), mmap_mode="r")                                                  
+                                                                                                                                
+    plants = df["facilityId"].drop_duplicates().sample(n=min(n, df["facilityId"].nunique()), random_state=42)                    
+                
+    fig, axes = plt.subplots(2, len(plants), figsize=(3 * len(plants), 7))                                                       
+    fig.suptitle(f"Per-plant residual examples (test set — {run_name})", fontweight="bold", fontsize=14)
+    axes[0, 0].set_ylabel("Low residual", fontsize=10, labelpad=8)                                                               
+    axes[1, 0].set_ylabel("High residual", fontsize=10, labelpad=8)                                                              
+                                        
+    for i, facility_id in enumerate(plants):                                                                                     
+        plant_df = df[df["facilityId"] == facility_id]                                                                           
+        low_row  = plant_df.loc[plant_df["abs_residual"].idxmin()]
+        high_row = plant_df.loc[plant_df["abs_residual"].idxmax()]                                                               
+                
+        for ax, row in [(axes[0, i], low_row), (axes[1, i], high_row)]:                                                          
+            img = images[int(row["npy_idx"])]
+            vmin, vmax = np.nanpercentile(img, [1, 99])                                                                          
+            ax.imshow(img, cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")                                        
+            ax.set_title(f"{row['facilityName']}\nresidual={row['abs_residual']:.2f}\ntrue={row['y_true']:.2f}", fontsize=6)
+            ax.axis("off")                                                                                                       
+                                        
+    plt.tight_layout()                                                                                                           
     _save(fig, run_dir, "residual_examples") 
 
 def print_mae_summary(train_df, val_df, test_df):

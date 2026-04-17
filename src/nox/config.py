@@ -26,13 +26,15 @@ FULL_DATA_CSV = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.csv")
 # ============================================================================
 # Stratification
 # ============================================================================
-SAMPLE_SIZE = 200000 # subset count of rows to run stratification on
+SAMPLE_SIZE = 500000 # subset count of rows to run stratification on
 MINS_FILTER = 60 # time window between emissions record and TEMPO image (minutes)
 IMG_RANGE = 72  # km range captured by image
 MIN_TEMPO_DURATION = 58 # min TEMPO image duration (minutes)
+PLANT_TYPE = "Coal" # power plant type to filter for
+ADJ_UNITS = True # whether to predict all units for a facility as a sum
 COUNTRIES_URL = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip" # US map shapefile
 
-TEMPO_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/TEMPO/V04"
+TEMPO_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/TEMPO/V03/tmp"
 STRAT_INPUT_CSV = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full2.csv")
 STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/pranavwalimbe/nox_powerplant_data"
 TRAIN_CSV = os.path.join(STRAT_BASE_DIR, "train.csv")
@@ -65,15 +67,15 @@ IMAGES_DIR = os.path.join(DATASET_DIR, "images")
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")
 IMG_SIZE = 56 # image size in pixels
 PLUME_FILTER_PERCENTILE = 0.50 # drop samples with plume heuristic below this percentile 
-MAX_IMG_VAL = 4e16 # maximum concentration value in images
+MAX_IMG_VAL = 8e16 # maximum concentration value in images
 MIN_IMG_VAL = -1e16 # minimum concentration value in images
 IMG_VAL_FILTER = 0.50 # max percent of image pixels >= MAX_IMG_VAL
 MIN_PIXEL_CLOUD = 0.20 # tempo cloud fraction for pixel quality filtering 
 IMG_CLOUD_FILTER = 0.75 # percent of image pixels that meet MIN_PIXEL_CLOUD fraction
+IMG_QA_FILTER = 0.80 # percent of images pixels with QA == 0
 LABEL_COL = "noxMass" # emissions variable to predict
-WIND_COLS = ["era5_u10", "era5_v10"] # wind variables to include in dataset
 MIN_CITY_PROXIMITY = 100 # minimum distance to nearby major city (km)
-SPLIT_SIZES = {"train": 15000, "val": 5000, "test": 5000} # size of each dataset split
+SPLIT_SIZES = {"train": 12000, "val": 4000, "test": 4000} # size of each dataset split
 
 # ============================================================================
 # ML modeling

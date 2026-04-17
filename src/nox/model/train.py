@@ -18,52 +18,54 @@ from model.utils import *
 
 def train_epoch(model, loader, optimizer, criterion, device):
     """Run one training epoch and return mean loss over the dataset"""
-    model.train()                                                                                                             
+    model.train()                                                                                                                
     total_loss = 0.0
-    for image, wind, label, unc_weight, freq_weight in loader:                                                                            
-        image, wind, label, unc_weight, freq_weight = image.to(device), wind.to(device), label.to(device), unc_weight.to(device), freq_weight.to(device)   
-        optimizer.zero_grad()                                                                                                 
-        pred = model(image, wind)           
-        loss = criterion(pred, label, reduction="none").mean()                                             
-        loss.backward()
-        optimizer.step()                                                                                                      
-        total_loss += loss.item() * len(label)
-    return total_loss / len(loader.dataset)                                                                                
+    for image, wind, num_adj, label, freq_weight in loader:                                                                      
+        image, wind, num_adj, label, freq_weight = image.to(device), wind.to(device), num_adj.to(device), label.to(device),
+freq_weight.to(device)                                                                                                     
+        optimizer.zero_grad()                                                                                                    
+        pred = model(image, wind, num_adj)
+        loss = (criterion(pred, label, reduction="none")).mean()                                                                 
+        loss.backward()                                                                                                          
+        optimizer.step()                    
+        total_loss += loss.item() * len(label)                                                                                   
+    return total_loss / len(loader.dataset)                                                                               
                                                                                                                             
-def val_epoch(model, loader, criterion, device):
-    """Run one validation epoch and return mean loss over the dataset"""                                                      
-    model.eval()
-    total_loss = 0.0                                                                                                          
-    with torch.no_grad():                   
-        for image, wind, label, *_ in loader:
-            image, wind, label = image.to(device), wind.to(device), label.to(device)
-            pred = model(image, wind)                                                                                         
-            loss = criterion(pred, label)   
-            total_loss += loss.item() * len(label)                                                                            
-    return total_loss / len(loader.dataset)                                                                                                                                                                                                      
-
-def run_inference(model, loader, device):
-    """Run model inference on a dataloader and return predictions as a numpy array"""                                         
-    model.eval()                            
-    preds = []                          
+def val_epoch(model, loader, criterion, device):                                                                                 
+    """Run one validation epoch and return mean loss over the dataset"""
+    model.eval()                                                        
+    total_loss = 0.0                                                                                                             
     with torch.no_grad():
-        for image, wind, *_  in loader:                                                                                     
-            image, wind = image.to(device), wind.to(device)
-            preds.append(model(image, wind).cpu().numpy())                                                                    
-    return np.concatenate(preds)                                                                                                                  
+        for image, wind, num_adj, label, *_ in loader:                                                                           
+            image, wind, num_adj, label = image.to(device), wind.to(device), num_adj.to(device), label.to(device)
+            pred = model(image, wind, num_adj)                                                                   
+            loss = criterion(pred, label)                                                                                        
+            total_loss += loss.item() * len(label)
+    return total_loss / len(loader.dataset)                                                                                                                                                                                                       
+
+def run_inference(model, loader, device):                                                                                        
+    """Run model inference on a dataloader and return predictions as a numpy array"""
+    model.eval()                                                                     
+    preds = []                                                                                                                   
+    with torch.no_grad():
+        for image, wind, num_adj, *_ in loader:                                                                                  
+            image, wind, num_adj = image.to(device), wind.to(device), num_adj.to(device)
+            preds.append(model(image, wind, num_adj).cpu().numpy())                     
+    return np.concatenate(preds)                                                                                                                     
                 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")                                                                                      
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu") 
+    print(f"device: {device}")                                                                                     
 
     # create run directory                                                                                                  
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
     run_dir = os.path.join(RUNS_DIR, run_name)                                                                              
     ckpt_dir = os.path.join(run_dir, "checkpoints")                                                                         
     os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(run_dir, exist_ok=True)                                                                                     
+    os.makedirs(run_dir, exist_ok=True)                                                                                   
                                                                                                                             
     # compute normalization stats from training set                                                                         
-    stats = compute_stats(split="train")                                                                                    
+    stats = compute_stats(split="train")                                                                                   
                 
     # initialize datasets and dataloaders                                                                                   
     train_dataset = NOxDataset("train", stats=stats)                                                                                                                         
@@ -72,7 +74,7 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
     train_eval_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)                                           
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)                                            
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)                                          
                 
     # initialize model, optimizer, loss, scheduler                                                                          
     model = NOxResNet().to(device)
