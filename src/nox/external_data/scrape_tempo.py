@@ -1,3 +1,9 @@
+"""
+Scraped tempo images for desired date range + version
+
+Output: tempo images placed in TEMPO_DIR 
+"""
+
 import earthaccess
 import os
 import sys
