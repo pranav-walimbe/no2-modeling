@@ -39,24 +39,26 @@ def compute_stats(split, batch_size=512):
     prev_qtr_mass = df["prev_qtr_mass"].values.astype(np.float32)
     n = images.shape[0]
 
-    # first pass: compute mean
-    total, sum_ = 0, 0.0
+    # first pass: compute per-channel mean
+    total, sums = 0, np.zeros(2, dtype=np.float64)
     for i in range(0, n, batch_size):
-        batch = np.clip(images[i:i+batch_size].ravel(), None, MAX_IMG_VAL).astype(np.float64)
-        total += len(batch)
-        sum_ += batch.sum()
-    mean = sum_ / total
+        batch = images[i:i+batch_size].astype(np.float64)  # (B, 2, H, W)
+        batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
+        total += batch.shape[0] * batch.shape[2] * batch.shape[3]
+        sums += batch.sum(axis=(0, 2, 3))
+    means = sums / total
 
-    # second pass: compute std
-    sum_sq_diff = 0.0
+    # second pass: compute per-channel std
+    sum_sq_diffs = np.zeros(2, dtype=np.float64)
     for i in range(0, n, batch_size):
-        batch = np.clip(images[i:i+batch_size].ravel(), None, MAX_IMG_VAL).astype(np.float64)
-        sum_sq_diff += ((batch - mean) ** 2).sum()
-    std = np.sqrt(sum_sq_diff / total)
+        batch = images[i:i+batch_size].astype(np.float64)  # (B, 2, H, W)
+        batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
+        sum_sq_diffs += ((batch - means[np.newaxis, :, np.newaxis, np.newaxis]) ** 2).sum(axis=(0, 2, 3))
+    stds = np.sqrt(sum_sq_diffs / total)
 
     return {
-        "image_mean": float(mean),
-        "image_std": float(std),
+        "image_mean": torch.tensor(means, dtype=torch.float32).view(2, 1, 1),
+        "image_std": torch.tensor(stds, dtype=torch.float32).view(2, 1, 1),
         "wind_u_mean": float(wind_u.mean()),
         "wind_u_std": float(wind_u.std()),
         "wind_v_mean": float(wind_v.mean()),
@@ -186,7 +188,7 @@ def plot_residual_examples(test_df, run_dir, n=10):
         high_row = plant_df.loc[plant_df["abs_residual"].idxmax()]
 
         for ax, row in [(axes[0, i], low_row), (axes[1, i], high_row)]:
-            img = images[int(row["npy_idx"])]
+            img = images[int(row["npy_idx"])][0]  # channel 0: VCD_t
             vmin, vmax = np.nanpercentile(img, [1, 99])
             ax.imshow(img, cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
             ax.set_title(f"{row['facilityName']}\nresidual={row['abs_residual']:.2f}\ntrue={row['y_true']:.2f}", fontsize=6)

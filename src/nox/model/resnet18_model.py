@@ -15,7 +15,7 @@ class NOxResNet(nn.Module):
         super().__init__()
 
         backbone = resnet18(weights=None)
-        backbone.conv1 = nn.Conv2d(1, 64, kernel_size=KERNEL_SIZE, stride=STRIDE, padding=PADDING, bias=False)
+        backbone.conv1 = nn.Conv2d(2, 64, kernel_size=KERNEL_SIZE, stride=STRIDE, padding=PADDING, bias=False)
         backbone.maxpool = nn.Identity()
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
 

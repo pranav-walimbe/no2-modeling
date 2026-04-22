@@ -25,14 +25,14 @@ class NOxDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        image = torch.tensor(self.images[idx]).float().unsqueeze(0)
+        image = torch.tensor(self.images[idx]).float()  # (2, H, W)
         label = torch.tensor(self.labels[idx]).float()
         wind_u = torch.tensor([self.wind_u[idx]]).float()
         wind_v = torch.tensor([self.wind_v[idx]]).float()
         num_adj = torch.tensor([self.num_adj[idx]]).float()
         prev_qtr_mass = torch.tensor([self.prev_qtr_mass[idx]]).float()
 
-        image = torch.clamp(image, max=MAX_IMG_VAL)
+        image[0] = torch.clamp(image[0], max=MAX_IMG_VAL)
 
         if self.stats is not None:
             image = (image - self.stats["image_mean"]) / self.stats["image_std"]
