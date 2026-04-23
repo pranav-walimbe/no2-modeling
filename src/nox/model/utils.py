@@ -4,10 +4,8 @@ Define utility functions (normalization, plotting, loss) for ML pipeline
 
 import sys
 import os
-import zarr
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 import pandas as pd
 import geopandas as gpd
 import seaborn as sns
@@ -15,54 +13,34 @@ import torch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import *
 
-def mse_loss(pred, target, reduction="mean"):
-    """Mean squared error loss"""
-    per_sample = (pred - target) ** 2
-    if reduction == "none":
-        return per_sample
-    return per_sample.mean()
-
-def mae_loss(pred, target, reduction="mean"):
-    """Mean absolute error loss"""
-    per_sample = torch.abs(pred - target)
-    if reduction == "none":
-        return per_sample
-    return per_sample.mean()
-
 def compute_stats(split, batch_size=512):
-    """Compute mean/std normalization stats from training images, wind, and lagged emissions"""
-    images = np.load(os.path.join(IMAGES_DIR, f"{split}_tempo.npy"), mmap_mode="r")
+    """Compute mean/std normalization stats from training images and tabular features"""
+    images = np.load(os.path.join(IMAGES_DIR, f"{split}_tempo.npy"))
     df = pd.read_csv(os.path.join(DATASET_DF, f"{split}_df.csv"))
-    wind_u = df[WIND_COLS[0]].values.astype(np.float32)
-    wind_v = df[WIND_COLS[1]].values.astype(np.float32)
     num_adj = df["num_adj_units"].values.astype(np.float32)
     prev_qtr_mass = df["prev_qtr_mass"].values.astype(np.float32)
     n = images.shape[0]
 
     # first pass: compute per-channel mean
-    total, sums = 0, np.zeros(2, dtype=np.float64)
+    total, sums = 0, np.zeros(4, dtype=np.float64)
     for i in range(0, n, batch_size):
-        batch = images[i:i+batch_size].astype(np.float64)  # (B, 2, H, W)
+        batch = images[i:i+batch_size].astype(np.float64)  # (B, 4, H, W)
         batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
         total += batch.shape[0] * batch.shape[2] * batch.shape[3]
         sums += batch.sum(axis=(0, 2, 3))
     means = sums / total
 
     # second pass: compute per-channel std
-    sum_sq_diffs = np.zeros(2, dtype=np.float64)
+    sum_sq_diffs = np.zeros(4, dtype=np.float64)
     for i in range(0, n, batch_size):
-        batch = images[i:i+batch_size].astype(np.float64)  # (B, 2, H, W)
+        batch = images[i:i+batch_size].astype(np.float64)  # (B, 4, H, W)
         batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
         sum_sq_diffs += ((batch - means[np.newaxis, :, np.newaxis, np.newaxis]) ** 2).sum(axis=(0, 2, 3))
     stds = np.sqrt(sum_sq_diffs / total)
 
     return {
-        "image_mean": torch.tensor(means, dtype=torch.float32).view(2, 1, 1),
-        "image_std": torch.tensor(stds, dtype=torch.float32).view(2, 1, 1),
-        "wind_u_mean": float(wind_u.mean()),
-        "wind_u_std": float(wind_u.std()),
-        "wind_v_mean": float(wind_v.mean()),
-        "wind_v_std": float(wind_v.std()),
+        "image_mean": torch.tensor(means, dtype=torch.float32).view(4, 1, 1),
+        "image_std": torch.tensor(stds, dtype=torch.float32).view(4, 1, 1),
         "num_adj_mean": float(num_adj.mean()),
         "num_adj_std": float(num_adj.std()),
         "prev_qtr_mass_mean": float(prev_qtr_mass.mean()),
@@ -96,15 +74,15 @@ def plot_loss_curve(train_losses, val_losses, run_dir):
     ax.plot(epochs, train_losses, label="Train loss", color="#4C9BE8", linewidth=2)
     ax.plot(epochs, val_losses, label="Val loss", color="#E85D5D", linewidth=2)
     ax.set_xlabel("Epoch", labelpad=8)
-    ax.set_ylabel("MAE Loss", labelpad=8)
-    ax.set_title(f"Training & Validation Loss\n({run_name})", fontweight="bold", pad=14)
+    ax.set_ylabel("Loss", labelpad=8)
+    ax.set_title(f"Training and Validation Loss\n({run_name})", fontweight="bold", pad=14)
     ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     ax.legend(fontsize=10, framealpha=0.9)
     plt.tight_layout()
     _save(fig, run_dir, "loss_curve")
 
 def plot_pred_vs_true(train_df, test_df, val_df, run_dir):
-    """Scatter plot of predicted vs true NOx emissions on log scale for all splits"""
+    """Scatter plot of predicted vs true NOx emissions for all splits"""
     run_name = os.path.basename(run_dir)
     sns.set_theme(style="whitegrid", font_scale=1.1)
     fig, axes = plt.subplots(1, 3, figsize=(21, 7))
@@ -119,12 +97,12 @@ def plot_pred_vs_true(train_df, test_df, val_df, run_dir):
         ax.set_ylabel(f"y_pred ({LABEL_COL})", labelpad=8)
         ax.set_title(f"{split} set", fontweight="bold", pad=14)
         ax.legend(fontsize=10, framealpha=0.9)
-    fig.suptitle(f"Predicted vs. True Emissions — {run_name}", fontweight="bold", fontsize=14)
+    fig.suptitle(f"Predicted vs True Emissions - {run_name}", fontweight="bold", fontsize=14)
     plt.tight_layout()
     _save(fig, run_dir, "pred_vs_true")
 
 def plot_residuals(train_df, test_df, val_df, run_dir):
-    """Scatter plot of absolute residuals vs true NOx emissions on log-log scale for all splits"""
+    """Scatter plot of absolute residuals vs true NOx emissions for all splits"""
     run_name = os.path.basename(run_dir)
     sns.set_theme(style="whitegrid", font_scale=1.1)
     fig, axes = plt.subplots(1, 3, figsize=(24, 5))
@@ -135,18 +113,15 @@ def plot_residuals(train_df, test_df, val_df, run_dir):
         ax.set_xlabel(f"y_true  ({LABEL_COL})", labelpad=8)
         ax.set_ylabel(f"|y_pred - y_true|  ({LABEL_COL})", labelpad=8)
         ax.set_title(f"{split} set", fontweight="bold", pad=14)
-    fig.suptitle(f"Absolute Residuals vs. True Emissions — {run_name}", fontweight="bold", fontsize=14)
+    fig.suptitle(f"Absolute Residuals vs True Emissions - {run_name}", fontweight="bold", fontsize=14)
     plt.tight_layout()
     _save(fig, run_dir, "residuals")
 
 def plot_spatial_error(train_df, test_df, val_df, run_dir):
     """Heatmap of per-plant MAE overlaid on a US map for all splits"""
     run_name = os.path.basename(run_dir)
-
-    # get US outline for geographic visualization
     us = gpd.read_file(COUNTRIES_URL)
     us = us[us.NAME == "United States of America"]
-
     sns.set_theme(style="white", font_scale=1.1)
     fig, axes = plt.subplots(3, 1, figsize=(12, 21))
     for ax, (df, split) in zip(axes, [(train_df, "train"), (test_df, "test"), (val_df, "val")]):
@@ -164,35 +139,63 @@ def plot_spatial_error(train_df, test_df, val_df, run_dir):
         ax.set_xlabel("Longitude", labelpad=8)
         ax.set_ylabel("Latitude", labelpad=8)
         ax.set_title(f"{split} set", fontweight="bold", pad=14)
-    fig.suptitle(f"Spatial Error Distribution — {run_name}", fontweight="bold", fontsize=14)
+    fig.suptitle(f"Spatial Error Distribution - {run_name}", fontweight="bold", fontsize=14)
     plt.tight_layout()
     _save(fig, run_dir, "spatial_error")
 
 def plot_residual_examples(test_df, run_dir, n=10):
-    """For n random plants, plot their lowest and highest residual prediction"""
+    """Plot n highest and n lowest residual predictions showing NO2 and delta NO2 channels"""
     run_name = os.path.basename(run_dir)
     df = test_df.copy().reset_index(drop=True)
     df["abs_residual"] = (df["y_pred"] - df["y_true"]).abs()
-    images = np.load(os.path.join(IMAGES_DIR, "test_tempo.npy"), mmap_mode="r")
+    images = np.load(os.path.join(IMAGES_DIR, "test_tempo.npy"))
 
-    plants = df["facilityId"].drop_duplicates().sample(n=min(n, df["facilityId"].nunique()), random_state=42)
+    # select top and bottom n samples by residual magnitude
+    high = df.nlargest(n, "abs_residual").reset_index(drop=True)
+    low = df.nsmallest(n, "abs_residual").reset_index(drop=True)
 
-    fig, axes = plt.subplots(2, len(plants), figsize=(3 * len(plants), 7))
-    fig.suptitle(f"Per-plant residual examples (test set — {run_name})", fontweight="bold", fontsize=14)
-    axes[0, 0].set_ylabel("Low residual", fontsize=10, labelpad=8)
-    axes[1, 0].set_ylabel("High residual", fontsize=10, labelpad=8)
+    # 4 rows: high no2, high delta, low no2, low delta
+    fig, axes = plt.subplots(4, n, figsize=(3 * n, 13))
+    fig.suptitle(f"Residual examples - test set ({run_name})", fontweight="bold", fontsize=14)
 
-    for i, facility_id in enumerate(plants):
-        plant_df = df[df["facilityId"] == facility_id]
-        low_row  = plant_df.loc[plant_df["abs_residual"].idxmin()]
-        high_row = plant_df.loc[plant_df["abs_residual"].idxmax()]
+    axes[0, 0].set_ylabel("High residual\nNO2", fontsize=9)
+    axes[1, 0].set_ylabel("High residual\ndelta NO2", fontsize=9)
+    axes[2, 0].set_ylabel("Low residual\nNO2", fontsize=9)
+    axes[3, 0].set_ylabel("Low residual\ndelta NO2", fontsize=9)
 
-        for ax, row in [(axes[0, i], low_row), (axes[1, i], high_row)]:
-            img = images[int(row["npy_idx"])][0]  # channel 0: VCD_t
-            vmin, vmax = np.nanpercentile(img, [1, 99])
-            ax.imshow(img, cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
-            ax.set_title(f"{row['facilityName']}\nresidual={row['abs_residual']:.2f}\ntrue={row['y_true']:.2f}", fontsize=6)
-            ax.axis("off")
+    for i, row in high.iterrows():
+        img = images[int(row["npy_idx"])]
+        no2, delta = img[0], img[1]
+
+        axes[0, i].imshow(no2, cmap="viridis",
+            vmin=np.nanpercentile(no2, 1), vmax=np.nanpercentile(no2, 99),
+            interpolation="nearest")
+        axes[0, i].set_title(
+            f"{row['facilityName']}\npred={row['y_pred']:.1f}  true={row['y_true']:.1f}",
+            fontsize=6)
+        axes[0, i].axis("off")
+
+        axes[1, i].imshow(delta, cmap="RdBu_r",
+            vmin=np.nanpercentile(delta, 1), vmax=np.nanpercentile(delta, 99),
+            interpolation="nearest")
+        axes[1, i].axis("off")
+
+    for i, row in low.iterrows():
+        img = images[int(row["npy_idx"])]
+        no2, delta = img[0], img[1]
+
+        axes[2, i].imshow(no2, cmap="viridis",
+            vmin=np.nanpercentile(no2, 1), vmax=np.nanpercentile(no2, 99),
+            interpolation="nearest")
+        axes[2, i].set_title(
+            f"{row['facilityName']}\npred={row['y_pred']:.1f}  true={row['y_true']:.1f}",
+            fontsize=6)
+        axes[2, i].axis("off")
+
+        axes[3, i].imshow(delta, cmap="RdBu_r",
+            vmin=np.nanpercentile(delta, 1), vmax=np.nanpercentile(delta, 99),
+            interpolation="nearest")
+        axes[3, i].axis("off")
 
     plt.tight_layout()
     _save(fig, run_dir, "residual_examples")
@@ -204,11 +207,10 @@ def print_mae_summary(train_df, val_df, test_df):
         mae = np.abs(df["y_true"].values - df["y_pred"].values).mean()
         print(f"  {split:<6} MAE: {mae:.4f}")
 
-    # stratified MAE on test set by label tertile
     print("\n--- Test MAE by emission tertile ---")
     t33, t66 = np.percentile(test_df["y_true"], [33, 66])
-    low = test_df[test_df["y_true"] <  t33]
-    mid = test_df[(test_df["y_true"] >= t33) & (test_df["y_true"] < t66)]
+    low  = test_df[test_df["y_true"] <  t33]
+    mid  = test_df[(test_df["y_true"] >= t33) & (test_df["y_true"] < t66)]
     high = test_df[test_df["y_true"] >= t66]
 
     for name, subset in [("low", low), ("mid", mid), ("high", high)]:

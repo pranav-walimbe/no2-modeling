@@ -15,19 +15,19 @@ class NOxResNet(nn.Module):
         super().__init__()
 
         backbone = resnet18(weights=None)
-        backbone.conv1 = nn.Conv2d(2, 64, kernel_size=KERNEL_SIZE, stride=STRIDE, padding=PADDING, bias=False)
+        backbone.conv1 = nn.Conv2d(4, 64, kernel_size=KERNEL_SIZE, stride=STRIDE, padding=PADDING, bias=False)
         backbone.maxpool = nn.Identity()
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
 
         self.head = nn.Sequential(
-            nn.Linear(512 + 4, RESNET_HEAD_DIM),  # 512 image + wind_u + wind_v + num_adj + prev_qtr_mass
+            nn.Linear(512 + 2, RESNET_HEAD_DIM),  # 512 image + num_adj + prev_qtr_mass
             nn.BatchNorm1d(RESNET_HEAD_DIM),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
             nn.Linear(RESNET_HEAD_DIM, 1),
         )
 
-    def forward(self, image, wind_u, wind_v, num_adj, prev_qtr_mass):
+    def forward(self, image, num_adj, prev_qtr_mass):
         x = self.backbone(image).flatten(1)
-        x = torch.cat([x, wind_u, wind_v, num_adj, prev_qtr_mass], dim=1)
+        x = torch.cat([x, num_adj, prev_qtr_mass], dim=1)
         return self.head(x).squeeze(1)

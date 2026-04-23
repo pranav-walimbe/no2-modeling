@@ -13,7 +13,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 from scipy.ndimage import zoom
 from scipy.spatial import cKDTree
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import *
 
@@ -43,103 +43,114 @@ def filter_by_city_proximity(df: pd.DataFrame, cities_gdf: gpd.GeoDataFrame):
     mask = dists_km >= MIN_CITY_PROXIMITY
     return df[mask].reset_index(drop=True)
 
-def extract_tempo_patch(args):
-    """Perform TEMPO patch extraction with pixel quality filtering; returns 2-channel (VCD_t, delta) patch"""
-    orig_idx, row = args
-    try:
-        # current hour: full quality checks
-        fpath = os.path.join(TEMPO_DIR, row["tempo"])
-        with nc.Dataset(fpath) as root:
-            lats = root["latitude"][:]
-            lons = root["longitude"][:]
+def extract_no2_data(fname, row, orig_idx, is_prev=False):
+    """Perform patch extraction and quality filtering for a given tempo image"""
+    fpath = os.path.join(TEMPO_DIR, fname)
+    with nc.Dataset(fpath) as root:
+        lats = root["latitude"][:]
+        lons = root["longitude"][:]
 
-            lat_idx = np.where((lats >= row["lat_min"]) & (lats <= row["lat_max"]))[0]
-            lon_idx = np.where((lons >= row["lon_min"]) & (lons <= row["lon_max"]))[0]
-            if lat_idx.size == 0 or lon_idx.size == 0:
-                print(f"SKIP [{orig_idx}]: {row['tempo']} — no pixels in range around ({row['lat']:.2f}, {row['lon']:.2f})")
-                return None
-            r0, r1 = lat_idx.min(), lat_idx.max() + 1
-            c0, c1 = lon_idx.min(), lon_idx.max() + 1
+        # find pixel window covering image bounds
+        lat_idx = np.where((lats >= row["lat_min"]) & (lats <= row["lat_max"]))[0]
+        lon_idx = np.where((lons >= row["lon_min"]) & (lons <= row["lon_max"]))[0]
+        if lat_idx.size == 0 or lon_idx.size == 0:
+            print(f"SKIP [{orig_idx}]: {fname} — no pixels in range around ({row['lat']:.2f}, {row['lon']:.2f})")
+            return None
+        r0, r1 = lat_idx.min(), lat_idx.max() + 1
+        c0, c1 = lon_idx.min(), lon_idx.max() + 1
 
-            # require sufficient fraction of pixels to be below cloud cover threshold
+        # apply cloud cover filter to current scan only
+        if not is_prev:
             cloud_ma = root["support_data"]["eff_cloud_fraction"][0, r0:r1, c0:c1]
             valid = ~np.ma.getmaskarray(cloud_ma)
             if not valid.any():
-                print(f"SKIP [{orig_idx}]: {row['tempo']} — cloud array is all masked")
+                print(f"SKIP [{orig_idx}]: {fname} — cloud array is all masked")
                 return None
-            cloud = np.array(cloud_ma)
-            frac_clean = np.mean(cloud[valid] <= MIN_PIXEL_CLOUD)
+            frac_clean = np.mean(np.array(cloud_ma)[valid] <= MIN_PIXEL_CLOUD)
             if frac_clean < IMG_CLOUD_FILTER:
-                print(f"SKIP [{orig_idx}]: {row['tempo']} — {frac_clean:.1%} pixels below cloud threshold")
+                print(f"SKIP [{orig_idx}]: {fname} — {frac_clean:.1%} pixels below cloud threshold")
                 return None
 
-            # require sufficient fraction of pixels to meet retrieval quality flag
-            qa = np.ma.filled(root["product"]["main_data_quality_flag"][0, r0:r1, c0:c1], fill_value=2)
-            frac_good = np.mean(qa == 0)
-            if frac_good < IMG_QA_FILTER:
-                print(f"SKIP [{orig_idx}]: {row['tempo']} — {frac_good:.1%} pixels have QA == 0")
-                return None
+        # check retrieval quality flag
+        qa = np.ma.filled(root["product"]["main_data_quality_flag"][0, r0:r1, c0:c1], fill_value=2)
+        frac_good = np.mean(qa == 0)
+        if frac_good < IMG_QA_FILTER:
+            print(f"SKIP [{orig_idx}]: {fname} — {frac_good:.1%} pixels have QA == 0")
+            return None
 
-            # reject patches with any masked no2 values or outlier concentrations
-            no2_ma = root["product"]["vertical_column_troposphere"][0, r0:r1, c0:c1]
-            if np.ma.getmaskarray(no2_ma).any():
-                print(f"SKIP [{orig_idx}]: {row['tempo']} — no2 patch contains masked pixels")
-                return None
-            no2 = np.array(no2_ma)
+        # reject patches with masked or out-of-range NO2 values
+        no2_ma = root["product"]["vertical_column_troposphere"][0, r0:r1, c0:c1]
+        if np.ma.getmaskarray(no2_ma).any():
+            print(f"SKIP [{orig_idx}]: {fname} — no2 patch contains masked pixels")
+            return None
+        no2 = np.array(no2_ma)
+        if no2.min() < MIN_IMG_VAL:
+            print(f"SKIP [{orig_idx}]: {fname} — min pixel value {no2.min():.2e} < {MIN_IMG_VAL:.2e}")
+            return None
+        frac_clipped = np.mean(no2 >= MAX_IMG_VAL)
+        if frac_clipped > IMG_VAL_FILTER:
+            print(f"SKIP [{orig_idx}]: {fname} — {frac_clipped:.1%} pixels at max value")
+            return None
 
-            if no2.min() < MIN_IMG_VAL:
-                print(f"SKIP [{orig_idx}]: {row['tempo']} — min pixel value {no2.min():.2e} < {MIN_IMG_VAL:.2e}")
-                return None
-            frac_clipped = np.mean(no2 >= MAX_IMG_VAL)
-            if frac_clipped > IMG_VAL_FILTER:
-                print(f"SKIP [{orig_idx}]: {row['tempo']} — {frac_clipped:.1%} pixels at max value")
-                return None
+    # resize to target image dimensions
+    return zoom(no2, (IMG_SIZE / no2.shape[0], IMG_SIZE / no2.shape[1]), order=1)
 
-        no2 = zoom(no2, (IMG_SIZE / no2.shape[0], IMG_SIZE / no2.shape[1]), order=1)
+def extract_wind_data(row):
+    """extract ERA5 u10/v10 values as a IMG_SIZE x IMG_SIZE raster"""
+    fpath = os.path.join(ERA5_DIR, row["era5"])
+    with nc.Dataset(fpath) as ds:
+        ds.set_auto_mask(False)
+        lats = ds["latitude"][:]
+        lons = ds["longitude"][:]
 
-        # previous hour: masked values and value range checks
-        fpath_prev = os.path.join(TEMPO_DIR, row["prev_tempo"])
-        with nc.Dataset(fpath_prev) as root:
-            lats = root["latitude"][:]
-            lons = root["longitude"][:]
+        # find grid point window covering image bounds
+        lat_idx = np.where((lats >= row["lat_min"]) & (lats <= row["lat_max"]))[0]
+        lon_idx = np.where((lons >= row["lon_min"]) & (lons <= row["lon_max"]))[0]
+        if lat_idx.size == 0 or lon_idx.size == 0:
+            return None
+        r0, r1 = lat_idx.min(), lat_idx.max() + 1
+        c0, c1 = lon_idx.min(), lon_idx.max() + 1
 
-            lat_idx = np.where((lats >= row["lat_min"]) & (lats <= row["lat_max"]))[0]
-            lon_idx = np.where((lons >= row["lon_min"]) & (lons <= row["lon_max"]))[0]
-            if lat_idx.size == 0 or lon_idx.size == 0:
-                print(f"SKIP [{orig_idx}]: {row['prev_tempo']} — no pixels in range")
-                return None
-            r0, r1 = lat_idx.min(), lat_idx.max() + 1
-            c0, c1 = lon_idx.min(), lon_idx.max() + 1
+        # compute time index within monthly file
+        dt = pd.Timestamp(row["date"])
+        time_idx = (dt.day - 1) * 24 + int(row["hour"])
 
-            # require sufficient fraction of pixels to meet retrieval quality flag (loosened constraint)
-            qa = np.ma.filled(root["product"]["main_data_quality_flag"][0, r0:r1, c0:c1], fill_value=2)
-            if np.mean(qa == 0) < IMG_QA_FILTER * 0.5:
-                print(f"SKIP [{orig_idx}]: {row['prev_tempo']} — prev QA below threshold")
-                return None
+        # read wind component patches
+        u10_patch = np.array(ds["u10"][time_idx, r0:r1, c0:c1])
+        v10_patch = np.array(ds["v10"][time_idx, r0:r1, c0:c1])
 
-            # reject patches with any masked no2 values or outlier concentrations
-            no2_prev_ma = root["product"]["vertical_column_troposphere"][0, r0:r1, c0:c1]
-            if np.ma.getmaskarray(no2_prev_ma).any():
-                print(f"SKIP [{orig_idx}]: {row['prev_tempo']} — prev no2 patch contains masked pixels")
-                return None
-            no2_prev = np.array(no2_prev_ma)
+    # upsample to image resolution with interpolation
+    u10_raster = zoom(u10_patch, (IMG_SIZE / u10_patch.shape[0], IMG_SIZE / u10_patch.shape[1]), order=1)
+    v10_raster = zoom(v10_patch, (IMG_SIZE / v10_patch.shape[0], IMG_SIZE / v10_patch.shape[1]), order=1)
+    return u10_raster.astype(np.float32), v10_raster.astype(np.float32)
 
-            if no2_prev.min() < MIN_IMG_VAL:
-                print(f"SKIP [{orig_idx}]: {row['prev_tempo']} — min pixel value {no2_prev.min():.2e} < {MIN_IMG_VAL:.2e}")
-                return None
-            frac_clipped = np.mean(no2_prev >= MAX_IMG_VAL)
-            if frac_clipped > IMG_VAL_FILTER:
-                print(f"SKIP [{orig_idx}]: {row['prev_tempo']} — {frac_clipped:.1%} pixels at max value")
-                return None
+def extract_image_data(args):
+    """Extract and stack all image channels; returns 4-channel (VCD_t, delta, u10, v10) patch or None"""
+    orig_idx, row = args
+    try:
+        # extract current and previous NO2 scans
+        no2 = extract_no2_data(row["tempo"], row, orig_idx, is_prev=False)
+        if no2 is None:
+            return None
 
-        no2_prev = zoom(no2_prev, (IMG_SIZE / no2_prev.shape[0], IMG_SIZE / no2_prev.shape[1]), order=1)
+        no2_prev = extract_no2_data(row["prev_tempo"], row, orig_idx, is_prev=True)
+        if no2_prev is None:
+            return None
+
+        # extract wind rasters
+        wind = extract_wind_data(row)
+        if wind is None:
+            print(f"SKIP [{orig_idx}]: {row['tempo']} — no ERA5 wind pixels in bounds")
+            return None
+        u10_raster, v10_raster = wind
+
+        # compute temporal difference and plume visibility score
         delta_no2 = no2 - no2_prev
-
-        # plume score: ratio of peak spread to background spread as a plume visibility heuristic
         p10, p50, p99 = np.percentile(no2, [10, 50, 99])
         plume_score = (p99 - p50) / (p50 - p10 + 1e-10)
 
-        patch = np.stack([no2, delta_no2], axis=0)[np.newaxis, ...].astype(np.float32)  # (1, 2, H, W)
+        # stack channels and return
+        patch = np.stack([no2, delta_no2, u10_raster, v10_raster], axis=0)[np.newaxis, ...].astype(np.float32)  # (1, 4, H, W)
         return (orig_idx, patch, plume_score)
 
     except Exception as e:
@@ -174,22 +185,27 @@ def visualize_split(df: pd.DataFrame, split: str):
 
 def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
     """Parallel patch extraction, npy write, and dataset DataFrame save for a given split"""
-    # prefiltering by city proximity
+
+    # filter records by city proximity and compute image bounds
     df = filter_by_city_proximity(df, cities_gdf)
     df = compute_bounds(df)
 
-    # parallelized tempo patch extraction
-    args = [(orig_idx, row) for orig_idx, row in df.iterrows()]
+    # extract no2 and wind data in parallel
+    args = [(orig_idx, row) for orig_idx, row in zip(df.index, df.to_dict("records"))]
+    valid = []
     with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
-        results = list(executor.map(extract_tempo_patch, args))
+        futures = [executor.submit(extract_image_data, arg) for arg in args]
+        for f in as_completed(futures):
+            result = f.result()
+            if result is not None:
+                valid.append(result)
 
-    valid = [r for r in results if r is not None]
     n_valid = len(valid)
     print(f"{n_valid} / {len(df)} patches passed filtering")
     if n_valid == 0:
         return
 
-    # filter by plume score — drop samples below percentile threshold
+    # drop samples below plume score percentile threshold
     plume_scores = np.array([r[2] for r in valid])
     threshold = np.percentile(plume_scores, PLUME_FILTER_PERCENTILE * 100)
     valid = [r for r, s in zip(valid, plume_scores) if s >= threshold]
@@ -197,25 +213,25 @@ def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
     if not valid:
         return
 
-    # extract desired amount of images for split
+    # trim to target split size
     n_store = min(SPLIT_SIZES[split], len(valid))
     valid = valid[:n_store]
 
     valid_idxs = [orig_idx for orig_idx, _, _ in valid]
     plume_scores = [s for _, _, s in valid]
 
-    # store image data in npy — shape: (N, 2, IMG_SIZE, IMG_SIZE) with channels [no2, delta_no2]
+    # save image stack with shape: (N, 4, IMG_SIZE, IMG_SIZE)
     patches = np.concatenate([patch for _, patch, _ in valid], axis=0)
     np.save(os.path.join(IMAGES_DIR, f"{split}_tempo.npy"), patches)
 
-    # store dataset DataFrame with original columns, label, wind speed, and npy index
+    # save dataset DataFrame with metadata and npy index
     out_df = df.loc[valid_idxs].drop(columns=["lat_min", "lat_max", "lon_min", "lon_max"]).copy()
     out_df["npy_idx"] = range(n_store)
     out_df["split"] = split
     out_df["plume_score"] = plume_scores
     out_df.to_csv(os.path.join(DATASET_DF, f"{split}_df.csv"), index=False)
 
-    # visualize split distribution
+    # plot geographic and label distributions
     visualize_split(out_df, split)
 
 def main():
@@ -234,8 +250,6 @@ def main():
 
     for split, df in splits.items():
         df["date"] = pd.to_datetime(df["date"])
-        if not all(col in df.columns for col in WIND_COLS):
-            sys.exit(f"ERROR: Wind data not present in {split} input csv")
         process_split(df, split, cities_gdf)
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ Output: train.csv, test.csv, val.csv located in output directory
 
 import sys
 import os
+import netCDF4 as nc
 from sklearn.model_selection import train_test_split
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -15,25 +16,26 @@ from collections import defaultdict
 import pandas as pd
 from datetime import datetime
 import numpy as np
-import xarray as xr
 from concurrent.futures import ProcessPoolExecutor
 import pickle
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import *
 
 # helper functions
+def project_to_meters(df: pd.DataFrame):
+    """Project lat/lon to NAD83 Conus Albers meters, returns x and y coordinate arrays"""
+    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326").to_crs("EPSG:5070")
+    return gdf.geometry.x.values, gdf.geometry.y.values
+
 def parse_tile(fname: str):
     """Return (dt, fname) if tile meets duration requirement"""
     try:
-        fpath = os.path.join(TEMPO_DIR, fname)
-        ds = xr.open_dataset(fpath, engine="netcdf4")
-        start = pd.Timestamp(ds.attrs["time_coverage_start"])
-        end = pd.Timestamp(ds.attrs["time_coverage_end"])
-        ds.close()
+        with nc.Dataset(os.path.join(TEMPO_DIR, fname)) as ds:
+            start = pd.Timestamp(ds.time_coverage_start)
+            end = pd.Timestamp(ds.time_coverage_end)
         if (end - start).total_seconds() / 60 < MIN_TEMPO_DURATION:
             return None
-        dt = pd.to_datetime(fname.split("_")[4], format="%Y%m%dT%H%M%SZ")
-        return (dt, fname)
+        return (pd.to_datetime(fname.split("_")[4], format="%Y%m%dT%H%M%SZ"), fname)
     except Exception as e:
         print(f"WARNING: skipping {fname}: {e}")
         return None
@@ -63,7 +65,7 @@ def build_tempo_mapping():
     return tempo_by_date
 
 def map_to_tempo(row: pd.Series, tempo_by_date: dict):
-    """Return (tempo, prev_hour_tempo) for a record"""
+    """Return tempo file name and previous hour tempo file name for a record"""
     target_dt = datetime(year=row['date'].year, month=row['date'].month, day=row['date'].day, hour=row['hour'])
     prev_dt = target_dt - pd.Timedelta(hours=1)
 
@@ -91,23 +93,21 @@ def map_chunk(args):
     chunk["tempo"], chunk["prev_tempo"] = zip(*results)
     return chunk
 
-def aggregate_units(df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_units(df: pd.DataFrame):
     """Filter to complete groups and aggregate units to one row per facility per hour"""
 
     # keep only groups where all units are present
     units_per_facility = df.groupby("facilityId")["unitId"].nunique()
-    df["_n_units"] = df.groupby(["facilityId", "date", "hour"])["unitId"].transform("nunique")
-    df["_expected"] = df["facilityId"].map(units_per_facility)
-    df = df[df["_n_units"] == df["_expected"]].drop(columns=["_n_units", "_expected"])
+    n_units = df.groupby(["facilityId", "date", "hour"])["unitId"].transform("nunique")
+    df = df[n_units == df["facilityId"].map(units_per_facility)].copy()
 
     # sum label across units per facility-hour
     df[LABEL_COL] = df.groupby(["facilityId", "date", "hour"])[LABEL_COL].transform("sum")
 
-    # find representative unit per facility (closest to centroid) and filter to it
-    unit_locs = df[["facilityId", "unitId", "lat", "lon"]].drop_duplicates(["facilityId", "unitId"])
-    centroids = unit_locs.groupby("facilityId")[["lat", "lon"]].mean().rename(columns={"lat": "c_lat", "lon": "c_lon"})
-    unit_locs = unit_locs.merge(centroids, on="facilityId")
-    unit_locs["dist"] = np.sqrt((unit_locs["lat"] - unit_locs["c_lat"])**2 + (unit_locs["lon"] - unit_locs["c_lon"])**2)
+    # find representative unit per facility (closest to centroid)
+    unit_locs = df[["facilityId", "unitId", "lat", "lon"]].drop_duplicates(["facilityId", "unitId"]).copy()
+    centroids = unit_locs.groupby("facilityId")[["lat", "lon"]].transform("mean")
+    unit_locs["dist"] = np.sqrt((unit_locs["lat"] - centroids["lat"])**2 + (unit_locs["lon"] - centroids["lon"])**2)
     rep_units = unit_locs.loc[unit_locs.groupby("facilityId")["dist"].idxmin(), ["facilityId", "unitId"]]
 
     df = df.merge(rep_units, on=["facilityId", "unitId"]).reset_index(drop=True)
@@ -115,10 +115,10 @@ def aggregate_units(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-def compute_prev_qtr_mass(df: pd.DataFrame) -> pd.DataFrame:
+def compute_prev_qtr_mass(df: pd.DataFrame):
     """Attach prev_qtr_mass: prior-quarter total emissions at the same hour."""
 
-    # build lookup: (facilityId, year, quarter, hour) -> total emissions
+    # build emissions lookup from full records
     full = (
         pd.read_csv(EMISSIONS_RECORDS_CSV, usecols=["date", "hour", "facilityId", "opTime", LABEL_COL], parse_dates=["date"])
         .query("opTime == 1.0")
@@ -126,26 +126,30 @@ def compute_prev_qtr_mass(df: pd.DataFrame) -> pd.DataFrame:
     )
     full["year"] = full["date"].dt.year
     full["quarter"] = full["date"].dt.quarter
-    lookup = full.groupby(["facilityId", "year", "quarter", "hour"])[LABEL_COL].sum().to_dict()
+    lookup_df = (
+        full.groupby(["facilityId", "year", "quarter", "hour"])[LABEL_COL]
+        .sum().reset_index().rename(columns={LABEL_COL: "prev_qtr_mass"})
+    )
 
-    # compute previous quarter for each row
+    # compute previous quarter keys for each row
     df = df.copy()
     df["year"] = df["date"].dt.year
     df["quarter"] = df["date"].dt.quarter
     df["prev_year"] = np.where(df["quarter"] == 1, df["year"] - 1, df["year"])
     df["prev_quarter"] = (df["quarter"] - 2) % 4 + 1
 
-    df["prev_qtr_mass"] = df.apply(
-        lambda row: lookup.get((row["facilityId"], row["prev_year"], row["prev_quarter"], row["hour"]), np.nan), axis=1
-    )
+    # merge to attach prev_qtr_mass
+    df = df.merge(lookup_df, left_on=["facilityId", "prev_year", "prev_quarter", "hour"],
+                right_on=["facilityId", "year", "quarter", "hour"], how="left")
+
     return (
-        df.drop(columns=["year", "quarter", "prev_year", "prev_quarter"])
+        df.drop(columns=["year_x", "quarter_x", "prev_year", "prev_quarter", "year_y", "quarter_y"])
         .dropna(subset=["prev_qtr_mass"])
         .reset_index(drop=True)
     )
 
 def compute_adj_plants(df: pd.DataFrame):
-    """Count facilities from STRAT_INPUT_CSV within IMG_RANGE patch centered on each facility in df"""
+    """Count facilities from STRAT_INPUT_CSV within IMG_RANGE patch centered on each facility"""
     half_m = (IMG_RANGE / 2) * 1000
 
     query = df[["facilityId", "lat", "lon"]].drop_duplicates("facilityId").reset_index(drop=True)
@@ -155,13 +159,8 @@ def compute_adj_plants(df: pd.DataFrame):
         .reset_index(drop=True)
     )
 
-    # project both sets to meters
-    def to_meters(plants):
-        gdf = gpd.GeoDataFrame(plants, geometry=gpd.points_from_xy(plants["lon"], plants["lat"]), crs="EPSG:4326").to_crs("EPSG:5070")
-        return gdf.geometry.x.values, gdf.geometry.y.values
-
-    qx, qy = to_meters(query)
-    ax, ay = to_meters(all_plants)
+    qx, qy = project_to_meters(query)
+    ax, ay = project_to_meters(all_plants)
 
     # count facilities in patch per query plant, subtract 1 to exclude self
     in_patch = (np.abs(qx[:, None] - ax[None, :]) < half_m) & (np.abs(qy[:, None] - ay[None, :]) < half_m)
@@ -170,14 +169,9 @@ def compute_adj_plants(df: pd.DataFrame):
     return query[["facilityId", "num_adj_plants"]]
 
 def cluster_plants(df: pd.DataFrame):
-    """check for intersecting IMG_RANGE x IMG_RANGE bounding boxes before stratifying"""
+    """Check for intersecting IMG_RANGE x IMG_RANGE bounding boxes before stratifying"""
     plants = df[["facilityId", "lat", "lon"]].drop_duplicates("facilityId").reset_index(drop=True)
-
-    # convert from lat/lon (WGS84) format to meters format (NAD83 Conus Albers)
-    gdf = gpd.GeoDataFrame(plants, geometry=gpd.points_from_xy(plants["lon"], plants["lat"]), crs="EPSG:4326")
-    gdf_proj = gdf.to_crs("EPSG:5070")
-    x = np.array([geom.x for geom in gdf_proj.geometry])
-    y = np.array([geom.y for geom in gdf_proj.geometry])
+    x, y = project_to_meters(plants)
 
     # construct adjacency matrix to derive cluster values
     dx = np.abs(x[:, None] - x[None, :])
@@ -189,7 +183,7 @@ def cluster_plants(df: pd.DataFrame):
 
 def resample_uniform(df: pd.DataFrame, n: int, bins: int = 20):
     """Resample to uniform label distribution using oversampling"""
-    np.random.seed(42)
+    rng = np.random.default_rng(42)
 
     bin_labels = pd.cut(df[LABEL_COL], bins=bins, labels=False, include_lowest=True)
     active_bins = bin_labels.dropna().unique()
@@ -198,7 +192,7 @@ def resample_uniform(df: pd.DataFrame, n: int, bins: int = 20):
     chosen = []
     for b in active_bins:
         idxs = np.where(bin_labels == b)[0]
-        chosen.extend(np.random.choice(idxs, size=n_per_bin, replace=len(idxs) < n_per_bin).tolist())
+        chosen.extend(rng.choice(idxs, size=n_per_bin, replace=len(idxs) < n_per_bin).tolist())
 
     total, unique = len(chosen), len(set(chosen))
     print(f"resample_uniform: {total - unique}/{total} oversampled ({100*(total-unique)/total:.1f}%)")
@@ -223,7 +217,7 @@ def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.Da
         ax.set_xlim(-130, -65)
         ax.set_ylim(24, 50)
 
-    # linear scale distribution
+    # label distribution visualization
     for ax, (label, split_df) in zip(axes[1], splits):
         ax.hist(split_df[LABEL_COL], bins=50, alpha=0.7)
         ax.set_title(label)
@@ -282,6 +276,12 @@ def main():
     train = resample_uniform(train_samples, n=SPLIT_SIZES["train"]*3)
     val = resample_uniform(val_samples, n=SPLIT_SIZES["val"]*3)
     test = resample_uniform(test_samples, n=SPLIT_SIZES["test"]*3)
+
+    # add era5 file paths to dataframes
+    for split_df in [train, val, test]:
+        split_df["era5"] = split_df["date"].apply(
+            lambda d: f"era5_{d.year}_{d.month:02d}.nc"
+        )
 
     # save splits and generate visualization
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)

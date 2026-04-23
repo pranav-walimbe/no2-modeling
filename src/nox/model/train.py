@@ -20,14 +20,14 @@ def train_epoch(model, loader, optimizer, criterion, device):
     """Run one training epoch and return mean loss over the dataset"""
     model.train()
     total_loss = 0.0
-    for image, wind_u, wind_v, num_adj, prev_qtr_mass, label in loader:
-        image, wind_u, wind_v, num_adj, prev_qtr_mass, label = (
-            image.to(device), wind_u.to(device), wind_v.to(device),
-            num_adj.to(device), prev_qtr_mass.to(device), label.to(device)
+    for image, num_adj, prev_qtr_mass, label in loader:
+        image, num_adj, prev_qtr_mass, label = (
+            image.to(device), num_adj.to(device),
+            prev_qtr_mass.to(device), label.to(device)
         )
         optimizer.zero_grad()
-        pred = model(image, wind_u, wind_v, num_adj, prev_qtr_mass)
-        loss = criterion(pred, label, reduction="none").mean()
+        pred = model(image, num_adj, prev_qtr_mass)
+        loss = criterion(pred, label)
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * len(label)
@@ -38,12 +38,12 @@ def val_epoch(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
-        for image, wind_u, wind_v, num_adj, prev_qtr_mass, label in loader:
-            image, wind_u, wind_v, num_adj, prev_qtr_mass, label = (
-                image.to(device), wind_u.to(device), wind_v.to(device),
-                num_adj.to(device), prev_qtr_mass.to(device), label.to(device)
+        for image, num_adj, prev_qtr_mass, label in loader:
+            image, num_adj, prev_qtr_mass, label = (
+                image.to(device), num_adj.to(device),
+                prev_qtr_mass.to(device), label.to(device)
             )
-            pred = model(image, wind_u, wind_v, num_adj, prev_qtr_mass)
+            pred = model(image, num_adj, prev_qtr_mass)
             loss = criterion(pred, label)
             total_loss += loss.item() * len(label)
     return total_loss / len(loader.dataset)
@@ -53,12 +53,12 @@ def run_inference(model, loader, device):
     model.eval()
     preds = []
     with torch.no_grad():
-        for image, wind_u, wind_v, num_adj, prev_qtr_mass, label in loader:
-            image, wind_u, wind_v, num_adj, prev_qtr_mass = (
-                image.to(device), wind_u.to(device), wind_v.to(device),
-                num_adj.to(device), prev_qtr_mass.to(device)
+        for image, num_adj, prev_qtr_mass, _ in loader:
+            image, num_adj, prev_qtr_mass = (
+                image.to(device), num_adj.to(device),
+                prev_qtr_mass.to(device)
             )
-            preds.append(model(image, wind_u, wind_v, num_adj, prev_qtr_mass).cpu().numpy())
+            preds.append(model(image, num_adj, prev_qtr_mass).cpu().numpy())
     return np.concatenate(preds)
 
 def main():
@@ -87,7 +87,7 @@ def main():
     # initialize model, optimizer, loss, scheduler
     model = NOxResNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    criterion = mae_loss
+    criterion = nn.L1Loss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=SCHEDULER_PATIENCE,
         factor=SCHEDULER_FACTOR)
     best_val_loss = float("inf")

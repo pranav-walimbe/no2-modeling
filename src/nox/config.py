@@ -72,7 +72,6 @@ MIN_PIXEL_CLOUD = 0.20 # tempo cloud fraction for pixel quality filtering
 IMG_CLOUD_FILTER = 0.50 # percent of image pixels that meet MIN_PIXEL_CLOUD fraction
 IMG_QA_FILTER = 0.80 # percent of images pixels with QA == 0
 LABEL_COL = "noxMass" # emissions variable to predict
-WIND_COLS = ["era5_u10", "era5_v10"] # wind vector data to include as model input
 MIN_CITY_PROXIMITY = 100 # minimum distance to nearby major city (km)
 SPLIT_SIZES = {"train": 18000, "val": 4000, "test": 4000} # size of each dataset split
 
@@ -83,15 +82,15 @@ RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"
 BATCH_SIZE = 128
 RESNET_HEAD_DIM = 128
 LR = 1e-4
-NUM_EPOCHS = 190
+NUM_EPOCHS = 200
 SCHEDULER_PATIENCE = 10
 SCHEDULER_FACTOR = 0.50
-EARLY_STOP_PATIENCE = 20
+EARLY_STOP_PATIENCE = 25
 KERNEL_SIZE = 3
 STRIDE = 1
 PADDING = 1
 WEIGHT_DECAY = 1e-4
-DROPOUT = 0.5
+DROPOUT = 0.3
 
 # ============================================================================
 # Other
