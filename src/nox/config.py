@@ -80,9 +80,9 @@ SPLIT_SIZES = {"train": 18000, "val": 4000, "test": 4000} # size of each dataset
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"
 BATCH_SIZE = 128
-RESNET_HEAD_DIM = 128
+HEAD_DIM = 128
 LR = 1e-4
-NUM_EPOCHS = 200
+NUM_EPOCHS = 300
 SCHEDULER_PATIENCE = 10
 SCHEDULER_FACTOR = 0.50
 EARLY_STOP_PATIENCE = 25
@@ -90,7 +90,7 @@ KERNEL_SIZE = 3
 STRIDE = 1
 PADDING = 1
 WEIGHT_DECAY = 1e-4
-DROPOUT = 0.3
+DROPOUT = 0.30
 
 # ============================================================================
 # Other

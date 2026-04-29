@@ -13,20 +13,20 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import *
 from model.dataset import NOxDataset
-from model.resnet18_model import NOxResNet
+from model.resnet_model import NOxModel
 from model.utils import *
 
 def train_epoch(model, loader, optimizer, criterion, device):
     """Run one training epoch and return mean loss over the dataset"""
     model.train()
     total_loss = 0.0
-    for image, num_adj, prev_qtr_mass, label in loader:
-        image, num_adj, prev_qtr_mass, label = (
-            image.to(device), num_adj.to(device),
-            prev_qtr_mass.to(device), label.to(device)
+    for image, num_adj, prev_qtr_mass, u10, v10, label in loader:
+        image, num_adj, prev_qtr_mass, u10, v10, label = (
+            image.to(device), num_adj.to(device), prev_qtr_mass.to(device),
+            u10.to(device), v10.to(device), label.to(device)
         )
         optimizer.zero_grad()
-        pred = model(image, num_adj, prev_qtr_mass)
+        pred = model(image, num_adj, prev_qtr_mass, u10, v10)
         loss = criterion(pred, label)
         loss.backward()
         optimizer.step()
@@ -38,12 +38,12 @@ def val_epoch(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
-        for image, num_adj, prev_qtr_mass, label in loader:
-            image, num_adj, prev_qtr_mass, label = (
-                image.to(device), num_adj.to(device),
-                prev_qtr_mass.to(device), label.to(device)
+        for image, num_adj, prev_qtr_mass, u10, v10, label in loader:
+            image, num_adj, prev_qtr_mass, u10, v10, label = (
+                image.to(device), num_adj.to(device), prev_qtr_mass.to(device),
+                u10.to(device), v10.to(device), label.to(device)
             )
-            pred = model(image, num_adj, prev_qtr_mass)
+            pred = model(image, num_adj, prev_qtr_mass, u10, v10)
             loss = criterion(pred, label)
             total_loss += loss.item() * len(label)
     return total_loss / len(loader.dataset)
@@ -53,17 +53,16 @@ def run_inference(model, loader, device):
     model.eval()
     preds = []
     with torch.no_grad():
-        for image, num_adj, prev_qtr_mass, _ in loader:
-            image, num_adj, prev_qtr_mass = (
-                image.to(device), num_adj.to(device),
-                prev_qtr_mass.to(device)
+        for image, num_adj, prev_qtr_mass, u10, v10, _ in loader:
+            image, num_adj, prev_qtr_mass, u10, v10 = (
+                image.to(device), num_adj.to(device), prev_qtr_mass.to(device),
+                u10.to(device), v10.to(device)
             )
-            preds.append(model(image, num_adj, prev_qtr_mass).cpu().numpy())
+            preds.append(model(image, num_adj, prev_qtr_mass, u10, v10).cpu().numpy())
     return np.concatenate(preds)
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device}")
 
     # create run directory
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -85,7 +84,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, drop_last=True)
 
     # initialize model, optimizer, loss, scheduler
-    model = NOxResNet().to(device)
+    model = NOxModel().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     criterion = nn.L1Loss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=SCHEDULER_PATIENCE,
@@ -149,8 +148,8 @@ def main():
     val_df["y_true"] = val_df[LABEL_COL].values
     val_df["y_pred"] = val_preds
 
+    # produce visuals for modeling results
     generate_eval_plots(train_df, test_df, val_df, run_dir)
-    print_mae_summary(train_df, val_df, test_df)
 
 if __name__ == "__main__":
     main()

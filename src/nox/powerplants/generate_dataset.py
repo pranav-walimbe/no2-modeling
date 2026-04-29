@@ -95,40 +95,29 @@ def extract_no2_data(fname, row, orig_idx, is_prev=False):
     # resize to target image dimensions
     return zoom(no2, (IMG_SIZE / no2.shape[0], IMG_SIZE / no2.shape[1]), order=1)
 
-def extract_wind_data(row):
-    """extract ERA5 u10/v10 values as a IMG_SIZE x IMG_SIZE raster"""
+def extract_wind_scalars(row):
+    """Extract ERA5 u10/v10 scalar values at the nearest grid point to the plant location"""
     fpath = os.path.join(ERA5_DIR, row["era5"])
     with nc.Dataset(fpath) as ds:
         ds.set_auto_mask(False)
         lats = ds["latitude"][:]
         lons = ds["longitude"][:]
 
-        # find grid point window covering image bounds
-        lat_idx = np.where((lats >= row["lat_min"]) & (lats <= row["lat_max"]))[0]
-        lon_idx = np.where((lons >= row["lon_min"]) & (lons <= row["lon_max"]))[0]
-        if lat_idx.size == 0 or lon_idx.size == 0:
-            return None
-        r0, r1 = lat_idx.min(), lat_idx.max() + 1
-        c0, c1 = lon_idx.min(), lon_idx.max() + 1
+        lat_idx = int(np.argmin(np.abs(lats - row["lat"])))
+        lon_idx = int(np.argmin(np.abs(lons - row["lon"])))
 
-        # compute time index within monthly file
         dt = pd.Timestamp(row["date"])
         time_idx = (dt.day - 1) * 24 + int(row["hour"])
 
-        # read wind component patches
-        u10_patch = np.array(ds["u10"][time_idx, r0:r1, c0:c1])
-        v10_patch = np.array(ds["v10"][time_idx, r0:r1, c0:c1])
+        u10 = float(ds["u10"][time_idx, lat_idx, lon_idx])
+        v10 = float(ds["v10"][time_idx, lat_idx, lon_idx])
 
-    # upsample to image resolution with interpolation
-    u10_raster = zoom(u10_patch, (IMG_SIZE / u10_patch.shape[0], IMG_SIZE / u10_patch.shape[1]), order=1)
-    v10_raster = zoom(v10_patch, (IMG_SIZE / v10_patch.shape[0], IMG_SIZE / v10_patch.shape[1]), order=1)
-    return u10_raster.astype(np.float32), v10_raster.astype(np.float32)
+    return u10, v10
 
 def extract_image_data(args):
-    """Extract and stack all image channels; returns 4-channel (VCD_t, delta, u10, v10) patch or None"""
+    """Extract image channels and wind scalars; returns (orig_idx, patch, plume_score, u10, v10) or None"""
     orig_idx, row = args
     try:
-        # extract current and previous NO2 scans
         no2 = extract_no2_data(row["tempo"], row, orig_idx, is_prev=False)
         if no2 is None:
             return None
@@ -137,21 +126,14 @@ def extract_image_data(args):
         if no2_prev is None:
             return None
 
-        # extract wind rasters
-        wind = extract_wind_data(row)
-        if wind is None:
-            print(f"SKIP [{orig_idx}]: {row['tempo']} — no ERA5 wind pixels in bounds")
-            return None
-        u10_raster, v10_raster = wind
+        u10, v10 = extract_wind_scalars(row)
 
-        # compute temporal difference and plume visibility score
         delta_no2 = no2 - no2_prev
         p10, p50, p99 = np.percentile(no2, [10, 50, 99])
         plume_score = (p99 - p50) / (p50 - p10 + 1e-10)
 
-        # stack channels and return
-        patch = np.stack([no2, delta_no2, u10_raster, v10_raster], axis=0)[np.newaxis, ...].astype(np.float32)  # (1, 4, H, W)
-        return (orig_idx, patch, plume_score)
+        patch = np.stack([no2, delta_no2], axis=0)[np.newaxis, ...].astype(np.float32)  # (1, 2, H, W)
+        return (orig_idx, patch, plume_score, u10, v10)
 
     except Exception as e:
         print(f"ERROR [{orig_idx}]: {row['tempo']}: {e}")
@@ -217,11 +199,13 @@ def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
     n_store = min(SPLIT_SIZES[split], len(valid))
     valid = valid[:n_store]
 
-    valid_idxs = [orig_idx for orig_idx, _, _ in valid]
-    plume_scores = [s for _, _, s in valid]
+    valid_idxs = [r[0] for r in valid]
+    plume_scores = [r[2] for r in valid]
+    u10_vals = [r[3] for r in valid]
+    v10_vals = [r[4] for r in valid]
 
-    # save image stack with shape: (N, 4, IMG_SIZE, IMG_SIZE)
-    patches = np.concatenate([patch for _, patch, _ in valid], axis=0)
+    # save image stack with shape: (N, 2, IMG_SIZE, IMG_SIZE)
+    patches = np.concatenate([r[1] for r in valid], axis=0)
     np.save(os.path.join(IMAGES_DIR, f"{split}_tempo.npy"), patches)
 
     # save dataset DataFrame with metadata and npy index
@@ -229,6 +213,8 @@ def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
     out_df["npy_idx"] = range(n_store)
     out_df["split"] = split
     out_df["plume_score"] = plume_scores
+    out_df["u10"] = u10_vals
+    out_df["v10"] = v10_vals
     out_df.to_csv(os.path.join(DATASET_DF, f"{split}_df.csv"), index=False)
 
     # plot geographic and label distributions

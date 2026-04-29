@@ -17,16 +17,20 @@ class NOxDataset(Dataset):
         self.labels = df[LABEL_COL].values.astype(np.float32)
         self.num_adj = df["num_adj_units"].values.astype(np.float32)
         self.prev_qtr_mass = df["prev_qtr_mass"].values.astype(np.float32)
+        self.u10 = df["u10"].values.astype(np.float32)
+        self.v10 = df["v10"].values.astype(np.float32)
         self.stats = stats
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        image = torch.tensor(self.images[idx]).float()  # (4, H, W): [no2, delta_no2, u10, v10]
+        image = torch.tensor(self.images[idx]).float()
         label = torch.tensor(self.labels[idx]).float()
         num_adj = torch.tensor([self.num_adj[idx]]).float()
         prev_qtr_mass = torch.tensor([self.prev_qtr_mass[idx]]).float()
+        u10 = torch.tensor([self.u10[idx]]).float()
+        v10 = torch.tensor([self.v10[idx]]).float()
 
         # apply ceiling on no2 concentration values
         image[0] = torch.clamp(image[0], max=MAX_IMG_VAL)
@@ -35,5 +39,7 @@ class NOxDataset(Dataset):
             image = (image - self.stats["image_mean"]) / self.stats["image_std"]
             num_adj = (num_adj - self.stats["num_adj_mean"]) / self.stats["num_adj_std"]
             prev_qtr_mass = (prev_qtr_mass - self.stats["prev_qtr_mass_mean"]) / self.stats["prev_qtr_mass_std"]
+            u10 = (u10 - self.stats["u10_mean"]) / self.stats["u10_std"]
+            v10 = (v10 - self.stats["v10_mean"]) / self.stats["v10_std"]
 
-        return image, num_adj, prev_qtr_mass, label
+        return image, num_adj, prev_qtr_mass, u10, v10, label

@@ -1,5 +1,5 @@
 """
-Define utility functions (normalization, plotting, loss) for ML pipeline
+Define utility functions (normalization, plotting) for ML pipeline
 """
 
 import sys
@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import geopandas as gpd
 import seaborn as sns
+import json
 import torch
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import *
@@ -19,32 +20,38 @@ def compute_stats(split, batch_size=512):
     df = pd.read_csv(os.path.join(DATASET_DF, f"{split}_df.csv"))
     num_adj = df["num_adj_units"].values.astype(np.float32)
     prev_qtr_mass = df["prev_qtr_mass"].values.astype(np.float32)
-    n = images.shape[0]
+    u10 = df["u10"].values.astype(np.float32)
+    v10 = df["v10"].values.astype(np.float32)
+    n, n_channels = images.shape[0], images.shape[1]
 
     # first pass: compute per-channel mean
-    total, sums = 0, np.zeros(4, dtype=np.float64)
+    total, sums = 0, np.zeros(n_channels, dtype=np.float64)
     for i in range(0, n, batch_size):
-        batch = images[i:i+batch_size].astype(np.float64)  # (B, 4, H, W)
+        batch = images[i:i+batch_size].astype(np.float64)
         batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
         total += batch.shape[0] * batch.shape[2] * batch.shape[3]
         sums += batch.sum(axis=(0, 2, 3))
     means = sums / total
 
     # second pass: compute per-channel std
-    sum_sq_diffs = np.zeros(4, dtype=np.float64)
+    sum_sq_diffs = np.zeros(n_channels, dtype=np.float64)
     for i in range(0, n, batch_size):
-        batch = images[i:i+batch_size].astype(np.float64)  # (B, 4, H, W)
+        batch = images[i:i+batch_size].astype(np.float64)
         batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
         sum_sq_diffs += ((batch - means[np.newaxis, :, np.newaxis, np.newaxis]) ** 2).sum(axis=(0, 2, 3))
     stds = np.sqrt(sum_sq_diffs / total)
 
     return {
-        "image_mean": torch.tensor(means, dtype=torch.float32).view(4, 1, 1),
-        "image_std": torch.tensor(stds, dtype=torch.float32).view(4, 1, 1),
+        "image_mean": torch.tensor(means, dtype=torch.float32).view(n_channels, 1, 1),
+        "image_std": torch.tensor(stds, dtype=torch.float32).view(n_channels, 1, 1),
         "num_adj_mean": float(num_adj.mean()),
         "num_adj_std": float(num_adj.std()),
         "prev_qtr_mass_mean": float(prev_qtr_mass.mean()),
         "prev_qtr_mass_std": float(prev_qtr_mass.std()),
+        "u10_mean": float(u10.mean()),
+        "u10_std": float(u10.std()),
+        "v10_mean": float(v10.mean()),
+        "v10_std": float(v10.std()),
     }
 
 def _save(fig, run_dir, plot_name):
@@ -143,84 +150,38 @@ def plot_spatial_error(train_df, test_df, val_df, run_dir):
     plt.tight_layout()
     _save(fig, run_dir, "spatial_error")
 
-def plot_residual_examples(test_df, run_dir, n=10):
-    """Plot n highest and n lowest residual predictions showing NO2 and delta NO2 channels"""
-    run_name = os.path.basename(run_dir)
-    df = test_df.copy().reset_index(drop=True)
-    df["abs_residual"] = (df["y_pred"] - df["y_true"]).abs()
-    images = np.load(os.path.join(IMAGES_DIR, "test_tempo.npy"))
+def save_results(train_df, test_df, val_df, run_dir):
+    results = {}
 
-    # select top and bottom n samples by residual magnitude
-    high = df.nlargest(n, "abs_residual").reset_index(drop=True)
-    low = df.nsmallest(n, "abs_residual").reset_index(drop=True)
-
-    # 4 rows: high no2, high delta, low no2, low delta
-    fig, axes = plt.subplots(4, n, figsize=(3 * n, 13))
-    fig.suptitle(f"Residual examples - test set ({run_name})", fontweight="bold", fontsize=14)
-
-    axes[0, 0].set_ylabel("High residual\nNO2", fontsize=9)
-    axes[1, 0].set_ylabel("High residual\ndelta NO2", fontsize=9)
-    axes[2, 0].set_ylabel("Low residual\nNO2", fontsize=9)
-    axes[3, 0].set_ylabel("Low residual\ndelta NO2", fontsize=9)
-
-    for i, row in high.iterrows():
-        img = images[int(row["npy_idx"])]
-        no2, delta = img[0], img[1]
-
-        axes[0, i].imshow(no2, cmap="viridis",
-            vmin=np.nanpercentile(no2, 1), vmax=np.nanpercentile(no2, 99),
-            interpolation="nearest")
-        axes[0, i].set_title(
-            f"{row['facilityName']}\npred={row['y_pred']:.1f}  true={row['y_true']:.1f}",
-            fontsize=6)
-        axes[0, i].axis("off")
-
-        axes[1, i].imshow(delta, cmap="RdBu_r",
-            vmin=np.nanpercentile(delta, 1), vmax=np.nanpercentile(delta, 99),
-            interpolation="nearest")
-        axes[1, i].axis("off")
-
-    for i, row in low.iterrows():
-        img = images[int(row["npy_idx"])]
-        no2, delta = img[0], img[1]
-
-        axes[2, i].imshow(no2, cmap="viridis",
-            vmin=np.nanpercentile(no2, 1), vmax=np.nanpercentile(no2, 99),
-            interpolation="nearest")
-        axes[2, i].set_title(
-            f"{row['facilityName']}\npred={row['y_pred']:.1f}  true={row['y_true']:.1f}",
-            fontsize=6)
-        axes[2, i].axis("off")
-
-        axes[3, i].imshow(delta, cmap="RdBu_r",
-            vmin=np.nanpercentile(delta, 1), vmax=np.nanpercentile(delta, 99),
-            interpolation="nearest")
-        axes[3, i].axis("off")
-
-    plt.tight_layout()
-    _save(fig, run_dir, "residual_examples")
-
-def print_mae_summary(train_df, val_df, test_df):
-    """Print MAE summary statistics across all splits"""
-    print("\n--- MAE by split ---")
     for split, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
-        mae = np.abs(df["y_true"].values - df["y_pred"].values).mean()
-        print(f"  {split:<6} MAE: {mae:.4f}")
+        y_true, y_pred = df["y_true"].values, df["y_pred"].values
+        mae = float(np.abs(y_true - y_pred).mean())
+        ss_res = ((y_true - y_pred) ** 2).sum()
+        ss_tot = ((y_true - y_true.mean()) ** 2).sum()
+        r2 = float(1 - ss_res / ss_tot)
+        results[split] = {"mae": mae, "r2": r2}
 
-    print("\n--- Test MAE by emission tertile ---")
     t33, t66 = np.percentile(test_df["y_true"], [33, 66])
     low  = test_df[test_df["y_true"] <  t33]
     mid  = test_df[(test_df["y_true"] >= t33) & (test_df["y_true"] < t66)]
     high = test_df[test_df["y_true"] >= t66]
 
+    results["test_tertiles"] = {}
     for name, subset in [("low", low), ("mid", mid), ("high", high)]:
-        mae = np.abs(subset["y_true"].values - subset["y_pred"].values).mean()
-        label_range = f"[{subset['y_true'].min():.1f}, {subset['y_true'].max():.1f}]"
-        print(f"  {name:<6} MAE: {mae:.4f}  (n={len(subset)}, label range {label_range})")
+        y_true, y_pred = subset["y_true"].values, subset["y_pred"].values
+        mae = float(np.abs(y_true - y_pred).mean())
+        results["test_tertiles"][name] = {
+            "mae": mae,
+            "n": len(subset),
+            "label_range": [float(y_true.min()), float(y_true.max())],
+        }
+
+    with open(os.path.join(run_dir, "results.json"), "w") as f:
+        json.dump(results, f, indent=2)
 
 def generate_eval_plots(train_df, test_df, val_df, run_dir):
     """Generate all inference evaluation plots for a completed training run"""
     plot_pred_vs_true(train_df, test_df, val_df, run_dir)
     plot_residuals(train_df, test_df, val_df, run_dir)
     plot_spatial_error(train_df, test_df, val_df, run_dir)
-    plot_residual_examples(test_df, run_dir)
+    save_results(train_df, test_df, val_df, run_dir)

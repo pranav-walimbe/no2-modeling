@@ -116,7 +116,7 @@ def aggregate_units(df: pd.DataFrame):
     return df
 
 def compute_prev_qtr_mass(df: pd.DataFrame):
-    """Attach prev_qtr_mass: prior-quarter total emissions at the same hour."""
+    """calculate prior-quarter mean emissions at the same hour"""
 
     # build emissions lookup from full records
     full = (
