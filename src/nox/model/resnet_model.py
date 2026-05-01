@@ -1,5 +1,5 @@
 """
-ResNet for NOx emissions regression from TEMPO imagery
+Custom ResNet for NOx emissions regression from TEMPO imagery
 """
 
 import sys
@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import *
-
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
@@ -30,7 +29,6 @@ class ResBlock(nn.Module):
 
     def forward(self, x):
         return self.relu(self.block(x) + self.residual(x))
-
 
 class NOxModel(nn.Module):
     def __init__(self):

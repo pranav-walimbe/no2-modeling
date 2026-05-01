@@ -75,13 +75,13 @@ def _plant_metrics(df):
 def plot_loss_curve(train_losses, val_losses, run_dir):
     """Plot training and validation loss across epochs"""
     run_name = os.path.basename(run_dir)
-    sns.set_theme(style="whitegrid", font_scale=1.1)
+    sns.set_theme(style="whitegrid", font_scale=1.4)
     fig, ax = plt.subplots(figsize=(8, 5))
     epochs = range(1, len(train_losses) + 1)
     ax.plot(epochs, train_losses, label="Train loss", color="#4C9BE8", linewidth=2)
     ax.plot(epochs, val_losses, label="Val loss", color="#E85D5D", linewidth=2)
     ax.set_xlabel("Epoch", labelpad=8)
-    ax.set_ylabel("Loss", labelpad=8)
+    ax.set_ylabel("Loss (MAE)", labelpad=8)
     ax.set_title(f"Training and Validation Loss\n({run_name})", fontweight="bold", pad=14)
     ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     ax.legend(fontsize=10, framealpha=0.9)
@@ -91,19 +91,19 @@ def plot_loss_curve(train_losses, val_losses, run_dir):
 def plot_pred_vs_true(train_df, test_df, val_df, run_dir):
     """Scatter plot of predicted vs true NOx emissions for all splits"""
     run_name = os.path.basename(run_dir)
-    sns.set_theme(style="whitegrid", font_scale=1.1)
+    sns.set_theme(style="whitegrid", font_scale=1.4)
     fig, axes = plt.subplots(1, 3, figsize=(21, 7))
     for ax, (df, split) in zip(axes, [(train_df, "train"), (test_df, "test"), (val_df, "val")]):
         ax.scatter(df["y_true"], df["y_pred"], alpha=0.4, s=8, linewidth=0, color="#4C9BE8")
         lims = [min(df["y_true"].min(), df["y_pred"].min()),
                 max(df["y_true"].max(), df["y_pred"].max())]
-        ax.plot(lims, lims, color="#222222", linewidth=1.2, linestyle="--", label="Perfect prediction")
+        ax.plot(lims, lims, color="#222222", linewidth=1.2, linestyle="--")
         ax.set_xlim(lims)
         ax.set_ylim(lims)
-        ax.set_xlabel(f"y_true ({LABEL_COL})", labelpad=8)
-        ax.set_ylabel(f"y_pred ({LABEL_COL})", labelpad=8)
+        ax.set_aspect("equal")
+        ax.set_xlabel("True NOx Emissions (lb/hr)", labelpad=8)
+        ax.set_ylabel("Predicted NOx Emissions (lb/hr)", labelpad=8)
         ax.set_title(f"{split} set", fontweight="bold", pad=14)
-        ax.legend(fontsize=10, framealpha=0.9)
     fig.suptitle(f"Predicted vs True Emissions - {run_name}", fontweight="bold", fontsize=14)
     plt.tight_layout()
     _save(fig, run_dir, "pred_vs_true")
@@ -111,7 +111,7 @@ def plot_pred_vs_true(train_df, test_df, val_df, run_dir):
 def plot_residuals(train_df, test_df, val_df, run_dir):
     """Scatter plot of absolute residuals vs true NOx emissions for all splits"""
     run_name = os.path.basename(run_dir)
-    sns.set_theme(style="whitegrid", font_scale=1.1)
+    sns.set_theme(style="whitegrid", font_scale=1.4)
     fig, axes = plt.subplots(1, 3, figsize=(24, 5))
     for ax, (df, split) in zip(axes, [(train_df, "train"), (test_df, "test"), (val_df, "val")]):
         df = df.copy()
@@ -129,7 +129,7 @@ def plot_spatial_error(train_df, test_df, val_df, run_dir):
     run_name = os.path.basename(run_dir)
     us = gpd.read_file(COUNTRIES_URL)
     us = us[us.NAME == "United States of America"]
-    sns.set_theme(style="white", font_scale=1.1)
+    sns.set_theme(style="white", font_scale=1.4)
     fig, axes = plt.subplots(3, 1, figsize=(12, 21))
     for ax, (df, split) in zip(axes, [(train_df, "train"), (test_df, "test"), (val_df, "val")]):
         metrics = _plant_metrics(df)
