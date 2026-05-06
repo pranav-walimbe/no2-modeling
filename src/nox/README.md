@@ -49,6 +49,18 @@ url: https://cds.climate.copernicus.eu/api/v2
 key: your-uid:your-api-key
 ```
 
+## Running the Pipeline
+
+Savio jobs should be used to run the scripts in the following order:
+
+1. `external_data/scrape_tempo.py` — download TEMPO NO2 imagery
+2. `external_data/scrape_era5.py` — download ERA5 wind reanalysis
+3. `concentrations/scrape_nox_emissions.py` — pull hourly NOx emissions records from CAMPD
+4. `concentrations/scrape_locations.py` — fetch plant coordinates
+5. `powerplants/partition_plants.py` — split plants into train/val/test
+6. `powerplants/generate_dataset.py` — build final image dataset with labels
+7. `model/train.py` — train the model
+
 ## Configuration
 
 All parameters live in `config.py`.
