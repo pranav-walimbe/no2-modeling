@@ -5,11 +5,11 @@ Output: nox_emissions_full.csv in output directory
 """
 
 import sys
-import os                                                                                                                                       
+import os
 import pandas as pd
 import requests
 import time
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config                                                                                                                                    
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config
 from config import *
 
 # helper functions
@@ -17,7 +17,7 @@ def get_facility_location(facility_id: int, year: int = 2023, retries: int = 3):
     """collect lat, lon, epaRegion from EPA API"""
     url = "https://api.epa.gov/easey/facilities-mgmt/facilities/attributes"
     params = {
-        "api_key": API_KEY,
+        "api_key": CAMPD_API_KEY,
         "facilityId": facility_id,
         "year": year,
         "page": 1,
@@ -56,7 +56,7 @@ def main():
     info_df.index.name = "facilityId"
 
     # replace existing file if exists
-    if os.path.exists(FULL_DATA_CSV):                                                                                                 
+    if os.path.exists(FULL_DATA_CSV):
         os.remove(FULL_DATA_CSV)
 
     # process input CSV in chunks + apply opTime / NaN filtering
