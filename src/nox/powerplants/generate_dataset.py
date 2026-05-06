@@ -224,8 +224,7 @@ def main():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     os.makedirs(DATASET_DF, exist_ok=True)
 
-    # city locations dataset for proximity filtering
-    CITIES_URL = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_populated_places_simple.zip"
+    # load in city locations dataset for proximity filtering
     cities_gdf = gpd.read_file(CITIES_URL).to_crs("EPSG:5070")
 
     splits = {

@@ -29,7 +29,11 @@ nox/
 
 ## Setup
 
-### 1. Create a `.env` file
+### 1. Set up the virtual environment
+
+Shell scripts to create and configure the virtual environment are provided in `setup/`. Run these once before submitting any jobs.
+
+### 2. Create a `.env` file
 
 ```
 CAMPD_API_KEY=your_campd_api_key
@@ -40,7 +44,7 @@ EARTHDATA_PASSWORD=your_nasa_earthdata_password
 - `CAMPD_API_KEY` — EPA Clean Air Markets Program Data API key for hourly NOx emissions records
 - `EARTHDATA_USERNAME` / `EARTHDATA_PASSWORD` — NASA EarthData credentials for downloading TEMPO NO2 V03 imagery
 
-### 2. Configure CDS API credentials
+### 3. Configure CDS API credentials
 
 ERA5 wind data requires a `~/.cdsapirc` file with your Copernicus Climate Data Store credentials:
 
@@ -49,88 +53,106 @@ url: https://cds.climate.copernicus.eu/api/v2
 key: your-uid:your-api-key
 ```
 
+### 4. Configure parameters
+
+All pipeline parameters are defined in `config.py` including data paths, filtering thresholds, and model hyperparameters.
+
+### 5. Create job logs + visualization directories
+
+```bash
+mkdir -p /global/home/users/<USERNAME>/job_logs
+mkdir -p /global/home/users/<USERNAME>/vis
+```
+
 ## Running the Pipeline
 
-Savio jobs should be used to run the scripts in the following order:
+**Step 1 — Download external data (`savio2`):**
 
-1. `external_data/scrape_tempo.py` — download TEMPO NO2 imagery
-2. `external_data/scrape_era5.py` — download ERA5 wind reanalysis
-3. `concentrations/scrape_nox_emissions.py` — pull hourly NOx emissions records from CAMPD
-4. `concentrations/scrape_locations.py` — fetch plant coordinates
-5. `powerplants/partition_plants.py` — split plants into train/val/test
-6. `powerplants/generate_dataset.py` — build final image dataset with labels
-7. `model/train.py` — train the model
+`scrape_external.sh`:
+```bash
+#!/bin/bash
+#SBATCH --job-name=scrape_external
+#SBATCH --account=fc_nitrates
+#SBATCH --partition=savio2_bigmem
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --time=08:00:00
+#SBATCH --output=/global/home/users/<USERNAME>/job_logs/scrape_external_%j.out
+#SBATCH --error=/global/home/users/<USERNAME>/job_logs/scrape_external_%j.err
 
-## Configuration
+source /global/home/users/<USERNAME>/venv/bin/activate
 
-All parameters live in `config.py`.
+cd /global/home/users/<USERNAME>/conus_co2/src/nox/external_data/
+python -u scrape_tempo.py
+python -u scrape_era5.py
+```
 
-### Emissions Scraping
+**Step 2 — Scrape emissions (run after Step 1 completes, `savio2`):**
 
-| Parameter | Default | Description |
-|---|---|---|
-| `EMISSIONS_START_DATE` | 2023-08-01 | Start of emissions record pull |
-| `EMISSIONS_END_DATE` | 2025-12-31 | End of emissions record pull |
-| `EMISSIONS_BASE_DIR` | Savio path | Output directory for emissions CSVs |
+`scrape_emissions.sh`:
+```bash
+#!/bin/bash
+#SBATCH --job-name=scrape_emissions
+#SBATCH --account=fc_nitrates
+#SBATCH --partition=savio2_bigmem
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --time=06:00:00
+#SBATCH --output=/global/home/users/<USERNAME>/job_logs/scrape_emissions_%j.out
+#SBATCH --error=/global/home/users/<USERNAME>/job_logs/scrape_emissions_%j.err
 
-### Stratification
+source /global/home/users/<USERNAME>/venv/bin/activate
 
-| Parameter | Default | Description |
-|---|---|---|
-| `SAMPLE_SIZE` | 500,000 | Rows to run stratification on |
-| `MINS_FILTER` | 60 | Max time delta (minutes) between emissions record and TEMPO image |
-| `IMG_RANGE` | 72 | Spatial extent of extracted image patch (km) |
-| `MIN_TEMPO_DURATION` | 58 | Minimum TEMPO scan duration to accept (minutes) |
-| `PLANT_TYPE` | `"Coal"` | Power plant fuel type filter |
-| `MIN_CITY_PROXIMITY` | 100 | Minimum distance to nearest major city (km) |
+cd /global/home/users/<USERNAME>/conus_co2/src/nox/concentrations/
+python -u scrape_nox_emissions.py
+python -u scrape_locations.py
+```
 
-### Wind Data (ERA5)
+**Step 3 — Partition plants and build dataset (run after Step 2 completes, `savio4_htc`):**
 
-| Parameter | Default | Description |
-|---|---|---|
-| `WIND_START_MONTH` / `WIND_START_YEAR` | 8 / 2023 | ERA5 download start |
-| `WIND_END_MONTH` / `WIND_END_YEAR` | 12 / 2025 | ERA5 download end |
+`build_dataset.sh`:
+```bash
+#!/bin/bash
+#SBATCH --job-name=build_dataset
+#SBATCH --account=fc_nitrates
+#SBATCH --partition=savio4_htc
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=56
+#SBATCH --time=04:00:00
+#SBATCH --output=/global/home/users/<USERNAME>/job_logs/build_dataset_%j.out
+#SBATCH --error=/global/home/users/<USERNAME>/job_logs/build_dataset_%j.err
 
-### TEMPO Data
+source /global/home/users/<USERNAME>/venv/bin/activate
 
-| Parameter | Default | Description |
-|---|---|---|
-| `TEMPO_START_DATE` | 2023-08-12 | TEMPO download start |
-| `TEMPO_END_DATE` | 2025-09-17 | TEMPO download end |
-| `TEMPO_VERSION` | `V03` | TEMPO product version |
+cd /global/home/users/<USERNAME>/conus_co2/src/nox/powerplants/
+python -u partition_plants.py
+python -u generate_dataset.py
+```
 
-### Dataset Generation
+**Step 4 — Train (run after Step 3 completes, `savio3_gpu`):**
 
-| Parameter | Default | Description |
-|---|---|---|
-| `IMG_SIZE` | 48 | Image size in pixels (48x48) |
-| `PLUME_FILTER_PERCENTILE` | 0.30 | Drop samples below this plume heuristic percentile |
-| `MAX_IMG_VAL` / `MIN_IMG_VAL` | 1e17 / -2e16 | NO2 concentration clipping bounds |
-| `IMG_VAL_FILTER` | 0.50 | Max fraction of pixels at or above `MAX_IMG_VAL` |
-| `MIN_PIXEL_CLOUD` | 0.20 | TEMPO cloud fraction threshold per pixel |
-| `IMG_CLOUD_FILTER` | 0.50 | Max fraction of pixels exceeding cloud threshold |
-| `IMG_QA_FILTER` | 0.80 | Min fraction of pixels with QA flag == 0 |
-| `SPLIT_SIZES` | train: 18K, val: 4K, test: 4K | Target samples per split |
-| `LABEL_COL` | `noxMass` | Target variable (hourly NOx mass in lb/hr) |
+`train.sh`:
+```bash
+#!/bin/bash
+#SBATCH --job-name=train
+#SBATCH --account=fc_nitrates
+#SBATCH --partition=savio3_gpu
+#SBATCH --qos=a40_gpu3_normal
+#SBATCH --gres=gpu:A40:1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=<YOUR EMAIL>
+#SBATCH --output=/global/home/users/<USERNAME>/job_logs/train_%j.out
+#SBATCH --error=/global/home/users/<USERNAME>/job_logs/train_%j.err
 
-### ML Modeling
+source /global/home/users/<USERNAME>/venv/bin/activate
 
-| Parameter | Default | Description |
-|---|---|---|
-| `BATCH_SIZE` | 128 | Training batch size |
-| `HEAD_DIM` | 128 | Regression head hidden dimension |
-| `LR` | 1e-4 | Adam learning rate |
-| `NUM_EPOCHS` | 300 | Max training epochs |
-| `SCHEDULER_PATIENCE` | 10 | LR scheduler plateau patience |
-| `SCHEDULER_FACTOR` | 0.50 | LR reduction factor on plateau |
-| `EARLY_STOP_PATIENCE` | 25 | Early stopping patience |
-| `WEIGHT_DECAY` | 1e-4 | Weight Decay |
-| `DROPOUT` | 0.30 | Dropout rate in regression head |
-| `KERNEL_SIZE` / `STRIDE` / `PADDING` | 3 / 1 / 1 | Conv layer geometry |
-
-### Other
-
-| Parameter | Description |
-|---|---|
-| `NUM_CORES` | Set automatically from `SLURM_CPUS_PER_TASK` for Savio jobs |
-| `COUNTRIES_URL` | Natural Earth shapefile used for U.S. map visualizations |
+cd /global/home/users/<USERNAME>/conus_co2/src/nox/model/
+python -u train.py
+```

@@ -24,16 +24,16 @@ def compute_stats(split, batch_size=512):
     v10 = df["v10"].values.astype(np.float32)
     n, n_channels = images.shape[0], images.shape[1]
 
-    # first pass: compute per-channel mean
+    # two-pass mean / sd computation using batching for efficiency
     total, sums = 0, np.zeros(n_channels, dtype=np.float64)
     for i in range(0, n, batch_size):
         batch = images[i:i+batch_size].astype(np.float64)
+        # clip only channel 0 (NO2 image)
         batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
         total += batch.shape[0] * batch.shape[2] * batch.shape[3]
         sums += batch.sum(axis=(0, 2, 3))
     means = sums / total
 
-    # second pass: compute per-channel std
     sum_sq_diffs = np.zeros(n_channels, dtype=np.float64)
     for i in range(0, n, batch_size):
         batch = images[i:i+batch_size].astype(np.float64)
@@ -67,9 +67,10 @@ def _plant_metrics(df):
         .apply(lambda g: pd.Series({
             "rmse": np.sqrt(((g["y_pred"] - g["y_true"]) ** 2).mean()),
             "mae": (g["y_pred"] - g["y_true"]).abs().mean(),
+            # avoid division by zero in MAPE calculation
             "mape": ((g["y_pred"] - g["y_true"]).abs() / g["y_true"].replace(0, np.nan)).mean() * 100,
             "mean_y_true": g["y_true"].mean(),
-        })).reset_index()
+        }), include_groups=False).reset_index()
     )
 
 def plot_loss_curve(train_losses, val_losses, run_dir):
@@ -114,6 +115,7 @@ def plot_residuals(train_df, test_df, val_df, run_dir):
     sns.set_theme(style="whitegrid", font_scale=1.4)
     fig, axes = plt.subplots(1, 3, figsize=(24, 5))
     for ax, (df, split) in zip(axes, [(train_df, "train"), (test_df, "test"), (val_df, "val")]):
+        # copy to avoid SettingWithCopyWarning when adding abs_residual column
         df = df.copy()
         df["abs_residual"] = (df["y_pred"] - df["y_true"]).abs()
         ax.scatter(df["y_true"], df["abs_residual"], alpha=0.4, s=8, linewidth=0, color="#4C9BE8")
@@ -141,6 +143,7 @@ def plot_spatial_error(train_df, test_df, val_df, run_dir):
             vmin=metrics["mae"].min(), vmax=metrics["mae"].max()
         )
         plt.colorbar(sc, ax=ax, label=f"MAE  ({LABEL_COL})")
+        # restrict vis bounds to CONUS only
         ax.set_xlim(-130, -65)
         ax.set_ylim(24, 50)
         ax.set_xlabel("Longitude", labelpad=8)
@@ -156,11 +159,11 @@ def save_results(train_df, test_df, val_df, run_dir):
     for split, df in [("train", train_df), ("val", val_df), ("test", test_df)]:
         y_true, y_pred = df["y_true"].values, df["y_pred"].values
         mae = float(np.abs(y_true - y_pred).mean())
-        ss_res = ((y_true - y_pred) ** 2).sum()
-        ss_tot = ((y_true - y_true.mean()) ** 2).sum()
-        r2 = float(1 - ss_res / ss_tot)
-        results[split] = {"mae": mae, "r2": r2}
+        # avoid division by zero in MAPE calculation
+        mape = float(np.nanmean(np.abs(y_true - y_pred) / np.where(y_true == 0, np.nan, y_true)) * 100)
+        results[split] = {"mae": mae, "mape": mape}
 
+    # split test set into thirds by emission magnitude to diagnose performance across operating regimes
     t33, t66 = np.percentile(test_df["y_true"], [33, 66])
     low  = test_df[test_df["y_true"] <  t33]
     mid  = test_df[(test_df["y_true"] >= t33) & (test_df["y_true"] < t66)]
@@ -170,8 +173,10 @@ def save_results(train_df, test_df, val_df, run_dir):
     for name, subset in [("low", low), ("mid", mid), ("high", high)]:
         y_true, y_pred = subset["y_true"].values, subset["y_pred"].values
         mae = float(np.abs(y_true - y_pred).mean())
+        mape = float(np.nanmean(np.abs(y_true - y_pred) / np.where(y_true == 0, np.nan, y_true)) * 100)
         results["test_tertiles"][name] = {
             "mae": mae,
+            "mape": mape,
             "n": len(subset),
             "label_range": [float(y_true.min()), float(y_true.max())],
         }
