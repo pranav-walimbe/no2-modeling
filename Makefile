@@ -2,7 +2,6 @@ PYTHON ?= python3
 VENV ?= .venv
 
 VENV_PYTHON := $(VENV)/bin/python
-VENV_PIP := $(VENV)/bin/pip
 SETUP_STAMP := $(VENV)/.setup
 
 .PHONY: help setup check clean
@@ -16,8 +15,9 @@ help:
 setup: $(SETUP_STAMP)
 
 $(SETUP_STAMP): requirements.txt | $(VENV_PYTHON)
-	$(VENV_PIP) install --upgrade pip
-	$(VENV_PIP) install -r requirements.txt
+	$(VENV_PYTHON) -m ensurepip --upgrade
+	$(VENV_PYTHON) -m pip install --upgrade pip
+	$(VENV_PYTHON) -m pip install -r requirements.txt
 	touch $(SETUP_STAMP)
 
 $(VENV_PYTHON):
@@ -30,4 +30,3 @@ check: setup
 clean:
 	find src -type d -name __pycache__ -prune -exec rm -rf {} +
 	rm -rf build dist .pytest_cache .ruff_cache
-	find . -maxdepth 2 -type d -name '*.egg-info' -prune -exec rm -rf {} +

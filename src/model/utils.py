@@ -2,17 +2,24 @@
 Define utility functions (normalization, plotting) for ML pipeline
 """
 
-import sys
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-import geopandas as gpd
-import seaborn as sns
 import json
+import os
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
 import torch
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from config import *
+
+from config import (
+    COUNTRIES_URL,
+    DATASET_DF,
+    IMAGES_DIR,
+    LABEL_COL,
+    MAX_IMG_VAL,
+)
+
 
 def compute_stats(split, batch_size=512):
     """Compute mean/std normalization stats from training images and tabular features"""
@@ -27,7 +34,7 @@ def compute_stats(split, batch_size=512):
     # two-pass mean / sd computation using batching for efficiency
     total, sums = 0, np.zeros(n_channels, dtype=np.float64)
     for i in range(0, n, batch_size):
-        batch = images[i:i+batch_size].astype(np.float64)
+        batch = images[i : i + batch_size].astype(np.float64)
         # clip only channel 0 (NO2 image)
         batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
         total += batch.shape[0] * batch.shape[2] * batch.shape[3]
@@ -36,7 +43,7 @@ def compute_stats(split, batch_size=512):
 
     sum_sq_diffs = np.zeros(n_channels, dtype=np.float64)
     for i in range(0, n, batch_size):
-        batch = images[i:i+batch_size].astype(np.float64)
+        batch = images[i : i + batch_size].astype(np.float64)
         batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
         sum_sq_diffs += ((batch - means[np.newaxis, :, np.newaxis, np.newaxis]) ** 2).sum(axis=(0, 2, 3))
     stds = np.sqrt(sum_sq_diffs / total)
@@ -54,24 +61,33 @@ def compute_stats(split, batch_size=512):
         "v10_std": float(v10.std()),
     }
 
+
 def _save(fig, run_dir, plot_name):
     """Save figure to run directory and close it"""
     path = os.path.join(run_dir, f"{plot_name}.png")
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
+
 def _plant_metrics(df):
     """Compute per-plant RMSE, MAE, MAPE, and mean true emissions"""
     return (
         df.groupby(["facilityId", "facilityName", "lon", "lat"])
-        .apply(lambda g: pd.Series({
-            "rmse": np.sqrt(((g["y_pred"] - g["y_true"]) ** 2).mean()),
-            "mae": (g["y_pred"] - g["y_true"]).abs().mean(),
-            # avoid division by zero in MAPE calculation
-            "mape": ((g["y_pred"] - g["y_true"]).abs() / g["y_true"].replace(0, np.nan)).mean() * 100,
-            "mean_y_true": g["y_true"].mean(),
-        }), include_groups=False).reset_index()
+        .apply(
+            lambda g: pd.Series(
+                {
+                    "rmse": np.sqrt(((g["y_pred"] - g["y_true"]) ** 2).mean()),
+                    "mae": (g["y_pred"] - g["y_true"]).abs().mean(),
+                    # avoid division by zero in MAPE calculation
+                    "mape": ((g["y_pred"] - g["y_true"]).abs() / g["y_true"].replace(0, np.nan)).mean() * 100,
+                    "mean_y_true": g["y_true"].mean(),
+                }
+            ),
+            include_groups=False,
+        )
+        .reset_index()
     )
+
 
 def plot_loss_curve(train_losses, val_losses, run_dir):
     """Plot training and validation loss across epochs"""
@@ -89,6 +105,7 @@ def plot_loss_curve(train_losses, val_losses, run_dir):
     plt.tight_layout()
     _save(fig, run_dir, "loss_curve")
 
+
 def plot_pred_vs_true(train_df, test_df, val_df, run_dir):
     """Scatter plot of predicted vs true NOx emissions for all splits"""
     run_name = os.path.basename(run_dir)
@@ -96,8 +113,7 @@ def plot_pred_vs_true(train_df, test_df, val_df, run_dir):
     fig, axes = plt.subplots(1, 3, figsize=(21, 7))
     for ax, (df, split) in zip(axes, [(train_df, "train"), (test_df, "test"), (val_df, "val")]):
         ax.scatter(df["y_true"], df["y_pred"], alpha=0.4, s=8, linewidth=0, color="#4C9BE8")
-        lims = [min(df["y_true"].min(), df["y_pred"].min()),
-                max(df["y_true"].max(), df["y_pred"].max())]
+        lims = [min(df["y_true"].min(), df["y_pred"].min()), max(df["y_true"].max(), df["y_pred"].max())]
         ax.plot(lims, lims, color="#222222", linewidth=1.2, linestyle="--")
         ax.set_xlim(lims)
         ax.set_ylim(lims)
@@ -108,6 +124,7 @@ def plot_pred_vs_true(train_df, test_df, val_df, run_dir):
     fig.suptitle(f"Predicted vs True Emissions - {run_name}", fontweight="bold", fontsize=14)
     plt.tight_layout()
     _save(fig, run_dir, "pred_vs_true")
+
 
 def plot_residuals(train_df, test_df, val_df, run_dir):
     """Scatter plot of absolute residuals vs true NOx emissions for all splits"""
@@ -126,6 +143,7 @@ def plot_residuals(train_df, test_df, val_df, run_dir):
     plt.tight_layout()
     _save(fig, run_dir, "residuals")
 
+
 def plot_spatial_error(train_df, test_df, val_df, run_dir):
     """Heatmap of per-plant MAE overlaid on a US map for all splits"""
     run_name = os.path.basename(run_dir)
@@ -137,10 +155,16 @@ def plot_spatial_error(train_df, test_df, val_df, run_dir):
         metrics = _plant_metrics(df)
         us.plot(ax=ax, color="lightgray", edgecolor="black")
         sc = ax.scatter(
-            metrics["lon"], metrics["lat"],
-            c=metrics["mae"], cmap="YlOrRd", s=40, alpha=0.85,
-            edgecolors="black", linewidths=0.3,
-            vmin=metrics["mae"].min(), vmax=metrics["mae"].max()
+            metrics["lon"],
+            metrics["lat"],
+            c=metrics["mae"],
+            cmap="YlOrRd",
+            s=40,
+            alpha=0.85,
+            edgecolors="black",
+            linewidths=0.3,
+            vmin=metrics["mae"].min(),
+            vmax=metrics["mae"].max(),
         )
         plt.colorbar(sc, ax=ax, label=f"MAE  ({LABEL_COL})")
         # restrict vis bounds to CONUS only
@@ -152,6 +176,7 @@ def plot_spatial_error(train_df, test_df, val_df, run_dir):
     fig.suptitle(f"Spatial Error Distribution - {run_name}", fontweight="bold", fontsize=14)
     plt.tight_layout()
     _save(fig, run_dir, "spatial_error")
+
 
 def save_results(train_df, test_df, val_df, run_dir):
     results = {}
@@ -165,8 +190,8 @@ def save_results(train_df, test_df, val_df, run_dir):
 
     # split test set into thirds by emission magnitude to diagnose performance across operating regimes
     t33, t66 = np.percentile(test_df["y_true"], [33, 66])
-    low  = test_df[test_df["y_true"] <  t33]
-    mid  = test_df[(test_df["y_true"] >= t33) & (test_df["y_true"] < t66)]
+    low = test_df[test_df["y_true"] < t33]
+    mid = test_df[(test_df["y_true"] >= t33) & (test_df["y_true"] < t66)]
     high = test_df[test_df["y_true"] >= t66]
 
     results["test_tertiles"] = {}
@@ -183,6 +208,7 @@ def save_results(train_df, test_df, val_df, run_dir):
 
     with open(os.path.join(run_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2)
+
 
 def generate_eval_plots(train_df, test_df, val_df, run_dir):
     """Generate all inference evaluation plots for a completed training run"""

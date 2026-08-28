@@ -2,18 +2,20 @@
 Define NOxDataset class for dataloader in ML pipeline
 """
 
-import sys
 import os
+
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-from config import *
+
+from config import DATASET_DF, IMAGES_DIR, LABEL_COL, MAX_IMG_VAL
+
 
 class NOxDataset(Dataset):
     def __init__(self, split, stats=None):
         df = pd.read_csv(os.path.join(DATASET_DF, f"{split}_df.csv"))
-        self.images = np.load(os.path.join(IMAGES_DIR, f"{split}_tempo.npy"))
+        self.images = np.load(os.path.join(IMAGES_DIR, f"{split}_tempo.npy"), mmap_mode="r")
         self.labels = df[LABEL_COL].values.astype(np.float32)
         self.num_adj = df["num_adj_units"].values.astype(np.float32)
         self.prev_qtr_mass = df["prev_qtr_mass"].values.astype(np.float32)
@@ -25,12 +27,12 @@ class NOxDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        image = torch.tensor(self.images[idx]).float()
-        label = torch.tensor(self.labels[idx]).float()
-        num_adj = torch.tensor([self.num_adj[idx]]).float()
-        prev_qtr_mass = torch.tensor([self.prev_qtr_mass[idx]]).float()
-        u10 = torch.tensor([self.u10[idx]]).float()
-        v10 = torch.tensor([self.v10[idx]]).float()
+        image = torch.from_numpy(np.array(self.images[idx], copy=True))
+        label = torch.tensor(self.labels[idx])
+        num_adj = torch.tensor([self.num_adj[idx]])
+        prev_qtr_mass = torch.tensor([self.prev_qtr_mass[idx]])
+        u10 = torch.tensor([self.u10[idx]])
+        v10 = torch.tensor([self.v10[idx]])
 
         # apply ceiling on no2 concentration values
         image[0] = torch.clamp(image[0], max=MAX_IMG_VAL)

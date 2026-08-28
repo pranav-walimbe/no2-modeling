@@ -4,28 +4,50 @@ Script to stratify power plant emission records into train/test/val splits
 Output: train.csv, test.csv, val.csv located in output directory
 """
 
-import sys
 import os
-import netCDF4 as nc
-from sklearn.model_selection import train_test_split
+import pickle
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime, timezone
+
 import geopandas as gpd
 import matplotlib.pyplot as plt
-from scipy.sparse.csgraph import connected_components
-from scipy.sparse import csr_matrix
-from collections import defaultdict
-import pandas as pd
-from datetime import datetime
+import netCDF4 as nc
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor
-import pickle
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from config import *
+import pandas as pd
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+from sklearn.model_selection import train_test_split
+
+from config import (
+    COUNTRIES_URL,
+    EMISSIONS_RECORDS_CSV,
+    IMG_RANGE,
+    LABEL_COL,
+    MIN_TEMPO_DURATION,
+    MINS_FILTER,
+    NUM_CORES,
+    PLANT_TYPE,
+    SAMPLE_SIZE,
+    SPLIT_SIZES,
+    STRAT_BASE_DIR,
+    STRAT_INPUT_CSV,
+    STRAT_VIS_PNG,
+    TEMPO_DIR,
+    TEMPO_MAPPING,
+    TEST_CSV,
+    TRAIN_CSV,
+    VAL_CSV,
+)
+from powerplants.matching import select_tempo_after
+
 
 # helper functions
 def project_to_meters(df: pd.DataFrame):
     """Project lat/lon to NAD83 Conus Albers meters, returns x and y coordinate arrays"""
     gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326").to_crs("EPSG:5070")
     return gdf.geometry.x.values, gdf.geometry.y.values
+
 
 def parse_tile(fname: str):
     """Return (dt, fname) if tile meets duration requirement"""
@@ -35,17 +57,35 @@ def parse_tile(fname: str):
             end = pd.Timestamp(ds.time_coverage_end)
         if (end - start).total_seconds() / 60 < MIN_TEMPO_DURATION:
             return None
-        return (pd.to_datetime(fname.split("_")[4], format="%Y%m%dT%H%M%SZ"), fname)
-    except Exception as e:
+        timestamp = pd.to_datetime(fname.split("_")[4], format="%Y%m%dT%H%M%SZ").to_pydatetime()
+        return (timestamp.replace(tzinfo=timezone.utc), fname)
+    except (IndexError, OSError, RuntimeError, ValueError) as e:
         print(f"WARNING: skipping {fname}: {e}")
         return None
+
+
+def normalize_tempo_mapping(mapping):
+    """Normalize cached timestamps to UTC and sort each date's tiles."""
+    normalized = {}
+    for scan_date, tiles in mapping.items():
+        normalized_tiles = []
+        for timestamp, fname in tiles:
+            timestamp = pd.Timestamp(timestamp).to_pydatetime()
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            else:
+                timestamp = timestamp.astimezone(timezone.utc)
+            normalized_tiles.append((timestamp, fname))
+        normalized[scan_date] = sorted(normalized_tiles, key=lambda tile: tile[0])
+    return normalized
+
 
 def build_tempo_mapping():
     """Return dict mapping dates to (timestamp, fname) for tiles meeting duration requirement"""
     # if we already computed this mapping then load it in
     if os.path.exists(TEMPO_MAPPING):
         with open(TEMPO_MAPPING, "rb") as f:
-            return pickle.load(f)
+            return normalize_tempo_mapping(pickle.load(f))
 
     # otherwise run parallelized scan of tempo images
     fnames = [f for f in os.listdir(TEMPO_DIR) if f.endswith(".nc")]
@@ -58,32 +98,31 @@ def build_tempo_mapping():
             dt, fname = result
             tempo_by_date[dt.date()].append((dt, fname))
 
+    tempo_by_date = normalize_tempo_mapping(tempo_by_date)
+
     os.makedirs(os.path.dirname(TEMPO_MAPPING), exist_ok=True)
     with open(TEMPO_MAPPING, "wb") as f:
         pickle.dump(dict(tempo_by_date), f)
 
     return tempo_by_date
 
+
 def map_to_tempo(row: pd.Series, tempo_by_date: dict):
     """Return tempo file name and previous hour tempo file name for a record"""
-    target_dt = datetime(year=row['date'].year, month=row['date'].month, day=row['date'].day, hour=row['hour'])
+    target_dt = datetime(
+        year=row["date"].year,
+        month=row["date"].month,
+        day=row["date"].day,
+        hour=row["hour"],
+        tzinfo=timezone.utc,
+    )
     prev_dt = target_dt - pd.Timedelta(hours=1)
 
-    tempo = None
-    for curr_dt, fname in tempo_by_date.get(target_dt.date(), []):
-        dt_diff = curr_dt - target_dt
-        if pd.Timedelta(0) < dt_diff <= pd.Timedelta(minutes=MINS_FILTER):
-            tempo = fname
-            break
-
-    prev_tempo = None
-    for curr_dt, fname in tempo_by_date.get(prev_dt.date(), []):
-        dt_diff = curr_dt - prev_dt
-        if pd.Timedelta(0) < dt_diff <= pd.Timedelta(minutes=MINS_FILTER):
-            prev_tempo = fname
-            break
+    tempo = select_tempo_after(target_dt, tempo_by_date.get(target_dt.date(), []), MINS_FILTER)
+    prev_tempo = select_tempo_after(prev_dt, tempo_by_date.get(prev_dt.date(), []), MINS_FILTER)
 
     return tempo, prev_tempo
+
 
 def map_chunk(args):
     """Pickleable helper for parallelized record-tempo mapping"""
@@ -92,6 +131,7 @@ def map_chunk(args):
     chunk = chunk.copy()
     chunk["tempo"], chunk["prev_tempo"] = zip(*results)
     return chunk
+
 
 def aggregate_units(df: pd.DataFrame):
     """Filter to complete groups and aggregate units to one row per facility per hour"""
@@ -107,7 +147,7 @@ def aggregate_units(df: pd.DataFrame):
     # find representative unit per facility (closest to centroid)
     unit_locs = df[["facilityId", "unitId", "lat", "lon"]].drop_duplicates(["facilityId", "unitId"]).copy()
     centroids = unit_locs.groupby("facilityId")[["lat", "lon"]].transform("mean")
-    unit_locs["dist"] = np.sqrt((unit_locs["lat"] - centroids["lat"])**2 + (unit_locs["lon"] - centroids["lon"])**2)
+    unit_locs["dist"] = np.sqrt((unit_locs["lat"] - centroids["lat"]) ** 2 + (unit_locs["lon"] - centroids["lon"]) ** 2)
     rep_units = unit_locs.loc[unit_locs.groupby("facilityId")["dist"].idxmin(), ["facilityId", "unitId"]]
 
     df = df.merge(rep_units, on=["facilityId", "unitId"]).reset_index(drop=True)
@@ -115,20 +155,25 @@ def aggregate_units(df: pd.DataFrame):
 
     return df
 
+
 def compute_prev_qtr_mass(df: pd.DataFrame):
     """calculate prior-quarter mean emissions at the same hour"""
 
     # build emissions lookup from full records
     full = (
-        pd.read_csv(EMISSIONS_RECORDS_CSV, usecols=["date", "hour", "facilityId", "opTime", LABEL_COL], parse_dates=["date"])
+        pd.read_csv(
+            EMISSIONS_RECORDS_CSV, usecols=["date", "hour", "facilityId", "opTime", LABEL_COL], parse_dates=["date"]
+        )
         .query("opTime == 1.0")
         .dropna(subset=["facilityId", LABEL_COL])
     )
-    full["year"] = full["date"].dt.year
-    full["quarter"] = full["date"].dt.quarter
+    facility_hours = full.groupby(["facilityId", "date", "hour"], as_index=False)[LABEL_COL].sum()
+    facility_hours["year"] = facility_hours["date"].dt.year
+    facility_hours["quarter"] = facility_hours["date"].dt.quarter
     lookup_df = (
-        full.groupby(["facilityId", "year", "quarter", "hour"])[LABEL_COL]
-        .sum().reset_index().rename(columns={LABEL_COL: "prev_qtr_mass"})
+        facility_hours.groupby(["facilityId", "year", "quarter", "hour"], as_index=False)[LABEL_COL]
+        .mean()
+        .rename(columns={LABEL_COL: "prev_qtr_mass"})
     )
 
     # compute previous quarter keys for each row
@@ -139,14 +184,19 @@ def compute_prev_qtr_mass(df: pd.DataFrame):
     df["prev_quarter"] = (df["quarter"] - 2) % 4 + 1
 
     # merge to attach prev_qtr_mass
-    df = df.merge(lookup_df, left_on=["facilityId", "prev_year", "prev_quarter", "hour"],
-                right_on=["facilityId", "year", "quarter", "hour"], how="left")
+    df = df.merge(
+        lookup_df,
+        left_on=["facilityId", "prev_year", "prev_quarter", "hour"],
+        right_on=["facilityId", "year", "quarter", "hour"],
+        how="left",
+    )
 
     return (
         df.drop(columns=["year_x", "quarter_x", "prev_year", "prev_quarter", "year_y", "quarter_y"])
         .dropna(subset=["prev_qtr_mass"])
         .reset_index(drop=True)
     )
+
 
 def compute_adj_plants(df: pd.DataFrame):
     """Count facilities from STRAT_INPUT_CSV within IMG_RANGE patch centered on each facility"""
@@ -168,6 +218,7 @@ def compute_adj_plants(df: pd.DataFrame):
 
     return query[["facilityId", "num_adj_plants"]]
 
+
 def cluster_plants(df: pd.DataFrame):
     """Check for intersecting IMG_RANGE x IMG_RANGE bounding boxes before stratifying"""
     plants = df[["facilityId", "lat", "lon"]].drop_duplicates("facilityId").reset_index(drop=True)
@@ -177,9 +228,10 @@ def cluster_plants(df: pd.DataFrame):
     dx = np.abs(x[:, None] - x[None, :])
     dy = np.abs(y[:, None] - y[None, :])
     adjacency = ((dx < IMG_RANGE * 1000) & (dy < IMG_RANGE * 1000)).astype(int)
-    n_components, labels = connected_components(csr_matrix(adjacency))
+    _, labels = connected_components(csr_matrix(adjacency))
     plants["cluster"] = labels
     return plants[["facilityId", "cluster"]]
+
 
 def resample_uniform(df: pd.DataFrame, n: int, bins: int = 20):
     """Resample to uniform label distribution using oversampling"""
@@ -194,17 +246,21 @@ def resample_uniform(df: pd.DataFrame, n: int, bins: int = 20):
         idxs = np.where(bin_labels == b)[0]
         chosen.extend(rng.choice(idxs, size=n_per_bin, replace=len(idxs) < n_per_bin).tolist())
 
+    rng.shuffle(chosen)
+    chosen = chosen[:n]
+
     total, unique = len(chosen), len(set(chosen))
-    print(f"resample_uniform: {total - unique}/{total} oversampled ({100*(total-unique)/total:.1f}%)")
+    print(f"resample_uniform: {total - unique}/{total} oversampled ({100 * (total - unique) / total:.1f}%)")
 
     return df.iloc[chosen].reset_index(drop=True)
+
 
 def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame):
     """Visualize stratification in terms of geography and nox emissions"""
 
     us = gpd.read_file(COUNTRIES_URL)
     us = us[us.NAME == "United States of America"]
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
+    _, axes = plt.subplots(2, 3, figsize=(20, 12))
     splits = [("Train", train), ("Val", val), ("Test", test)]
 
     # spatial visualization of stratification
@@ -229,12 +285,13 @@ def plot_split_distributions(train: pd.DataFrame, val: pd.DataFrame, test: pd.Da
     plt.savefig(STRAT_VIS_PNG, dpi=150)
     plt.close()
 
+
 def main():
     df = pd.read_csv(STRAT_INPUT_CSV)
-    df['date'] = pd.to_datetime(df['date'])
+    df["date"] = pd.to_datetime(df["date"])
 
     # only include desired plant type
-    df = df[df['primaryFuelInfo'] == PLANT_TYPE]
+    df = df[df["primaryFuelInfo"] == PLANT_TYPE]
 
     # build TEMPO mapping and run parallelized record-tempo mapping
     tempo_by_date = build_tempo_mapping()
@@ -242,12 +299,12 @@ def main():
     with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
         results = list(executor.map(map_chunk, [(c, tempo_by_date) for c in chunks]))
     df = pd.concat(results).reset_index(drop=True)
-    df = df[df['tempo'].notna() & df['prev_tempo'].notna()].reset_index(drop=True)
+    df = df[df["tempo"].notna() & df["prev_tempo"].notna()].reset_index(drop=True)
 
     # filter to isolated plants before aggregation
     adj_map = compute_adj_plants(df)
     df = df.merge(adj_map, on="facilityId")
-    df = df[df['num_adj_plants'] == 0].reset_index(drop=True)
+    df = df[df["num_adj_plants"] == 0].reset_index(drop=True)
 
     # aggregate multi-unit records per facility per hour and compute previous quarter mean emissions
     df = aggregate_units(df)
@@ -273,15 +330,13 @@ def main():
     test_samples = df[df["cluster"].isin(test_c["cluster"])].reset_index(drop=True)
 
     # resample splits to have uniform label distributions
-    train = resample_uniform(train_samples, n=SPLIT_SIZES["train"]*3)
-    val = resample_uniform(val_samples, n=SPLIT_SIZES["val"]*3)
-    test = resample_uniform(test_samples, n=SPLIT_SIZES["test"]*3)
+    train = resample_uniform(train_samples, n=SPLIT_SIZES["train"] * 3)
+    val = resample_uniform(val_samples, n=SPLIT_SIZES["val"] * 3)
+    test = resample_uniform(test_samples, n=SPLIT_SIZES["test"] * 3)
 
     # add era5 file paths to dataframes
     for split_df in [train, val, test]:
-        split_df["era5"] = split_df["date"].apply(
-            lambda d: f"era5_{d.year}_{d.month:02d}.nc"
-        )
+        split_df["era5"] = split_df["date"].apply(lambda d: f"era5_{d.year}_{d.month:02d}.nc")
 
     # save splits and generate visualization
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
@@ -289,6 +344,7 @@ def main():
     val.to_csv(VAL_CSV, index=False)
     test.to_csv(TEST_CSV, index=False)
     plot_split_distributions(train, val, test)
+
 
 if __name__ == "__main__":
     main()

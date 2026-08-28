@@ -2,12 +2,11 @@
 Custom ResNet for NOx emissions regression from TEMPO imagery
 """
 
-import sys
-import os
 import torch
-import torch.nn as nn
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from config import *
+from torch import nn
+
+from config import DROPOUT, HEAD_DIM, KERNEL_SIZE, PADDING, STRIDE
+
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
@@ -23,12 +22,15 @@ class ResBlock(nn.Module):
             nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_channels),
-            ) if stride != 1 or in_channels != out_channels else nn.Identity()
+            )
+            if stride != 1 or in_channels != out_channels
+            else nn.Identity()
         )
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x):
         return self.relu(self.block(x) + self.residual(x))
+
 
 class NOxModel(nn.Module):
     def __init__(self):

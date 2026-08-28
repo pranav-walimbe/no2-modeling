@@ -4,20 +4,22 @@ Script to augment hourly emissions data with location data from EPA facilities A
 Output: nox_emissions_full.csv in output directory
 """
 
-import sys
 import os
+import time
+
 import pandas as pd
 import requests
-import time
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))) # access config
-from config import *
+
+from config import EMISSIONS_RECORDS_CSV, FULL_DATA_CSV
+from prerequisites import require_campd_credentials
+
 
 # helper functions
 def get_facility_location(facility_id: int, year: int = 2023, retries: int = 3):
     """collect lat, lon, epaRegion from EPA API"""
     url = "https://api.epa.gov/easey/facilities-mgmt/facilities/attributes"
     params = {
-        "api_key": CAMPD_API_KEY,
+        "api_key": require_campd_credentials(),
         "facilityId": facility_id,
         "year": year,
         "page": 1,
@@ -37,10 +39,12 @@ def get_facility_location(facility_id: int, year: int = 2023, retries: int = 3):
         except requests.exceptions.RequestException as e:
             print(f"ERROR: Request failed for facility {facility_id} (attempt {attempt}): {e}")
         if attempt < retries:
-            time.sleep(2 ** attempt)
+            time.sleep(2**attempt)
     return None
 
+
 def main():
+    require_campd_credentials()
     # collect unique facility ids
     facility_ids = set()
     for chunk in pd.read_csv(EMISSIONS_RECORDS_CSV, usecols=["facilityId"], chunksize=500000):
@@ -69,6 +73,7 @@ def main():
             continue
         chunk.to_csv(FULL_DATA_CSV, mode="a", index=False, header=not header_written)
         header_written = True
+
 
 if __name__ == "__main__":
     main()

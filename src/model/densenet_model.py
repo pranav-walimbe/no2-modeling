@@ -2,12 +2,11 @@
 Custom DenseNet for NOx emissions regression from TEMPO imagery
 """
 
-import sys
-import os
 import torch
-import torch.nn as nn
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from config import *
+from torch import nn
+
+from config import DROPOUT, HEAD_DIM
+
 
 class DenseLayer(nn.Module):
     def __init__(self, in_channels, growth_rate):
@@ -21,6 +20,7 @@ class DenseLayer(nn.Module):
     def forward(self, x):
         return torch.cat([x, self.layer(x)], dim=1)
 
+
 class DenseBlock(nn.Module):
     def __init__(self, in_channels, num_layers, growth_rate):
         super().__init__()
@@ -31,6 +31,7 @@ class DenseBlock(nn.Module):
 
     def forward(self, x):
         return self.block(x)
+
 
 class Transition(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -44,6 +45,7 @@ class Transition(nn.Module):
 
     def forward(self, x):
         return self.layer(x)
+
 
 class NOxModel(nn.Module):
     def __init__(self):
@@ -73,11 +75,11 @@ class NOxModel(nn.Module):
 
         # 332 image features + 4 scalars
         self.head = nn.Sequential(
-            nn.Linear(332 + 4, 128),
-            nn.BatchNorm1d(128),
+            nn.Linear(332 + 4, HEAD_DIM),
+            nn.BatchNorm1d(HEAD_DIM),
             nn.ReLU(),
             nn.Dropout(DROPOUT),
-            nn.Linear(128, 1),
+            nn.Linear(HEAD_DIM, 1),
         )
 
     def forward(self, image, num_adj, prev_qtr_mass, u10, v10):

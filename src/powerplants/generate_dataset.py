@@ -4,18 +4,43 @@ Script to splice satellite images and generate modeling dataset
 Output: train/val/test tempo npy arrays and per-split DataFrames in DATASET_DIR
 """
 
-import sys
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
 import netCDF4 as nc
 import numpy as np
 import pandas as pd
-import geopandas as gpd
-import matplotlib.pyplot as plt
 from scipy.ndimage import zoom
 from scipy.spatial import cKDTree
-from concurrent.futures import ProcessPoolExecutor, as_completed
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from config import *
+
+from config import (
+    CITIES_URL,
+    COUNTRIES_URL,
+    DATASET_DF,
+    ERA5_DIR,
+    IMAGES_DIR,
+    IMG_CLOUD_FILTER,
+    IMG_QA_FILTER,
+    IMG_RANGE,
+    IMG_SIZE,
+    IMG_VAL_FILTER,
+    LABEL_COL,
+    MAX_IMG_VAL,
+    MIN_CITY_PROXIMITY,
+    MIN_IMG_VAL,
+    MIN_PIXEL_CLOUD,
+    NUM_CORES,
+    PLUME_FILTER_PERCENTILE,
+    SPLIT_SIZES,
+    TEMPO_DIR,
+    TEST_CSV,
+    TRAIN_CSV,
+    VAL_CSV,
+    VIS_DIR,
+)
+
 
 def compute_bounds(df: pd.DataFrame):
     """Compute IMG_RANGE x IMG_RANGE bounds in lat/lon terms for each record"""
@@ -30,11 +55,13 @@ def compute_bounds(df: pd.DataFrame):
     df["lon_max"] = bounds["maxx"].values
     return df
 
+
 def filter_by_city_proximity(df: pd.DataFrame, cities_gdf: gpd.GeoDataFrame):
     """Filter records to meet MIN_CITY_PROXIMITY threshold to minimize ambient emissions"""
     # convert from lat/lon (WGS84) format to meters (NAD83 Conus Albers) format
-    plants_gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["lon"], df["lat"]),
-        crs="EPSG:4326").to_crs("EPSG:5070")
+    plants_gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326").to_crs(
+        "EPSG:5070"
+    )
     plant_coords = np.column_stack([plants_gdf.geometry.x, plants_gdf.geometry.y])
     cities_coords = np.column_stack([cities_gdf.geometry.x, cities_gdf.geometry.y])
 
@@ -42,6 +69,7 @@ def filter_by_city_proximity(df: pd.DataFrame, cities_gdf: gpd.GeoDataFrame):
     dists_km = cKDTree(cities_coords).query(plant_coords, k=1)[0] / 1000
     mask = dists_km >= MIN_CITY_PROXIMITY
     return df[mask].reset_index(drop=True)
+
 
 def extract_no2_data(fname, row, orig_idx, is_prev=False):
     """Perform patch extraction and quality filtering for a given tempo image"""
@@ -95,6 +123,7 @@ def extract_no2_data(fname, row, orig_idx, is_prev=False):
     # resize to target image dimensions
     return zoom(no2, (IMG_SIZE / no2.shape[0], IMG_SIZE / no2.shape[1]), order=1)
 
+
 def extract_wind_scalars(row):
     """Extract ERA5 u10/v10 scalar values at the nearest grid point to the plant location"""
     fpath = os.path.join(ERA5_DIR, row["era5"])
@@ -113,6 +142,7 @@ def extract_wind_scalars(row):
         v10 = float(ds["v10"][time_idx, lat_idx, lon_idx])
 
     return u10, v10
+
 
 def extract_image_data(args):
     """Extract image channels and wind scalars; returns (orig_idx, patch, plume_score, u10, v10) or None"""
@@ -135,9 +165,10 @@ def extract_image_data(args):
         patch = np.stack([no2, delta_no2], axis=0)[np.newaxis, ...].astype(np.float32)  # (1, 2, H, W)
         return (orig_idx, patch, plume_score, u10, v10)
 
-    except Exception as e:
+    except (IndexError, KeyError, OSError, RuntimeError, ValueError) as e:
         print(f"ERROR [{orig_idx}]: {row['tempo']}: {e}")
         return None
+
 
 def visualize_split(df: pd.DataFrame, split: str):
     """Visualize geographic distribution, label distribution, and log-label distribution for a split"""
@@ -165,6 +196,7 @@ def visualize_split(df: pd.DataFrame, split: str):
     plt.savefig(os.path.join(VIS_DIR, f"dataset_vis_{split}.png"), dpi=150)
     plt.close()
 
+
 def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
     """Parallel patch extraction, npy write, and dataset DataFrame save for a given split"""
 
@@ -186,6 +218,8 @@ def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
     print(f"{n_valid} / {len(df)} patches passed filtering")
     if n_valid == 0:
         return
+
+    valid.sort(key=lambda result: result[0])
 
     # drop samples below plume score percentile threshold
     plume_scores = np.array([r[2] for r in valid])
@@ -220,6 +254,7 @@ def process_split(df: pd.DataFrame, split: str, cities_gdf: gpd.GeoDataFrame):
     # plot geographic and label distributions
     visualize_split(out_df, split)
 
+
 def main():
     os.makedirs(IMAGES_DIR, exist_ok=True)
     os.makedirs(DATASET_DF, exist_ok=True)
@@ -236,6 +271,7 @@ def main():
     for split, df in splits.items():
         df["date"] = pd.to_datetime(df["date"])
         process_split(df, split, cities_gdf)
+
 
 if __name__ == "__main__":
     main()
