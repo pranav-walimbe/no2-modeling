@@ -3,27 +3,29 @@ VENV ?= .venv
 
 VENV_PYTHON := $(VENV)/bin/python
 VENV_PIP := $(VENV)/bin/pip
+SETUP_STAMP := $(VENV)/.setup
 
-.PHONY: help setup install check clean
+.PHONY: help setup check clean
 
 help:
 	@echo "Available targets:"
 	@echo "  setup    Create the virtual environment and install dependencies"
-	@echo "  install  Install or update dependencies in the virtual environment"
-	@echo "  check    Compile Python sources to catch syntax errors"
+	@echo "  check    Run Ruff and compile Python sources"
 	@echo "  clean    Remove local Python caches and build artifacts"
 
-setup: $(VENV_PYTHON)
+setup: $(SETUP_STAMP)
+
+$(SETUP_STAMP): requirements.txt | $(VENV_PYTHON)
 	$(VENV_PIP) install --upgrade pip
 	$(VENV_PIP) install -r requirements.txt
-
-install: setup
+	touch $(SETUP_STAMP)
 
 $(VENV_PYTHON):
 	$(PYTHON) -m venv $(VENV)
 
-check:
-	$(PYTHON) -m compileall -q src
+check: setup
+	$(VENV_PYTHON) -m ruff check src
+	$(VENV_PYTHON) -m compileall -q src
 
 clean:
 	find src -type d -name __pycache__ -prune -exec rm -rf {} +
