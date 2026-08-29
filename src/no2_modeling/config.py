@@ -1,3 +1,5 @@
+"""Configuration values for collection, preprocessing, and modeling."""
+
 import os
 from datetime import date
 

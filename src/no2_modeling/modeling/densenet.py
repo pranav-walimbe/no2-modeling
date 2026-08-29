@@ -5,7 +5,7 @@ Custom DenseNet for NOx emissions regression from TEMPO imagery
 import torch
 from torch import nn
 
-from config import DROPOUT, HEAD_DIM
+from no2_modeling.config import DROPOUT, HEAD_DIM
 
 
 class DenseLayer(nn.Module):

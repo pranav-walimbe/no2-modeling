@@ -13,12 +13,12 @@ from datetime import date, timedelta
 import pandas as pd
 import requests
 
-from config import (
+from no2_modeling.config import (
     EMISSIONS_END_DATE,
     EMISSIONS_RECORDS_CSV,
     EMISSIONS_START_DATE,
 )
-from prerequisites import require_campd_credentials
+from no2_modeling.prerequisites import require_campd_credentials
 
 # states to include in requests
 STATE_CODES = [

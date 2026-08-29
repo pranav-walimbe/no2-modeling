@@ -5,19 +5,38 @@ imagery, EPA CAMPD records, ERA5 wind reanalysis, and plant-level features.
 
 ## Prerequisites
 
-- Python 3 with `venv`
+- `uv`
+- The Savio `python/3.11.6-gcc-11.4.0` module
 - An EPA CAMPD API key
 - A NASA Earthdata account with access to TEMPO products
 - A Copernicus Climate Data Store account with ERA5 API access
 - Access to the configured Savio project paths, or corresponding local path
-changes in `src/config.py`
+  changes in `src/no2_modeling/config.py`
 
 ## Python environment
 
-From the repository root, create `.venv` and install all dependencies:
+Install `uv` once on a login node using its official installer. The default
+installation under `~/.local/bin` is visible from Savio compute nodes, although
+jobs do not need `uv` after the environment has been created:
 
 ```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+From the repository root, load Savio's Python 3.11 module and create the locked
+project environment:
+
+```bash
+module load python/3.11.6-gcc-11.4.0
 make setup
+```
+
+`uv` creates `.venv` by default. If the environment is too large for your home
+quota, place it in scratch instead and use the same path in Slurm jobs:
+
+```bash
+UV_CACHE_DIR=/global/scratch/users/$USER/uv-cache \
+    make setup VENV=/global/scratch/users/$USER/no2-modeling-venv
 ```
 
 Run static and syntax checks with:
@@ -49,7 +68,7 @@ key: your-api-key
 
 ## Configuration
 
-Review `src/config.py` before running the pipeline. It contains:
+Review `src/no2_modeling/config.py` before running the pipeline. It contains:
 
 - Savio input and output paths
 - collection date ranges and filtering thresholds
@@ -70,32 +89,38 @@ mkdir -p /global/home/users/<USERNAME>/vis
 ## Pipeline order
 
 Run commands from the repository root so `.env` is discovered consistently.
+Load the same Python module and activate the environment once per shell or job:
+
+```bash
+module load python/3.11.6-gcc-11.4.0
+source .venv/bin/activate
+```
 
 1. Download TEMPO and ERA5 data:
 
    ```bash
-   PYTHONPATH=src .venv/bin/python -u -m external_data.scrape_tempo
-   PYTHONPATH=src .venv/bin/python -u -m external_data.scrape_era5
+   python -u -m no2_modeling.collection.scrape_tempo
+   python -u -m no2_modeling.collection.scrape_era5
    ```
 
 2. Download EPA emissions and facility locations:
 
    ```bash
-   PYTHONPATH=src .venv/bin/python -u -m concentrations.scrape_nox_emissions
-   PYTHONPATH=src .venv/bin/python -u -m concentrations.scrape_locations
+   python -u -m no2_modeling.collection.scrape_emissions
+   python -u -m no2_modeling.collection.scrape_locations
    ```
 
 3. Partition plants and generate model-ready datasets:
 
    ```bash
-   PYTHONPATH=src .venv/bin/python -u -m powerplants.partition_plants
-   PYTHONPATH=src .venv/bin/python -u -m powerplants.generate_dataset
+   python -u -m no2_modeling.preprocessing.partition_plants
+   python -u -m no2_modeling.preprocessing.generate_dataset
    ```
 
 4. Train and evaluate the model:
 
    ```bash
-   PYTHONPATH=src .venv/bin/python -u -m model.train
+   python -u -m no2_modeling.modeling.training
    ```
 
 Each stage depends on the outputs of the preceding stage. The scripts currently
@@ -113,7 +138,7 @@ The original workflow used these resources:
 | Partition and dataset build | `savio4_htc` | 4 hours | 56 CPUs |
 | Model training | `savio3_gpu` | 2 hours | 8 CPUs, 1 A40 GPU |
 
-Start from `scripts/example_job_script.sh` and tailor the command and resources
+Start from `scripts/slurm/example_job.sh` and tailor the command and resources
 for each stage. A representative job body is:
 
 ```bash
@@ -129,10 +154,15 @@ for each stage. A representative job body is:
 #SBATCH --error=/global/home/users/<USERNAME>/job_logs/%x_%j.err
 
 cd /global/home/users/<USERNAME>/no2-modeling
+module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
-PYTHONPATH=src python -u -m external_data.scrape_tempo
-PYTHONPATH=src python -u -m external_data.scrape_era5
+python -u -m no2_modeling.collection.scrape_tempo
+python -u -m no2_modeling.collection.scrape_era5
 ```
+
+For a scratch environment, replace the activation line with the exact path used
+for `make setup VENV=...`. Create or update the environment on a login node;
+the batch job only activates and runs it.
 
 For training, use the GPU partition and add the appropriate GPU/QoS directives,
 for example:
