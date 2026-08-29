@@ -8,13 +8,13 @@ import os
 
 import earthaccess
 
-from config import (
+from no2_modeling.config import (
     TEMPO_DIR,
     TEMPO_END_DATE,
     TEMPO_START_DATE,
     TEMPO_VERSION,
 )
-from prerequisites import require_earthdata_credentials
+from no2_modeling.prerequisites import require_earthdata_credentials
 
 
 def main():

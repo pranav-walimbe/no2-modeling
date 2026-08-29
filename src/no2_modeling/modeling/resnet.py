@@ -5,7 +5,7 @@ Custom ResNet for NOx emissions regression from TEMPO imagery
 import torch
 from torch import nn
 
-from config import DROPOUT, HEAD_DIM, KERNEL_SIZE, PADDING, STRIDE
+from no2_modeling.config import DROPOUT, HEAD_DIM, KERNEL_SIZE, PADDING, STRIDE
 
 
 class ResBlock(nn.Module):

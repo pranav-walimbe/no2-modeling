@@ -10,6 +10,7 @@
 #SBATCH --error=/global/home/users/<YOUR USERNAME>/job_logs/<JOB_NAME>_%j.err
 
 cd "<PATH TO REPOSITORY>" # example /global/home/users/<USERNAME>/no2-modeling
+module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
 
-PYTHONPATH=src python -u -m "<MODULE>" # example powerplants.generate_dataset
+python -u -m "<MODULE>" # example no2_modeling.preprocessing.generate_dataset

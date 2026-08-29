@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from config import (
+from no2_modeling.config import (
     CAMPD_API_KEY,
     EARTHDATA_PASSWORD,
     EARTHDATA_USERNAME,

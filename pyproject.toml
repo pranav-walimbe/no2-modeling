@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "no2-modeling"
+version = "0.1.0"
+description = "Estimate power-plant NOx emissions from TEMPO satellite imagery"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "cdsapi",
+    "earthaccess",
+    "geopandas",
+    "matplotlib",
+    "netCDF4",
+    "numpy>=1.26,<2",
+    "pandas",
+    "python-dotenv",
+    "requests",
+    "scikit-learn",
+    "scipy",
+    "seaborn",
+    "torch==2.3.1",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.12"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["no2_modeling*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+torch = {index = "pytorch-cu118"}
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
