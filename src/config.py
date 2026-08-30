@@ -17,12 +17,24 @@ EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 # Emissions scraping
 # ============================================================================
 EMISSIONS_START_DATE = date(2023, 8, 1)  # start of CAMPD hourly NOx pull
-EMISSIONS_END_DATE = date(2025, 12, 31)  # end of CAMPD hourly NOx pull
+EMISSIONS_END_DATE = date.today()  # request through the latest date available from CAMPD
 EMISSIONS_BASE_DIR = (
     "/global/scratch/projects/fc_nitrates/ddp/nox/nox_emissions"  # HPC output directory for emissions data
 )
-EMISSIONS_RECORDS_CSV = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_all.csv")  # raw per-record emissions
+EMISSIONS_RECORDS_CSV = os.path.join(
+    EMISSIONS_BASE_DIR, "nox_emissions_all.csv"
+)  # raw operating and non-operating hourly records
 FULL_DATA_CSV = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.csv")  # emissions merged with plant metadata
+
+# ============================================================================
+# Power price scraping
+# ============================================================================
+POWER_PRICE_START_DATE = EMISSIONS_START_DATE
+POWER_PRICE_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/power_prices"
+POWER_PRICE_HOURLY_DIR = os.path.join(POWER_PRICE_BASE_DIR, "hourly")
+POWER_PRICE_DERIVED_DIR = os.path.join(POWER_PRICE_BASE_DIR, "derived", "hourly_spreads")
+POWER_PRICE_METADATA_DIR = os.path.join(POWER_PRICE_BASE_DIR, "metadata")
+POWER_PRICE_TEMP_DIR = os.path.join(POWER_PRICE_BASE_DIR, "temporary")
 
 # ============================================================================
 # Stratification
