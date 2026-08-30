@@ -9,8 +9,8 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
-from no2_modeling.config import COUNTRIES_URL, IMG_RANGE, LABEL_COL, STRAT_VIS_PNG
-from no2_modeling.preprocessing.plant_features import project_to_meters
+from config import COUNTRIES_URL, IMG_RANGE, LABEL_COL, STRAT_VIS_PNG
+from preprocessing.plant_features import project_to_meters
 
 
 def cluster_plants(df: pd.DataFrame) -> pd.DataFrame:

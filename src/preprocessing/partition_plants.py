@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-from no2_modeling.config import (
+from config import (
     LABEL_COL,
     NUM_CORES,
     PLANT_TYPE,
@@ -19,9 +19,9 @@ from no2_modeling.config import (
     TRAIN_CSV,
     VAL_CSV,
 )
-from no2_modeling.preprocessing.matching import build_tempo_mapping, map_chunk
-from no2_modeling.preprocessing.plant_features import aggregate_units, compute_adj_plants, compute_prev_qtr_mass
-from no2_modeling.preprocessing.splitting import cluster_plants, plot_split_distributions, resample_uniform
+from preprocessing.matching import build_tempo_mapping, map_chunk
+from preprocessing.plant_features import aggregate_units, compute_adj_plants, compute_prev_qtr_mass
+from preprocessing.splitting import cluster_plants, plot_split_distributions, resample_uniform
 
 
 def main() -> None:

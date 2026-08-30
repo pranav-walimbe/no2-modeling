@@ -10,8 +10,8 @@ import time
 import pandas as pd
 import requests
 
-from no2_modeling.config import EMISSIONS_RECORDS_CSV, FULL_DATA_CSV
-from no2_modeling.prerequisites import require_campd_credentials
+from config import EMISSIONS_RECORDS_CSV, FULL_DATA_CSV
+from prerequisites import require_campd_credentials
 
 
 # helper functions

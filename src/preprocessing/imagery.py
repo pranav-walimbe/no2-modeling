@@ -9,7 +9,7 @@ import pandas as pd
 from scipy.ndimage import zoom
 from scipy.spatial import cKDTree
 
-from no2_modeling.config import (
+from config import (
     ERA5_DIR,
     IMG_CLOUD_FILTER,
     IMG_QA_FILTER,

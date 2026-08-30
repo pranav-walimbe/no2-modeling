@@ -29,10 +29,11 @@ dev = ["ruff>=0.12"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+py-modules = ["config", "prerequisites"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["no2_modeling*"]
+include = ["collection*", "eda*", "modeling*", "preprocessing*"]
 
 [tool.ruff]
 line-length = 120

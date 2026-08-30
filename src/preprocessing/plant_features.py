@@ -4,7 +4,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from no2_modeling.config import EMISSIONS_RECORDS_CSV, IMG_RANGE, LABEL_COL, STRAT_INPUT_CSV
+from config import EMISSIONS_RECORDS_CSV, IMG_RANGE, LABEL_COL, STRAT_INPUT_CSV
 
 
 def project_to_meters(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:

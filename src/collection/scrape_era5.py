@@ -8,14 +8,14 @@ import os
 
 import cdsapi
 
-from no2_modeling.config import (
+from config import (
     ERA5_DIR,
     WIND_END_MONTH,
     WIND_END_YEAR,
     WIND_START_MONTH,
     WIND_START_YEAR,
 )
-from no2_modeling.prerequisites import require_cds_credentials
+from prerequisites import require_cds_credentials
 
 
 def main():
