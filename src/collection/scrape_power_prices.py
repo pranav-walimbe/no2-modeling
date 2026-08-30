@@ -198,9 +198,7 @@ def aggregate_hourly(frame: pd.DataFrame) -> pd.DataFrame:
         One complete hourly record per market location.
     """
     data = frame.copy()
-    data["duration_minutes"] = (
-        data["interval_end_utc"] - data["interval_start_utc"]
-    ).dt.total_seconds() / 60
+    data["duration_minutes"] = (data["interval_end_utc"] - data["interval_start_utc"]).dt.total_seconds() / 60
     if (data["duration_minutes"] <= 0).any():
         raise ValueError("Price response contains a nonpositive interval duration")
     data["hour_utc"] = data["interval_start_utc"].dt.floor("h")
@@ -216,10 +214,14 @@ def aggregate_hourly(frame: pd.DataFrame) -> pd.DataFrame:
     ).reset_index()
     for column in ("price_usd_mwh", "energy", "congestion", "loss"):
         valid_duration = data["duration_minutes"].where(data[column].notna())
-        numerator = (data[column] * valid_duration).groupby(
-            [data[group_column] for group_column in group_columns],
-            observed=True,
-        ).sum(min_count=1)
+        numerator = (
+            (data[column] * valid_duration)
+            .groupby(
+                [data[group_column] for group_column in group_columns],
+                observed=True,
+            )
+            .sum(min_count=1)
+        )
         denominator = valid_duration.groupby(
             [data[group_column] for group_column in group_columns],
             observed=True,
@@ -409,8 +411,7 @@ def scrape_iso(
             )
             hourly = aggregate_hourly(normalized)
             hourly = hourly.loc[
-                (hourly["interval_start_utc"] >= window.start_utc)
-                & (hourly["interval_start_utc"] < window.end_utc)
+                (hourly["interval_start_utc"] >= window.start_utc) & (hourly["interval_start_utc"] < window.end_utc)
             ].reset_index(drop=True)
             write_partition(hourly, output_path, temporary_dir)
             _update_locations(hourly, iso, metadata_dir, temporary_dir)

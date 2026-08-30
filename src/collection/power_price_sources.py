@@ -138,9 +138,7 @@ class MISOSource(PowerPriceSource):
 
     def _fetch_legacy(self, market: MarketName, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         # MISO's legacy reports expose final RT and ex-post DA hourly files
-        gridstatus_market = (
-            Markets.DAY_AHEAD_HOURLY if market == "day_ahead" else Markets.REAL_TIME_HOURLY_FINAL
-        )
+        gridstatus_market = Markets.DAY_AHEAD_HOURLY if market == "day_ahead" else Markets.REAL_TIME_HOURLY_FINAL
         return self.legacy_client.get_lmp(date=start, end=end, market=gridstatus_market, locations="ALL")
 
     def _fetch_current(self, market: MarketName, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
@@ -208,7 +206,9 @@ class ERCOTSource(PowerPriceSource):
                 )
                 workbook = gridstatus_utils.get_zip_file(doc_info.url)
                 sheets = pd.read_excel(workbook, sheet_name=None)
-                populated_sheets = [sheet for sheet in sheets.values() if not sheet.empty and not sheet.isna().all().all()]
+                populated_sheets = [
+                    sheet for sheet in sheets.values() if not sheet.empty and not sheet.isna().all().all()
+                ]
                 parsed = _parse_ercot_rtm_intervals(pd.concat(populated_sheets), self.timezone)
                 self.year_cache[cache_key] = self.client._finalize_spp_df(
                     parsed,
