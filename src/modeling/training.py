@@ -11,7 +11,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from no2_modeling.config import (
+from config import (
     BATCH_SIZE,
     DATASET_DF,
     EARLY_STOP_PATIENCE,
@@ -23,10 +23,10 @@ from no2_modeling.config import (
     SCHEDULER_PATIENCE,
     WEIGHT_DECAY,
 )
-from no2_modeling.modeling.dataset import NOxDataset, compute_stats
-from no2_modeling.modeling.evaluation import save_results
-from no2_modeling.modeling.plotting import plot_loss_curve, plot_pred_vs_true, plot_residuals, plot_spatial_error
-from no2_modeling.modeling.resnet import NOxModel
+from modeling.dataset import NOxDataset, compute_stats
+from modeling.evaluation import save_results
+from modeling.plotting import plot_loss_curve, plot_pred_vs_true, plot_residuals, plot_spatial_error
+from modeling.resnet import NOxModel
 
 
 def move_batch_to_device(batch, device):

@@ -11,9 +11,9 @@ imagery, EPA CAMPD records, ERA5 wind reanalysis, and plant-level features.
 - A NASA Earthdata account with access to TEMPO products
 - A Copernicus Climate Data Store account with ERA5 API access
 - Access to the configured Savio project paths, or corresponding local path
-  changes in `src/no2_modeling/config.py`
+  changes in `src/config.py`
 
-## Python environment
+## Initial Python environment setup
 
 Install `uv` once on a login node using its official installer. The default
 installation under `~/.local/bin` is visible from Savio compute nodes, although
@@ -38,6 +38,10 @@ quota, place it in scratch instead and use the same path in Slurm jobs:
 UV_CACHE_DIR=/global/scratch/users/$USER/uv-cache \
     make setup VENV=/global/scratch/users/$USER/no2-modeling-venv
 ```
+
+This setup step is only needed when `.venv` does not exist or dependencies in
+`pyproject.toml` or `uv.lock` change. Normal Slurm jobs activate the existing
+environment directly and do not run `make setup` or `uv sync`.
 
 Run static and syntax checks with:
 
@@ -68,7 +72,7 @@ key: your-api-key
 
 ## Configuration
 
-Review `src/no2_modeling/config.py` before running the pipeline. It contains:
+Review `src/config.py` before running the pipeline. It contains:
 
 - Savio input and output paths
 - collection date ranges and filtering thresholds
@@ -82,7 +86,7 @@ user's home directory. Update user-specific paths such as `VIS_DIR` and
 job logs and visualizations, before submitting jobs:
 
 ```bash
-mkdir -p /global/home/users/<USERNAME>/job_logs
+mkdir -p /global/home/users/<USERNAME>/no2-modeling/logs
 mkdir -p /global/home/users/<USERNAME>/vis
 ```
 
@@ -99,28 +103,28 @@ source .venv/bin/activate
 1. Download TEMPO and ERA5 data:
 
    ```bash
-   python -u -m no2_modeling.collection.scrape_tempo
-   python -u -m no2_modeling.collection.scrape_era5
+   python -u -m collection.scrape_tempo
+   python -u -m collection.scrape_era5
    ```
 
 2. Download EPA emissions and facility locations:
 
    ```bash
-   python -u -m no2_modeling.collection.scrape_emissions
-   python -u -m no2_modeling.collection.scrape_locations
+   python -u -m collection.scrape_emissions
+   python -u -m collection.scrape_locations
    ```
 
 3. Partition plants and generate model-ready datasets:
 
    ```bash
-   python -u -m no2_modeling.preprocessing.partition_plants
-   python -u -m no2_modeling.preprocessing.generate_dataset
+   python -u -m preprocessing.partition_plants
+   python -u -m preprocessing.generate_dataset
    ```
 
 4. Train and evaluate the model:
 
    ```bash
-   python -u -m no2_modeling.modeling.training
+   python -u -m modeling.training
    ```
 
 Each stage depends on the outputs of the preceding stage. The scripts currently
@@ -150,19 +154,21 @@ for each stage. A representative job body is:
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --time=08:00:00
-#SBATCH --output=/global/home/users/<USERNAME>/job_logs/%x_%j.out
-#SBATCH --error=/global/home/users/<USERNAME>/job_logs/%x_%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=<EMAIL>
+#SBATCH --output=/global/home/users/<USERNAME>/no2-modeling/logs/%x-%j.log
+#SBATCH --error=/global/home/users/<USERNAME>/no2-modeling/logs/%x-%j.err
 
 cd /global/home/users/<USERNAME>/no2-modeling
 module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
-python -u -m no2_modeling.collection.scrape_tempo
-python -u -m no2_modeling.collection.scrape_era5
+srun python -u -m collection.scrape_tempo
+srun python -u -m collection.scrape_era5
 ```
 
-For a scratch environment, replace the activation line with the exact path used
-for `make setup VENV=...`. Create or update the environment on a login node;
-the batch job only activates and runs it.
+For a scratch environment, replace the activation line with the exact existing
+environment path. Create or update environments on a login node only when
+needed; the batch job only activates and runs them.
 
 For training, use the GPU partition and add the appropriate GPU/QoS directives,
 for example:

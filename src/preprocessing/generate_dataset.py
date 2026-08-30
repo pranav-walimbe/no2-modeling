@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from no2_modeling.config import (
+from config import (
     CITIES_URL,
     COUNTRIES_URL,
     DATASET_DF,
@@ -22,7 +22,7 @@ from no2_modeling.config import (
     VAL_CSV,
     VIS_DIR,
 )
-from no2_modeling.preprocessing.imagery import compute_bounds, extract_image_data, filter_by_city_proximity
+from preprocessing.imagery import compute_bounds, extract_image_data, filter_by_city_proximity
 
 
 def visualize_split(df: pd.DataFrame, split: str) -> None:

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import netCDF4 as nc
 import pandas as pd
 
-from no2_modeling.config import MIN_TEMPO_DURATION, MINS_FILTER, NUM_CORES, TEMPO_DIR, TEMPO_MAPPING
+from config import MIN_TEMPO_DURATION, MINS_FILTER, NUM_CORES, TEMPO_DIR, TEMPO_MAPPING
 
 
 def select_tempo_after(

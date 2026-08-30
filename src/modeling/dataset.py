@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from no2_modeling.config import DATASET_DF, IMAGES_DIR, LABEL_COL, MAX_IMG_VAL
+from config import DATASET_DF, IMAGES_DIR, LABEL_COL, MAX_IMG_VAL
 
 
 def compute_stats(split: str, batch_size: int = 512) -> dict:

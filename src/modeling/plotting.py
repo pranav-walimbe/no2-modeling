@@ -7,8 +7,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from no2_modeling.config import COUNTRIES_URL, LABEL_COL
-from no2_modeling.modeling.evaluation import plant_metrics
+from config import COUNTRIES_URL, LABEL_COL
+from modeling.evaluation import plant_metrics
 
 
 def _save(fig, run_dir: str, plot_name: str) -> None:
