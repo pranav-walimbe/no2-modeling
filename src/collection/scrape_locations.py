@@ -1,77 +1,99 @@
-"""
-Script to augment hourly emissions data with location data from EPA facilities API
-
-Output: nox_emissions_full.csv in output directory
-"""
+"""Add current facility locations to the raw hourly emissions records."""
 
 import os
 import time
+from datetime import date
 
 import pandas as pd
 import requests
 
-from config import EMISSIONS_RECORDS_CSV, FULL_DATA_CSV
+from config import EMISSIONS_RECORDS_CSV, EMISSIONS_START_DATE, FULL_DATA_CSV
 from prerequisites import require_campd_credentials
 
+API_URL = "https://api.epa.gov/easey/facilities-mgmt/facilities/attributes"
+CHUNK_SIZE = 500_000
+MAX_RETRIES = 3
 
-# helper functions
-def get_facility_location(facility_id: int, year: int = 2023, retries: int = 3):
-    """collect lat, lon, epaRegion from EPA API"""
-    url = "https://api.epa.gov/easey/facilities-mgmt/facilities/attributes"
-    params = {
-        "api_key": require_campd_credentials(),
-        "facilityId": facility_id,
-        "year": year,
-        "page": 1,
-        "perPage": 1,
-    }
-    # use exponential backoff with retries
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"Fetching {facility_id} data (attempt {attempt}/{retries})")
-            resp = requests.get(url, params=params, timeout=30)
-            if resp.status_code == 200:
-                data = resp.json()
-                if not data:
-                    return None
-                return (data[0]["latitude"], data[0]["longitude"], data[0]["epaRegion"])
-            print(f"ERROR: API {resp.status_code} for {facility_id}: {resp.text[:200]}")
-        except requests.exceptions.RequestException as e:
-            print(f"ERROR: Request failed for facility {facility_id} (attempt {attempt}): {e}")
-        if attempt < retries:
-            time.sleep(2**attempt)
+
+def get_facility_location(
+    facility_id: int,
+    latest_year: int,
+    earliest_year: int,
+) -> tuple[float, float, int] | None:
+    """Return coordinates from the newest available facility attributes.
+
+    Args:
+        facility_id: EPA facility identifier.
+        latest_year: First facility-attribute year to query.
+        earliest_year: Oldest facility-attribute year to query.
+
+    Returns:
+        Latitude, longitude, and EPA region when attributes are available.
+    """
+    for year in range(latest_year, earliest_year - 1, -1):
+        params = {
+            "api_key": require_campd_credentials(),
+            "facilityId": int(facility_id),
+            "year": year,
+            "page": 1,
+            "perPage": 1,
+        }
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                print(f"Fetching facility {facility_id} for {year} (attempt {attempt}/{MAX_RETRIES})")
+                response = requests.get(API_URL, params=params, timeout=30)
+                response.raise_for_status()
+                payload = response.json()
+                records = payload.get("items", []) if isinstance(payload, dict) else payload
+                if records:
+                    record = records[0]
+                    return (record["latitude"], record["longitude"], record["epaRegion"])
+                break
+            except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as error:
+                if attempt == MAX_RETRIES:
+                    print(f"WARNING: facility {facility_id} failed for {year}: {error}")
+                    break
+                time.sleep(2**attempt)
+
     return None
 
 
-def main():
+def main() -> None:
+    """Write emissions records augmented with current facility locations."""
     require_campd_credentials()
-    # collect unique facility ids
-    facility_ids = set()
-    for chunk in pd.read_csv(EMISSIONS_RECORDS_CSV, usecols=["facilityId"], chunksize=500000):
-        facility_ids.update(chunk["facilityId"].unique())
 
-    # fetch lat, lon, epaRegion for each facility
-    facility_info = {}
-    for fid in facility_ids:
-        result = get_facility_location(fid)
-        if result:
-            facility_info[fid] = result
-    info_df = pd.DataFrame.from_dict(facility_info, orient="index", columns=["lat", "lon", "epaRegion"])
-    info_df.index.name = "facilityId"
+    facility_ids: set[int] = set()
+    for chunk in pd.read_csv(EMISSIONS_RECORDS_CSV, usecols=["facilityId"], chunksize=CHUNK_SIZE):
+        facility_ids.update(chunk["facilityId"].dropna().astype(int).unique())
 
-    # replace existing file if exists
+    facility_info: dict[int, tuple[float, float, int]] = {}
+    for facility_id in sorted(facility_ids):
+        location = get_facility_location(
+            facility_id,
+            latest_year=date.today().year,
+            earliest_year=EMISSIONS_START_DATE.year,
+        )
+        if location is not None:
+            facility_info[facility_id] = location
+
+    info_frame = pd.DataFrame.from_dict(
+        facility_info,
+        orient="index",
+        columns=["lat", "lon", "epaRegion"],
+    )
+    info_frame.index.name = "facilityId"
+
     if os.path.exists(FULL_DATA_CSV):
         os.remove(FULL_DATA_CSV)
 
-    # process input CSV in chunks + apply opTime / NaN filtering
     header_written = False
-    for chunk in pd.read_csv(EMISSIONS_RECORDS_CSV, chunksize=500000):
-        chunk = chunk[chunk["opTime"] >= 1]
-        chunk = chunk.merge(info_df, on="facilityId", how="left")
-        chunk = chunk.dropna()
-        if chunk.empty:
+    for chunk in pd.read_csv(EMISSIONS_RECORDS_CSV, chunksize=CHUNK_SIZE):
+        augmented = chunk.merge(info_frame, on="facilityId", how="left")
+        augmented = augmented.dropna(subset=["lat", "lon", "epaRegion"])
+        if augmented.empty:
             continue
-        chunk.to_csv(FULL_DATA_CSV, mode="a", index=False, header=not header_written)
+        augmented.to_csv(FULL_DATA_CSV, mode="a", index=False, header=not header_written)
         header_written = True
 
 

@@ -204,6 +204,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Local agent handoff state
+AGENTS.md
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
