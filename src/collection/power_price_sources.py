@@ -380,14 +380,20 @@ class SPPSource(PowerPriceSource):
 
     def fetch(self, market: MarketName, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         """Fetch SPP settlement locations, repairing only missing hours."""
+        lower, upper = start.tz_convert("UTC"), end.tz_convert("UTC")
         frames: list[pd.DataFrame] = []
         month = start.normalize().replace(day=1)
         while month < end:
-            frames.append(self._load_monthly_report(market, month.year, month.month))
+            key = (market, month.year, month.month)
+            report = self._load_monthly_report(market, month.year, month.month)
+            try:
+                interval_start = report["Interval Start"]
+                frames.append(report.loc[(interval_start >= lower) & (interval_start < upper)].copy())
+            finally:
+                self.month_cache.pop(key, None)
+                del report
             month += pd.DateOffset(months=1)
         frame = _concat_frames(frames)
-        lower, upper = start.tz_convert("UTC"), end.tz_convert("UTC")
-        frame = frame.loc[(frame["Interval Start"] >= lower) & (frame["Interval Start"] < upper)].copy()
 
         expected_hours = pd.date_range(lower, upper, freq="h", inclusive="left")
         locations = frame["Location"].drop_duplicates().sort_values()
@@ -400,12 +406,22 @@ class SPPSource(PowerPriceSource):
         if len(missing):
             missing_table = missing.to_frame(index=False)
             local_days = missing_table["Hour"].dt.tz_convert(self.timezone).dt.normalize().unique()
-            daily = _concat_frames(
-                [self._load_daily_report(market, pd.Timestamp(day)) for day in local_days],
-            )
-            daily["Hour"] = daily["Interval Start"].dt.floor("h")
-            repair = daily.merge(missing_table, on=["Location", "Hour"], how="inner").drop(columns="Hour")
-            frame = pd.concat([frame, repair], ignore_index=True)
+            repairs: list[pd.DataFrame] = []
+            for day_value in local_days:
+                day = pd.Timestamp(day_value)
+                key = (market, day.strftime("%Y%m%d"))
+                daily = self._load_daily_report(market, day)
+                try:
+                    daily = daily.copy()
+                    daily["Hour"] = daily["Interval Start"].dt.floor("h")
+                    repair = daily.merge(missing_table, on=["Location", "Hour"], how="inner").drop(columns="Hour")
+                    if not repair.empty:
+                        repairs.append(repair)
+                finally:
+                    self.day_cache.pop(key, None)
+                    del daily
+            if repairs:
+                frame = pd.concat([frame, *repairs], ignore_index=True)
         return frame.sort_values(["Location", "Interval Start"]).reset_index(drop=True)
 
 
