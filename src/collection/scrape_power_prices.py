@@ -15,9 +15,10 @@ from urllib.error import HTTPError as UrlHTTPError
 
 import pandas as pd
 import requests
+from pyarrow import ArrowException
 
-from collection.power_price_sources import SOURCE_FACTORIES, MarketName, create_source
-from config import POWER_PRICE_HOURLY_DIR, POWER_PRICE_METADATA_DIR, POWER_PRICE_START_DATE, POWER_PRICE_TEMP_DIR
+from collection.power_price_sources import DEFAULT_ISOS, SOURCE_FACTORIES, MarketName, create_source
+from config import POWER_PRICE_BASE_DIR, POWER_PRICE_METADATA_DIR, POWER_PRICE_START_DATE, POWER_PRICE_TEMP_DIR
 
 MARKETS: tuple[MarketName, ...] = ("day_ahead", "real_time")
 STANDARD_COLUMNS = [
@@ -282,26 +283,18 @@ def _settlement_status(iso: str, market: MarketName) -> str:
     }.get(iso, "published")
 
 
-def partition_path(base_dir: Path, iso: str, market: MarketName, window: MonthWindow) -> Path:
-    """Return the Hive-style Parquet path for a market month.
+def partition_path(base_dir: Path, iso: str, window: MonthWindow) -> Path:
+    """Return the provider directory path for a monthly Parquet file.
 
     Args:
-        base_dir: Root hourly price directory.
+        base_dir: Root power-price directory.
         iso: ISO identifier.
-        market: Normalized market name.
         window: Target month partition.
 
     Returns:
-        Final Parquet path for the partition.
+        Final Parquet path containing both markets for the month.
     """
-    return (
-        base_dir
-        / f"iso={iso}"
-        / f"market={market}"
-        / f"year={window.year:04d}"
-        / f"month={window.month:02d}"
-        / "prices.parquet"
-    )
+    return base_dir / iso / f"{window.year:04d}-{window.month:02d}.parquet"
 
 
 def write_partition(frame: pd.DataFrame, output_path: Path, temporary_dir: Path) -> None:
@@ -309,7 +302,7 @@ def write_partition(frame: pd.DataFrame, output_path: Path, temporary_dir: Path)
 
     Args:
         frame: Complete normalized hourly partition.
-        output_path: Final Hive-style partition path.
+        output_path: Final provider and month Parquet path.
         temporary_dir: Scratch directory for atomic writes.
     """
     if frame.empty:
@@ -322,6 +315,47 @@ def write_partition(frame: pd.DataFrame, output_path: Path, temporary_dir: Path)
     temporary_path = temporary_dir / f"prices-{uuid.uuid4().hex}.parquet.part"
     frame.to_parquet(temporary_path, engine="pyarrow", compression="zstd", index=False)
     os.replace(temporary_path, output_path)
+
+
+def _partition_covers_window(output_path: Path, iso: str, window: MonthWindow) -> bool:
+    # Inspect stored keys before deciding whether a source request is needed
+    if not output_path.exists():
+        return False
+    try:
+        stored = pd.read_parquet(
+            output_path,
+            columns=["iso", "market", "location_id", "interval_start_utc", "source"],
+        )
+    except (ArrowException, KeyError, OSError, ValueError):
+        return False
+    if stored.empty:
+        return False
+    if set(stored["iso"].dropna().astype(str)) != {iso}:
+        return False
+    if set(stored["source"].dropna().astype(str)) != {f"gridstatus:{iso.lower()}"}:
+        return False
+    stored["interval_start_utc"] = pd.to_datetime(stored["interval_start_utc"], utc=True, errors="coerce")
+    if stored["interval_start_utc"].isna().any():
+        return False
+    key = ["market", "location_id", "interval_start_utc"]
+    if stored.duplicated(key).any():
+        return False
+
+    expected_hours = pd.date_range(
+        window.start_utc,
+        window.end_utc,
+        freq="h",
+        inclusive="left",
+    )
+    for market in MARKETS:
+        market_rows = stored.loc[stored["market"] == market]
+        if market_rows.empty:
+            return False
+        for _, location_rows in market_rows.groupby("location_id", observed=True):
+            observed_hours = pd.DatetimeIndex(location_rows["interval_start_utc"].unique())
+            if not expected_hours.difference(observed_hours).empty:
+                return False
+    return True
 
 
 def _update_locations(frame: pd.DataFrame, iso: str, metadata_dir: Path, temporary_dir: Path) -> None:
@@ -345,7 +379,6 @@ def _update_locations(frame: pd.DataFrame, iso: str, metadata_dir: Path, tempora
 def _update_manifest(
     frame: pd.DataFrame,
     iso: str,
-    market: MarketName,
     window: MonthWindow,
     metadata_dir: Path,
     temporary_dir: Path,
@@ -353,12 +386,16 @@ def _update_manifest(
     # Persist completion metadata separately for each ISO array task
     output_path = metadata_dir / "manifests" / f"{iso}.json"
     manifest = json.loads(output_path.read_text()) if output_path.exists() else {"iso": iso, "partitions": {}}
-    partition_key = f"{market}/{window.year:04d}-{window.month:02d}"
+    partition_key = f"{window.year:04d}-{window.month:02d}"
     manifest["partitions"][partition_key] = {
         "rows": len(frame),
         "first_interval_utc": frame["interval_start_utc"].min().isoformat(),
         "last_interval_utc": frame["interval_start_utc"].max().isoformat(),
         "retrieved_at_utc": frame["retrieved_at_utc"].max().isoformat(),
+        "markets": {
+            market: int(len(market_frame))
+            for market, market_frame in frame.groupby("market", observed=True)
+        },
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir.mkdir(parents=True, exist_ok=True)
@@ -371,30 +408,35 @@ def scrape_iso(
     iso: str,
     start: date,
     end: date,
-    hourly_dir: Path,
+    base_dir: Path,
     metadata_dir: Path,
     temporary_dir: Path,
     overwrite: bool = False,
 ) -> None:
-    """Download all monthly DA and RT partitions for one ISO.
+    """Download monthly DA and RT files for one ISO.
 
     Args:
         iso: ISO identifier.
         start: Inclusive first UTC date.
         end: Inclusive final UTC date.
-        hourly_dir: Root output directory for normalized hourly partitions.
+        base_dir: Root output directory with one subdirectory per ISO.
         metadata_dir: Root output directory for location and manifest metadata.
         temporary_dir: Scratch directory for atomic writes.
         overwrite: Replace existing complete monthly partitions.
     """
-    source = create_source(iso)
+    source = None
     for window in month_windows(start, end):
+        output_path = partition_path(base_dir, iso, window)
+        if not overwrite and _partition_covers_window(output_path, iso, window):
+            print(f"Skipping complete partition {output_path}")
+            continue
+        if output_path.exists() and not overwrite:
+            print(f"Refetching incomplete partition {output_path}")
+        if source is None:
+            source = create_source(iso)
+        local_start, local_end = local_query_bounds(window, source.timezone)
+        monthly_frames: list[pd.DataFrame] = []
         for market in MARKETS:
-            output_path = partition_path(hourly_dir, iso, market, window)
-            if output_path.exists() and not overwrite:
-                print(f"Skipping existing partition {output_path}")
-                continue
-            local_start, local_end = local_query_bounds(window, source.timezone)
             description = f"{iso} {market} {window.year:04d}-{window.month:02d}"
             print(f"Fetching {description}")
             raw = call_with_retries(
@@ -413,11 +455,15 @@ def scrape_iso(
             hourly = hourly.loc[
                 (hourly["interval_start_utc"] >= window.start_utc) & (hourly["interval_start_utc"] < window.end_utc)
             ].reset_index(drop=True)
-            write_partition(hourly, output_path, temporary_dir)
-            _update_locations(hourly, iso, metadata_dir, temporary_dir)
-            _update_manifest(hourly, iso, market, window, metadata_dir, temporary_dir)
-            print(f"Wrote {len(hourly):,} rows to {output_path}")
+            monthly_frames.append(hourly)
             time.sleep(REQUEST_INTERVAL_SECONDS)
+        monthly = pd.concat(monthly_frames, ignore_index=True).sort_values(
+            ["market", "location_id", "interval_start_utc"],
+        )
+        write_partition(monthly, output_path, temporary_dir)
+        _update_locations(monthly, iso, metadata_dir, temporary_dir)
+        _update_manifest(monthly, iso, window, metadata_dir, temporary_dir)
+        print(f"Wrote {len(monthly):,} rows to {output_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -433,13 +479,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Run the requested ISO backfill with resumable monthly partitions."""
     args = parse_args()
-    isos = list(SOURCE_FACTORIES) if args.iso == "all" else [args.iso]
+    isos = list(DEFAULT_ISOS) if args.iso == "all" else [args.iso]
     for iso in isos:
         scrape_iso(
             iso=iso,
             start=args.start,
             end=args.end,
-            hourly_dir=Path(POWER_PRICE_HOURLY_DIR),
+            base_dir=Path(POWER_PRICE_BASE_DIR),
             metadata_dir=Path(POWER_PRICE_METADATA_DIR),
             temporary_dir=Path(POWER_PRICE_TEMP_DIR),
             overwrite=args.overwrite,

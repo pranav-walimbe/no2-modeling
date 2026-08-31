@@ -1,19 +1,38 @@
-"""Add current facility locations to the raw hourly emissions records."""
+"""Add current facility attributes to hourly emissions in compressed Parquet."""
 
 import os
 import time
 from datetime import date
+from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import requests
 
-from config import EMISSIONS_RECORDS_CSV, EMISSIONS_START_DATE, FULL_DATA_CSV
+from config import EMISSIONS_RECORDS_CSV, EMISSIONS_START_DATE, FULL_DATA_PARQUET
 from prerequisites import require_campd_credentials
 
 API_URL = "https://api.epa.gov/easey/facilities-mgmt/facilities/attributes"
 CHUNK_SIZE = 500_000
 MAX_RETRIES = 3
 RECORDS_PER_PAGE = 500
+ROW_GROUP_SIZE = 250_000
+
+EMISSIONS_DTYPES = {
+    "stateCode": "string",
+    "facilityName": "string",
+    "facilityId": "Int64",
+    "unitId": "string",
+    "date": "string",
+    "hour": "Int8",
+    "opTime": "Float64",
+    "noxMass": "Float64",
+    "noxRate": "Float64",
+    "grossLoad": "Float64",
+    "primaryFuelInfo": "string",
+    "unitType": "string",
+}
 
 FACILITY_ATTRIBUTE_COLUMNS = {
     "year": "facilityAttributeYear",
@@ -46,6 +65,16 @@ UNIT_ATTRIBUTE_COLUMNS = {
     "so2Phase": "so2Phase",
 }
 
+ATTRIBUTE_STRING_COLUMNS = [
+    "county",
+    "countyCode",
+    "fipsCode",
+    "nercRegion",
+    "sourceCategory",
+    "ownerOperator",
+    *(column for column in UNIT_ATTRIBUTE_COLUMNS.values() if column != "maxHourlyHIRate"),
+]
+
 
 def _fetch_attribute_page(
     facility_id: int,
@@ -71,9 +100,16 @@ def _fetch_attribute_page(
             if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
                 raise TypeError("unexpected facility-attribute response")
             return records
-        except (requests.exceptions.RequestException, ValueError, TypeError) as error:
+        except requests.exceptions.RequestException as error:
+            status = error.response.status_code if error.response is not None else None
+            detail = type(error).__name__ if status is None else f"{type(error).__name__} (HTTP {status})"
             if attempt == MAX_RETRIES:
-                print(f"WARNING: facility {facility_id} failed for {year}, page {page}: {error}")
+                print(f"WARNING: facility {facility_id} failed for {year}, page {page}: {detail}")
+                return None
+            time.sleep(2**attempt)
+        except (ValueError, TypeError) as error:
+            if attempt == MAX_RETRIES:
+                print(f"WARNING: facility {facility_id} failed for {year}, page {page}: {type(error).__name__}")
                 return None
             time.sleep(2**attempt)
 
@@ -141,8 +177,94 @@ def _build_attribute_frames(
     return facility_attributes, unit_attributes
 
 
+def _augment_chunk(
+    chunk: pd.DataFrame,
+    facility_attributes: pd.DataFrame,
+    unit_attributes: pd.DataFrame,
+) -> pd.DataFrame:
+    # Join approved attributes and stabilize Parquet column types
+    data = chunk.copy()
+    data["facilityId"] = pd.to_numeric(data["facilityId"], errors="coerce").astype("Int64")
+    data["unitId"] = data["unitId"].astype("string").str.strip()
+    data["unitIdKey"] = data["unitId"]
+    augmented = data.merge(facility_attributes, on="facilityId", how="left")
+    augmented = augmented.merge(unit_attributes, on=["facilityId", "unitIdKey"], how="left")
+    augmented = augmented.drop(columns="unitIdKey")
+
+    augmented["facilityAttributeYear"] = pd.to_numeric(
+        augmented["facilityAttributeYear"],
+        errors="coerce",
+    ).astype("Int64")
+    for column in ("lat", "lon", "epaRegion", "maxHourlyHIRate"):
+        augmented[column] = pd.to_numeric(augmented[column], errors="coerce").astype("Float64")
+    for column in ATTRIBUTE_STRING_COLUMNS:
+        augmented[column] = augmented[column].astype("string")
+    return augmented.dropna(subset=["lat", "lon", "epaRegion"])
+
+
+def write_augmented_parquet(
+    input_path: Path,
+    output_path: Path,
+    facility_attributes: pd.DataFrame,
+    unit_attributes: pd.DataFrame,
+    chunk_size: int = CHUNK_SIZE,
+) -> int:
+    """Stream enriched emissions into one atomic Zstd Parquet file.
+
+    Args:
+        input_path: Raw hourly emissions CSV.
+        output_path: Final compressed Parquet file.
+        facility_attributes: One row of facility attributes per facility.
+        unit_attributes: One row of unit attributes per facility and unit.
+        chunk_size: Number of CSV rows read per batch.
+
+    Returns:
+        Number of enriched rows written.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".part")
+    temporary_path.unlink(missing_ok=True)
+    writer: pq.ParquetWriter | None = None
+    schema: pa.Schema | None = None
+    row_count = 0
+
+    try:
+        reader = pd.read_csv(input_path, dtype=EMISSIONS_DTYPES, chunksize=chunk_size)
+        for chunk in reader:
+            augmented = _augment_chunk(chunk, facility_attributes, unit_attributes)
+            if augmented.empty:
+                continue
+            table = pa.Table.from_pandas(augmented, preserve_index=False)
+            if writer is None:
+                schema = table.schema
+                writer = pq.ParquetWriter(
+                    temporary_path,
+                    schema,
+                    compression="zstd",
+                    use_dictionary=True,
+                )
+            elif schema is not None:
+                table = table.cast(schema)
+            writer.write_table(table, row_group_size=ROW_GROUP_SIZE)
+            row_count += len(augmented)
+    except BaseException:
+        if writer is not None:
+            writer.close()
+        temporary_path.unlink(missing_ok=True)
+        raise
+    else:
+        if writer is not None:
+            writer.close()
+
+    if row_count == 0:
+        temporary_path.unlink(missing_ok=True)
+        raise RuntimeError("No emissions rows had complete facility location attributes")
+    os.replace(temporary_path, output_path)
+    return row_count
+
+
 def main() -> None:
-    """Write emissions records augmented with current facility locations."""
+    """Write emissions records augmented with current facility attributes."""
     require_campd_credentials()
 
     facility_ids: set[int] = set()
@@ -163,21 +285,13 @@ def main() -> None:
 
     facility_attributes, unit_attributes = _build_attribute_frames(attribute_records)
 
-    if os.path.exists(FULL_DATA_CSV):
-        os.remove(FULL_DATA_CSV)
-
-    header_written = False
-    for chunk in pd.read_csv(EMISSIONS_RECORDS_CSV, chunksize=CHUNK_SIZE):
-        chunk["facilityId"] = pd.to_numeric(chunk["facilityId"], errors="coerce").astype("Int64")
-        chunk["unitIdKey"] = chunk["unitId"].astype("string").str.strip()
-        augmented = chunk.merge(facility_attributes, on="facilityId", how="left")
-        augmented = augmented.merge(unit_attributes, on=["facilityId", "unitIdKey"], how="left")
-        augmented = augmented.drop(columns="unitIdKey")
-        augmented = augmented.dropna(subset=["lat", "lon", "epaRegion"])
-        if augmented.empty:
-            continue
-        augmented.to_csv(FULL_DATA_CSV, mode="a", index=False, header=not header_written)
-        header_written = True
+    row_count = write_augmented_parquet(
+        input_path=Path(EMISSIONS_RECORDS_CSV),
+        output_path=Path(FULL_DATA_PARQUET),
+        facility_attributes=facility_attributes,
+        unit_attributes=unit_attributes,
+    )
+    print(f"Wrote {row_count:,} rows to {FULL_DATA_PARQUET}")
 
 
 if __name__ == "__main__":
