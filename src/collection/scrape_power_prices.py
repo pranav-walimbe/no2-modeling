@@ -125,12 +125,14 @@ def _first_column(frame: pd.DataFrame, candidates: tuple[str, ...]) -> pd.Series
 
 
 def _canonical_location_type(value: object) -> str:
-    # Collapse market-specific labels into the two retained regional types
+    # Collapse market-specific labels into the retained location types
     normalized = str(value).strip().casefold().replace("_", " ")
     if normalized in {"hub", "trading hub"}:
         return "hub"
     if normalized in {"zone", "load zone", "loadzone", "dlap"}:
         return "load_zone"
+    if normalized == "settlement location":
+        return "settlement_location"
     raise ValueError(f"Unsupported regional location type: {value!r}")
 
 
@@ -392,10 +394,7 @@ def _update_manifest(
         "first_interval_utc": frame["interval_start_utc"].min().isoformat(),
         "last_interval_utc": frame["interval_start_utc"].max().isoformat(),
         "retrieved_at_utc": frame["retrieved_at_utc"].max().isoformat(),
-        "markets": {
-            market: int(len(market_frame))
-            for market, market_frame in frame.groupby("market", observed=True)
-        },
+        "markets": {market: int(len(market_frame)) for market, market_frame in frame.groupby("market", observed=True)},
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir.mkdir(parents=True, exist_ok=True)
@@ -443,6 +442,8 @@ def scrape_iso(
                 lambda: source.fetch(market, local_start, local_end),
                 description,
             )
+            interval_start = pd.to_datetime(raw["Interval Start"], utc=True)
+            raw = raw.loc[(interval_start >= window.start_utc) & (interval_start < window.end_utc)].copy()
             retrieved_at = pd.Timestamp.now(tz="UTC")
             normalized = normalize_prices(
                 raw,
@@ -456,6 +457,7 @@ def scrape_iso(
                 (hourly["interval_start_utc"] >= window.start_utc) & (hourly["interval_start_utc"] < window.end_utc)
             ].reset_index(drop=True)
             monthly_frames.append(hourly)
+            del raw, normalized, hourly
             time.sleep(REQUEST_INTERVAL_SECONDS)
         monthly = pd.concat(monthly_frames, ignore_index=True).sort_values(
             ["market", "location_id", "interval_start_utc"],
