@@ -30,7 +30,6 @@ CAISO_DLAP_LOCATIONS = [
     "DLAP_SDGE-APND",
     "DLAP_VEA-APND",
 ]
-SPP_HUBS = {"SPPNORTH_HUB", "SPPSOUTH_HUB"}
 SPP_DOWNLOAD_URL = "https://portal.spp.org/file-browser-api/download"
 SPP_ENDPOINTS = {
     "day_ahead": "da-lmp-by-settlement-location",
@@ -119,13 +118,11 @@ def _concat_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 
 def _parse_spp_monthly_report(stream: BinaryIO) -> pd.DataFrame:
-    # Filter while reading so only the two hub rows remain in memory
+    # Monthly reports store one row per location and price component
     frames: list[pd.DataFrame] = []
     for chunk in pd.read_csv(stream, chunksize=100_000, skipinitialspace=True):
         chunk.columns = chunk.columns.str.strip()
-        chunk = chunk.loc[chunk["Settlement Location Name"].isin(SPP_HUBS)]
-        if not chunk.empty:
-            frames.append(chunk)
+        frames.append(chunk)
     data = _concat_frames(frames)
     if data.empty:
         return data
@@ -154,11 +151,16 @@ def _parse_spp_monthly_report(stream: BinaryIO) -> pd.DataFrame:
         aggfunc="first",
     ).reset_index()
     result = result.rename(columns={"Settlement Location Name": "Location", **SPP_PRICE_COLUMNS})
-    for column in SPP_PRICE_COLUMNS.values():
+    for column in ("LMP", "Congestion", "Loss"):
         if column not in result:
             result[column] = pd.NA
+    derived_energy = result["LMP"] - result["Congestion"] - result["Loss"]
+    if "Energy" in result:
+        result["Energy"] = result["Energy"].fillna(derived_energy)
+    else:
+        result["Energy"] = derived_energy
     result["Interval End"] = result["Interval Start"] + pd.Timedelta(hours=1)
-    result["Location Type"] = "Hub"
+    result["Location Type"] = "Settlement Location"
     columns = ["Interval Start", "Interval End", "Location", "Location Type", *SPP_PRICE_COLUMNS.values()]
     return result[columns]
 
@@ -168,9 +170,13 @@ def _parse_spp_daily_report(stream: BinaryIO, market: MarketName) -> pd.DataFram
     frames: list[pd.DataFrame] = []
     for chunk in pd.read_csv(stream, chunksize=100_000, skipinitialspace=True):
         chunk.columns = chunk.columns.str.strip()
-        chunk = chunk.loc[chunk["Settlement Location"].isin(SPP_HUBS)]
-        if not chunk.empty:
-            frames.append(chunk)
+        chunk = chunk.rename(
+            columns={
+                "Settlement Location Name": "Settlement Location",
+                "GMT Interval": "GMTIntervalEnd",
+            },
+        )
+        frames.append(chunk)
     data = _concat_frames(frames)
     if data.empty:
         return data
@@ -181,7 +187,7 @@ def _parse_spp_daily_report(stream: BinaryIO, market: MarketName) -> pd.DataFram
     data = data.rename(
         columns={"Settlement Location": "Location", "MEC": "Energy", "MCC": "Congestion", "MLC": "Loss"},
     )
-    data["Location Type"] = "Hub"
+    data["Location Type"] = "Settlement Location"
     columns = ["Interval Start", "Interval End", "Location", "Location Type", "LMP", "Energy", "Congestion", "Loss"]
     return data[columns]
 
@@ -304,7 +310,7 @@ class MISOSource(PowerPriceSource):
 
 
 class SPPSource(PowerPriceSource):
-    """SPP hourly hub prices."""
+    """SPP prices at every published settlement location."""
 
     iso = "SPP"
     timezone = "US/Central"
@@ -373,7 +379,7 @@ class SPPSource(PowerPriceSource):
         return frame
 
     def fetch(self, market: MarketName, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-        """Fetch SPP hubs from monthly reports, repairing only missing hours."""
+        """Fetch SPP settlement locations, repairing only missing hours."""
         frames: list[pd.DataFrame] = []
         month = start.normalize().replace(day=1)
         while month < end:
@@ -384,7 +390,8 @@ class SPPSource(PowerPriceSource):
         frame = frame.loc[(frame["Interval Start"] >= lower) & (frame["Interval Start"] < upper)].copy()
 
         expected_hours = pd.date_range(lower, upper, freq="h", inclusive="left")
-        expected = pd.MultiIndex.from_product([sorted(SPP_HUBS), expected_hours], names=["Location", "Hour"])
+        locations = frame["Location"].drop_duplicates().sort_values()
+        expected = pd.MultiIndex.from_product([locations, expected_hours], names=["Location", "Hour"])
         observed = pd.MultiIndex.from_arrays(
             [frame["Location"], frame["Interval Start"].dt.floor("h")],
             names=["Location", "Hour"],

@@ -37,6 +37,9 @@ POWER_PRICE_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/power_price
 POWER_PRICE_DERIVED_DIR = os.path.join(POWER_PRICE_BASE_DIR, "derived", "hourly_spreads")
 POWER_PRICE_METADATA_DIR = os.path.join(POWER_PRICE_BASE_DIR, "metadata")
 POWER_PRICE_TEMP_DIR = os.path.join(POWER_PRICE_BASE_DIR, "temporary")
+PLANT_ZONE_MAPPING = os.path.join(
+    POWER_PRICE_METADATA_DIR, "node_zone_mapping", "plant_zone_mapping.parquet"
+)
 
 # ============================================================================
 # Stratification
