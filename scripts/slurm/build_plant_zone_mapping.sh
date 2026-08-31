@@ -21,4 +21,4 @@ source .venv/bin/activate
 export PYTHONPATH="/global/home/users/pranavwalimbe/no2-modeling/src"
 export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"
 
-srun python -u -m collection.plant_zone_mapping --batch-size 100000
+srun python -u -m collection.map_plant_zones --batch-size 100000
