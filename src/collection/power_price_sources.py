@@ -1,11 +1,15 @@
 """GridStatus adapters for regional day-ahead and real-time power prices."""
 
+import io
 import os
+import zipfile
 from abc import ABC, abstractmethod
-from typing import Literal
+from typing import BinaryIO, Literal
+from urllib.parse import urlencode
 
 import pandas as pd
-from gridstatus import CAISO, ISONE, MISO, NYISO, PJM, SPP, Ercot
+import requests
+from gridstatus import CAISO, ISONE, MISO, NYISO, PJM, Ercot
 from gridstatus import utils as gridstatus_utils
 from gridstatus.base import Markets
 from gridstatus.ercot import HISTORICAL_RTM_LOAD_ZONE_AND_HUB_PRICES_RTID
@@ -19,12 +23,77 @@ HUB_LOCATION_TYPES = {"hub", "trading hub"}
 ZONE_LOCATION_TYPES = {"zone", "load zone", "loadzone", "dlap"}
 REGIONAL_LOCATION_TYPES = HUB_LOCATION_TYPES | ZONE_LOCATION_TYPES
 MISO_API_CUTOVER = pd.Timestamp("2025-12-12", tz="EST")
+MISO_API_CHUNK_DURATION = pd.Timedelta(days=1)
 CAISO_DLAP_LOCATIONS = [
     "DLAP_PGAE-APND",
     "DLAP_SCE-APND",
     "DLAP_SDGE-APND",
     "DLAP_VEA-APND",
 ]
+SPP_HUBS = {"SPPNORTH_HUB", "SPPSOUTH_HUB"}
+SPP_DOWNLOAD_URL = "https://portal.spp.org/file-browser-api/download"
+SPP_ENDPOINTS = {
+    "day_ahead": "da-lmp-by-settlement-location",
+    "real_time": "rtbm-lmp-by-location",
+}
+SPP_MONTHLY_PREFIXES = {"day_ahead": "DA-LMP-MONTHLY-SL", "real_time": "RTBM-LMP-MONTHLY-SL"}
+SPP_DAILY_PREFIXES = {"day_ahead": "DA-LMP-SL", "real_time": "RTBM-LMP-DAILY-SL"}
+SPP_PRICE_COLUMNS = {"LMP": "LMP", "MEC": "Energy", "MCC": "Congestion", "MLC": "Loss"}
+
+
+class _HTTPRangeReader(io.RawIOBase):
+    """Expose a remote ZIP as seekable without downloading it in full."""
+
+    def __init__(self, session: requests.Session, url: str) -> None:
+        self.session = session
+        self.url = url
+        response = session.head(url, timeout=(10, 60))
+        response.raise_for_status()
+        if "bytes" not in response.headers.get("Accept-Ranges", "").lower():
+            raise RuntimeError("SPP archive does not support bounded byte-range requests")
+        self.length = int(response.headers["Content-Length"])
+        self.position = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_CUR:
+            offset += self.position
+        elif whence == io.SEEK_END:
+            offset += self.length
+        if not 0 <= offset <= self.length:
+            raise ValueError("seek outside SPP archive")
+        self.position = offset
+        return offset
+
+    def read(self, size: int = -1) -> bytes:
+        if self.position >= self.length or size == 0:
+            return b""
+        end = self.length - 1 if size < 0 else min(self.position + size - 1, self.length - 1)
+        response = self.session.get(
+            self.url,
+            headers={"Range": f"bytes={self.position}-{end}"},
+            stream=True,
+            timeout=(10, 120),
+        )
+        try:
+            if response.status_code != 206:
+                raise RuntimeError(f"SPP ignored bounded range request (HTTP {response.status_code})")
+            payload = response.content
+        finally:
+            response.close()
+        expected = end - self.position + 1
+        if len(payload) != expected:
+            raise OSError(f"SPP returned {len(payload)} bytes for a {expected}-byte range")
+        self.position += len(payload)
+        return payload
 
 
 def _require_environment(name: str) -> str:
@@ -47,6 +116,74 @@ def _concat_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     # Preserve an empty response when a split date range has no applicable segment
     populated = [frame for frame in frames if not frame.empty]
     return pd.concat(populated, ignore_index=True) if populated else pd.DataFrame()
+
+
+def _parse_spp_monthly_report(stream: BinaryIO) -> pd.DataFrame:
+    # Filter while reading so only the two hub rows remain in memory
+    frames: list[pd.DataFrame] = []
+    for chunk in pd.read_csv(stream, chunksize=100_000, skipinitialspace=True):
+        chunk.columns = chunk.columns.str.strip()
+        chunk = chunk.loc[chunk["Settlement Location Name"].isin(SPP_HUBS)]
+        if not chunk.empty:
+            frames.append(chunk)
+    data = _concat_frames(frames)
+    if data.empty:
+        return data
+
+    hour_columns = [column for column in data if column.upper().startswith("HE")]
+    data = data.melt(
+        id_vars=["Date", "Settlement Location Name", "Price Type"],
+        value_vars=hour_columns,
+        var_name="Hour Ending",
+        value_name="Price",
+    ).dropna(subset=["Price"])
+    hour = data["Hour Ending"].str.extract(r"(\d+)", expand=False).astype(int)
+    interval_start = pd.to_datetime(data["Date"]) + pd.to_timedelta(hour - 1, unit="h")
+    repeated = data["Hour Ending"].str.upper().str.contains("X") | data["Hour Ending"].str.endswith(".1")
+    data["Interval Start"] = interval_start.dt.tz_localize(
+        "US/Central",
+        ambiguous=~repeated,
+        nonexistent="NaT",
+    ).dt.tz_convert("UTC")
+    data["Price"] = pd.to_numeric(data["Price"], errors="coerce")
+    data = data.loc[data["Price Type"].isin(SPP_PRICE_COLUMNS)].dropna(subset=["Interval Start", "Price"])
+    result = data.pivot_table(
+        index=["Interval Start", "Settlement Location Name"],
+        columns="Price Type",
+        values="Price",
+        aggfunc="first",
+    ).reset_index()
+    result = result.rename(columns={"Settlement Location Name": "Location", **SPP_PRICE_COLUMNS})
+    for column in SPP_PRICE_COLUMNS.values():
+        if column not in result:
+            result[column] = pd.NA
+    result["Interval End"] = result["Interval Start"] + pd.Timedelta(hours=1)
+    result["Location Type"] = "Hub"
+    columns = ["Interval Start", "Interval End", "Location", "Location Type", *SPP_PRICE_COLUMNS.values()]
+    return result[columns]
+
+
+def _parse_spp_daily_report(stream: BinaryIO, market: MarketName) -> pd.DataFrame:
+    # Daily data repair holes in monthly reports, including repeated DST hours
+    frames: list[pd.DataFrame] = []
+    for chunk in pd.read_csv(stream, chunksize=100_000, skipinitialspace=True):
+        chunk.columns = chunk.columns.str.strip()
+        chunk = chunk.loc[chunk["Settlement Location"].isin(SPP_HUBS)]
+        if not chunk.empty:
+            frames.append(chunk)
+    data = _concat_frames(frames)
+    if data.empty:
+        return data
+    data["Interval End"] = pd.to_datetime(data["GMTIntervalEnd"], utc=True)
+    data["Interval Start"] = data["Interval End"] - pd.Timedelta(
+        minutes=60 if market == "day_ahead" else 5,
+    )
+    data = data.rename(
+        columns={"Settlement Location": "Location", "MEC": "Energy", "MCC": "Congestion", "MLC": "Loss"},
+    )
+    data["Location Type"] = "Hub"
+    columns = ["Interval Start", "Interval End", "Location", "Location Type", "LMP", "Energy", "Congestion", "Loss"]
+    return data[columns]
 
 
 def _parse_ercot_rtm_intervals(frame: pd.DataFrame, timezone: str) -> pd.DataFrame:
@@ -144,9 +281,17 @@ class MISOSource(PowerPriceSource):
     def _fetch_current(self, market: MarketName, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         # MISO Data Exchange superseded the legacy pricing reports in December 2025
         client = self._current_client()
-        if market == "day_ahead":
-            return client.get_lmp_day_ahead_hourly_ex_post(date=start, end=end)
-        return client.get_lmp_real_time_hourly_ex_post_final(date=start, end=end)
+        frames: list[pd.DataFrame] = []
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + MISO_API_CHUNK_DURATION, end)
+            if market == "day_ahead":
+                frame = client.get_lmp_day_ahead_hourly_ex_post(date=chunk_start, end=chunk_end)
+            else:
+                frame = client.get_lmp_real_time_hourly_ex_post_final(date=chunk_start, end=chunk_end)
+            frames.append(_filter_location_types(frame, REGIONAL_LOCATION_TYPES))
+            chunk_start = chunk_end
+        return _concat_frames(frames)
 
     def fetch(self, market: MarketName, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
         """Fetch final hourly MISO hub and load-zone LMPs."""
@@ -165,22 +310,96 @@ class SPPSource(PowerPriceSource):
     timezone = "US/Central"
 
     def __init__(self) -> None:
-        self.client = SPP()
+        self.session = requests.Session()
+        self.month_cache: dict[tuple[MarketName, int, int], pd.DataFrame] = {}
+        self.day_cache: dict[tuple[MarketName, str], pd.DataFrame] = {}
+        self.archive_cache: dict[tuple[MarketName, int], zipfile.ZipFile] = {}
+
+    def _url(self, market: MarketName, path: str) -> str:
+        # Keep SPP paths URL-encoded, including the leading slash
+        endpoint = SPP_ENDPOINTS[market]
+        return f"{SPP_DOWNLOAD_URL}/{endpoint}?{urlencode({'path': path})}"
+
+    def _load_annual_member(self, market: MarketName, year: int, member: str) -> bytes:
+        # ZipFile seeks through bounded ranges and reads only the selected member
+        key = (market, year)
+        if key not in self.archive_cache:
+            reader = _HTTPRangeReader(self.session, self._url(market, f"/{year}/{year}.zip"))
+            self.archive_cache[key] = zipfile.ZipFile(reader)
+        return self.archive_cache[key].read(member)
+
+    def _load_monthly_report(self, market: MarketName, year: int, month: int) -> pd.DataFrame:
+        # SPP retires older loose CSVs into a yearly archive
+        key = (market, year, month)
+        if key in self.month_cache:
+            return self.month_cache[key]
+        filename = f"{SPP_MONTHLY_PREFIXES[market]}-{year}{month:02d}.csv"
+        path = f"/{year}/{month:02d}/{filename}"
+        response = self.session.get(self._url(market, path), stream=True, timeout=(10, 120))
+        try:
+            if response.status_code == 404:
+                member = f"{year}/{month:02d}/{filename}"
+                frame = _parse_spp_monthly_report(io.BytesIO(self._load_annual_member(market, year, member)))
+            else:
+                response.raise_for_status()
+                response.raw.decode_content = True
+                frame = _parse_spp_monthly_report(response.raw)
+        finally:
+            response.close()
+        self.month_cache[key] = frame
+        return frame
+
+    def _load_daily_report(self, market: MarketName, day: pd.Timestamp) -> pd.DataFrame:
+        # Fetch one day only when the monthly report is incomplete
+        day_key = day.strftime("%Y%m%d")
+        key = (market, day_key)
+        if key in self.day_cache:
+            return self.day_cache[key]
+        suffix = f"{day_key}0100" if market == "day_ahead" else day_key
+        filename = f"{SPP_DAILY_PREFIXES[market]}-{suffix}.csv"
+        path = f"/{day.year}/{day.month:02d}/By_Day/{filename}"
+        response = self.session.get(self._url(market, path), stream=True, timeout=(10, 120))
+        try:
+            if response.status_code == 404:
+                member = f"{day.year}/{day.month:02d}/By_Day/{filename}"
+                frame = _parse_spp_daily_report(io.BytesIO(self._load_annual_member(market, day.year, member)), market)
+            else:
+                response.raise_for_status()
+                response.raw.decode_content = True
+                frame = _parse_spp_daily_report(response.raw, market)
+        finally:
+            response.close()
+        self.day_cache[key] = frame
+        return frame
 
     def fetch(self, market: MarketName, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-        """Fetch SPP hub prices at hourly DA or five-minute RT resolution."""
-        if market == "day_ahead":
-            return self.client.get_lmp_day_ahead_hourly(
-                date=start,
-                end=end,
-                location_type="Hub",
-            )
-        return self.client.get_lmp_real_time_5_min_by_location(
-            date=start,
-            end=end,
-            location_type="Hub",
-            use_daily_files=True,
+        """Fetch SPP hubs from monthly reports, repairing only missing hours."""
+        frames: list[pd.DataFrame] = []
+        month = start.normalize().replace(day=1)
+        while month < end:
+            frames.append(self._load_monthly_report(market, month.year, month.month))
+            month += pd.DateOffset(months=1)
+        frame = _concat_frames(frames)
+        lower, upper = start.tz_convert("UTC"), end.tz_convert("UTC")
+        frame = frame.loc[(frame["Interval Start"] >= lower) & (frame["Interval Start"] < upper)].copy()
+
+        expected_hours = pd.date_range(lower, upper, freq="h", inclusive="left")
+        expected = pd.MultiIndex.from_product([sorted(SPP_HUBS), expected_hours], names=["Location", "Hour"])
+        observed = pd.MultiIndex.from_arrays(
+            [frame["Location"], frame["Interval Start"].dt.floor("h")],
+            names=["Location", "Hour"],
         )
+        missing = expected.difference(observed)
+        if len(missing):
+            missing_table = missing.to_frame(index=False)
+            local_days = missing_table["Hour"].dt.tz_convert(self.timezone).dt.normalize().unique()
+            daily = _concat_frames(
+                [self._load_daily_report(market, pd.Timestamp(day)) for day in local_days],
+            )
+            daily["Hour"] = daily["Interval Start"].dt.floor("h")
+            repair = daily.merge(missing_table, on=["Location", "Hour"], how="inner").drop(columns="Hour")
+            frame = pd.concat([frame, repair], ignore_index=True)
+        return frame.sort_values(["Location", "Interval Start"]).reset_index(drop=True)
 
 
 class ERCOTSource(PowerPriceSource):
