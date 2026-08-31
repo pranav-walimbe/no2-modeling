@@ -24,14 +24,16 @@ EMISSIONS_BASE_DIR = (
 EMISSIONS_RECORDS_CSV = os.path.join(
     EMISSIONS_BASE_DIR, "nox_emissions_all.csv"
 )  # raw operating and non-operating hourly records
-FULL_DATA_CSV = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.csv")  # emissions merged with plant metadata
+FULL_DATA_PARQUET = os.path.join(
+    EMISSIONS_BASE_DIR,
+    "nox_emissions_full.parquet",
+)  # emissions merged with plant metadata
 
 # ============================================================================
 # Power price scraping
 # ============================================================================
 POWER_PRICE_START_DATE = EMISSIONS_START_DATE
 POWER_PRICE_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/power_prices"
-POWER_PRICE_HOURLY_DIR = os.path.join(POWER_PRICE_BASE_DIR, "hourly")
 POWER_PRICE_DERIVED_DIR = os.path.join(POWER_PRICE_BASE_DIR, "derived", "hourly_spreads")
 POWER_PRICE_METADATA_DIR = os.path.join(POWER_PRICE_BASE_DIR, "metadata")
 POWER_PRICE_TEMP_DIR = os.path.join(POWER_PRICE_BASE_DIR, "temporary")

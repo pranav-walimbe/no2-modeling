@@ -321,6 +321,8 @@ SOURCE_FACTORIES: dict[str, type[PowerPriceSource]] = {
     "SPP": SPPSource,
 }
 
+DEFAULT_ISOS: tuple[str, ...] = tuple(iso for iso in SOURCE_FACTORIES if iso != "PJM")
+
 
 def create_source(iso: str) -> PowerPriceSource:
     """Construct the configured source adapter for an ISO.
