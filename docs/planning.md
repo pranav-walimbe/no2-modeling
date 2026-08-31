@@ -1,165 +1,234 @@
-# Research plan: detecting power-plant NOx anomalies with TEMPO
+# Research plan: near-real-time detection of anomalous power-plant activity with TEMPO
 
-## Research question
+## Goal
 
-Can hourly TEMPO NO2 observations detect departures from expected power-plant operation and NOx emissions, and how do weather, source density, fuel mix, and pixel resolution limit attribution?
+Build and evaluate a system that uses TEMPO NO2 observations to detect unusual power-plant activity near the time it occurs. The first study will focus on plant starts and stops because they produce clear operating-state labels and have a direct connection to electricity-market conditions.
 
-NO2/NOx is the sole satellite pollutant in the planned models and the basis for the paper's claims. Reserve SO2 for future work.
+The project has two linked questions:
 
-The study will estimate continuous deviations from an expectation model. It will serve two applications:
+1. Can TEMPO distinguish plant starts and stops from normal operation under realistic cloud, wind, and source-separation conditions?
+2. Do TEMPO-detectable events coincide with changes in wholesale power prices after accounting for information that market participants could observe without TEMPO?
 
-- Atmospheric science: detect unusual emissions, control performance, and fossil-generation changes.
-- Commodity research: test whether plant or regional operating surprises add information before standard public reports.
+The first question establishes atmospheric detection skill. The second tests whether the signal has value as a measure of unexpected thermal-plant availability. The initial analysis will estimate associations and predictive value. It will not interpret price changes as causal effects of one plant unless the research design supports that claim.
 
-## Targets
+## System concept
 
-### Operating anomaly
+For each plant and TEMPO scan, the system will:
 
-Estimate the expected range of gross load or capacity factor from capacity, unit and fuel type, calendar variables, weather, and regional electricity demand. Define the operating anomaly from the signed difference between observed and expected output, scaled by the model's uncertainty.
+1. Form an expectation for normal plant activity from plant characteristics, calendar variables, weather, past operating patterns, and regional grid conditions.
+2. Extract the plant's NO2 field and quality information from TEMPO.
+3. Estimate the probability of a start, stop, or continued operating state.
+4. Attach the plant to a fixed ISO price location.
+5. Compare the detected event with day-ahead and real-time power prices before and after the scan.
 
-This target covers outages, startups, shutdowns, and dispatch changes. It is the primary commodity target.
+Historical replay will mimic a near-real-time system. Every feature must carry an availability timestamp, and each prediction may use only information available by the simulated decision time.
 
-### Emissions anomaly
+## Phase-one scope
 
-Estimate the expected range of hourly NOx emissions and define the emissions anomaly from the signed difference between observed and expected emissions. A version conditioned on gross load will measure emissions-intensity or control-performance surprise. Exclude observed load at market inference time when it has not entered the public information set.
+### Plants and events
 
-Train on signed continuous residuals and derive high, normal, and low event classes afterward. Add startup, shutdown, and ramp labels when CAMPD supports them.
+Use CAMPD hourly records from August 1, 2023 onward. Start with coal plants and other large NOx sources that have reliable gross-load and operating-time records. Expand to gas units after measuring detection limits for the strongest sources.
 
-## Defining expectation
+Define events at the unit level, then aggregate them to the facility level:
 
-### Fleet model
+- **Start:** a transition from no operation to sustained positive operation or gross load.
+- **Stop:** a transition from sustained positive operation to no operation.
+- **Continuation:** stable on or off operation outside an event exclusion window.
 
-Fit quantile models using plant characteristics, calendar variables, weather, and region. Estimate the 5th, 50th, and 95th percentiles to capture changes in conditional variance. The fleet model must transfer to plants absent from training and must omit historical facility-emissions priors.
+Require the new state to persist for a minimum number of hours. Treat ramps, brief interruptions, missing records, and mixed unit states as separate cases rather than forcing them into start or stop labels. Set thresholds from engineering meaning and label audits, then freeze them before outcome analysis.
 
-### Plant calibration
+### Geography
 
-Add a past-only moving correction to the fleet estimate for known-site monitoring. Limit the effect of large residuals and pause updates during flagged events so sustained anomalies do not enter the baseline. Compare this hybrid with a seasonal plant median and a raw plant-hour exponential moving average.
+Use CAISO, ERCOT, ISO-NE, MISO, NYISO, and SPP in phase one. Exclude PJM until a stable data-access path is available. Report how this exclusion changes plant, fuel, capacity, and event coverage.
 
-Convert each observation's position within its expected distribution to a common anomaly scale across plants and operating regimes.
+Retain plants only when the analysis can assign a defensible price location. Prefer the plant's load zone or DLAP. Use a liquid hub when the ISO does not publish load-zone prices or when the plant-zone mapping cannot support historical consistency.
 
-Use a hurdle model for operating state and conditional output. Generate every expectation through rolling-origin or out-of-fold prediction.
+### Price outcomes
 
-Keep behavior and observation features separate. The expectation model receives engineering, calendar, demand, and dispatch-weather variables. The TEMPO model receives plume winds, cloud, air-mass-factor, and retrieval-quality variables.
+Collect hourly day-ahead and real-time prices at retained hubs and load zones. Preserve the energy, congestion, and loss components when the ISO publishes them.
 
-## Source and fuel scope
+Primary outcomes:
 
-Match the target to source identifiability:
+- Real-time locational marginal price.
+- Day-ahead locational marginal price.
+- Real-time minus day-ahead price spread.
+- Same-market price change relative to pre-event hours.
 
-1. Isolated plants: plant-level emissions and operating targets.
-2. Homogeneous clusters: group emissions and generation targets.
-3. Heterogeneous unresolved clusters: aggregate NOx, with fuel-specific generation as an experimental target.
+The real-time minus day-ahead spread is the main measure of an operating surprise because day-ahead prices capture the market's prior schedule and real-time prices capture updated system conditions. Component analysis can show whether an association comes from system energy, transmission congestion, or marginal losses.
 
-Construct a response kernel for each source from location, wind, stack or plume height, and dispersion. Aggregate sources when their response vectors become too collinear at TEMPO resolution. Permit the model to abstain when the scene cannot support attribution.
+## Data organization and joins
 
-Center evaluation on coal and coal-dominant groups because they provide the strongest NOx test. Retain other fuels for NOx coverage and transfer tests. A fuel-aware model should use capacity shares, expected emissions-intensity shares, controls, unit counts, source spacing, and a fuel-concentration index. Do not infer aggregate generation from mixed-fuel plumes without these features.
+### Plant-hour table
 
-## Data and preparation
+Store CAMPD hourly operation and emissions with facility and unit attributes in one Zstd-compressed Parquet file. Retain stable identifiers, coordinates, fuel, capacity, unit type, controls, operating time, gross load, and NOx mass.
 
-### TEMPO and meteorology
+### Power-price tables
 
-- Use standard V04 Level-3 NO2 as the sole satellite input. Retain its 0.02-degree grid, scan timestamp, retrieval uncertainty, quality information, and coverage indicators.
-- Include column uncertainty, quality flags, cloud properties, geometry, pressure, terrain, albedo, and boundary-layer height.
-- Use archived HRRR model runs for training and live HRRR for inference. For each observation, select a weather field valid at the TEMPO scan time from a model cycle available by the decision timestamp.
-- Use HRRR wind components near 100, 200, 300, and 500 m; interpolate at stack and plume-rise heights.
-- Add stability, wind shear, and disagreement across vertical levels.
-- Use HRRR temperature in two roles. Plant-local and regional 2 m temperature enter the expectation model to capture weather-driven load and dispatch. Vertical temperature profiles, potential-temperature gradients, and derived stability enter the TEMPO model to represent plume rise and boundary-layer mixing.
-- Keep HRRR inputs tabular in the primary experiment. Summarize plant-local, regional, upwind, downwind, and vertical-profile conditions instead of adding a meteorology raster.
+Store one Zstd-compressed Parquet file per ISO and calendar month. Each file contains both markets and identifies the ISO, market, location, location type, UTC interval, LMP components, settlement status, native interval length, retrieval time, and source.
 
-### Regional electricity data
+### Plant-to-price crosswalk
 
-- Use the EIA-930 Hourly Electric Grid Monitor as the nationwide source. Map each plant to its balancing authority using EIA-860 metadata.
-- Use hourly balancing-authority demand after EIA publishes it, which respondents must provide within 60 minutes after the reported hour. Use the current-day demand forecast only after its publication time.
-- Treat generation by fuel and total interchange as recent-history features because EIA publishes them with a one-day lag. Treat interchange with neighboring balancing authorities as a two-day-lag feature.
-- Derive demand level, one- and three-hour ramps, demand forecast error, hour-of-week demand percentile, and temperature-conditioned demand surprise. Add lagged coal and gas generation shares and net interchange as secondary features.
-- Archive each API response with retrieval and source-publication timestamps. The historical API may contain revisions that were unavailable at the original decision time.
-- Keep direct ISO and RTO feeds outside the core paper. They can provide five-minute load, fuel mix, prices, and outages in a later market-specific implementation.
+Create a versioned crosswalk with one row per plant and effective period. Include:
 
-### Plants and labels
+- CAMPD facility ID and coordinates.
+- ISO and balancing authority.
+- Price location ID, name, and type.
+- Mapping method and source.
+- Effective start and end dates.
+- Distance or other match-quality diagnostics.
+- Manual-review status.
 
-Use capacity, fuel, unit type, stack height, controls, commissioning age, heat rate, and member locations. Build CAMPD labels for NOx, gross load, operating time, and operating-state changes.
+Do not derive mappings during each analysis run. Build the crosswalk once, review ambiguous assignments, and use effective dates to handle boundary or market-definition changes.
 
-Revise the current collection before modeling power. It sums facility NOx but retains one representative unit's gross load. The new aggregation must sum compatible electrical loads and separate steam-load records. The scraper should retain SO2 and CO2 for future work, along with heat input, load units, status fields, method-of-determination fields, zero operation, and missingness.
+### Time alignment
 
-### Physical representation
+Use UTC as the storage and join key. Preserve source time zones and daylight-saving fields when needed for audits. Attach each plant-hour to the price interval with the same UTC start time.
 
-- Align CAMPD hours to facility time zone and TEMPO exposure time; test plume-travel lags.
-- Extract fixed plant-centered patches from the V04 Level-3 grid and transform copies into downwind and crosswind coordinates.
-- Derive upwind background, downwind enhancement, plume width and decay, directional derivative, flux divergence, column tendency, matched-filter response, and signal-to-uncertainty ratio.
-- Compare single scans with adjacent scans, daily samples, and rolling multi-day samples.
-- Apply consistent cloud and quality tests across sequences while retaining missingness indicators.
+TEMPO scans do not align with the top of each hour. Record scan start, midpoint, and end times. Link the scan to the plant operating hour that overlaps the exposure, then test adjacent hours to account for plume travel and reporting alignment.
 
-Do not upsample the V04 Level-3 grid or claim sub-grid structure. Response kernels, plume coordinates, and changing winds can address source resolution within the observed grid. Revisit super-resolution only if a mass-conserving model improves held-out emission or event estimates after downsampling.
+## TEMPO detection study
 
-## Models and experiments
+### Observation construction
+
+Extract a fixed plant-centered TEMPO Level-3 NO2 patch for each usable scan. Keep the native grid. Store retrieval quality, cloud information, uncertainty, viewing geometry, and the fraction of valid pixels.
+
+Use wind fields to define upwind and downwind regions. Candidate summaries include background-adjusted column enhancement, downwind signal-to-noise ratio, plume alignment, and matched-filter response. A raster model may complement these summaries after the physical baseline is established.
+
+### Prediction target
+
+Estimate three probabilities for each usable plant-scan observation:
+
+- Start.
+- Stop.
+- No state change.
+
+Evaluate an operating-versus-off model as a supporting task. Keep continuous gross-load and NOx-change targets for sensitivity analysis, but center phase one on state transitions.
+
+### Baselines
+
+Compare the TEMPO system against these information sets:
+
+1. Calendar and plant characteristics.
+2. Calendar, plant characteristics, weather, and historical operating profiles.
+3. The second baseline plus regional demand and public grid conditions available by the decision time.
+4. An oracle baseline that adds recent CAMPD operation without treating it as a deployable input.
+5. The strongest deployable baseline with TEMPO physical summaries.
+6. The strongest deployable baseline with a wind-conditioned TEMPO patch encoder.
+
+TEMPO adds value only if it improves held-out event detection over the strongest non-satellite baseline.
+
+### Validation design
+
+Use time-based splits and plant-held-out splits. A time split measures monitoring at known plants; a plant split measures transfer to facilities absent from training.
+
+Report precision-recall area, event precision and recall, false alerts per plant-day, detection delay, and probability calibration. Break results out by fuel, event direction, NOx magnitude, cloud fraction, wind speed, source isolation, and distance to nearby emitters.
+
+Measure coverage as well as accuracy. A system that performs well on a small clear-sky subset may still have limited monitoring value. Allow the model to abstain when cloud, retrieval quality, or source confusion prevents a defensible prediction.
+
+## Power-price analysis
+
+### Descriptive event study
+
+For each confirmed CAMPD start or stop, construct an event window around the transition. Plot day-ahead prices, real-time prices, and their spread in event time. Normalize outcomes against the same location's hour-of-week baseline.
+
+Estimate average event-time changes with plant, price-location, calendar, and hour controls. Cluster uncertainty by price location and date where the sample supports it. Report starts and stops separately.
+
+### Matched comparisons
+
+Match each event hour to non-event observations at the same plant or price location with similar season, hour, weather, regional demand, and prior price conditions. Exclude control hours near another large plant event in the same zone.
+
+This comparison reduces dispatch and seasonality confounding. It does not remove all system-level causes that can affect plant operation and prices at the same time.
+
+### Incremental prediction test
+
+Create a walk-forward model for real-time price changes and real-time minus day-ahead spreads. Use only features available by each forecast timestamp.
 
 Compare:
 
-1. Seasonal median and raw exponential-moving-average expectations.
-2. Cold-start fleet quantile expectation.
-3. Plant-calibrated fleet expectation.
-4. Plant characteristics and weather without TEMPO.
-5. Plant characteristics, weather, and EIA-930 regional electricity data without TEMPO.
-6. Directional-derivative or flux-divergence emission estimates without supervised raster features.
-7. Physics summaries plus plant characteristics, weather, and regional electricity data.
-8. Wind-conditioned V04 Level-3 raster model.
-9. A hybrid model that combines the physical estimator and the raster model.
-10. Temporal versions of the combined model.
+1. Price, calendar, weather, demand, and public grid-history features.
+2. The same model plus CAMPD event labels, as an upper bound that may arrive too late for live use.
+3. The first model plus TEMPO event probabilities and scene-quality measures.
 
-Ablate NO2, EIA-930 regional demand, tendency features, vertical winds, temperature and stability features, uncertainty, plant characteristics, and temporal context. Claim satellite value only if the combined model beats the plant-weather-electricity baseline on held-out plants or times.
+The TEMPO signal has prospective value if the third model improves out-of-sample error or tail-event detection and the scan product arrives before the target decision cutoff. Report results with and without CAMPD labels to separate detection skill from operational latency.
 
-Use two hybrid forms. First, feed the directional-derivative or flux-divergence estimate and its uncertainty diagnostics into the supervised model. Second, fit a past-only residual correction to the physical estimate and stack its out-of-fold prediction with the raster model. Compare these with a scene-quality gate that favors the physical branch under identifiable, high-signal conditions and allows the raster branch to dominate when derivatives become noisy. Keep the uncorrected physical estimate as a benchmark so the hybrid's gain and any loss of transferability remain visible.
+### Heterogeneity
 
-## Existing event support
+Test whether price associations differ by:
 
-The coal data contain 5.18 million unit-hours and 2.93 million facility-hours across 178 facilities. An exploratory event rule, an hourly change above 25% of a facility's 95th-percentile level, found:
+- Start versus stop.
+- Plant capacity and fuel.
+- Load zone versus hub mapping.
+- System load and reserve conditions.
+- Congested versus uncongested hours.
+- Expected versus unexpected events based on day-ahead prices and public grid data.
 
-- 33,123 gross-load changes, including 15,972 during approximate daylight hours.
-- 74,597 NOx changes, including 37,197 during approximate daylight hours.
-- Daylight load events at 175 facilities and daylight NOx events at all 178.
+Pre-specify the main comparisons. Treat the rest as exploratory and control false discoveries when testing many event windows or subgroups.
 
-These counts establish label-stage feasibility. TEMPO coverage, clouds, sequence requirements, and identifiability will reduce support. The final labels will use out-of-sample residuals and require operating time, load, adjacent hours, and status fields where available.
+## Near-real-time constraints
 
-## Evaluation
+The research system must track when each input becomes available, not only when the underlying event occurred.
 
-### Atmospheric science
+For each source, record:
 
-- Hold out source groups to test transfer and hold out time to test known-site monitoring.
-- Report results by source class, fuel, emission magnitude, wind, cloud, spacing, and identifiability.
-- Use MAE, normalized MAE, R2, rank correlation, calibration, and plant-macro averages.
-- Use precision-recall area, event F1, false alarms per observation, and detection delay for derived events.
-- Estimate detection limits for NOx, operating changes, and each source-separation regime.
-- Report accuracy, calibration, coverage, and inference time separately. Measure latency from the availability of V04 Level-3 and the selected HRRR cycle. Record HRRR initialization, forecast lead, and provider-availability timestamps.
+- Event or observation time.
+- Source publication time.
+- Retrieval time.
+- Revision or settlement status.
 
-### Commodity research
+Historical CAMPD records provide labels but may not support live detection. Final real-time prices support retrospective evaluation; preliminary prices may be required for a deployed monitor. TEMPO product latency must be measured from observed file arrival rather than assumed from nominal schedules.
 
-Use a walk-forward backtest with observation-availability timestamps. Reproduce cloud gaps, V04 Level-3 latency, HRRR model-cycle availability, and EIA-930 publication lags. Exclude revised or future records, and compare against weather, ISO prices and outages, EIA data, and other public inputs.
+Run the full evaluation as a historical replay. Delay each feature until its recorded availability time. Report detection accuracy and end-to-end latency as separate outcomes.
 
-Test plant anomalies and regional thermal-availability aggregates against nodal or hub power-price spreads. Statistical detection has economic value only if the signal improves forecasts after public information available at release time.
+## Bias and failure modes
 
-## Decision rules
+Address these risks before interpreting results:
 
-- **Satellite input:** use standard V04 Level-3 NO2 for all planned models. Leave Level-2, NRT, and SO2 extensions outside the current scope.
-- **Attribution:** report plant estimates only when response kernels pass an identifiability threshold.
-- **Fuel:** use coal as the primary detectability stratum and mixed fuels as the transfer and attribution test.
-- **Cadence:** select the shortest interval with stable held-out skill.
-- **Target:** model continuous residuals; use direct classification only if it improves calibration or represents a distinct status.
-- **Expectation:** use fleet quantiles for unseen plants and past-only plant calibration for known sites. Include EIA-930 regional demand only when the source had published it by the decision timestamp; use generation and interchange as lagged history.
-- **Market claim:** require signal availability before, or incremental to, standard public data.
+- **Cloud selection:** observable events may differ by season, region, and weather.
+- **Shared causes:** demand, outages, weather, and fuel constraints can move plant operation and prices together.
+- **Dispatch endogeneity:** high prices can cause a plant start, while a plant outage can also raise prices.
+- **Spatial mismatch:** a hub price can dilute a local plant effect.
+- **Source confusion:** nearby emitters can create a TEMPO signal that the model assigns to the wrong plant.
+- **Label error:** CAMPD timestamps, unit aggregation, and zero-operation rules can shift event labels.
+- **Revisions:** final price and emissions records may contain information unavailable in real time.
 
-## Paper framing
+Use negative-control hours, placebo event times, alternative event definitions, and mapping-quality filters. Present the price work as correlation and forecasting unless a later design establishes causal identification.
 
-**Atmospheric-science question:** Under which source and atmospheric conditions can standard TEMPO V04 Level-3 NO2 detect and attribute anomalous power-sector NOx emissions? Contributions include an expectation-based target, HRRR-informed plume representation, a comparison of physical and learned estimators, and fuel-specific detection limits. The climate link concerns fossil-generation changes and co-emitted pollutants; TEMPO does not measure CO2 directly.
+## Decision gates
 
-**Commodity application:** Can TEMPO anomaly scores improve regional thermal-availability and power-spread forecasts? Keep this as a separate application unless the walk-forward results support an economic claim.
+Proceed in stages:
 
-## Literature anchors
+1. **Label audit:** CAMPD start and stop labels pass manual review across fuels and operating patterns.
+2. **Coverage audit:** enough events overlap usable TEMPO scans in the six retained ISOs.
+3. **Detection gate:** TEMPO improves event detection over non-satellite baselines on held-out times or plants.
+4. **Mapping audit:** each retained plant has a reviewed price-location assignment with effective dates.
+5. **Market gate:** TEMPO probabilities improve walk-forward price or spread forecasts after enforcing data-availability times.
+6. **Deployment gate:** measured TEMPO latency and coverage support a useful alert window.
+
+Failure at a gate still produces a useful result, such as a detection-limit estimate, a map of observable plants, or evidence that latency prevents market use.
+
+## Initial deliverables
+
+1. Audited facility-level start and stop table from August 1, 2023 onward.
+2. Six-ISO hourly price archive with day-ahead, real-time, and price components.
+3. Versioned plant-to-price-location crosswalk.
+4. Event-count and TEMPO-overlap report by ISO, fuel, and plant.
+5. Baseline CAMPD event study of prices without TEMPO.
+6. TEMPO event detector with held-out accuracy, coverage, and latency results.
+7. Walk-forward test of whether TEMPO event probabilities add price information.
+
+## Primary paper framing
+
+**Main question:** Under which atmospheric and source conditions can TEMPO detect power-plant starts and stops near the time they occur?
+
+**Application question:** Do those detections provide timely information about thermal availability and regional wholesale power-price surprises?
+
+The paper should lead with detection validity, coverage, and latency. Power prices provide a concrete system-level application and a test of incremental information. Economic claims require walk-forward gains after enforcing the publication time of every competing input.
+
+## Literature and data references
 
 - [Sun et al.: hourly TEMPO NOx emissions](https://doi.org/10.1029/2025JD044565)
 - [Beirle et al.: point-source NOx flux divergence](https://doi.org/10.5194/essd-13-2995-2021)
-- [Koene et al.: divergence-method limits](https://doi.org/10.1029/2023JD039904)
-- [Kuhlmann et al.: temporal variability and source aggregation](https://doi.org/10.5194/acp-26-4405-2026)
-- [TEMPO V04 trace-gas guide](https://asdc.larc.nasa.gov/documents/tempo/guide/TEMPO_Level-2-3_trace_gas_clouds_user_guide_V2.1.pdf)
-- [NOAA HRRR model and open archive](https://registry.opendata.aws/noaa-hrrr-pds/)
-- [NOAA operational model access](https://nomads.ncep.noaa.gov/)
-- [EIA-930 reporting schedule](https://www.eia.gov/Survey/)
-- [EIA electricity API](https://www.eia.gov/opendata/index.php/browser/electricity/rto)
+- [Koene et al.: limits of divergence-based NOx estimates](https://doi.org/10.1029/2023JD039904)
+- [TEMPO trace-gas and cloud product guide](https://asdc.larc.nasa.gov/documents/tempo/guide/TEMPO_Level-2-3_trace_gas_clouds_user_guide_V2.1.pdf)
+- [EPA CAMPD](https://campd.epa.gov/)
+- [NOAA HRRR archive](https://registry.opendata.aws/noaa-hrrr-pds/)
