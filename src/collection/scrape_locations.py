@@ -1,38 +1,20 @@
-"""Add current facility attributes to hourly emissions in compressed Parquet."""
+"""Add current facility attributes to hourly emissions with Polars."""
 
 import os
 import time
 from datetime import date
 from pathlib import Path
 
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
+import polars as pl
 import requests
 
-from config import EMISSIONS_RECORDS_CSV, EMISSIONS_START_DATE, FULL_DATA_PARQUET
+from config import EMISSIONS_RECORDS_PARQUET, EMISSIONS_START_DATE, FULL_DATA_PARQUET
 from prerequisites import require_campd_credentials
 
 API_URL = "https://api.epa.gov/easey/facilities-mgmt/facilities/attributes"
-CHUNK_SIZE = 500_000
 MAX_RETRIES = 3
 RECORDS_PER_PAGE = 500
 ROW_GROUP_SIZE = 250_000
-
-EMISSIONS_DTYPES = {
-    "stateCode": "string",
-    "facilityName": "string",
-    "facilityId": "Int64",
-    "unitId": "string",
-    "date": "string",
-    "hour": "Int8",
-    "opTime": "Float64",
-    "noxMass": "Float64",
-    "noxRate": "Float64",
-    "grossLoad": "Float64",
-    "primaryFuelInfo": "string",
-    "unitType": "string",
-}
 
 FACILITY_ATTRIBUTE_COLUMNS = {
     "year": "facilityAttributeYear",
@@ -65,15 +47,22 @@ UNIT_ATTRIBUTE_COLUMNS = {
     "so2Phase": "so2Phase",
 }
 
-ATTRIBUTE_STRING_COLUMNS = [
-    "county",
-    "countyCode",
-    "fipsCode",
-    "nercRegion",
-    "sourceCategory",
-    "ownerOperator",
-    *(column for column in UNIT_ATTRIBUTE_COLUMNS.values() if column != "maxHourlyHIRate"),
-]
+ATTRIBUTE_SCHEMA = {
+    "facilityId": pl.Int64,
+    "unitId": pl.String,
+    "year": pl.Int64,
+    "latitude": pl.Float64,
+    "longitude": pl.Float64,
+    "epaRegion": pl.Float64,
+    **{
+        column: pl.String
+        for column in (
+            (set(FACILITY_ATTRIBUTE_COLUMNS) | set(UNIT_ATTRIBUTE_COLUMNS))
+            - {"year", "latitude", "longitude", "epaRegion", "maxHourlyHIRate"}
+        )
+    },
+    "maxHourlyHIRate": pl.Float64,
+}
 
 
 def _fetch_attribute_page(
@@ -151,72 +140,42 @@ def get_facility_attributes(
     return []
 
 
-def _build_attribute_frames(
-    records: list[dict[str, object]],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _build_attribute_frames(records: list[dict[str, object]]) -> tuple[pl.DataFrame, pl.DataFrame]:
     # Separate facility-level fields from unit-level fields before the hourly join
-    attributes = pd.DataFrame.from_records(records)
-    required_columns = {"facilityId", "unitId", *FACILITY_ATTRIBUTE_COLUMNS, *UNIT_ATTRIBUTE_COLUMNS}
-    attributes = attributes.reindex(columns=sorted(required_columns))
-    attributes["facilityId"] = pd.to_numeric(attributes["facilityId"], errors="coerce").astype("Int64")
-    attributes["unitIdKey"] = attributes["unitId"].astype("string").str.strip()
-
-    facility_columns = ["facilityId", *FACILITY_ATTRIBUTE_COLUMNS]
-    facility_attributes = (
-        attributes[facility_columns]
-        .rename(columns=FACILITY_ATTRIBUTE_COLUMNS)
-        .drop_duplicates(subset=["facilityId"], keep="first")
+    attributes = pl.DataFrame(records, schema=ATTRIBUTE_SCHEMA, strict=False).with_columns(
+        pl.col("unitId").str.strip_chars()
     )
-
-    unit_columns = ["facilityId", "unitIdKey", *UNIT_ATTRIBUTE_COLUMNS]
+    facility_attributes = (
+        attributes.select(
+            "facilityId",
+            *(pl.col(source).alias(target) for source, target in FACILITY_ATTRIBUTE_COLUMNS.items()),
+        )
+        .unique(subset="facilityId", keep="first", maintain_order=True)
+    )
     unit_attributes = (
-        attributes[unit_columns]
-        .rename(columns=UNIT_ATTRIBUTE_COLUMNS)
-        .drop_duplicates(subset=["facilityId", "unitIdKey"], keep="first")
+        attributes.select(
+            "facilityId",
+            pl.col("unitId").alias("unitIdKey"),
+            *(pl.col(source).alias(target) for source, target in UNIT_ATTRIBUTE_COLUMNS.items()),
+        )
+        .unique(subset=["facilityId", "unitIdKey"], keep="first", maintain_order=True)
     )
     return facility_attributes, unit_attributes
-
-
-def _augment_chunk(
-    chunk: pd.DataFrame,
-    facility_attributes: pd.DataFrame,
-    unit_attributes: pd.DataFrame,
-) -> pd.DataFrame:
-    # Join approved attributes and stabilize Parquet column types
-    data = chunk.copy()
-    data["facilityId"] = pd.to_numeric(data["facilityId"], errors="coerce").astype("Int64")
-    data["unitId"] = data["unitId"].astype("string").str.strip()
-    data["unitIdKey"] = data["unitId"]
-    augmented = data.merge(facility_attributes, on="facilityId", how="left")
-    augmented = augmented.merge(unit_attributes, on=["facilityId", "unitIdKey"], how="left")
-    augmented = augmented.drop(columns="unitIdKey")
-
-    augmented["facilityAttributeYear"] = pd.to_numeric(
-        augmented["facilityAttributeYear"],
-        errors="coerce",
-    ).astype("Int64")
-    for column in ("lat", "lon", "epaRegion", "maxHourlyHIRate"):
-        augmented[column] = pd.to_numeric(augmented[column], errors="coerce").astype("Float64")
-    for column in ATTRIBUTE_STRING_COLUMNS:
-        augmented[column] = augmented[column].astype("string")
-    return augmented.dropna(subset=["lat", "lon", "epaRegion"])
 
 
 def write_augmented_parquet(
     input_path: Path,
     output_path: Path,
-    facility_attributes: pd.DataFrame,
-    unit_attributes: pd.DataFrame,
-    chunk_size: int = CHUNK_SIZE,
+    facility_attributes: pl.DataFrame,
+    unit_attributes: pl.DataFrame,
 ) -> int:
     """Stream enriched emissions into one atomic Zstd Parquet file.
 
     Args:
-        input_path: Raw hourly emissions CSV.
+        input_path: Raw hourly emissions Parquet file.
         output_path: Final compressed Parquet file.
         facility_attributes: One row of facility attributes per facility.
         unit_attributes: One row of unit attributes per facility and unit.
-        chunk_size: Number of CSV rows read per batch.
 
     Returns:
         Number of enriched rows written.
@@ -224,55 +183,60 @@ def write_augmented_parquet(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_suffix(output_path.suffix + ".part")
     temporary_path.unlink(missing_ok=True)
-    writer: pq.ParquetWriter | None = None
-    schema: pa.Schema | None = None
-    row_count = 0
+
+    source = pl.scan_parquet(input_path)
+    missing_columns = {"facilityId", "unitId"}.difference(source.collect_schema().names())
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Raw hourly emissions Parquet is missing required columns: {missing}")
+
+    unit_id = pl.col("unitId").cast(pl.String, strict=False).str.strip_chars()
+    augmented = (
+        source.with_columns(
+            pl.col("facilityId").cast(pl.Int64, strict=False),
+            unit_id.alias("unitId"),
+            unit_id.alias("unitIdKey"),
+        )
+        .join(facility_attributes.lazy(), on="facilityId", how="left")
+        .join(unit_attributes.lazy(), on=["facilityId", "unitIdKey"], how="left")
+        .drop("unitIdKey")
+        .drop_nulls(["lat", "lon", "epaRegion"])
+    )
 
     try:
-        reader = pd.read_csv(input_path, dtype=EMISSIONS_DTYPES, chunksize=chunk_size)
-        for chunk in reader:
-            augmented = _augment_chunk(chunk, facility_attributes, unit_attributes)
-            if augmented.empty:
-                continue
-            table = pa.Table.from_pandas(augmented, preserve_index=False)
-            if writer is None:
-                schema = table.schema
-                writer = pq.ParquetWriter(
-                    temporary_path,
-                    schema,
-                    compression="zstd",
-                    use_dictionary=True,
-                )
-            elif schema is not None:
-                table = table.cast(schema)
-            writer.write_table(table, row_group_size=ROW_GROUP_SIZE)
-            row_count += len(augmented)
+        augmented.sink_parquet(
+            temporary_path,
+            compression="zstd",
+            statistics=True,
+            row_group_size=ROW_GROUP_SIZE,
+        )
+        row_count = pl.scan_parquet(temporary_path).select(pl.len()).collect().item()
+        if row_count == 0:
+            raise RuntimeError("No emissions rows had complete facility location attributes")
+        os.replace(temporary_path, output_path)
     except BaseException:
-        if writer is not None:
-            writer.close()
         temporary_path.unlink(missing_ok=True)
         raise
-    else:
-        if writer is not None:
-            writer.close()
-
-    if row_count == 0:
-        temporary_path.unlink(missing_ok=True)
-        raise RuntimeError("No emissions rows had complete facility location attributes")
-    os.replace(temporary_path, output_path)
     return row_count
 
 
 def main() -> None:
-    """Write emissions records augmented with current facility attributes."""
+    """Write hourly emissions enriched with current facility attributes."""
     require_campd_credentials()
 
-    facility_ids: set[int] = set()
-    for chunk in pd.read_csv(EMISSIONS_RECORDS_CSV, usecols=["facilityId"], chunksize=CHUNK_SIZE):
-        facility_ids.update(chunk["facilityId"].dropna().astype(int).unique())
+    input_path = Path(EMISSIONS_RECORDS_PARQUET)
+    facility_ids = (
+        pl.scan_parquet(input_path)
+        .select(pl.col("facilityId").cast(pl.Int64, strict=False))
+        .drop_nulls()
+        .unique()
+        .sort("facilityId")
+        .collect()["facilityId"]
+        .to_list()
+    )
 
     attribute_records: list[dict[str, object]] = []
-    for facility_id in sorted(facility_ids):
+    for facility_id in facility_ids:
         attribute_records.extend(
             get_facility_attributes(
                 facility_id,
@@ -284,9 +248,8 @@ def main() -> None:
         raise RuntimeError("CAMPD returned no facility attributes")
 
     facility_attributes, unit_attributes = _build_attribute_frames(attribute_records)
-
     row_count = write_augmented_parquet(
-        input_path=Path(EMISSIONS_RECORDS_CSV),
+        input_path=input_path,
         output_path=Path(FULL_DATA_PARQUET),
         facility_attributes=facility_attributes,
         unit_attributes=unit_attributes,

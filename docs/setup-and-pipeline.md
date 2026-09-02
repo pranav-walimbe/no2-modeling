@@ -117,9 +117,12 @@ source .venv/bin/activate
 3. Partition plants and generate model-ready datasets:
 
    ```bash
-   python -u -m preprocessing.partition_plants
+   python -u -m preprocessing.stratify_plants
    python -u -m preprocessing.generate_dataset
    ```
+
+   Pass `--overwrite` to `stratify_plants` to rebuild and replace the cached
+   TEMPO timestamp mapping. Without the flag, an existing mapping is reused.
 
 4. Train and evaluate the model:
 

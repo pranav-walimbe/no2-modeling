@@ -206,9 +206,10 @@ cython_debug/
 
 # Local agent handoff state
 AGENTS.md
+/.agents/
 
 # Local analysis and batch scripts
-/scripts/
+/scripts/slurm/
 /src/eda/
 
 # Marimo
