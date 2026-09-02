@@ -30,18 +30,6 @@ FULL_DATA_PARQUET = os.path.join(
 )  # emissions merged with plant metadata
 
 # ============================================================================
-# Power price scraping
-# ============================================================================
-POWER_PRICE_START_DATE = EMISSIONS_START_DATE
-POWER_PRICE_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/power_prices"
-POWER_PRICE_DERIVED_DIR = os.path.join(POWER_PRICE_BASE_DIR, "derived", "hourly_spreads")
-POWER_PRICE_METADATA_DIR = os.path.join(POWER_PRICE_BASE_DIR, "metadata")
-POWER_PRICE_TEMP_DIR = os.path.join(POWER_PRICE_BASE_DIR, "temporary")
-PLANT_ZONE_MAPPING = os.path.join(
-    POWER_PRICE_METADATA_DIR, "node_zone_mapping", "plant_zone_mapping.parquet"
-)
-
-# ============================================================================
 # TEMPO data scraping
 # ============================================================================
 TEMPO_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/TEMPO"
