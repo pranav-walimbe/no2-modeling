@@ -210,6 +210,10 @@ AGENTS.md
 # Local analysis and batch scripts
 /scripts/
 /src/eda/
+/src/collection/map_plant_zones.py
+/src/collection/plant_zone_mapping.py
+/src/collection/power_price_sources.py
+/src/collection/scrape_power_prices.py
 
 # Marimo
 marimo/_static/
