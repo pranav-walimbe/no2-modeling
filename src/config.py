@@ -1,7 +1,7 @@
 """Configuration values for collection, preprocessing, and modeling."""
 
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 
 from dotenv import load_dotenv
 
@@ -42,15 +42,24 @@ PLANT_ZONE_MAPPING = os.path.join(
 )
 
 # ============================================================================
+# TEMPO data scraping
+# ============================================================================
+TEMPO_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/TEMPO"
+TEMPO_LEVEL = "L2"  # native-pixel product; supported values are L2 and L3
+TEMPO_VERSION = "V04"  # supported values are V03 and V04
+TEMPO_PRODUCT = f"TEMPO_NO2_{TEMPO_LEVEL}"
+TEMPO_DIR = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION, TEMPO_LEVEL, "raw")
+TEMPO_MAPPING = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION, TEMPO_LEVEL, "tempo_mapping", "tempo.pkl")
+TEMPO_DOWNLOAD_BATCH_SIZE = 100  # bounds downloader memory and retry scope
+TEMPO_START_DATE = "2023-08-02 00:00:00"  # beginning of the TEMPO science record
+TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
+
+# ============================================================================
 # Stratification
 # ============================================================================
 MINS_FILTER = 60  # max time delta (minutes) between emissions record and TEMPO image
 IMG_RANGE = 72  # spatial extent of extracted image patch (km)
-MIN_TEMPO_DURATION = 58  # minimum TEMPO scan duration to accept (minutes)
-TEMPO_MAPPING = (
-    "/global/scratch/projects/fc_nitrates/ddp/nox/TEMPO/tempo_mapping/tempo.pkl"  # cached (image, timestamp) lookup map
-)
-TEMPO_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/TEMPO/V03/tmp"  # raw downloaded TEMPO files
+MIN_TEMPO_DURATION = 58  # minimum L3 scan duration to accept (minutes)
 STRAT_BASE_DIR = (
     "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # output directory for stratified splits
 )
@@ -68,13 +77,6 @@ WIND_START_MONTH = 8  # ERA5 download start month
 WIND_START_YEAR = 2023  # ERA5 download start year
 WIND_END_MONTH = 12  # ERA5 download end month
 WIND_END_YEAR = 2025  # ERA5 download end year
-
-# ============================================================================
-# TEMPO data scraping
-# ============================================================================
-TEMPO_START_DATE = "2023-08-12 00:00:00"  # TEMPO download start (instrument available from Aug 2023)
-TEMPO_END_DATE = "2025-09-17 00:00:00"  # TEMPO download end
-TEMPO_VERSION = "V03"  # TEMPO product version
 
 # ============================================================================
 # Dataset generation

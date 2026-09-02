@@ -39,7 +39,6 @@ pip-delete-this-directory.txt
 # Unit test / coverage reports
 /tests/
 /logs/
-/scripts/push.sh
 htmlcov/
 .tox/
 .nox/
@@ -209,7 +208,7 @@ AGENTS.md
 /.agents/
 
 # Local analysis and batch scripts
-/scripts/slurm/
+/scripts/
 /src/eda/
 
 # Marimo

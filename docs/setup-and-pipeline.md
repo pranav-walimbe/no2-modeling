@@ -100,21 +100,33 @@ module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
 ```
 
-1. Download TEMPO and ERA5 data:
+1. Select the TEMPO collection in `src/config.py`. `TEMPO_LEVEL` accepts `L2`
+   or `L3`, and `TEMPO_VERSION` accepts `V03` or `V04`. The default is raw L2
+   V04. Files are stored under:
+
+   ```text
+   TEMPO/<version>/<level>/raw/<year>/<month>/
+   ```
+
+2. Download TEMPO and ERA5 data:
 
    ```bash
    python -u -m collection.scrape_tempo
    python -u -m collection.scrape_era5
    ```
 
-2. Download EPA emissions and facility locations:
+   The TEMPO scraper searches one month at a time, downloads in batches set by
+   `TEMPO_DOWNLOAD_BATCH_SIZE`, and skips files already present at their final
+   path. Rerunning the same range is therefore idempotent for completed files.
+
+3. Download EPA emissions and facility locations:
 
    ```bash
    python -u -m collection.scrape_emissions
    python -u -m collection.scrape_locations
    ```
 
-3. Partition plants and generate model-ready datasets:
+4. Partition plants and generate model-ready datasets:
 
    ```bash
    python -u -m preprocessing.stratify_plants
@@ -123,8 +135,11 @@ source .venv/bin/activate
 
    Pass `--overwrite` to `stratify_plants` to rebuild and replace the cached
    TEMPO timestamp mapping. Without the flag, an existing mapping is reused.
+   The downloader accepts L2 and L3. `stratify_plants` currently reads NASA's
+   L3 grid schema, so it stops with a clear error when raw L2 is selected. L2
+   must first be quality-filtered and gridded by AOI before stratification.
 
-4. Train and evaluate the model:
+5. Train and evaluate the model:
 
    ```bash
    python -u -m modeling.training

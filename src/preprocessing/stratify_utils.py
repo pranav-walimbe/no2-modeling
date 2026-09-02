@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import netCDF4 as nc
@@ -23,6 +24,7 @@ from config import (
     NUM_CORES,
     STRAT_VIS_PNG,
     TEMPO_DIR,
+    TEMPO_LEVEL,
     TEMPO_MAPPING,
 )
 
@@ -46,18 +48,20 @@ def select_tempo_after(
     return min(eligible, default=(None, None), key=lambda item: item[0])[1]
 
 
-def parse_tile(filename: str) -> tuple[datetime, str] | None:
-    """Return the timestamp and filename when a tile meets the duration requirement."""
+def parse_tile(paths: tuple[str, str]) -> tuple[datetime, str] | None:
+    """Return the timestamp and relative path for a qualifying L3 tile."""
+    absolute_path, relative_path = paths
     try:
-        with nc.Dataset(os.path.join(TEMPO_DIR, filename)) as dataset:
+        with nc.Dataset(absolute_path) as dataset:
             start = datetime.fromisoformat(dataset.time_coverage_start.replace("Z", "+00:00"))
             end = datetime.fromisoformat(dataset.time_coverage_end.replace("Z", "+00:00"))
         if (end - start).total_seconds() / 60 < MIN_TEMPO_DURATION:
             return None
+        filename = Path(relative_path).name
         timestamp = datetime.strptime(filename.split("_")[4], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-        return timestamp, filename
+        return timestamp, relative_path
     except (IndexError, OSError, RuntimeError, ValueError) as error:
-        print(f"WARNING: skipping {filename}: {error}")
+        print(f"WARNING: skipping {relative_path}: {error}")
         return None
 
 
@@ -85,19 +89,20 @@ def normalize_tempo_mapping(mapping: dict) -> dict[date, list[tuple[datetime, st
 
 def build_tempo_mapping(overwrite: bool = False) -> dict[date, list[tuple[datetime, str]]]:
     """Map dates to qualifying TEMPO tiles with optional cache replacement."""
+    if TEMPO_LEVEL != "L3":
+        raise RuntimeError("Raw TEMPO L2 granules must be gridded before stratification")
     if not overwrite and os.path.exists(TEMPO_MAPPING):
         with open(TEMPO_MAPPING, "rb") as file:
             return normalize_tempo_mapping(pickle.load(file))
 
-    filenames = [filename for filename in os.listdir(TEMPO_DIR) if filename.endswith(".nc")]
+    tempo_root = Path(TEMPO_DIR)
+    paths = ((str(path), str(path.relative_to(tempo_root))) for path in tempo_root.rglob("*.nc") if path.is_file())
     with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
-        results = list(executor.map(parse_tile, filenames))
-
-    tempo_by_date = defaultdict(list)
-    for result in results:
-        if result is not None:
-            timestamp, filename = result
-            tempo_by_date[timestamp.date()].append((timestamp, filename))
+        tempo_by_date = defaultdict(list)
+        for result in executor.map(parse_tile, paths, chunksize=32):
+            if result is not None:
+                timestamp, filename = result
+                tempo_by_date[timestamp.date()].append((timestamp, filename))
 
     normalized = normalize_tempo_mapping(tempo_by_date)
     os.makedirs(os.path.dirname(TEMPO_MAPPING), exist_ok=True)
