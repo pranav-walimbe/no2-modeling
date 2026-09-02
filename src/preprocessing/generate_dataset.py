@@ -17,9 +17,9 @@ from config import (
     NUM_CORES,
     PLUME_FILTER_PERCENTILE,
     SPLIT_SIZES,
-    TEST_CSV,
-    TRAIN_CSV,
-    VAL_CSV,
+    TEST_RECORDS_CSV,
+    TRAIN_RECORDS_CSV,
+    VAL_RECORDS_CSV,
     VIS_DIR,
 )
 from preprocessing.imagery import compute_bounds, extract_image_data, filter_by_city_proximity
@@ -96,9 +96,9 @@ def main() -> None:
     os.makedirs(DATASET_DF, exist_ok=True)
     cities_gdf = gpd.read_file(CITIES_URL).to_crs("EPSG:5070")
     splits = {
-        "train": pd.read_csv(TRAIN_CSV),
-        "val": pd.read_csv(VAL_CSV),
-        "test": pd.read_csv(TEST_CSV),
+        "train": pd.read_csv(TRAIN_RECORDS_CSV),
+        "val": pd.read_csv(VAL_RECORDS_CSV),
+        "test": pd.read_csv(TEST_RECORDS_CSV),
     }
     for split, df in splits.items():
         df["date"] = pd.to_datetime(df["date"])

@@ -16,13 +16,13 @@ EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 # ============================================================================
 # Emissions scraping
 # ============================================================================
-EMISSIONS_START_DATE = date(2023, 8, 1)  # start of CAMPD hourly NOx pull
+EMISSIONS_START_DATE = date(2023, 8, 1)  # start of CAMPD hourly emissions pull
 EMISSIONS_END_DATE = date.today()  # request through the latest date available from CAMPD
 EMISSIONS_BASE_DIR = (
     "/global/scratch/projects/fc_nitrates/ddp/nox/nox_emissions"  # HPC output directory for emissions data
 )
-EMISSIONS_RECORDS_CSV = os.path.join(
-    EMISSIONS_BASE_DIR, "nox_emissions_all.csv"
+EMISSIONS_RECORDS_PARQUET = os.path.join(
+    EMISSIONS_BASE_DIR, "nox_emissions_all.parquet"
 )  # raw operating and non-operating hourly records
 FULL_DATA_PARQUET = os.path.join(
     EMISSIONS_BASE_DIR,
@@ -44,24 +44,19 @@ PLANT_ZONE_MAPPING = os.path.join(
 # ============================================================================
 # Stratification
 # ============================================================================
-SAMPLE_SIZE = 500000  # number of rows to run stratification on
 MINS_FILTER = 60  # max time delta (minutes) between emissions record and TEMPO image
 IMG_RANGE = 72  # spatial extent of extracted image patch (km)
 MIN_TEMPO_DURATION = 58  # minimum TEMPO scan duration to accept (minutes)
-PLANT_TYPE = "Coal"  # power plant fuel type filter
 TEMPO_MAPPING = (
     "/global/scratch/projects/fc_nitrates/ddp/nox/TEMPO/tempo_mapping/tempo.pkl"  # cached (image, timestamp) lookup map
 )
 TEMPO_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/TEMPO/V03/tmp"  # raw downloaded TEMPO files
-STRAT_INPUT_CSV = os.path.join(
-    EMISSIONS_BASE_DIR, "nox_emissions_full2.csv"
-)  # emissions CSV with quality and proximity filters applied
 STRAT_BASE_DIR = (
     "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # output directory for stratified splits
 )
-TRAIN_CSV = os.path.join(STRAT_BASE_DIR, "train.csv")  # train split metadata
-VAL_CSV = os.path.join(STRAT_BASE_DIR, "val.csv")  # val split metadata
-TEST_CSV = os.path.join(STRAT_BASE_DIR, "test.csv")  # test split metadata
+TRAIN_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "train_records.csv")  # train split metadata
+VAL_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "val_records.csv")  # validation split metadata
+TEST_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "test_records.csv")  # test split metadata
 VIS_DIR = "/global/home/users/pranavwalimbe/vis"  # output directory for visualizations
 STRAT_VIS_PNG = os.path.join(VIS_DIR, "strat_vis.png")  # stratification distribution plot
 

@@ -1,18 +1,18 @@
-"""Download all CAMPD hourly records and replace the configured raw CSV."""
+"""Download CAMPD hourly records into compressed Parquet."""
 
 import calendar
-import csv
 import json
 import os
 import random
+import tempfile
 import time
 from datetime import date, timedelta
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 import requests
 
-from config import EMISSIONS_END_DATE, EMISSIONS_RECORDS_CSV, EMISSIONS_START_DATE
+from config import EMISSIONS_END_DATE, EMISSIONS_RECORDS_PARQUET, EMISSIONS_START_DATE
 from prerequisites import require_campd_credentials
 
 STATE_CODES = [
@@ -67,7 +67,7 @@ STATE_CODES = [
     "WY",
 ]
 
-NOX_COLS = [
+HOURLY_EMISSIONS_COLUMNS = [
     "stateCode",
     "facilityName",
     "facilityId",
@@ -75,12 +75,50 @@ NOX_COLS = [
     "date",
     "hour",
     "opTime",
-    "noxMass",
-    "noxRate",
     "grossLoad",
+    "noxMass",
+    "noxMassMeasureFlg",
+    "noxRate",
+    "noxRateMeasureFlg",
+    "so2Mass",
+    "so2MassMeasureFlg",
+    "so2Rate",
+    "so2RateMeasureFlg",
+    "co2Mass",
+    "co2MassMeasureFlg",
+    "co2Rate",
+    "co2RateMeasureFlg",
+    "heatInput",
+    "heatInputMeasureFlg",
     "primaryFuelInfo",
     "unitType",
 ]
+HOURLY_STRING_COLUMNS = [
+    "stateCode",
+    "facilityName",
+    "unitId",
+    "noxMassMeasureFlg",
+    "noxRateMeasureFlg",
+    "so2MassMeasureFlg",
+    "so2RateMeasureFlg",
+    "co2MassMeasureFlg",
+    "co2RateMeasureFlg",
+    "heatInputMeasureFlg",
+    "primaryFuelInfo",
+    "unitType",
+]
+HOURLY_FLOAT_COLUMNS = [
+    "opTime",
+    "grossLoad",
+    "noxMass",
+    "noxRate",
+    "so2Mass",
+    "so2Rate",
+    "co2Mass",
+    "co2Rate",
+    "heatInput",
+]
+REQUIRED_RESPONSE_COLUMNS = {"facilityId", "unitId", "date", "hour", "opTime"}
 
 API_URL = "https://api.epa.gov/easey/streaming-services/emissions/apportioned/hourly"
 REQUEST_INTERVAL_SECONDS = 5
@@ -195,18 +233,44 @@ def fetch_chunk(state: str, begin: str, end: str) -> list[dict[str, object]]:
     raise AssertionError("Retry loop exited unexpectedly")
 
 
+def normalize_hourly_records(records: list[dict[str, object]]) -> pl.DataFrame:
+    """Normalize one API response to the stable hourly Parquet schema.
+
+    Args:
+        records: Hourly records returned by the CAMPD API.
+
+    Returns:
+        Records with stable column order and data types.
+    """
+    frame = pl.DataFrame(records, infer_schema_length=None)
+    missing_required = REQUIRED_RESPONSE_COLUMNS.difference(frame.columns)
+    if missing_required:
+        missing = ", ".join(sorted(missing_required))
+        raise ValueError(f"CAMPD response is missing required columns: {missing}")
+
+    missing_optional = set(HOURLY_EMISSIONS_COLUMNS).difference(frame.columns)
+    if missing_optional:
+        frame = frame.with_columns(pl.lit(None).alias(column) for column in sorted(missing_optional))
+    return frame.select(HOURLY_EMISSIONS_COLUMNS).with_columns(
+        pl.col("facilityId").cast(pl.Int64, strict=False),
+        pl.col("hour").cast(pl.Int8, strict=False),
+        pl.col("date").cast(pl.String).str.to_date(strict=False),
+        *(pl.col(column).cast(pl.String, strict=False) for column in HOURLY_STRING_COLUMNS),
+        *(pl.col(column).cast(pl.Float64, strict=False) for column in HOURLY_FLOAT_COLUMNS),
+    )
+
+
 def main() -> None:
-    """Download the configured period and atomically replace the raw CSV."""
+    """Download the configured period and atomically replace raw Parquet."""
     require_campd_credentials()
 
-    output_path = Path(EMISSIONS_RECORDS_CSV)
+    output_path = Path(EMISSIONS_RECORDS_PARQUET)
     temporary_path = output_path.with_suffix(output_path.suffix + ".part")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path.unlink(missing_ok=True)
 
-    header_written = False
     row_count = 0
-    latest_date: str | None = None
+    latest_date: date | None = None
     available_end = latest_completed_quarter_end(date.today())
     effective_end = min(EMISSIONS_END_DATE, available_end)
     if EMISSIONS_START_DATE > effective_end:
@@ -214,39 +278,41 @@ def main() -> None:
     if effective_end < EMISSIONS_END_DATE:
         print(f"Capping CAMPD end date at latest completed quarter: {effective_end}")
 
-    for state in STATE_CODES:
-        for begin, end in month_ranges(EMISSIONS_START_DATE, effective_end):
-            rows = fetch_chunk(state, begin, end)
-            if not rows:
-                time.sleep(REQUEST_INTERVAL_SECONDS)
-                continue
+    try:
+        with tempfile.TemporaryDirectory(prefix=".hourly-parts-", dir=output_path.parent) as directory:
+            parts_directory = Path(directory)
+            part_number = 0
+            for state in STATE_CODES:
+                for begin, end in month_ranges(EMISSIONS_START_DATE, effective_end):
+                    rows = fetch_chunk(state, begin, end)
+                    if not rows:
+                        time.sleep(REQUEST_INTERVAL_SECONDS)
+                        continue
 
-            frame = pd.DataFrame(rows)
-            required_columns = {"facilityId", "unitId", "date", "hour", "opTime"}
-            missing_columns = required_columns.difference(frame.columns)
-            if missing_columns:
-                missing = ", ".join(sorted(missing_columns))
-                raise ValueError(f"{state} {begin} response is missing required columns: {missing}")
+                    frame = normalize_hourly_records(rows)
+                    part_path = parts_directory / f"part-{part_number:05d}.parquet"
+                    frame.write_parquet(part_path, compression="zstd", statistics=True)
+                    part_number += 1
+                    row_count += frame.height
+                    chunk_latest_date = frame["date"].drop_nulls().max()
+                    if chunk_latest_date is not None:
+                        latest_date = max(latest_date or chunk_latest_date, chunk_latest_date)
+                    print(f"Wrote {frame.height:,} rows; cumulative rows: {row_count:,}")
+                    time.sleep(REQUEST_INTERVAL_SECONDS)
 
-            frame = frame.reindex(columns=NOX_COLS)
-            frame.to_csv(
+            if part_number == 0:
+                raise RuntimeError("CAMPD returned no hourly records")
+
+            pl.scan_parquet(parts_directory / "*.parquet").sink_parquet(
                 temporary_path,
-                mode="a",
-                index=False,
-                header=not header_written,
-                quoting=csv.QUOTE_NONNUMERIC,
+                compression="zstd",
+                statistics=True,
             )
-            header_written = True
-            row_count += len(frame)
-            chunk_latest_date = str(frame["date"].dropna().max())
-            latest_date = max(latest_date or chunk_latest_date, chunk_latest_date)
-            print(f"Wrote {len(frame):,} rows; cumulative rows: {row_count:,}")
-            time.sleep(REQUEST_INTERVAL_SECONDS)
+        os.replace(temporary_path, output_path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
-    if not header_written:
-        raise RuntimeError("CAMPD returned no hourly records")
-
-    os.replace(temporary_path, output_path)
     print(f"Replaced {output_path} with {row_count:,} rows through {latest_date}")
 
 
