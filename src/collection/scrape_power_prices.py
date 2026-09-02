@@ -17,7 +17,13 @@ import pandas as pd
 import requests
 from pyarrow import ArrowException
 
-from collection.power_price_sources import DEFAULT_ISOS, SOURCE_FACTORIES, MarketName, create_source
+from collection.power_price_sources import (
+    DEFAULT_ISOS,
+    SOURCE_FACTORIES,
+    MarketName,
+    PowerPriceSource,
+    create_source,
+)
 from config import POWER_PRICE_BASE_DIR, POWER_PRICE_METADATA_DIR, POWER_PRICE_START_DATE, POWER_PRICE_TEMP_DIR
 
 MARKETS: tuple[MarketName, ...] = ("day_ahead", "real_time")
@@ -39,6 +45,11 @@ STANDARD_COLUMNS = [
     "retrieved_at_utc",
     "source",
 ]
+PRICE_COLUMNS = ("price_usd_mwh", "energy", "congestion", "loss")
+HOURLY_GROUP_COLUMNS = ["iso", "market", "location_id", "location_name", "location_type", "hour_utc"]
+PARTITION_KEY_COLUMNS = ["iso", "market", "location_id", "interval_start_utc"]
+STORED_KEY_COLUMNS = ["market", "location_id", "interval_start_utc"]
+LOCATION_COLUMNS = ["iso", "location_id", "location_name", "location_type"]
 MAX_RETRIES = 5
 INITIAL_BACKOFF_SECONDS = 30
 MAX_BACKOFF_SECONDS = 300
@@ -55,6 +66,11 @@ class MonthWindow:
     month: int
     start_utc: pd.Timestamp
     end_utc: pd.Timestamp
+
+    @property
+    def label(self) -> str:
+        """Return the canonical calendar-month label."""
+        return f"{self.year:04d}-{self.month:02d}"
 
 
 def latest_completed_quarter_end(today: date) -> date:
@@ -205,8 +221,7 @@ def aggregate_hourly(frame: pd.DataFrame) -> pd.DataFrame:
     if (data["duration_minutes"] <= 0).any():
         raise ValueError("Price response contains a nonpositive interval duration")
     data["hour_utc"] = data["interval_start_utc"].dt.floor("h")
-    group_columns = ["iso", "market", "location_id", "location_name", "location_type", "hour_utc"]
-    grouped = data.groupby(group_columns, sort=True, observed=True)
+    grouped = data.groupby(HOURLY_GROUP_COLUMNS, sort=True, observed=True)
     hourly = grouped.agg(
         coverage_minutes=("duration_minutes", "sum"),
         source_interval_minutes=("duration_minutes", "median"),
@@ -215,20 +230,11 @@ def aggregate_hourly(frame: pd.DataFrame) -> pd.DataFrame:
         retrieved_at_utc=("retrieved_at_utc", "max"),
         source=("source", "first"),
     ).reset_index()
-    for column in ("price_usd_mwh", "energy", "congestion", "loss"):
+    group_keys = [data[column] for column in HOURLY_GROUP_COLUMNS]
+    for column in PRICE_COLUMNS:
         valid_duration = data["duration_minutes"].where(data[column].notna())
-        numerator = (
-            (data[column] * valid_duration)
-            .groupby(
-                [data[group_column] for group_column in group_columns],
-                observed=True,
-            )
-            .sum(min_count=1)
-        )
-        denominator = valid_duration.groupby(
-            [data[group_column] for group_column in group_columns],
-            observed=True,
-        ).sum(min_count=1)
+        numerator = (data[column] * valid_duration).groupby(group_keys, observed=True).sum(min_count=1)
+        denominator = valid_duration.groupby(group_keys, observed=True).sum(min_count=1)
         hourly[column] = (numerator / denominator).to_numpy()
     incomplete = ~hourly["coverage_minutes"].round(6).eq(60)
     if incomplete.any():
@@ -296,7 +302,7 @@ def partition_path(base_dir: Path, iso: str, window: MonthWindow) -> Path:
     Returns:
         Final Parquet path containing both markets for the month.
     """
-    return base_dir / iso / f"{window.year:04d}-{window.month:02d}.parquet"
+    return base_dir / iso / f"{window.label}.parquet"
 
 
 def write_partition(frame: pd.DataFrame, output_path: Path, temporary_dir: Path) -> None:
@@ -309,8 +315,7 @@ def write_partition(frame: pd.DataFrame, output_path: Path, temporary_dir: Path)
     """
     if frame.empty:
         raise ValueError(f"Refusing to write empty partition {output_path}")
-    unique_key = ["iso", "market", "location_id", "interval_start_utc"]
-    if frame.duplicated(unique_key).any():
+    if frame.duplicated(PARTITION_KEY_COLUMNS).any():
         raise ValueError(f"Refusing to write duplicate rows to {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir.mkdir(parents=True, exist_ok=True)
@@ -339,8 +344,7 @@ def _partition_covers_window(output_path: Path, iso: str, window: MonthWindow) -
     stored["interval_start_utc"] = pd.to_datetime(stored["interval_start_utc"], utc=True, errors="coerce")
     if stored["interval_start_utc"].isna().any():
         return False
-    key = ["market", "location_id", "interval_start_utc"]
-    if stored.duplicated(key).any():
+    if stored.duplicated(STORED_KEY_COLUMNS).any():
         return False
 
     expected_hours = pd.date_range(
@@ -363,7 +367,7 @@ def _partition_covers_window(output_path: Path, iso: str, window: MonthWindow) -
 def _update_locations(frame: pd.DataFrame, iso: str, metadata_dir: Path, temporary_dir: Path) -> None:
     # Each ISO task owns its metadata file and cannot conflict with other array tasks
     output_path = metadata_dir / "locations" / f"iso={iso}" / "locations.parquet"
-    locations = frame[["iso", "location_id", "location_name", "location_type"]].drop_duplicates()
+    locations = frame[LOCATION_COLUMNS].drop_duplicates()
     if output_path.exists():
         locations = pd.concat([pd.read_parquet(output_path), locations], ignore_index=True).drop_duplicates()
     write_path = temporary_dir / f"locations-{iso}-{os.getpid()}.parquet.part"
@@ -388,8 +392,7 @@ def _update_manifest(
     # Persist completion metadata separately for each ISO array task
     output_path = metadata_dir / "manifests" / f"{iso}.json"
     manifest = json.loads(output_path.read_text()) if output_path.exists() else {"iso": iso, "partitions": {}}
-    partition_key = f"{window.year:04d}-{window.month:02d}"
-    manifest["partitions"][partition_key] = {
+    manifest["partitions"][window.label] = {
         "rows": len(frame),
         "first_interval_utc": frame["interval_start_utc"].min().isoformat(),
         "last_interval_utc": frame["interval_start_utc"].max().isoformat(),
@@ -401,6 +404,50 @@ def _update_manifest(
     temporary_path = temporary_dir / f"manifest-{iso}-{os.getpid()}.json.part"
     temporary_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     os.replace(temporary_path, output_path)
+
+
+def _slice_to_window(frame: pd.DataFrame, timestamp_column: str, window: MonthWindow) -> pd.DataFrame:
+    # Restrict source records to the requested half-open UTC window
+    timestamps = pd.to_datetime(frame[timestamp_column], utc=True)
+    within_window = (timestamps >= window.start_utc) & (timestamps < window.end_utc)
+    return frame.loc[within_window].copy()
+
+
+def _fetch_market_window(
+    source: PowerPriceSource,
+    iso: str,
+    market: MarketName,
+    window: MonthWindow,
+) -> pd.DataFrame:
+    # Fetch one source market and convert it to complete UTC hours
+    local_start, local_end = local_query_bounds(window, source.timezone)
+    description = f"{iso} {market} {window.label}"
+    print(f"Fetching {description}")
+    raw = call_with_retries(
+        lambda: source.fetch(market, local_start, local_end),
+        description,
+    )
+    raw = _slice_to_window(raw, "Interval Start", window)
+    normalized = normalize_prices(
+        raw,
+        iso=iso,
+        market=market,
+        settlement_status=_settlement_status(iso, market),
+        retrieved_at=pd.Timestamp.now(tz="UTC"),
+    )
+    hourly = aggregate_hourly(normalized)
+    return _slice_to_window(hourly, "interval_start_utc", window).reset_index(drop=True)
+
+
+def _fetch_month(source: PowerPriceSource, iso: str, window: MonthWindow) -> pd.DataFrame:
+    # Fetch both markets and return one deterministically ordered partition
+    market_frames: list[pd.DataFrame] = []
+    for market in MARKETS:
+        market_frames.append(_fetch_market_window(source, iso, market, window))
+        time.sleep(REQUEST_INTERVAL_SECONDS)
+    return pd.concat(market_frames, ignore_index=True).sort_values(
+        ["market", "location_id", "interval_start_utc"],
+    )
 
 
 def scrape_iso(
@@ -423,7 +470,7 @@ def scrape_iso(
         temporary_dir: Scratch directory for atomic writes.
         overwrite: Replace existing complete monthly partitions.
     """
-    source = None
+    source: PowerPriceSource | None = None
     for window in month_windows(start, end):
         output_path = partition_path(base_dir, iso, window)
         if not overwrite and _partition_covers_window(output_path, iso, window):
@@ -433,35 +480,7 @@ def scrape_iso(
             print(f"Refetching incomplete partition {output_path}")
         if source is None:
             source = create_source(iso)
-        local_start, local_end = local_query_bounds(window, source.timezone)
-        monthly_frames: list[pd.DataFrame] = []
-        for market in MARKETS:
-            description = f"{iso} {market} {window.year:04d}-{window.month:02d}"
-            print(f"Fetching {description}")
-            raw = call_with_retries(
-                lambda: source.fetch(market, local_start, local_end),
-                description,
-            )
-            interval_start = pd.to_datetime(raw["Interval Start"], utc=True)
-            raw = raw.loc[(interval_start >= window.start_utc) & (interval_start < window.end_utc)].copy()
-            retrieved_at = pd.Timestamp.now(tz="UTC")
-            normalized = normalize_prices(
-                raw,
-                iso=iso,
-                market=market,
-                settlement_status=_settlement_status(iso, market),
-                retrieved_at=retrieved_at,
-            )
-            hourly = aggregate_hourly(normalized)
-            hourly = hourly.loc[
-                (hourly["interval_start_utc"] >= window.start_utc) & (hourly["interval_start_utc"] < window.end_utc)
-            ].reset_index(drop=True)
-            monthly_frames.append(hourly)
-            del raw, normalized, hourly
-            time.sleep(REQUEST_INTERVAL_SECONDS)
-        monthly = pd.concat(monthly_frames, ignore_index=True).sort_values(
-            ["market", "location_id", "interval_start_utc"],
-        )
+        monthly = _fetch_month(source, iso, window)
         write_partition(monthly, output_path, temporary_dir)
         _update_locations(monthly, iso, metadata_dir, temporary_dir)
         _update_manifest(monthly, iso, window, metadata_dir, temporary_dir)
