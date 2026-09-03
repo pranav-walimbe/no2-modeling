@@ -1,8 +1,6 @@
 """Partition AOI-hour emission records into train, validation, and test splits."""
 
-import argparse
 import os
-from collections.abc import Iterable
 
 import polars as pl
 
@@ -14,7 +12,6 @@ from config import (
     LABEL_COL,
     NOX_MASS_COL,
     STRAT_BASE_DIR,
-    TEMPO_LEVEL,
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
     VAL_RECORDS_CSV,
@@ -29,13 +26,10 @@ from preprocessing.stratify_utils import (
     build_aois,
     cluster_aois,
     filter_usable_nox_measurements,
-    plot_split_distributions,
 )
 from preprocessing.tempo_mapping import (
-    add_tempo_files,
-    add_tempo_l2_observations,
-    build_tempo_l2_caches,
-    build_tempo_mapping,
+    add_tempo_observations,
+    load_tempo_mapping,
     serialize_tempo_path_lists,
 )
 
@@ -108,20 +102,8 @@ def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
     }
 
 
-def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    """Parse stratification command-line arguments."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="recompute and replace the TEMPO metadata cache",
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv: Iterable[str] | None = None) -> None:
+def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
-    args = parse_args(argv)
     source = pl.scan_parquet(FULL_DATA_PARQUET)
     missing_columns = set(REQUIRED_COLUMNS).difference(source.collect_schema().names())
     if missing_columns:
@@ -138,28 +120,19 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     facilities = records.select("facilityId", "lat", "lon").drop_nulls().unique(subset="facilityId").collect()
     aois = build_aois(facilities)
+    bounded_aois = add_aoi_bounds(aois)
+    observations = load_tempo_mapping()
     spatial_aois = build_aoi_spatial_frame(aois)
     membership = build_aoi_membership(aois, facilities, spatial_aois)
     frame = aggregate_aoi_hours(records, aois, membership).filter(
         pl.col("avg_heat_input").is_not_null() & pl.col("avg_pwr_gen").is_not_null() & pl.col(LABEL_COL).is_not_null()
     )
     frame = frame.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
-    bounded_aois = add_aoi_bounds(aois)
-    if TEMPO_LEVEL == "L2":
-        observations = build_tempo_l2_caches(bounded_aois, overwrite=args.overwrite)
-        frame = add_tempo_l2_observations(frame, observations)
-    else:
-        frame = add_tempo_files(frame, build_tempo_mapping(overwrite=args.overwrite)).with_columns(
-            pl.lit(None, dtype=pl.Datetime(time_zone="UTC")).alias("tempo_time"),
-            pl.lit(None, dtype=pl.Datetime(time_zone="UTC")).alias("prev_tempo_time"),
-            pl.lit(None, dtype=pl.Float64).alias("tempo_delta_minutes"),
-            pl.lit(None, dtype=pl.Float64).alias("coverage_percent"),
-        )
+    frame = add_tempo_observations(frame, observations)
     frame = frame.filter(pl.col("tempo").is_not_null() & pl.col("prev_tempo").is_not_null())
     bounds = bounded_aois.select(AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max")
     frame = add_hrrr_files(frame.join(bounds, on=AOI_ID_COL, how="left"))
-    if TEMPO_LEVEL == "L2":
-        frame = serialize_tempo_path_lists(frame)
+    frame = serialize_tempo_path_lists(frame)
 
     splits = {name: split.select(OUTPUT_COLUMNS) for name, split in _split_by_cluster(frame).items()}
 
@@ -167,7 +140,6 @@ def main(argv: Iterable[str] | None = None) -> None:
     splits["train"].write_csv(TRAIN_RECORDS_CSV)
     splits["val"].write_csv(VAL_RECORDS_CSV)
     splits["test"].write_csv(TEST_RECORDS_CSV)
-    plot_split_distributions(splits["train"], splits["val"], splits["test"])
 
 
 if __name__ == "__main__":

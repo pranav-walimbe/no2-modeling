@@ -1,8 +1,5 @@
 """Utilities for building and splitting AOI-hour records."""
 
-import os
-
-import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import shapely
@@ -19,7 +16,6 @@ from config import (
     MIN_DELTA_HISTORY,
     MIN_DELTA_SCALE_LB,
     NOX_MASS_COL,
-    STRAT_VIS_PNG,
 )
 
 AOI_ID_COL = "aoi_id"
@@ -309,28 +305,3 @@ def add_aoi_bounds(frame: pl.DataFrame) -> pl.DataFrame:
         pl.Series("lon_min", longitudes.min(axis=0), dtype=pl.Float64),
         pl.Series("lon_max", longitudes.max(axis=0), dtype=pl.Float64),
     )
-
-
-def plot_split_distributions(train: pl.DataFrame, val: pl.DataFrame, test: pl.DataFrame) -> None:
-    """Visualize geographic and label distributions for each split."""
-    _, axes = plt.subplots(2, 3, figsize=(20, 12))
-    splits = [("Train", train), ("Val", val), ("Test", test)]
-
-    for axis, (label, split_frame) in zip(axes[0], splits):
-        axis.scatter(split_frame["lon"], split_frame["lat"], s=5, alpha=0.3)
-        axis.set_title(f"{label} : n = {split_frame.height}")
-        axis.set_xlabel("Longitude")
-        axis.set_ylabel("Latitude")
-        axis.set_xlim(-130, -65)
-        axis.set_ylim(24, 50)
-
-    for axis, (label, split_frame) in zip(axes[1], splits):
-        axis.hist(split_frame[LABEL_COL], bins=50, alpha=0.7)
-        axis.set_title(label)
-        axis.set_xlabel(LABEL_COL)
-        axis.set_ylabel("Count")
-
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(STRAT_VIS_PNG), exist_ok=True)
-    plt.savefig(STRAT_VIS_PNG, dpi=150)
-    plt.close()

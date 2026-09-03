@@ -205,7 +205,9 @@ cython_debug/
 
 # Local agent handoff state
 AGENTS.md
+CLAUDE.md
 /.agents/
+/.claude/
 
 # Local analysis and batch scripts
 /scripts/
