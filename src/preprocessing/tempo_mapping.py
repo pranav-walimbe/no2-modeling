@@ -1,10 +1,12 @@
-"""Build TEMPO metadata mappings and match observations to emissions hours."""
+"""Build the TEMPO granule index and AOI-observation mapping."""
 
+import argparse
 import json
 import multiprocessing
 import os
-import pickle
 import re
+import shutil
+import tempfile
 from collections import defaultdict
 from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor
@@ -18,21 +20,21 @@ import shapely
 from pycanopy import SpatialFrame
 
 from config import (
-    MIN_TEMPO_DURATION,
-    MINS_FILTER,
+    FULL_DATA_PARQUET,
     NUM_CORES,
-    TEMPO_AOI_OBSERVATION_CACHE,
+    TEMPO_AOI_MAPPING,
     TEMPO_DIR,
     TEMPO_GEOLOCATION_STRIDE,
-    TEMPO_GRANULE_CACHE,
-    TEMPO_MAPPING,
+    TEMPO_GRANULE_MAPPING,
     TEMPO_MAX_DELTA_MINUTES,
     TEMPO_MIN_DELTA_MINUTES,
 )
+from preprocessing.stratify_utils import add_aoi_bounds, build_aois
 
 AOI_ID_COL = "aoi_id"
 SCAN_BREAK_MINUTES = 30
 COVERAGE_TOLERANCE_DEGREES = 1e-6
+FOOTPRINT_BOUNDS_TOLERANCE_DEGREES = 1e-3
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 GRANULE_PATTERN = re.compile(r"_S(?P<scan>\d+)G(?P<granule>\d+)")
@@ -81,128 +83,7 @@ OBSERVATION_SCHEMA = {
     "mirror_step_ends": pl.List(pl.Int32),
     "sampled_pixel_count": pl.Int64,
 }
-
-
-def select_tempo_after(
-    target_dt: datetime,
-    candidates: Iterable[tuple[datetime, str]],
-    window_minutes: int,
-) -> str | None:
-    """Return the closest L3 candidate after a target within a time window."""
-    window = timedelta(minutes=window_minutes)
-    eligible = [
-        (current_dt - target_dt, filename)
-        for current_dt, filename in candidates
-        if timedelta(0) < current_dt - target_dt <= window
-    ]
-    return min(eligible, default=(None, None), key=lambda item: item[0])[1]
-
-
-def parse_tile(paths: tuple[str, str]) -> tuple[datetime, str] | None:
-    """Return the timestamp and relative path for a qualifying L3 tile."""
-    absolute_path, relative_path = paths
-    try:
-        with nc.Dataset(absolute_path) as dataset:
-            start = datetime.fromisoformat(dataset.time_coverage_start.replace("Z", "+00:00"))
-            end = datetime.fromisoformat(dataset.time_coverage_end.replace("Z", "+00:00"))
-        if (end - start).total_seconds() / SECONDS_PER_MINUTE < MIN_TEMPO_DURATION:
-            return None
-        filename = Path(relative_path).name
-        timestamp = datetime.strptime(filename.split("_")[4], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-        return timestamp, relative_path
-    except (IndexError, OSError, RuntimeError, ValueError) as error:
-        print(f"WARNING: skipping {relative_path}: {error}")
-        return None
-
-
-def _as_utc(timestamp: object) -> datetime:
-    # Support pandas timestamps stored by older L3 mapping caches
-    if hasattr(timestamp, "to_pydatetime"):
-        timestamp = timestamp.to_pydatetime()
-    if not isinstance(timestamp, datetime):
-        raise TypeError(f"Unsupported TEMPO timestamp type: {type(timestamp).__name__}")
-    if timestamp.tzinfo is None:
-        return timestamp.replace(tzinfo=timezone.utc)
-    return timestamp.astimezone(timezone.utc)
-
-
-def normalize_tempo_mapping(mapping: dict) -> dict[date, list[tuple[datetime, str]]]:
-    """Normalize cached L3 timestamps to UTC and sort each date's tiles."""
-    normalized = {}
-    for scan_date, tiles in mapping.items():
-        normalized[scan_date] = sorted(
-            [(_as_utc(timestamp), filename) for timestamp, filename in tiles],
-            key=lambda tile: tile[0],
-        )
-    return normalized
-
-
-def build_tempo_mapping(overwrite: bool = False) -> dict[date, list[tuple[datetime, str]]]:
-    """Build or load the legacy L3 timestamp mapping."""
-    if not overwrite and os.path.exists(TEMPO_MAPPING):
-        with open(TEMPO_MAPPING, "rb") as file:
-            return normalize_tempo_mapping(pickle.load(file))
-
-    tempo_root = Path(TEMPO_DIR)
-    paths = ((str(path), str(path.relative_to(tempo_root))) for path in tempo_root.rglob("*.nc") if path.is_file())
-    with ProcessPoolExecutor(
-        max_workers=NUM_CORES,
-        mp_context=multiprocessing.get_context("spawn"),
-    ) as executor:
-        tempo_by_date = defaultdict(list)
-        for result in executor.map(parse_tile, paths, chunksize=32):
-            if result is not None:
-                timestamp, filename = result
-                tempo_by_date[timestamp.date()].append((timestamp, filename))
-
-    normalized = normalize_tempo_mapping(tempo_by_date)
-    os.makedirs(os.path.dirname(TEMPO_MAPPING), exist_ok=True)
-    with open(TEMPO_MAPPING, "wb") as file:
-        pickle.dump(normalized, file)
-    return normalized
-
-
-def add_tempo_files(
-    frame: pl.DataFrame,
-    tempo_by_date: dict[date, list[tuple[datetime, str]]],
-) -> pl.DataFrame:
-    """Attach current and preceding legacy L3 filenames to AOI-hour rows."""
-    candidates = pl.DataFrame(
-        [
-            {"scan_datetime": timestamp, "tempo": filename}
-            for tiles in tempo_by_date.values()
-            for timestamp, filename in tiles
-        ],
-        schema={"scan_datetime": pl.Datetime(time_zone="UTC"), "tempo": pl.String},
-    ).sort("scan_datetime")
-    target_hours = frame.select("date", "hour").unique()
-    targets = target_hours.with_columns(
-        (pl.col("date").cast(pl.Datetime(time_zone="UTC")) + pl.duration(hours=pl.col("hour"))).alias("target_datetime")
-    )
-    tolerance = timedelta(minutes=MINS_FILTER)
-    current = targets.sort("target_datetime").join_asof(
-        candidates,
-        left_on="target_datetime",
-        right_on="scan_datetime",
-        strategy="forward",
-        tolerance=tolerance,
-        allow_exact_matches=False,
-    )
-    previous_candidates = candidates.rename({"scan_datetime": "prev_scan_datetime", "tempo": "prev_tempo"})
-    matches = (
-        current.with_columns((pl.col("target_datetime") - pl.duration(hours=1)).alias("prev_target_datetime"))
-        .sort("prev_target_datetime")
-        .join_asof(
-            previous_candidates,
-            left_on="prev_target_datetime",
-            right_on="prev_scan_datetime",
-            strategy="forward",
-            tolerance=tolerance,
-            allow_exact_matches=False,
-        )
-        .drop("target_datetime", "scan_datetime", "prev_target_datetime", "prev_scan_datetime")
-    )
-    return frame.join(matches, on=["date", "hour"], how="left")
+AOI_COLUMNS = ["facilityId", "lat", "lon"]
 
 
 def _empty_frame(schema: dict[str, pl.DataType]) -> pl.DataFrame:
@@ -230,8 +111,25 @@ def _granule_numbers(dataset: nc.Dataset, path: Path) -> tuple[int, int]:
         return int(match.group("scan")), int(match.group("granule"))
 
 
+def _read_granule_footprint(dataset: nc.Dataset) -> object:
+    # Normalize the TEMPO latitude-longitude WKT to Shapely x-y order
+    footprint = shapely.from_wkt(str(dataset.getncattr("geospatial_bounds")))
+    lat_min = float(dataset.getncattr("geospatial_lat_min"))
+    lat_max = float(dataset.getncattr("geospatial_lat_max"))
+    lon_min = float(dataset.getncattr("geospatial_lon_min"))
+    lon_max = float(dataset.getncattr("geospatial_lon_max"))
+    raw_bounds = np.asarray(footprint.bounds)
+    lat_lon_bounds = np.asarray((lat_min, lon_min, lat_max, lon_max))
+    lon_lat_bounds = np.asarray((lon_min, lat_min, lon_max, lat_max))
+    if np.allclose(raw_bounds, lat_lon_bounds, rtol=0, atol=FOOTPRINT_BOUNDS_TOLERANCE_DEGREES):
+        footprint = shapely.transform(footprint, lambda coordinates: coordinates[:, ::-1])
+    elif not np.allclose(raw_bounds, lon_lat_bounds, rtol=0, atol=FOOTPRINT_BOUNDS_TOLERANCE_DEGREES):
+        raise ValueError("geospatial_bounds does not match the declared latitude-longitude bounds")
+    return footprint
+
+
 def _parse_granule(task: tuple[str, str, int, int]) -> dict[str, object] | None:
-    # Read global attributes only for one Cache A row
+    # Read global attributes only for one granule-index row
     absolute_path_text, relative_path, year, month = task
     absolute_path = Path(absolute_path_text)
     try:
@@ -239,7 +137,7 @@ def _parse_granule(task: tuple[str, str, int, int]) -> dict[str, object] | None:
             scan_num, granule_num = _granule_numbers(dataset, absolute_path)
             start = _parse_utc(dataset.getncattr("time_coverage_start"))
             end = _parse_utc(dataset.getncattr("time_coverage_end"))
-            footprint = shapely.from_wkt(str(dataset.getncattr("geospatial_bounds")))
+            footprint = _read_granule_footprint(dataset)
         if footprint.is_empty or not footprint.is_valid:
             raise ValueError("invalid geospatial_bounds polygon")
         return {
@@ -258,7 +156,7 @@ def _parse_granule(task: tuple[str, str, int, int]) -> dict[str, object] | None:
 
 
 def _write_parquet_atomic(frame: pl.DataFrame, destination: Path) -> None:
-    # Keep incomplete cache files invisible to resumable readers
+    # Keep incomplete mapping files invisible to resumable readers
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(f"{destination.suffix}.{os.getpid()}.tmp")
     try:
@@ -275,29 +173,25 @@ def _read_parquet_files(paths: Iterable[Path], schema: dict[str, pl.DataType]) -
     return pl.concat(frames, how="vertical_relaxed") if frames else _empty_frame(schema)
 
 
-def build_granule_cache(
+def build_granule_index(
     tempo_dir: str | Path = TEMPO_DIR,
-    cache_dir: str | Path = TEMPO_GRANULE_CACHE,
+    mapping_dir: str | Path = TEMPO_GRANULE_MAPPING,
     *,
     overwrite: bool = False,
     workers: int = NUM_CORES,
-) -> set[date]:
-    """Incrementally build monthly Cache A Parquet files.
+) -> None:
+    """Build missing monthly granule-index partitions.
 
     Args:
         tempo_dir: Root containing ``year/month`` raw granule directories.
-        cache_dir: Root for partitioned granule-index Parquet files.
-        overwrite: Reparse every discovered granule.
+        mapping_dir: Root for partitioned granule-index Parquet files.
+        overwrite: Rebuild every discovered monthly partition.
         workers: Number of independent NetCDF readers.
-
-    Returns:
-        UTC dates affected by newly parsed granules.
     """
     tempo_root = Path(tempo_dir)
-    cache_root = Path(cache_dir)
-    if overwrite:
-        for cache_path in cache_root.rglob("granules.parquet"):
-            cache_path.unlink()
+    mapping_root = Path(mapping_dir)
+    if overwrite and mapping_root.exists():
+        shutil.rmtree(mapping_root)
     discovered: dict[tuple[int, int], list[Path]] = defaultdict(list)
     for path in tempo_root.rglob("*.nc"):
         if not path.is_file():
@@ -310,22 +204,16 @@ def build_granule_cache(
             continue
         discovered[(year, month)].append(path)
 
-    existing_by_month: dict[tuple[int, int], pl.DataFrame] = {}
     tasks: list[tuple[str, str, int, int]] = []
     for (year, month), paths in sorted(discovered.items()):
-        cache_path = cache_root / f"year={year:04d}" / f"month={month:02d}" / "granules.parquet"
-        existing = _empty_frame(GRANULE_SCHEMA) if overwrite or not cache_path.exists() else pl.read_parquet(cache_path)
-        existing_by_month[(year, month)] = existing
-        cached_paths = set(existing["relative_path"].to_list())
-        tasks.extend(
-            (str(path), str(path.relative_to(tempo_root)), year, month)
-            for path in sorted(paths)
-            if str(path.relative_to(tempo_root)) not in cached_paths
-        )
+        mapping_path = mapping_root / f"year={year:04d}" / f"month={month:02d}" / "granules.parquet"
+        if mapping_path.exists() and not overwrite:
+            continue
+        tasks.extend((str(path), str(path.relative_to(tempo_root)), year, month) for path in sorted(paths))
 
     if workers < 1:
         raise ValueError("workers must be at least 1")
-    print(f"Cache A: {len(tasks)} new granules across {len(discovered)} monthly partitions")
+    print(f"Granule index: reading {len(tasks)} granules")
     if not tasks:
         parsed = []
     elif workers == 1:
@@ -335,37 +223,21 @@ def build_granule_cache(
             parsed = list(executor.map(_parse_granule, tasks, chunksize=32))
 
     new_by_month: dict[tuple[int, int], list[dict[str, object]]] = defaultdict(list)
-    changed_dates: set[date] = set()
     for row in parsed:
         if row is None:
             continue
         new_by_month[(int(row["year"]), int(row["month"]))].append(row)
-        start_date = row["time_coverage_start"].date()
-        changed_dates.update((start_date, start_date - timedelta(days=1)))
 
-    months_to_write = set(new_by_month)
-    if overwrite:
-        months_to_write.update(existing_by_month)
-    for year_month in months_to_write:
-        rows = new_by_month[year_month]
-        combined = (
-            pl.concat(
-                [existing_by_month[year_month], pl.DataFrame(rows, schema=GRANULE_SCHEMA)],
-                how="vertical_relaxed",
-            )
-            .unique(subset="relative_path", keep="last")
-            .sort("time_coverage_start", "granule_num")
-        )
+    for year_month, rows in sorted(new_by_month.items()):
+        frame = pl.DataFrame(rows, schema=GRANULE_SCHEMA).sort("time_coverage_start", "granule_num")
         year, month = year_month
-        destination = cache_root / f"year={year:04d}" / f"month={month:02d}" / "granules.parquet"
-        _write_parquet_atomic(combined, destination)
-
-    return changed_dates
+        destination = mapping_root / f"year={year:04d}" / f"month={month:02d}" / "granules.parquet"
+        _write_parquet_atomic(frame, destination)
 
 
-def read_granule_cache(cache_dir: str | Path = TEMPO_GRANULE_CACHE) -> pl.DataFrame:
-    """Read all Cache A partitions into one Polars frame."""
-    return _read_parquet_files(Path(cache_dir).rglob("granules.parquet"), GRANULE_SCHEMA)
+def read_granule_index(mapping_dir: str | Path = TEMPO_GRANULE_MAPPING) -> pl.DataFrame:
+    """Read all granule-index partitions into one Polars frame."""
+    return _read_parquet_files(Path(mapping_dir).rglob("granules.parquet"), GRANULE_SCHEMA)
 
 
 def _group_scan_occurrences(index: pl.DataFrame) -> list[dict[str, object]]:
@@ -410,7 +282,7 @@ def _combine_scan_rows(rows: list[dict[str, object]]) -> dict[str, object]:
 
 
 def _normalize_aois(aois: pl.DataFrame) -> pl.DataFrame:
-    # Retain only the stable AOI definition needed by Cache B
+    # Retain only the stable AOI definition needed by the AOI mapping
     columns = [AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max"]
     return aois.select(columns).cast({AOI_ID_COL: pl.Int64}).sort(AOI_ID_COL)
 
@@ -485,6 +357,32 @@ def gps_seconds_to_utc(seconds: float) -> datetime:
     return GPS_EPOCH + timedelta(seconds=float(seconds) - leap_seconds)
 
 
+def _read_geolocation_arrays(geolocation: nc.Group, stride: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Apply the cross-track stride in the NetCDF read
+    time_variable = geolocation.variables["time"]
+    latitude_variable = geolocation.variables["latitude"]
+    longitude_variable = geolocation.variables["longitude"]
+    if len(time_variable.dimensions) != 1 or len(latitude_variable.dimensions) != 2:
+        raise ValueError("Unexpected TEMPO geolocation dimensions")
+    if longitude_variable.dimensions != latitude_variable.dimensions:
+        raise ValueError("TEMPO latitude and longitude dimensions differ")
+    mirror_dimension = time_variable.dimensions[0]
+    if latitude_variable.dimensions.count(mirror_dimension) != 1:
+        raise ValueError("No unique geolocation dimension matches time")
+    mirror_axis = latitude_variable.dimensions.index(mirror_dimension)
+    cross_track_axis = 1 - mirror_axis
+    read_key = [slice(None), slice(None)]
+    read_key[cross_track_axis] = slice(None, None, stride)
+    key = tuple(read_key)
+    times = np.asarray(np.ma.filled(time_variable[:], np.nan), dtype=np.float64)
+    latitudes = np.asarray(np.ma.filled(latitude_variable[key], np.nan), dtype=np.float64)
+    longitudes = np.asarray(np.ma.filled(longitude_variable[key], np.nan), dtype=np.float64)
+    if mirror_axis == 1:
+        latitudes = latitudes.T
+        longitudes = longitudes.T
+    return times, latitudes, longitudes
+
+
 def _sample_granule_steps(
     path: Path,
     bounds: tuple[float, float, float, float],
@@ -493,16 +391,10 @@ def _sample_granule_steps(
     # Count sampled AOI pixels for each mirror-step time
     with nc.Dataset(path) as dataset:
         geolocation = dataset.groups["geolocation"]
-        times = np.asarray(np.ma.filled(geolocation.variables["time"][:], np.nan), dtype=np.float64)
-        latitudes = np.asarray(np.ma.filled(geolocation.variables["latitude"][:], np.nan), dtype=np.float64)
-        longitudes = np.asarray(np.ma.filled(geolocation.variables["longitude"][:], np.nan), dtype=np.float64)
+        times, latitudes, longitudes = _read_geolocation_arrays(geolocation, stride)
     if times.ndim != 1 or latitudes.ndim != 2 or longitudes.shape != latitudes.shape:
         raise ValueError(f"Unexpected geolocation shapes in {path}")
-    if latitudes.shape[0] == times.size:
-        latitudes, longitudes = latitudes[:, ::stride], longitudes[:, ::stride]
-    elif latitudes.shape[1] == times.size:
-        latitudes, longitudes = latitudes[::stride, :].T, longitudes[::stride, :].T
-    else:
+    if latitudes.shape[0] != times.size:
         raise ValueError(f"No geolocation dimension matches time in {path}")
 
     lon_min, lat_min, lon_max, lat_max = bounds
@@ -574,66 +466,66 @@ def _write_observation_day(task: tuple[str, str, int, list[dict[str, object]]]) 
     return destination_text
 
 
-def _prepare_aoi_snapshot(aois: pl.DataFrame, cache_root: Path, overwrite: bool) -> None:
-    # Refuse to mix Cache B rows made for different AOI bounds
-    current = _normalize_aois(aois)
-    snapshot = cache_root / "aois.parquet"
-    if snapshot.exists() and not overwrite:
-        cached = pl.read_parquet(snapshot).sort(AOI_ID_COL)
-        if not cached.equals(current):
-            raise ValueError("AOI definitions changed; rerun stratify_plants with --overwrite")
-        return
-    _write_parquet_atomic(current, snapshot)
+def _observation_shard_path(mapping_root: Path, scan_date: date) -> Path:
+    # Keep every date shard in its year-month partition
+    return (
+        mapping_root
+        / f"year={scan_date.year:04d}"
+        / f"month={scan_date.month:02d}"
+        / f"date={scan_date.isoformat()}.parquet"
+    )
 
 
-def build_aoi_observation_cache(
+def _select_granules_for_scan_dates(granules: pl.DataFrame, scan_dates: set[date] | None) -> pl.DataFrame:
+    # Include the following UTC date for scans crossing midnight
+    if scan_dates is None:
+        return granules
+    relevant_dates = sorted(scan_dates | {scan_date + timedelta(days=1) for scan_date in scan_dates})
+    return granules.filter(pl.col("time_coverage_start").dt.date().is_in(relevant_dates))
+
+
+def build_aoi_mapping(
     aois: pl.DataFrame,
     granules: pl.DataFrame,
-    changed_dates: set[date],
     tempo_dir: str | Path = TEMPO_DIR,
-    cache_dir: str | Path = TEMPO_AOI_OBSERVATION_CACHE,
+    mapping_dir: str | Path = TEMPO_AOI_MAPPING,
     *,
     overwrite: bool = False,
     workers: int = NUM_CORES,
     stride: int = TEMPO_GEOLOCATION_STRIDE,
+    scan_dates: set[date] | None = None,
 ) -> None:
-    """Build resumable daily Cache B shards for covered AOI scans.
+    """Build daily AOI-observation shards for selected scan dates.
 
     Args:
         aois: AOI rows carrying identifiers and WGS84 bounds.
-        granules: Cache A rows.
-        changed_dates: Dates affected by Cache A additions.
+        granules: Granule-index rows.
         tempo_dir: Root used to resolve relative granule paths.
-        cache_dir: Root for Cache B Parquet files.
-        overwrite: Replace all existing daily shards.
+        mapping_dir: Root for AOI-observation Parquet files.
+        overwrite: Replace existing shards for the selected dates.
         workers: Number of independent date workers.
         stride: Cross-track geolocation sampling stride.
+        scan_dates: Optional scan-start dates owned by this invocation.
     """
     if workers < 1:
         raise ValueError("workers must be at least 1")
     if stride < 1:
         raise ValueError("stride must be at least 1")
-    cache_root = Path(cache_dir)
-    _prepare_aoi_snapshot(aois, cache_root, overwrite)
-    if overwrite:
-        for path in cache_root.rglob("date=*.parquet"):
-            path.unlink()
+    mapping_root = Path(mapping_dir)
 
-    scans = _group_scan_occurrences(granules)
+    selected_granules = _select_granules_for_scan_dates(granules, scan_dates)
+    scans = _group_scan_occurrences(selected_granules)
     scans_by_date: dict[date, list[dict[str, object]]] = defaultdict(list)
     for scan in scans:
-        scans_by_date[scan["scan_start"].date()].append(scan)
+        scan_date = scan["scan_start"].date()
+        if scan_dates is None or scan_date in scan_dates:
+            scans_by_date[scan_date].append(scan)
 
     dates_to_build: list[date] = []
     scans_to_build: list[dict[str, object]] = []
     for scan_date, date_scans in sorted(scans_by_date.items()):
-        destination = (
-            cache_root
-            / f"year={scan_date.year:04d}"
-            / f"month={scan_date.month:02d}"
-            / f"date={scan_date.isoformat()}.parquet"
-        )
-        if destination.exists() and not overwrite and scan_date not in changed_dates:
+        destination = _observation_shard_path(mapping_root, scan_date)
+        if destination.exists() and not overwrite:
             continue
         dates_to_build.append(scan_date)
         scans_to_build.extend(date_scans)
@@ -645,15 +537,10 @@ def build_aoi_observation_cache(
 
     tasks: list[tuple[str, str, int, list[dict[str, object]]]] = []
     for scan_date in dates_to_build:
-        destination = (
-            cache_root
-            / f"year={scan_date.year:04d}"
-            / f"month={scan_date.month:02d}"
-            / f"date={scan_date.isoformat()}.parquet"
-        )
+        destination = _observation_shard_path(mapping_root, scan_date)
         tasks.append((str(tempo_dir), str(destination), stride, candidates_by_date[scan_date]))
 
-    print(f"Cache B: {len(tasks)} scan dates using {workers} workers and geolocation stride {stride}")
+    print(f"AOI mapping: {len(tasks)} scan dates using {workers} workers and geolocation stride {stride}")
     if not tasks:
         return
     if workers == 1:
@@ -664,31 +551,21 @@ def build_aoi_observation_cache(
         list(executor.map(_write_observation_day, tasks, chunksize=1))
 
 
-def read_aoi_observation_cache(cache_dir: str | Path = TEMPO_AOI_OBSERVATION_CACHE) -> pl.DataFrame:
-    """Read all daily Cache B shards into one Polars frame."""
-    return _read_parquet_files(Path(cache_dir).rglob("date=*.parquet"), OBSERVATION_SCHEMA)
+def read_aoi_mapping(mapping_dir: str | Path = TEMPO_AOI_MAPPING) -> pl.DataFrame:
+    """Read all daily AOI-observation shards into one Polars frame."""
+    return _read_parquet_files(Path(mapping_dir).rglob("date=*.parquet"), OBSERVATION_SCHEMA)
 
 
-def build_tempo_l2_caches(
-    aois: pl.DataFrame,
-    *,
-    overwrite: bool = False,
-    workers: int = NUM_CORES,
-) -> pl.DataFrame:
-    """Build both TEMPO L2 caches and return AOI observations."""
-    changed_dates = build_granule_cache(overwrite=overwrite, workers=workers)
-    granules = read_granule_cache()
-    build_aoi_observation_cache(
-        aois,
-        granules,
-        changed_dates,
-        overwrite=overwrite,
-        workers=workers,
-    )
-    return read_aoi_observation_cache()
+def load_tempo_mapping() -> pl.DataFrame:
+    """Load the prebuilt TEMPO AOI-observation mapping."""
+    if not list(Path(TEMPO_GRANULE_MAPPING).rglob("granules.parquet")):
+        raise FileNotFoundError("TEMPO granule index is missing; run the TEMPO mapping jobs first")
+    if not list(Path(TEMPO_AOI_MAPPING).rglob("date=*.parquet")):
+        raise FileNotFoundError("TEMPO AOI mapping is missing; run the TEMPO mapping jobs first")
+    return read_aoi_mapping(TEMPO_AOI_MAPPING)
 
 
-def add_tempo_l2_observations(frame: pl.DataFrame, observations: pl.DataFrame) -> pl.DataFrame:
+def add_tempo_observations(frame: pl.DataFrame, observations: pl.DataFrame) -> pl.DataFrame:
     """Match valid consecutive AOI observations to emissions clock hours."""
     if observations.is_empty():
         return frame.with_columns(
@@ -762,3 +639,117 @@ def serialize_tempo_path_lists(frame: pl.DataFrame) -> pl.DataFrame:
             for column in ("tempo", "prev_tempo")
         ]
     )
+
+
+def _load_aois() -> pl.DataFrame:
+    # Rebuild the same AOI definitions used by stratify_plants
+    source = pl.scan_parquet(FULL_DATA_PARQUET)
+    missing = set(AOI_COLUMNS).difference(source.collect_schema().names())
+    if missing:
+        raise ValueError(f"Full emissions data is missing AOI columns: {', '.join(sorted(missing))}")
+    facilities = source.select(AOI_COLUMNS).drop_nulls().unique(subset="facilityId").collect()
+    return add_aoi_bounds(build_aois(facilities))
+
+
+def _available_mapping_months(granules: pl.DataFrame) -> list[tuple[int, int]]:
+    # Month directories are the unit of resumable array work
+    return list(granules.select("year", "month").unique().sort("year", "month").iter_rows())
+
+
+def partition_mapping_months(
+    months: list[tuple[int, int]],
+    task_id: int,
+    task_count: int,
+) -> list[tuple[int, int]]:
+    """Return the deterministic round-robin month partition for one array task.
+
+    Args:
+        months: Sorted year-month pairs available in the granule index.
+        task_id: Zero-based array task identifier.
+        task_count: Total number of array tasks.
+
+    Returns:
+        Months owned exclusively by the requested task.
+    """
+    if task_count < 1:
+        raise ValueError("task_count must be at least 1")
+    if not 0 <= task_id < task_count:
+        raise ValueError("task_id must be in [0, task_count)")
+    return months[task_id::task_count]
+
+
+def _scan_dates_for_month(granules: pl.DataFrame, year: int, month: int) -> set[date]:
+    return set(
+        granules.filter((pl.col("year") == year) & (pl.col("month") == month))
+        .select(pl.col("time_coverage_start").dt.date().alias("scan_date"))
+        .unique()["scan_date"]
+        .to_list()
+    )
+
+
+def _build_index(overwrite: bool, workers: int) -> None:
+    build_granule_index(overwrite=overwrite, workers=workers)
+    if overwrite and Path(TEMPO_AOI_MAPPING).exists():
+        shutil.rmtree(TEMPO_AOI_MAPPING)
+
+
+def _build_observations(task_id: int, task_count: int, overwrite: bool, workers: int) -> None:
+    # Infer unfinished work from absent month directories
+    granules = read_granule_index()
+    if granules.is_empty():
+        raise FileNotFoundError("TEMPO granule index is missing; run the index job first")
+    months = list(_available_mapping_months(granules))
+    assigned_months = partition_mapping_months(months, task_id, task_count)
+    mapping_root = Path(TEMPO_AOI_MAPPING)
+    mapping_root.parent.mkdir(parents=True, exist_ok=True)
+    aois = _load_aois()
+
+    for year, month in assigned_months:
+        destination = mapping_root / f"year={year:04d}" / f"month={month:02d}"
+        if next(destination.glob("date=*.parquet"), None) is not None and not overwrite:
+            continue
+        scan_dates = _scan_dates_for_month(granules, year, month)
+        with tempfile.TemporaryDirectory(prefix="tempo-mapping-", dir=mapping_root.parent) as temporary:
+            temporary_root = Path(temporary) / "aoi_observations"
+            build_aoi_mapping(
+                aois,
+                granules,
+                workers=workers,
+                scan_dates=scan_dates,
+                mapping_dir=temporary_root,
+            )
+            built_month = temporary_root / f"year={year:04d}" / f"month={month:02d}"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                shutil.rmtree(destination)
+            os.replace(built_month, destination)
+
+
+def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
+    """Parse staged TEMPO mapping command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="stage", required=True)
+
+    index_parser = subparsers.add_parser("index", help="build missing monthly granule-index partitions")
+    index_parser.add_argument("--overwrite", action="store_true")
+    index_parser.add_argument("--workers", type=int, default=NUM_CORES)
+
+    observation_parser = subparsers.add_parser("observations", help="build one partition of AOI mapping months")
+    observation_parser.add_argument("--task-id", type=int, required=True)
+    observation_parser.add_argument("--task-count", type=int, required=True)
+    observation_parser.add_argument("--overwrite", action="store_true")
+    observation_parser.add_argument("--workers", type=int, default=NUM_CORES)
+    return parser.parse_args(argv)
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    """Run one staged TEMPO mapping operation."""
+    args = parse_args(argv)
+    if args.stage == "index":
+        _build_index(args.overwrite, args.workers)
+    else:
+        _build_observations(args.task_id, args.task_count, args.overwrite, args.workers)
+
+
+if __name__ == "__main__":
+    main()

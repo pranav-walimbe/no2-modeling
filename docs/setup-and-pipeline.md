@@ -102,9 +102,9 @@ module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
 ```
 
-1. Select the TEMPO collection in `src/config.py`. `TEMPO_LEVEL` accepts `L2`
-   or `L3`, and `TEMPO_VERSION` accepts `V03` or `V04`. The default is raw L2
-   V04. Files are stored under:
+1. Select the TEMPO collection in `src/config.py`. Preprocessing uses
+   `TEMPO_LEVEL = "L2"`; `TEMPO_VERSION` accepts `V03` or `V04`. The default
+   is V04. Files are stored under:
 
    ```text
    TEMPO/<version>/<level>/raw/<year>/<month>/
@@ -136,27 +136,31 @@ source .venv/bin/activate
    replacing its existing output if CAMPD requests fail or if enrichment would
    drop any hourly emissions rows.
 
-4. Partition plants and generate model-ready datasets:
+4. Build the TEMPO mappings, partition plants, and generate model-ready datasets:
 
    ```bash
+   scripts/slurm/submit_tempo_mapping.sh --overwrite
+   # Wait for the observation job array to finish successfully.
    python -u -m preprocessing.stratify_plants
    python -u -m preprocessing.generate_dataset
    ```
 
-   Pass `--overwrite` to `stratify_plants` to rebuild the TEMPO caches. For L2,
-   Cache A stores monthly Parquet granule indexes with WKB footprints. Cache B
-   stores daily Parquet AOI-scan observations with stitched granule paths,
-   mirror-step ranges, and observation times. Cache A adds newly downloaded
-   paths incrementally and Cache B resumes from completed date shards. The
-   process pool uses `NUM_CORES`, which reads `SLURM_CPUS_PER_TASK` in a batch
-   job. L3 continues to use the older timestamp mapping benchmark.
+   `preprocessing.tempo_mapping` owns TEMPO mapping construction. Its index job
+   builds monthly granule-index Parquet files. A dependent job array owns
+   disjoint months and builds daily AOI-observation shards containing stitched
+   granule paths, mirror-step ranges, and observation times. Existing populated
+   month directories are skipped. Pass `--overwrite` to rebuild the index and
+   AOI mappings from scratch; the submit wrapper forwards it to both jobs. Each
+   task uses `NUM_CORES`, which reads `SLURM_CPUS_PER_TASK`.
+
+   `preprocessing.stratify_plants` only reads the prebuilt TEMPO mapping before
+   matching observations and writing splits.
    The stratifier computes consecutive-hour AOI NOx mass changes and normalizes
    them with the previous completed quarter's median and MAD. Overlapping AOI
    clusters are assigned intact to the 70/15/15 train, validation, and test
    splits without resampling.
-   The downloader and stratifier accept L2 and L3. L2 raster oversampling in
-   `generate_dataset` remains separate work; the stratifier only builds and
-   matches the L2 metadata caches at this stage.
+   Raster oversampling in `generate_dataset` remains separate work; the
+   stratifier only reads and matches the prebuilt TEMPO mapping at this stage.
 
 5. Train and evaluate the model:
 
