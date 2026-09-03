@@ -143,15 +143,20 @@ source .venv/bin/activate
    python -u -m preprocessing.generate_dataset
    ```
 
-   Pass `--overwrite` to `stratify_plants` to rebuild and replace the cached
-   TEMPO timestamp mapping. Without the flag, an existing mapping is reused.
+   Pass `--overwrite` to `stratify_plants` to rebuild the TEMPO caches. For L2,
+   Cache A stores monthly Parquet granule indexes with WKB footprints. Cache B
+   stores daily Parquet AOI-scan observations with stitched granule paths,
+   mirror-step ranges, and observation times. Cache A adds newly downloaded
+   paths incrementally and Cache B resumes from completed date shards. The
+   process pool uses `NUM_CORES`, which reads `SLURM_CPUS_PER_TASK` in a batch
+   job. L3 continues to use the older timestamp mapping benchmark.
    The stratifier computes consecutive-hour AOI NOx mass changes and normalizes
    them with the previous completed quarter's median and MAD. Overlapping AOI
    clusters are assigned intact to the 70/15/15 train, validation, and test
    splits without resampling.
-   The downloader accepts L2 and L3. `stratify_plants` currently reads NASA's
-   L3 grid schema, so it stops with a clear error when raw L2 is selected. L2
-   must first be quality-filtered and gridded by AOI before stratification.
+   The downloader and stratifier accept L2 and L3. L2 raster oversampling in
+   `generate_dataset` remains separate work; the stratifier only builds and
+   matches the L2 metadata caches at this stage.
 
 5. Train and evaluate the model:
 

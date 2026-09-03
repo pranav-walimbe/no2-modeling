@@ -14,6 +14,7 @@ from config import (
     LABEL_COL,
     NOX_MASS_COL,
     STRAT_BASE_DIR,
+    TEMPO_LEVEL,
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
     VAL_RECORDS_CSV,
@@ -21,15 +22,21 @@ from config import (
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
     add_aoi_bounds,
-    add_tempo_files,
+    add_hrrr_files,
     aggregate_aoi_hours,
     build_aoi_membership,
     build_aoi_spatial_frame,
     build_aois,
-    build_tempo_mapping,
     cluster_aois,
     filter_usable_nox_measurements,
     plot_split_distributions,
+)
+from preprocessing.tempo_mapping import (
+    add_tempo_files,
+    add_tempo_l2_observations,
+    build_tempo_l2_caches,
+    build_tempo_mapping,
+    serialize_tempo_path_lists,
 )
 
 TRAIN_FRACTION = 0.70
@@ -51,7 +58,11 @@ OUTPUT_COLUMNS = [
     "cluster",
     "tempo",
     "prev_tempo",
-    "era5",
+    "tempo_time",
+    "prev_tempo_time",
+    "tempo_delta_minutes",
+    "coverage_percent",
+    "hrrr",
     "avg_heat_input",
     "avg_pwr_gen",
     NOX_MASS_COL,
@@ -93,8 +104,7 @@ def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
         "test": clusters.slice(train_count + val_count),
     }
     return {
-        name: frame.join(split_clusters, on="cluster", how="inner")
-        for name, split_clusters in cluster_splits.items()
+        name: frame.join(split_clusters, on="cluster", how="inner") for name, split_clusters in cluster_splits.items()
     }
 
 
@@ -104,7 +114,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="recompute and replace the cached TEMPO mapping",
+        help="recompute and replace the TEMPO metadata cache",
     )
     return parser.parse_args(argv)
 
@@ -131,24 +141,25 @@ def main(argv: Iterable[str] | None = None) -> None:
     spatial_aois = build_aoi_spatial_frame(aois)
     membership = build_aoi_membership(aois, facilities, spatial_aois)
     frame = aggregate_aoi_hours(records, aois, membership).filter(
-        pl.col("avg_heat_input").is_not_null()
-        & pl.col("avg_pwr_gen").is_not_null()
-        & pl.col(LABEL_COL).is_not_null()
+        pl.col("avg_heat_input").is_not_null() & pl.col("avg_pwr_gen").is_not_null() & pl.col(LABEL_COL).is_not_null()
     )
     frame = frame.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
-    frame = add_tempo_files(frame, build_tempo_mapping(overwrite=args.overwrite)).filter(
-        pl.col("tempo").is_not_null() & pl.col("prev_tempo").is_not_null()
-    )
-    bounds = add_aoi_bounds(aois).select(AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max")
-    frame = frame.join(bounds, on=AOI_ID_COL, how="left").with_columns(
-        pl.concat_str(
-            pl.lit("era5_"),
-            pl.col("date").dt.year(),
-            pl.lit("_"),
-            pl.col("date").dt.month().cast(pl.String).str.pad_start(2, "0"),
-            pl.lit(".nc"),
-        ).alias("era5")
-    )
+    bounded_aois = add_aoi_bounds(aois)
+    if TEMPO_LEVEL == "L2":
+        observations = build_tempo_l2_caches(bounded_aois, overwrite=args.overwrite)
+        frame = add_tempo_l2_observations(frame, observations)
+    else:
+        frame = add_tempo_files(frame, build_tempo_mapping(overwrite=args.overwrite)).with_columns(
+            pl.lit(None, dtype=pl.Datetime(time_zone="UTC")).alias("tempo_time"),
+            pl.lit(None, dtype=pl.Datetime(time_zone="UTC")).alias("prev_tempo_time"),
+            pl.lit(None, dtype=pl.Float64).alias("tempo_delta_minutes"),
+            pl.lit(None, dtype=pl.Float64).alias("coverage_percent"),
+        )
+    frame = frame.filter(pl.col("tempo").is_not_null() & pl.col("prev_tempo").is_not_null())
+    bounds = bounded_aois.select(AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max")
+    frame = add_hrrr_files(frame.join(bounds, on=AOI_ID_COL, how="left"))
+    if TEMPO_LEVEL == "L2":
+        frame = serialize_tempo_path_lists(frame)
 
     splits = {name: split.select(OUTPUT_COLUMNS) for name, split in _split_by_cluster(frame).items()}
 
