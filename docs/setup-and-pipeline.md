@@ -1,7 +1,8 @@
 # Setup and pipeline guide
 
 This project predicts hourly power-plant NOx emissions using TEMPO satellite
-imagery, EPA CAMPD records, ERA5 wind reanalysis, and plant-level features.
+imagery, EPA CAMPD records, HRRR meteorology, and plant-level features. ERA5
+remains available as a benchmark weather input.
 
 ## Prerequisites
 
@@ -9,7 +10,7 @@ imagery, EPA CAMPD records, ERA5 wind reanalysis, and plant-level features.
 - The Savio `python/3.11.6-gcc-11.4.0` module
 - An EPA CAMPD API key
 - A NASA Earthdata account with access to TEMPO products
-- A Copernicus Climate Data Store account with ERA5 API access
+- A Copernicus Climate Data Store account when collecting the ERA5 benchmark
 - Access to the configured Savio project paths, or corresponding local path
   changes in `src/config.py`
 
@@ -62,8 +63,9 @@ EARTHDATA_PASSWORD=your_nasa_earthdata_password
 Do not commit this file. The variables are used for EPA CAMPD hourly NOx data
 and NASA Earthdata TEMPO downloads.
 
-ERA5 downloads use the CDS API. Create `~/.cdsapirc` using the credentials and
-format shown in your CDS account's API setup page. A typical configuration is:
+Optional ERA5 benchmark downloads use the CDS API. Create `~/.cdsapirc` using
+the credentials and format shown in your CDS account's API setup page. A
+typical configuration is:
 
 ```yaml
 url: https://cds.climate.copernicus.eu/api
@@ -108,16 +110,19 @@ source .venv/bin/activate
    TEMPO/<version>/<level>/raw/<year>/<month>/
    ```
 
-2. Download TEMPO and ERA5 data:
+2. Download TEMPO and HRRR data:
 
    ```bash
    python -u -m collection.scrape_tempo
-   python -u -m collection.scrape_era5
+   python -u -m collection.scrape_hrrr
    ```
 
    The TEMPO scraper searches one month at a time, downloads in batches set by
    `TEMPO_DOWNLOAD_BATCH_SIZE`, and skips files already present at their final
    path. Rerunning the same range is therefore idempotent for completed files.
+   The HRRR scraper saves one atomic GRIB2 subset per UTC hour under
+   `HRRR/raw/<year>/<month>/<day>`. Each file contains 10 m U/V wind, 2 m
+   temperature, and boundary-layer height from the hourly `f00` analysis.
 
 3. Download EPA emissions and facility locations:
 
@@ -125,6 +130,11 @@ source .venv/bin/activate
    python -u -m collection.scrape_emissions
    python -u -m collection.scrape_locations
    ```
+
+   Facility attributes are fetched in nationwide pages for each year rather
+   than with one request per facility. The location stage stops without
+   replacing its existing output if CAMPD requests fail or if enrichment would
+   drop any hourly emissions rows.
 
 4. Partition plants and generate model-ready datasets:
 
@@ -135,6 +145,10 @@ source .venv/bin/activate
 
    Pass `--overwrite` to `stratify_plants` to rebuild and replace the cached
    TEMPO timestamp mapping. Without the flag, an existing mapping is reused.
+   The stratifier computes consecutive-hour AOI NOx mass changes and normalizes
+   them with the previous completed quarter's median and MAD. Overlapping AOI
+   clusters are assigned intact to the 70/15/15 train, validation, and test
+   splits without resampling.
    The downloader accepts L2 and L3. `stratify_plants` currently reads NASA's
    L3 grid schema, so it stops with a clear error when raw L2 is selected. L2
    must first be quality-filtered and gridded by AOI before stratification.
@@ -155,7 +169,7 @@ The original workflow used these resources:
 
 | Stage | Savio partition | Typical time | CPU/GPU |
 | --- | --- | ---: | --- |
-| TEMPO and ERA5 download | `savio2_bigmem` | 8 hours | 1 CPU |
+| TEMPO and HRRR download | `savio4_htc` | Range-dependent | 4 CPUs |
 | EPA emissions download | `savio2_bigmem` | 6 hours | 1 CPU |
 | Partition and dataset build | `savio4_htc` | 4 hours | 56 CPUs |
 | Model training | `savio3_gpu` | 2 hours | 8 CPUs, 1 A40 GPU |
@@ -181,7 +195,7 @@ cd /global/home/users/<USERNAME>/no2-modeling
 module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
 srun python -u -m collection.scrape_tempo
-srun python -u -m collection.scrape_era5
+srun python -u -m collection.scrape_hrrr
 ```
 
 For a scratch environment, replace the activation line with the exact existing

@@ -67,6 +67,14 @@ WIND_END_MONTH = 12  # ERA5 download end month
 WIND_END_YEAR = 2025  # ERA5 download end year
 
 # ============================================================================
+# HRRR data scraping
+# ============================================================================
+HRRR_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/HRRR"
+HRRR_START_DATE = EMISSIONS_START_DATE
+HRRR_END_DATE = EMISSIONS_END_DATE
+HRRR_MAX_WORKERS = 4
+
+# ============================================================================
 # Dataset generation
 # ============================================================================
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
@@ -80,7 +88,14 @@ IMG_VAL_FILTER = 0.50  # max fraction of pixels at or above MAX_IMG_VAL
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 IMG_CLOUD_FILTER = 0.50  # max fraction of pixels exceeding MIN_PIXEL_CLOUD
 IMG_QA_FILTER = 0.80  # min fraction of pixels with QA flag == 0
-LABEL_COL = "noxMass"  # target variable (hourly NOx mass, lb/hr)
+NOX_MASS_COL = "nox_mass"
+DELTA_NOX_MASS_COL = "delta_nox_mass"
+DELTA_NOX_MED_COL = "delta_nox_med"
+DELTA_NOX_SCALE_COL = "delta_nox_scale"
+LABEL_COL = "delta_nox_norm"
+MIN_DELTA_HISTORY = 168
+MIN_DELTA_SCALE_LB = 0.1
+MAD_NORMAL_SCALE = 1.4826
 MIN_CITY_PROXIMITY = 100  # minimum distance to nearest major city (km)
 SPLIT_SIZES = {"train": 18000, "val": 4000, "test": 4000}  # target sample count per split
 
