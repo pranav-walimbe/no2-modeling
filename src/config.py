@@ -38,6 +38,9 @@ TEMPO_VERSION = "V04"  # supported values are V03 and V04
 TEMPO_PRODUCT = f"TEMPO_NO2_{TEMPO_LEVEL}"
 TEMPO_DIR = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION, TEMPO_LEVEL, "raw")
 TEMPO_MAPPING = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION, TEMPO_LEVEL, "tempo_mapping", "tempo.pkl")
+TEMPO_CACHE_DIR = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION, TEMPO_LEVEL, "cache")
+TEMPO_GRANULE_CACHE = os.path.join(TEMPO_CACHE_DIR, "granules")
+TEMPO_AOI_OBSERVATION_CACHE = os.path.join(TEMPO_CACHE_DIR, "aoi_observations")
 TEMPO_DOWNLOAD_BATCH_SIZE = 100  # bounds downloader memory and retry scope
 TEMPO_START_DATE = "2023-08-02 00:00:00"  # beginning of the TEMPO science record
 TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
@@ -46,6 +49,9 @@ TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
 # Stratification
 # ============================================================================
 MINS_FILTER = 60  # max time delta (minutes) between emissions record and TEMPO image
+TEMPO_MIN_DELTA_MINUTES = 45
+TEMPO_MAX_DELTA_MINUTES = 75
+TEMPO_GEOLOCATION_STRIDE = 4
 IMG_RANGE = 72  # spatial extent of extracted image patch (km)
 MIN_TEMPO_DURATION = 58  # minimum L3 scan duration to accept (minutes)
 STRAT_BASE_DIR = (

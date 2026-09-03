@@ -1,15 +1,8 @@
 """Utilities for building and splitting AOI-hour records."""
 
 import os
-import pickle
-from collections import defaultdict
-from collections.abc import Iterable
-from concurrent.futures import ProcessPoolExecutor
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 
 import matplotlib.pyplot as plt
-import netCDF4 as nc
 import numpy as np
 import polars as pl
 import shapely
@@ -25,147 +18,41 @@ from config import (
     MAD_NORMAL_SCALE,
     MIN_DELTA_HISTORY,
     MIN_DELTA_SCALE_LB,
-    MIN_TEMPO_DURATION,
-    MINS_FILTER,
     NOX_MASS_COL,
-    NUM_CORES,
     STRAT_VIS_PNG,
-    TEMPO_DIR,
-    TEMPO_LEVEL,
-    TEMPO_MAPPING,
 )
 
 AOI_ID_COL = "aoi_id"
+HRRR_PRODUCT = "wrfsfcf00"  # hourly surface analysis product named in every HRRR filename
+HRRR_FIELD_SLUG = "wind-temp-blh"  # field subset named in every HRRR filename
 WGS84_TO_CONUS = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
 CONUS_TO_WGS84 = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True)
 
 
-def select_tempo_after(
-    target_dt: datetime,
-    candidates: Iterable[tuple[datetime, str]],
-    window_minutes: int,
-) -> str | None:
-    """Return the closest candidate after a target within the given window."""
-    window = timedelta(minutes=window_minutes)
-    eligible = [
-        (current_dt - target_dt, filename)
-        for current_dt, filename in candidates
-        if timedelta(0) < current_dt - target_dt <= window
-    ]
-    return min(eligible, default=(None, None), key=lambda item: item[0])[1]
+def add_hrrr_files(frame: pl.DataFrame) -> pl.DataFrame:
+    """Attach the HRRR storage-root-relative GRIB2 path to AOI-hour rows.
 
+    The path is keyed on the same UTC date and hour that select the TEMPO
+    tiles, so both sources describe one clock hour. One file holds every
+    configured field, so wind, temperature, and boundary-layer height share
+    this column.
 
-def parse_tile(paths: tuple[str, str]) -> tuple[datetime, str] | None:
-    """Return the timestamp and relative path for a qualifying L3 tile."""
-    absolute_path, relative_path = paths
-    try:
-        with nc.Dataset(absolute_path) as dataset:
-            start = datetime.fromisoformat(dataset.time_coverage_start.replace("Z", "+00:00"))
-            end = datetime.fromisoformat(dataset.time_coverage_end.replace("Z", "+00:00"))
-        if (end - start).total_seconds() / 60 < MIN_TEMPO_DURATION:
-            return None
-        filename = Path(relative_path).name
-        timestamp = datetime.strptime(filename.split("_")[4], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-        return timestamp, relative_path
-    except (IndexError, OSError, RuntimeError, ValueError) as error:
-        print(f"WARNING: skipping {relative_path}: {error}")
-        return None
+    Args:
+        frame: AOI-hour rows carrying UTC date and hour columns.
 
-
-def _as_utc(timestamp: object) -> datetime:
-    # Support pandas timestamps stored by older mapping caches
-    if hasattr(timestamp, "to_pydatetime"):
-        timestamp = timestamp.to_pydatetime()
-    if not isinstance(timestamp, datetime):
-        raise TypeError(f"Unsupported TEMPO timestamp type: {type(timestamp).__name__}")
-    if timestamp.tzinfo is None:
-        return timestamp.replace(tzinfo=timezone.utc)
-    return timestamp.astimezone(timezone.utc)
-
-
-def normalize_tempo_mapping(mapping: dict) -> dict[date, list[tuple[datetime, str]]]:
-    """Normalize cached timestamps to UTC and sort each date's tiles."""
-    normalized = {}
-    for scan_date, tiles in mapping.items():
-        normalized[scan_date] = sorted(
-            [(_as_utc(timestamp), filename) for timestamp, filename in tiles],
-            key=lambda tile: tile[0],
-        )
-    return normalized
-
-
-def build_tempo_mapping(overwrite: bool = False) -> dict[date, list[tuple[datetime, str]]]:
-    """Map dates to qualifying TEMPO tiles with optional cache replacement."""
-    if TEMPO_LEVEL != "L3":
-        raise RuntimeError("Raw TEMPO L2 granules must be gridded before stratification")
-    if not overwrite and os.path.exists(TEMPO_MAPPING):
-        with open(TEMPO_MAPPING, "rb") as file:
-            return normalize_tempo_mapping(pickle.load(file))
-
-    tempo_root = Path(TEMPO_DIR)
-    paths = ((str(path), str(path.relative_to(tempo_root))) for path in tempo_root.rglob("*.nc") if path.is_file())
-    with ProcessPoolExecutor(max_workers=NUM_CORES) as executor:
-        tempo_by_date = defaultdict(list)
-        for result in executor.map(parse_tile, paths, chunksize=32):
-            if result is not None:
-                timestamp, filename = result
-                tempo_by_date[timestamp.date()].append((timestamp, filename))
-
-    normalized = normalize_tempo_mapping(tempo_by_date)
-    os.makedirs(os.path.dirname(TEMPO_MAPPING), exist_ok=True)
-    with open(TEMPO_MAPPING, "wb") as file:
-        pickle.dump(normalized, file)
-    return normalized
-
-
-def _record_datetime(record_date: date | datetime, hour: int) -> datetime:
-    # Build the UTC start of a CAMPD reporting hour
-    if isinstance(record_date, datetime):
-        record_date = record_date.date()
-    return datetime.combine(record_date, datetime.min.time(), tzinfo=timezone.utc).replace(hour=int(hour))
-
-
-def add_tempo_files(
-    frame: pl.DataFrame,
-    tempo_by_date: dict[date, list[tuple[datetime, str]]],
-) -> pl.DataFrame:
-    """Attach current and preceding TEMPO filenames to AOI-hour rows."""
-    candidates = pl.DataFrame(
-        [
-            {"scan_datetime": timestamp, "tempo": filename}
-            for tiles in tempo_by_date.values()
-            for timestamp, filename in tiles
-        ],
-        schema={"scan_datetime": pl.Datetime(time_zone="UTC"), "tempo": pl.String},
-    ).sort("scan_datetime")
-    target_hours = frame.select("date", "hour").unique()
-    targets = target_hours.with_columns(
-        (pl.col("date").cast(pl.Datetime(time_zone="UTC")) + pl.duration(hours=pl.col("hour"))).alias("target_datetime")
+    Returns:
+        The frame with an added HRRR path column.
+    """
+    return frame.with_columns(
+        pl.format(
+            "raw/{}/hrrr_{}_{}z_{}_{}.grib2",
+            pl.col("date").dt.strftime("%Y/%m/%d"),
+            pl.col("date").dt.strftime("%Y%m%d"),
+            pl.col("hour").cast(pl.String).str.pad_start(2, "0"),
+            pl.lit(HRRR_PRODUCT),
+            pl.lit(HRRR_FIELD_SLUG),
+        ).alias("hrrr")
     )
-    tolerance = timedelta(minutes=MINS_FILTER)
-    current = targets.sort("target_datetime").join_asof(
-        candidates,
-        left_on="target_datetime",
-        right_on="scan_datetime",
-        strategy="forward",
-        tolerance=tolerance,
-        allow_exact_matches=False,
-    )
-    previous_candidates = candidates.rename({"scan_datetime": "prev_scan_datetime", "tempo": "prev_tempo"})
-    matches = (
-        current.with_columns((pl.col("target_datetime") - pl.duration(hours=1)).alias("prev_target_datetime"))
-        .sort("prev_target_datetime")
-        .join_asof(
-            previous_candidates,
-            left_on="prev_target_datetime",
-            right_on="prev_scan_datetime",
-            strategy="forward",
-            tolerance=tolerance,
-            allow_exact_matches=False,
-        )
-        .drop("target_datetime", "scan_datetime", "prev_target_datetime", "prev_scan_datetime")
-    )
-    return frame.join(matches, on=["date", "hour"], how="left")
 
 
 def add_projected_coordinates(frame: pl.DataFrame) -> pl.DataFrame:
@@ -275,9 +162,7 @@ def add_previous_quarter_same_hour_averages(hourly: pl.LazyFrame) -> pl.LazyFram
 def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
     """Add hourly NOx changes normalized by the prior completed quarter."""
     with_deltas = (
-        hourly.with_columns(
-            (pl.col("date").cast(pl.Datetime) + pl.duration(hours=pl.col("hour"))).alias("_hour_start")
-        )
+        hourly.with_columns((pl.col("date").cast(pl.Datetime) + pl.duration(hours=pl.col("hour"))).alias("_hour_start"))
         .sort(AOI_ID_COL, "_hour_start")
         .with_columns(
             pl.col(NOX_MASS_COL).shift(1).over(AOI_ID_COL).alias("_previous_nox_mass"),
