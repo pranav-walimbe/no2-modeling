@@ -14,6 +14,10 @@ from prerequisites import require_campd_credentials
 API_URL = "https://api.epa.gov/easey/facilities-mgmt/facilities/attributes"
 MAX_RETRIES = 3
 RECORDS_PER_PAGE = 500
+REQUEST_INTERVAL_SECONDS = 4
+INITIAL_RETRY_DELAY_SECONDS = 30
+MAX_RETRY_DELAY_SECONDS = 300
+RATE_LIMIT_WAIT_SECONDS = 3_600
 ROW_GROUP_SIZE = 250_000
 
 FACILITY_ATTRIBUTE_COLUMNS = {
@@ -66,14 +70,12 @@ ATTRIBUTE_SCHEMA = {
 
 
 def _fetch_attribute_page(
-    facility_id: int,
     year: int,
     page: int,
-) -> list[dict[str, object]] | None:
-    # Fetch one page while distinguishing an empty result from a failed request
+) -> list[dict[str, object]]:
+    # Fetch one nationwide page and fail after bounded retries
     params = {
         "api_key": require_campd_credentials(),
-        "facilityId": facility_id,
         "year": year,
         "page": page,
         "perPage": RECORDS_PER_PAGE,
@@ -81,63 +83,96 @@ def _fetch_attribute_page(
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"Fetching facility {facility_id} for {year}, page {page} (attempt {attempt}/{MAX_RETRIES})")
+            print(f"Fetching all facilities for {year}, page {page} (attempt {attempt}/{MAX_RETRIES})")
             response = requests.get(API_URL, params=params, timeout=30)
             response.raise_for_status()
             payload = response.json()
             records = payload.get("items", []) if isinstance(payload, dict) else payload
             if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
                 raise TypeError("unexpected facility-attribute response")
+            time.sleep(REQUEST_INTERVAL_SECONDS)
             return records
         except requests.exceptions.RequestException as error:
             status = error.response.status_code if error.response is not None else None
             detail = type(error).__name__ if status is None else f"{type(error).__name__} (HTTP {status})"
             if attempt == MAX_RETRIES:
-                print(f"WARNING: facility {facility_id} failed for {year}, page {page}: {detail}")
-                return None
-            time.sleep(2**attempt)
+                raise RuntimeError(f"Facility attributes failed for {year}, page {page}: {detail}") from error
+            if status == 429:
+                retry_after = error.response.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after and retry_after.isdigit() else RATE_LIMIT_WAIT_SECONDS
+            else:
+                delay = min(INITIAL_RETRY_DELAY_SECONDS * 2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS)
+            print(f"WARNING: facility attributes failed for {year}, page {page}: {detail}; retrying in {delay:.0f}s")
+            time.sleep(delay)
         except (ValueError, TypeError) as error:
             if attempt == MAX_RETRIES:
-                print(f"WARNING: facility {facility_id} failed for {year}, page {page}: {type(error).__name__}")
-                return None
-            time.sleep(2**attempt)
+                raise RuntimeError(
+                    f"Facility attributes returned invalid data for {year}, page {page}: {type(error).__name__}"
+                ) from error
+            delay = min(INITIAL_RETRY_DELAY_SECONDS * 2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS)
+            print(
+                f"WARNING: facility attributes returned invalid data for {year}, page {page}: "
+                f"{type(error).__name__}; retrying in {delay:.0f}s"
+            )
+            time.sleep(delay)
 
     raise AssertionError("Retry loop exited unexpectedly")
 
 
+def _fetch_attribute_year(year: int) -> list[dict[str, object]]:
+    # Collect every nationwide page for one year
+    records: list[dict[str, object]] = []
+    page = 1
+    while True:
+        page_records = _fetch_attribute_page(year, page)
+        records.extend(page_records)
+        if len(page_records) < RECORDS_PER_PAGE:
+            return records
+        page += 1
+
+
 def get_facility_attributes(
-    facility_id: int,
+    facility_ids: list[int],
     latest_year: int,
     earliest_year: int,
 ) -> list[dict[str, object]]:
-    """Return all unit records from the newest available attribute year.
+    """Return unit records from each facility's newest available year.
 
     Args:
-        facility_id: EPA facility identifier.
+        facility_ids: EPA facility identifiers required by the emissions data.
         latest_year: First facility-attribute year to query.
         earliest_year: Oldest facility-attribute year to query.
 
     Returns:
-        Facility and unit attribute records from the newest available year.
+        Facility and unit records from the newest available year per facility.
     """
+    remaining_facility_ids = set(facility_ids)
+    selected_records: list[dict[str, object]] = []
+
     for year in range(latest_year, earliest_year - 1, -1):
-        records: list[dict[str, object]] = []
-        page = 1
-        while True:
-            page_records = _fetch_attribute_page(facility_id, year, page)
-            if page_records is None:
-                return []
-            if not page_records:
-                break
-            records.extend(page_records)
-            if len(page_records) < RECORDS_PER_PAGE:
-                return records
-            page += 1
+        year_records = _fetch_attribute_year(year)
+        matched_records: list[dict[str, object]] = []
+        matched_facility_ids: set[int] = set()
+        for record in year_records:
+            try:
+                facility_id = int(record["facilityId"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if facility_id in remaining_facility_ids:
+                matched_records.append(record)
+                matched_facility_ids.add(facility_id)
 
-        if records:
-            return records
+        selected_records.extend(matched_records)
+        remaining_facility_ids.difference_update(matched_facility_ids)
+        print(
+            f"Matched {len(matched_facility_ids):,} facilities for {year}; "
+            f"{len(remaining_facility_ids):,} still need attributes"
+        )
+        if not remaining_facility_ids:
+            return selected_records
 
-    return []
+    missing = ", ".join(str(facility_id) for facility_id in sorted(remaining_facility_ids))
+    raise RuntimeError(f"CAMPD returned no facility attributes for required facilities: {missing}")
 
 
 def _build_attribute_frames(records: list[dict[str, object]]) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -145,21 +180,15 @@ def _build_attribute_frames(records: list[dict[str, object]]) -> tuple[pl.DataFr
     attributes = pl.DataFrame(records, schema=ATTRIBUTE_SCHEMA, strict=False).with_columns(
         pl.col("unitId").str.strip_chars()
     )
-    facility_attributes = (
-        attributes.select(
-            "facilityId",
-            *(pl.col(source).alias(target) for source, target in FACILITY_ATTRIBUTE_COLUMNS.items()),
-        )
-        .unique(subset="facilityId", keep="first", maintain_order=True)
-    )
-    unit_attributes = (
-        attributes.select(
-            "facilityId",
-            pl.col("unitId").alias("unitIdKey"),
-            *(pl.col(source).alias(target) for source, target in UNIT_ATTRIBUTE_COLUMNS.items()),
-        )
-        .unique(subset=["facilityId", "unitIdKey"], keep="first", maintain_order=True)
-    )
+    facility_attributes = attributes.select(
+        "facilityId",
+        *(pl.col(source).alias(target) for source, target in FACILITY_ATTRIBUTE_COLUMNS.items()),
+    ).unique(subset="facilityId", keep="first", maintain_order=True)
+    unit_attributes = attributes.select(
+        "facilityId",
+        pl.col("unitId").alias("unitIdKey"),
+        *(pl.col(source).alias(target) for source, target in UNIT_ATTRIBUTE_COLUMNS.items()),
+    ).unique(subset=["facilityId", "unitIdKey"], keep="first", maintain_order=True)
     return facility_attributes, unit_attributes
 
 
@@ -191,6 +220,7 @@ def write_augmented_parquet(
         raise ValueError(f"Raw hourly emissions Parquet is missing required columns: {missing}")
 
     unit_id = pl.col("unitId").cast(pl.String, strict=False).str.strip_chars()
+    source_row_count = source.select(pl.len()).collect().item()
     augmented = (
         source.with_columns(
             pl.col("facilityId").cast(pl.Int64, strict=False),
@@ -213,6 +243,12 @@ def write_augmented_parquet(
         row_count = pl.scan_parquet(temporary_path).select(pl.len()).collect().item()
         if row_count == 0:
             raise RuntimeError("No emissions rows had complete facility location attributes")
+        if row_count < source_row_count:
+            raise RuntimeError(
+                f"Location enrichment dropped {source_row_count - row_count:,} of {source_row_count:,} emissions rows"
+            )
+        if row_count > source_row_count:
+            raise RuntimeError(f"Location enrichment added {row_count - source_row_count:,} duplicate emissions rows")
         os.replace(temporary_path, output_path)
     except BaseException:
         temporary_path.unlink(missing_ok=True)
@@ -235,17 +271,11 @@ def main() -> None:
         .to_list()
     )
 
-    attribute_records: list[dict[str, object]] = []
-    for facility_id in facility_ids:
-        attribute_records.extend(
-            get_facility_attributes(
-                facility_id,
-                latest_year=date.today().year,
-                earliest_year=EMISSIONS_START_DATE.year,
-            )
-        )
-    if not attribute_records:
-        raise RuntimeError("CAMPD returned no facility attributes")
+    attribute_records = get_facility_attributes(
+        facility_ids=facility_ids,
+        latest_year=date.today().year,
+        earliest_year=EMISSIONS_START_DATE.year,
+    )
 
     facility_attributes, unit_attributes = _build_attribute_frames(attribute_records)
     row_count = write_augmented_parquet(

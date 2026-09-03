@@ -17,10 +17,17 @@ from pycanopy import SpatialFrame
 from pyproj import Transformer
 
 from config import (
+    DELTA_NOX_MASS_COL,
+    DELTA_NOX_MED_COL,
+    DELTA_NOX_SCALE_COL,
     IMG_RANGE,
     LABEL_COL,
+    MAD_NORMAL_SCALE,
+    MIN_DELTA_HISTORY,
+    MIN_DELTA_SCALE_LB,
     MIN_TEMPO_DURATION,
     MINS_FILTER,
+    NOX_MASS_COL,
     NUM_CORES,
     STRAT_VIS_PNG,
     TEMPO_DIR,
@@ -265,6 +272,69 @@ def add_previous_quarter_same_hour_averages(hourly: pl.LazyFrame) -> pl.LazyFram
     )
 
 
+def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
+    """Add hourly NOx changes normalized by the prior completed quarter."""
+    with_deltas = (
+        hourly.with_columns(
+            (pl.col("date").cast(pl.Datetime) + pl.duration(hours=pl.col("hour"))).alias("_hour_start")
+        )
+        .sort(AOI_ID_COL, "_hour_start")
+        .with_columns(
+            pl.col(NOX_MASS_COL).shift(1).over(AOI_ID_COL).alias("_previous_nox_mass"),
+            pl.col("_hour_start").shift(1).over(AOI_ID_COL).alias("_previous_hour_start"),
+        )
+        .with_columns(
+            pl.when(pl.col("_hour_start") - pl.col("_previous_hour_start") == pl.duration(hours=1))
+            .then(pl.col(NOX_MASS_COL) - pl.col("_previous_nox_mass"))
+            .alias(DELTA_NOX_MASS_COL),
+            pl.col("date").dt.year().alias("_year"),
+            pl.col("date").dt.quarter().alias("_quarter"),
+        )
+    )
+    quarter_medians = (
+        with_deltas.filter(pl.col(DELTA_NOX_MASS_COL).is_not_null())
+        .group_by(AOI_ID_COL, "_year", "_quarter")
+        .agg(
+            pl.col(DELTA_NOX_MASS_COL).median().alias(DELTA_NOX_MED_COL),
+            pl.len().alias("_delta_history_count"),
+        )
+    )
+    quarter_stats = (
+        with_deltas.filter(pl.col(DELTA_NOX_MASS_COL).is_not_null())
+        .join(quarter_medians, on=[AOI_ID_COL, "_year", "_quarter"], how="inner")
+        .group_by(AOI_ID_COL, "_year", "_quarter")
+        .agg(
+            pl.col(DELTA_NOX_MED_COL).first(),
+            pl.col("_delta_history_count").first(),
+            (pl.col(DELTA_NOX_MASS_COL) - pl.col(DELTA_NOX_MED_COL)).abs().median().alias("_delta_nox_mad"),
+        )
+        .with_columns(
+            pl.max_horizontal(pl.col("_delta_nox_mad") * MAD_NORMAL_SCALE, pl.lit(MIN_DELTA_SCALE_LB)).alias(
+                DELTA_NOX_SCALE_COL
+            ),
+            pl.when(pl.col("_quarter") == 4).then(pl.col("_year") + 1).otherwise(pl.col("_year")).alias("_year"),
+            pl.when(pl.col("_quarter") == 4).then(1).otherwise(pl.col("_quarter") + 1).alias("_quarter"),
+        )
+    )
+    return (
+        with_deltas.join(quarter_stats, on=[AOI_ID_COL, "_year", "_quarter"], how="left")
+        .with_columns(
+            pl.when(pl.col("_delta_history_count") >= MIN_DELTA_HISTORY)
+            .then((pl.col(DELTA_NOX_MASS_COL) - pl.col(DELTA_NOX_MED_COL)) / pl.col(DELTA_NOX_SCALE_COL))
+            .alias(LABEL_COL)
+        )
+        .drop(
+            "_hour_start",
+            "_previous_nox_mass",
+            "_previous_hour_start",
+            "_year",
+            "_quarter",
+            "_delta_nox_mad",
+            "_delta_history_count",
+        )
+    )
+
+
 def aggregate_aoi_hours(
     records: pl.DataFrame | pl.LazyFrame,
     aois: pl.DataFrame,
@@ -288,13 +358,13 @@ def aggregate_aoi_hours(
         records_lazy.join(membership.lazy(), on="facilityId", how="inner")
         .group_by(AOI_ID_COL, "date", "hour")
         .agg(
-            pl.col(LABEL_COL).sum().alias(LABEL_COL),
+            pl.col("noxMass").sum().alias(NOX_MASS_COL),
             pl.col("heatInput").mean().alias("_hourly_avg_heat_input"),
             pl.col("grossLoad").mean().alias("_hourly_avg_pwr_gen"),
         )
     )
     return (
-        add_previous_quarter_same_hour_averages(hourly)
+        add_delta_nox_targets(add_previous_quarter_same_hour_averages(hourly))
         .join(unit_counts, on=AOI_ID_COL, how="left")
         .join(aois.select(AOI_ID_COL, "lat", "lon", "x_m", "y_m").lazy(), on=AOI_ID_COL, how="left")
         .sort(AOI_ID_COL, "date", "hour")

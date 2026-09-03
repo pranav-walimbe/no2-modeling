@@ -7,8 +7,12 @@ from collections.abc import Iterable
 import polars as pl
 
 from config import (
+    DELTA_NOX_MASS_COL,
+    DELTA_NOX_MED_COL,
+    DELTA_NOX_SCALE_COL,
     FULL_DATA_PARQUET,
     LABEL_COL,
+    NOX_MASS_COL,
     STRAT_BASE_DIR,
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
@@ -50,6 +54,10 @@ OUTPUT_COLUMNS = [
     "era5",
     "avg_heat_input",
     "avg_pwr_gen",
+    NOX_MASS_COL,
+    DELTA_NOX_MASS_COL,
+    DELTA_NOX_MED_COL,
+    DELTA_NOX_SCALE_COL,
     LABEL_COL,
 ]
 REQUIRED_COLUMNS = [
@@ -59,7 +67,7 @@ REQUIRED_COLUMNS = [
     "lon",
     "date",
     "hour",
-    LABEL_COL,
+    "noxMass",
     "grossLoad",
     "heatInput",
     "noxMassMeasureFlg",
@@ -68,15 +76,25 @@ REQUIRED_COLUMNS = [
 ]
 
 
-def _split_randomly(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
-    # Assign every row once using a reproducible random shuffle
-    shuffled = frame.sample(fraction=1.0, shuffle=True, seed=SPLIT_SEED)
-    train_count = int(frame.height * TRAIN_FRACTION)
-    val_count = int(frame.height * VAL_FRACTION)
+def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
+    # Assign each geographic cluster to exactly one split
+    if frame["cluster"].null_count() > 0:
+        raise ValueError("Cannot split records with missing cluster assignments")
+
+    clusters = frame.select("cluster").unique().sort("cluster").sample(fraction=1.0, shuffle=True, seed=SPLIT_SEED)
+    if clusters.height < 3:
+        raise ValueError("At least three geographic clusters are required to create train, validation, and test splits")
+
+    train_count = min(clusters.height - 2, max(1, int(clusters.height * TRAIN_FRACTION)))
+    val_count = min(clusters.height - train_count - 1, max(1, int(clusters.height * VAL_FRACTION)))
+    cluster_splits = {
+        "train": clusters.slice(0, train_count),
+        "val": clusters.slice(train_count, val_count),
+        "test": clusters.slice(train_count + val_count),
+    }
     return {
-        "train": shuffled.slice(0, train_count),
-        "val": shuffled.slice(train_count, val_count),
-        "test": shuffled.slice(train_count + val_count),
+        name: frame.join(split_clusters, on="cluster", how="inner")
+        for name, split_clusters in cluster_splits.items()
     }
 
 
@@ -113,7 +131,9 @@ def main(argv: Iterable[str] | None = None) -> None:
     spatial_aois = build_aoi_spatial_frame(aois)
     membership = build_aoi_membership(aois, facilities, spatial_aois)
     frame = aggregate_aoi_hours(records, aois, membership).filter(
-        pl.col("avg_heat_input").is_not_null() & pl.col("avg_pwr_gen").is_not_null()
+        pl.col("avg_heat_input").is_not_null()
+        & pl.col("avg_pwr_gen").is_not_null()
+        & pl.col(LABEL_COL).is_not_null()
     )
     frame = frame.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
     frame = add_tempo_files(frame, build_tempo_mapping(overwrite=args.overwrite)).filter(
@@ -130,7 +150,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         ).alias("era5")
     )
 
-    splits = {name: split.select(OUTPUT_COLUMNS) for name, split in _split_randomly(frame).items()}
+    splits = {name: split.select(OUTPUT_COLUMNS) for name, split in _split_by_cluster(frame).items()}
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     splits["train"].write_csv(TRAIN_RECORDS_CSV)
