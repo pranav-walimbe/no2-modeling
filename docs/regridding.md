@@ -18,26 +18,30 @@ A native value enters the NO2 mean when:
 - effective cloud fraction is at most `MIN_PIXEL_CLOUD`, currently 0.20; and
 - the NO2 value and footprint geometry are valid.
 
-Filtering occurs before averaging. Diagnostics are nevertheless calculated
-from all geometrically valid overlapping footprints so rejected inputs remain
-visible. Each output contains:
+Filtering occurs before averaging. Cloud and quality diagnostics still use all
+geometrically valid overlapping footprints so rejected inputs remain visible.
 
-| Raster | Meaning |
-|---|---|
-| `no2` | Accepted overlap-area-weighted tropospheric NO2 |
-| `sum_weight` | Total accepted overlap area in km2 |
-| `sum_weight_squared` | Sum of squared accepted overlap areas in km4 |
-| `effective_sample_size` | `(sum_weight)^2 / sum_weight_squared` |
-| `total_overlap_area` | Overlap area in km2 from all native contributors |
-| `native_pixel_count` | Number of all native contributors |
-| `accepted_pixel_count` | Number of contributors accepted into NO2 |
-| `weighted_cloud_fraction` | Overlap-weighted cloud fraction from all inputs |
-| `good_quality_fraction` | Fraction of all overlap area carrying quality flag 0 |
-| `main_data_quality_flag` | Worst overlapping native flag, like NASA's conservative L3 flag |
-| `retrieval_uncertainty` | Overlap-weighted uncertainty of accepted contributors |
+## Saved raster bundle
 
-Only `no2` is changed by cell masking. The raw diagnostics remain available so
-the support rule can be revised without rerunning tessellation.
+Each AOI scan is saved as one compressed `.npz` containing five aligned 48 by
+48 `float32` rasters:
+
+| Raster | What one output pixel displays | Missing value |
+|---|---|---|
+| `no2` | Overlap-area-weighted tropospheric NO2 from quality-0 footprints with cloud fraction at most 0.20, in molecules/cm2 | `NaN` when no accepted value reaches the cell or accepted overlap is below 0.25 km2 |
+| `weighted_cloud_fraction` | Overlap-area-weighted cloud fraction from all valid native footprints, including footprints rejected from NO2 | `NaN` when no footprint with valid cloud information overlaps the cell |
+| `good_quality_fraction` | Share of total overlapping footprint area carrying quality flag 0, from 0 to 1 | `NaN` when no valid native footprint overlaps the cell |
+| `retrieval_uncertainty` | Overlap-area-weighted NO2 retrieval uncertainty from accepted footprints, in molecules/cm2 | `NaN` when no accepted footprint has finite uncertainty |
+| `sum_weight` | Total area in km2 where accepted native footprints overlap the cell | `0.0` when no accepted footprint overlaps; zero is a real absence of support rather than a missing value |
+
+The ancillary rasters can remain populated where `no2` is `NaN`. This preserves
+information about cloudy or low-overlap cells. Downstream code uses finite
+`no2` values as the validity mask and requires both scans to be finite before
+forming a delta.
+
+The regridder also calculates squared weight, effective sample size, total
+overlap area, contributor counts, and worst quality internally. These values
+support masking and validation but are not persisted in the modeling bundle.
 
 ## EDA decisions
 
