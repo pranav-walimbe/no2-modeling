@@ -81,6 +81,12 @@ For each pixel the code does four things.
 4. Evaluate that curve at the grid cell centres near the pixel. The result is
    each cell's weight for that pixel.
 
+Each weight is then divided by the pixel's footprint area in square
+kilometres. Without that, a large edge-of-scan pixel would count for more than a
+small one purely for being bigger, wherever the two overlap the same cell. It
+also sets the units: a cell's total weight is a response per square kilometre,
+which is the scale `TEMPO_CELL_WEIGHT_FLOOR` is compared against.
+
 Then each output cell takes the weighted mean of every pixel that reached it.
 A cell's value is the sum of `weight x NO2` divided by the sum of `weight`.
 
@@ -140,6 +146,7 @@ and runs a little faster.
 | `OVERSAMPLE_FACTOR` | 3 | Time against integration accuracy. |
 | `TEMPO_RESPONSE_CUTOFF` | 1e-6 | Window size against truncation error. |
 | `TEMPO_CELL_WEIGHT_FLOOR` | 0.01 | Cell count against cell reliability. |
+| `TEMPO_EFFECTIVE_SAMPLE_FLOOR` | 0.0 | Off until the paired-cell sweep sets it. |
 | `SRF_MIN_WEIGHT` | 1e-3 | Only affects the reported pixel count per cell. |
 
 ### Cloud threshold
@@ -241,8 +248,6 @@ measurement picks a value.
   calculation. The earlier sweep compared a different set of cells at each
   cutoff, which made it unusable. The harness now reports value error and lost
   coverage separately.
-- **Area weighting.** POPY divides each response by its footprint area. The EDA
-  measured that at under 1 percent, so the pipeline leaves it out for now.
 - **Selection margin.** 8 km is measured as safe but is still a fixed number
   rather than one derived per footprint.
 

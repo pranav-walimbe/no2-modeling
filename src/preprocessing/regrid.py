@@ -126,6 +126,7 @@ class _PixelResponse:
     width_xtrack: np.ndarray
     width_step: np.ndarray
     support_radius: np.ndarray
+    area_km2: np.ndarray
     values: np.ndarray
 
 
@@ -263,8 +264,9 @@ def _build_pixel_response(
     offsets = corners - centre[:, None, :]
     fwhm_xtrack = np.linalg.norm(offsets[:, 2:4].mean(axis=1) - offsets[:, 0:2].mean(axis=1), axis=1)
     fwhm_step = np.linalg.norm(offsets[:, 1:3].mean(axis=1) - offsets[:, [0, 3]].mean(axis=1), axis=1)
+    area_km2 = _footprint_area_km2(corners)
 
-    usable = np.isfinite(offsets).all(axis=(1, 2)) & (fwhm_xtrack > 0) & (fwhm_step > 0)
+    usable = np.isfinite(offsets).all(axis=(1, 2)) & (fwhm_xtrack > 0) & (fwhm_step > 0) & (area_km2 > 0)
     offsets, centre = offsets[usable], centre[usable]
     fwhm_xtrack, fwhm_step = fwhm_xtrack[usable], fwhm_step[usable]
     rectangle = np.stack([np.array([-1.0, -1.0, 1.0, 1.0]), np.array([-1.0, 1.0, 1.0, -1.0])], axis=1)
@@ -280,8 +282,17 @@ def _build_pixel_response(
         support_radius=_support_radius(
             offsets, exponent_xtrack, exponent_step, exponent_outer, inflate, response_cutoff
         ),
+        area_km2=area_km2[usable],
         values=pixels.values[usable],
     )
+
+
+def _footprint_area_km2(corners: np.ndarray) -> np.ndarray:
+    # Shoelace area of each projected footprint
+    shifted_x = np.roll(corners[:, :, 0], -1, axis=1)
+    shifted_y = np.roll(corners[:, :, 1], -1, axis=1)
+    twice_area = np.sum(corners[:, :, 0] * shifted_y - corners[:, :, 1] * shifted_x, axis=1)
+    return 0.5 * np.abs(twice_area) / (METRES_PER_KM**2)
 
 
 def _support_radius(
@@ -391,15 +402,17 @@ def oversample(
         )
         if not reached.any():
             continue
-        weights = _window_weights(
+        evaluated = _window_weights(
             response, index, offset_x[reached], offset_y[reached], exponent_xtrack, exponent_step, exponent_outer
         )
-        weights[weights < response_cutoff] = 0.0
+        evaluated[evaluated < response_cutoff] = 0.0
+        # POPY divides the response by footprint area so a large pixel cannot outweigh a small one
+        weights = evaluated / response.area_km2[index]
         # These slices are views into the full rasters
         sum_weight[rows, columns][reached] += weights
         sum_weight_squared[rows, columns][reached] += np.square(weights)
         sum_weighted_value[rows, columns][reached] += weights * response.values[index]
-        count[rows, columns][reached] += weights >= min_weight
+        count[rows, columns][reached] += evaluated >= min_weight
 
     observed = sum_weight > 0
     no2 = np.full(shape, np.nan)
