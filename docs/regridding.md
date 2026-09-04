@@ -125,7 +125,7 @@ of a typical column. Sampling at 3x is off by 0.3 percent. So 3x is converged an
 ### Why each pixel only looks at nearby cells
 
 A pixel's response fades with distance, so past some point its weight is too
-small to matter. `TEMPO_RESPONSE_CUTOFF` sets that point at 1e-6, and the code
+small to matter. `RESPONSE_CUTOFF` in `regrid.py` sets that point at 1e-6, and the code
 turns it into a radius: the block of grid cells a given pixel can reach at all.
 Each pixel is then evaluated inside its own small block instead of against the
 whole grid.
@@ -144,7 +144,7 @@ and runs a little faster.
 | snow and ice filter | off | Nothing measurable in warm-season scans. |
 | `SELECTION_MARGIN_KM` | 8.0 | Runtime against edge accuracy. |
 | `OVERSAMPLE_FACTOR` | 3 | Time against integration accuracy. |
-| `TEMPO_RESPONSE_CUTOFF` | 1e-6 | Window size against truncation error. |
+| `RESPONSE_CUTOFF` | 1e-6 | Window size against truncation error. |
 | `TEMPO_CELL_WEIGHT_FLOOR` | 0.01 | Cell count against cell reliability. |
 | `TEMPO_EFFECTIVE_SAMPLE_FLOOR` | 0.0 | Off until the paired-cell sweep sets it. |
 | `SRF_MIN_WEIGHT` | 1e-3 | Only affects the reported pixel count per cell. |

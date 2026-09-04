@@ -15,7 +15,6 @@ from config import (
     MIN_PIXEL_CLOUD,
     TEMPO_CELL_WEIGHT_FLOOR,
     TEMPO_EFFECTIVE_SAMPLE_FLOOR,
-    TEMPO_RESPONSE_CUTOFF,
     TEMPO_SRF_EXPONENT_OUTER,
     TEMPO_SRF_EXPONENT_STEP,
     TEMPO_SRF_EXPONENT_XTRACK,
@@ -27,6 +26,7 @@ METRES_PER_KM = 1000.0
 CORNER_COUNT = 4
 QUALITY_FLAG_GOOD = 0
 SRF_MIN_WEIGHT = 1e-3  # response below this does not count a pixel toward a cell
+RESPONSE_CUTOFF = 1e-6  # response below this does not reach a cell at all
 SELECTION_MARGIN_KM = 8.0  # keep pixels centred this far outside the AOI grid
 OVERSAMPLE_FACTOR = 3  # fine cells per output cell along each axis
 
@@ -354,7 +354,7 @@ def oversample(
     exponent_outer: float = TEMPO_SRF_EXPONENT_OUTER,
     inflate: float = TEMPO_SRF_INFLATE,
     min_weight: float = SRF_MIN_WEIGHT,
-    response_cutoff: float = TEMPO_RESPONSE_CUTOFF,
+    response_cutoff: float = RESPONSE_CUTOFF,
 ) -> RegriddedRaster:
     """Integrate every pixel's spatial response over the AOI grid.
 
