@@ -25,6 +25,7 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "seaborn",
+    "shapely",
     "torch==2.3.1",
 ]
 
