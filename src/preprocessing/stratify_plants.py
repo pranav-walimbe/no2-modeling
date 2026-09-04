@@ -6,7 +6,6 @@ import polars as pl
 
 from config import (
     DELTA_NOX_MASS_COL,
-    DELTA_NOX_MED_COL,
     DELTA_NOX_SCALE_COL,
     FULL_DATA_PARQUET,
     LABEL_COL,
@@ -66,7 +65,6 @@ OUTPUT_COLUMNS = [
     "avg_pwr_gen",
     NOX_MASS_COL,
     DELTA_NOX_MASS_COL,
-    DELTA_NOX_MED_COL,
     DELTA_NOX_SCALE_COL,
     LABEL_COL,
 ]
