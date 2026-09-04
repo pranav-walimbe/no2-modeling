@@ -80,6 +80,7 @@ class GranulePixels:
     latitudes: np.ndarray
     corner_longitudes: np.ndarray
     corner_latitudes: np.ndarray
+    uncertainties: np.ndarray | None = None
 
     def __len__(self) -> int:
         return int(self.values.size)
@@ -98,6 +99,7 @@ class GranulePixels:
             latitudes=self.latitudes[keep],
             corner_longitudes=self.corner_longitudes[keep],
             corner_latitudes=self.corner_latitudes[keep],
+            uncertainties=None if self.uncertainties is None else self.uncertainties[keep],
         )
 
 
@@ -131,6 +133,7 @@ def empty_pixels() -> GranulePixels:
         latitudes=np.empty(0, dtype=np.float64),
         corner_longitudes=np.empty((0, CORNER_COUNT), dtype=np.float64),
         corner_latitudes=np.empty((0, CORNER_COUNT), dtype=np.float64),
+        uncertainties=np.empty(0, dtype=np.float64),
     )
 
 
@@ -145,6 +148,11 @@ def concatenate_pixels(parts: list[GranulePixels]) -> GranulePixels:
         latitudes=np.concatenate([part.latitudes for part in usable]),
         corner_longitudes=np.concatenate([part.corner_longitudes for part in usable]),
         corner_latitudes=np.concatenate([part.corner_latitudes for part in usable]),
+        uncertainties=(
+            np.concatenate([part.uncertainties for part in usable])
+            if all(part.uncertainties is not None for part in usable)
+            else None
+        ),
     )
 
 
@@ -176,6 +184,7 @@ def read_granule_pixels(
         geolocation = dataset.groups["geolocation"]
         support = dataset.groups["support_data"]
         values = _filled(product.variables["vertical_column_troposphere"])
+        uncertainties = _filled(product.variables["vertical_column_troposphere_uncertainty"])
         quality = _filled(product.variables["main_data_quality_flag"])
         cloud = _filled(support.variables["eff_cloud_fraction"])
         latitudes = _filled(geolocation.variables["latitude"])
@@ -205,6 +214,7 @@ def read_granule_pixels(
         latitudes=latitudes[keep],
         corner_longitudes=corner_longitudes[keep],
         corner_latitudes=corner_latitudes[keep],
+        uncertainties=uncertainties[keep],
     )
 
 
