@@ -37,11 +37,8 @@ TEMPO_AOI_MAPPING = os.path.join(TEMPO_MAPPING_DIR, "aoi_observations")
 TEMPO_START_DATE = "2023-08-02 00:00:00"  # beginning of the TEMPO science record
 TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
 
-TEMPO_SRF_EXPONENT_XTRACK = 2.0  # shape exponent along the north-south detector array
-TEMPO_SRF_EXPONENT_STEP = 3.0  # shape exponent along the east-west mirror-step axis
-TEMPO_SRF_EXPONENT_OUTER = 1.0  # outer exponent applied to the summed radial term
-TEMPO_SRF_INFLATE = 1.0  # multiplier stretching each pixel response beyond its footprint
-TEMPO_CELL_WEIGHT_FLOOR = 0.01  # total response per km2 below which a cell is not observed
+TEMPO_GOOD_QUALITY_FLAG = 0  # V04 main_data_quality_flag value accepted into the NO2 mean
+TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.0  # disabled until paired-scan EDA selects accepted overlap-area support
 TEMPO_EFFECTIVE_SAMPLE_FLOOR = 0.0  # disabled until the paired-cell survival sweep settles a value
 
 # ============================================================================
