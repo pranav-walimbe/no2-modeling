@@ -18,16 +18,9 @@ EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 # ============================================================================
 EMISSIONS_START_DATE = date(2023, 8, 1)  # start of CAMPD hourly emissions pull
 EMISSIONS_END_DATE = date.today()  # request through the latest date available from CAMPD
-EMISSIONS_BASE_DIR = (
-    "/global/scratch/projects/fc_nitrates/ddp/nox/nox_emissions"  # HPC output directory for emissions data
-)
-EMISSIONS_RECORDS_PARQUET = os.path.join(
-    EMISSIONS_BASE_DIR, "nox_emissions_all.parquet"
-)  # raw operating and non-operating hourly records
-FULL_DATA_PARQUET = os.path.join(
-    EMISSIONS_BASE_DIR,
-    "nox_emissions_full.parquet",
-)  # emissions merged with plant metadata
+EMISSIONS_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_emissions"  # HPC output directory for emissions
+EMISSIONS_RECORDS_PARQUET = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_all.parquet")  # hourly records, any status
+FULL_DATA_PARQUET = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.parquet")  # emissions with plant metadata
 
 # ============================================================================
 # TEMPO data scraping
@@ -41,7 +34,6 @@ TEMPO_MAPPING_DIR = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION, TEMPO_LEVEL, "te
 TEMPO_L3_DIR = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION)  # NASA Level 3 scan files used as a regridding reference
 TEMPO_GRANULE_MAPPING = os.path.join(TEMPO_MAPPING_DIR, "granules")
 TEMPO_AOI_MAPPING = os.path.join(TEMPO_MAPPING_DIR, "aoi_observations")
-TEMPO_DOWNLOAD_BATCH_SIZE = 100  # bounds downloader memory and retry scope
 TEMPO_START_DATE = "2023-08-02 00:00:00"  # beginning of the TEMPO science record
 TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
 
@@ -49,11 +41,6 @@ TEMPO_SRF_EXPONENT_XTRACK = 2.0  # shape exponent along the north-south detector
 TEMPO_SRF_EXPONENT_STEP = 3.0  # shape exponent along the east-west mirror-step axis
 TEMPO_SRF_EXPONENT_OUTER = 1.0  # outer exponent applied to the summed radial term
 TEMPO_SRF_INFLATE = 1.0  # multiplier stretching each pixel response beyond its footprint
-TEMPO_SRF_MIN_WEIGHT = 1e-3  # response below this does not count a pixel toward a cell
-TEMPO_SELECTION_MARGIN_KM = 8.0  # keep pixels centred this far outside the AOI grid
-
-TEMPO_OVERSAMPLE_FACTOR = 3  # fine cells per output cell along each axis
-
 TEMPO_CELL_WEIGHT_FLOOR = 0.01  # cells below this total weight are not observed
 
 # ============================================================================
@@ -61,11 +48,8 @@ TEMPO_CELL_WEIGHT_FLOOR = 0.01  # cells below this total weight are not observed
 # ============================================================================
 TEMPO_MIN_DELTA_MINUTES = 50
 TEMPO_MAX_DELTA_MINUTES = 70
-TEMPO_GEOLOCATION_STRIDE = 4
 IMG_RANGE = 72  # spatial extent of extracted image patch (km)
-STRAT_BASE_DIR = (
-    "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # output directory for stratified splits
-)
+STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # stratified split output directory
 TRAIN_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "train_records.csv")  # train split metadata
 VAL_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "val_records.csv")  # validation split metadata
 TEST_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "test_records.csv")  # test split metadata
@@ -86,7 +70,6 @@ WIND_END_YEAR = 2025  # ERA5 download end year
 HRRR_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/HRRR"
 HRRR_START_DATE = EMISSIONS_START_DATE
 HRRR_END_DATE = EMISSIONS_END_DATE
-HRRR_MAX_WORKERS = 4
 
 # ============================================================================
 # Dataset generation
@@ -104,12 +87,10 @@ IMG_CLOUD_FILTER = 0.50  # max fraction of pixels exceeding MIN_PIXEL_CLOUD
 IMG_QA_FILTER = 0.80  # min fraction of pixels with QA flag == 0
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
-DELTA_NOX_MED_COL = "delta_nox_med"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
 LABEL_COL = "delta_nox_norm"
 MIN_DELTA_HISTORY = 168
 DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added to its scale
-MAD_NORMAL_SCALE = 1.4826
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_PROXIMITY = 50  # minimum distance to nearest major city (km)
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city

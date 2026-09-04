@@ -23,7 +23,6 @@ from config import (
     NUM_CORES,
     TEMPO_AOI_MAPPING,
     TEMPO_DIR,
-    TEMPO_GEOLOCATION_STRIDE,
     TEMPO_GRANULE_MAPPING,
     TEMPO_MAX_DELTA_MINUTES,
     TEMPO_MIN_DELTA_MINUTES,
@@ -31,6 +30,7 @@ from config import (
 from preprocessing.stratify_utils import add_aoi_bounds, build_aois
 
 AOI_ID_COL = "aoi_id"
+GEOLOCATION_STRIDE = 4  # cross-track stride when sampling geolocation for AOI pixels
 SCAN_BREAK_MINUTES = 30
 COVERAGE_TOLERANCE_DEGREES = 1e-6
 FOOTPRINT_BOUNDS_TOLERANCE_DEGREES = 1e-3
@@ -541,7 +541,7 @@ def build_aoi_mapping(
     *,
     overwrite: bool = False,
     workers: int = NUM_CORES,
-    stride: int = TEMPO_GEOLOCATION_STRIDE,
+    stride: int = GEOLOCATION_STRIDE,
     scan_dates: set[date] | None = None,
 ) -> None:
     """Build daily AOI-observation shards for selected scan dates.

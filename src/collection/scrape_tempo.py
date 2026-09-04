@@ -12,7 +12,6 @@ import earthaccess
 
 from config import (
     TEMPO_DIR,
-    TEMPO_DOWNLOAD_BATCH_SIZE,
     TEMPO_END_DATE,
     TEMPO_LEVEL,
     TEMPO_PRODUCT,
@@ -21,6 +20,7 @@ from config import (
 )
 from prerequisites import require_earthdata_credentials
 
+DOWNLOAD_BATCH_SIZE = 100  # bounds downloader memory and retry scope
 _SUPPORTED_LEVELS = {"L2", "L3"}
 _SUPPORTED_VERSIONS = {"V03", "V04"}
 _GRANULE_PATTERN = re.compile(r"^TEMPO_NO2_(L2|L3)_(V\d{2})_(\d{8})T(\d{6})Z_S(\d{3})(?:G(\d{2}))?\.nc$")
@@ -96,8 +96,8 @@ def _validate_config() -> None:
         raise ValueError(f"Unsupported TEMPO_VERSION {TEMPO_VERSION!r}; choose V03 or V04")
     if TEMPO_PRODUCT != f"TEMPO_NO2_{TEMPO_LEVEL}":
         raise ValueError("TEMPO_PRODUCT must match TEMPO_LEVEL")
-    if TEMPO_DOWNLOAD_BATCH_SIZE < 1:
-        raise ValueError("TEMPO_DOWNLOAD_BATCH_SIZE must be positive")
+    if DOWNLOAD_BATCH_SIZE < 1:
+        raise ValueError("DOWNLOAD_BATCH_SIZE must be positive")
 
 
 def _download_window(start: datetime, end: datetime) -> tuple[int, int, int]:
@@ -127,7 +127,7 @@ def _download_window(start: datetime, end: datetime) -> tuple[int, int, int]:
 
         pending = pending_by_directory.setdefault(output_dir, [])
         pending.append(result)
-        if len(pending) >= TEMPO_DOWNLOAD_BATCH_SIZE:
+        if len(pending) >= DOWNLOAD_BATCH_SIZE:
             output_dir.mkdir(parents=True, exist_ok=True)
             earthaccess.download(pending, output_dir)
             existing_by_directory[output_dir].update(_granule_filename(item) for item in pending)

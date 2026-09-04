@@ -118,8 +118,9 @@ source .venv/bin/activate
    ```
 
    The TEMPO scraper searches one month at a time, downloads in batches set by
-   `TEMPO_DOWNLOAD_BATCH_SIZE`, and skips files already present at their final
-   path. Rerunning the same range is therefore idempotent for completed files.
+   `DOWNLOAD_BATCH_SIZE` in `collection/scrape_tempo.py`, and skips files
+   already present at their final path. Rerunning the same range is therefore
+   idempotent for completed files.
    The HRRR scraper saves one atomic GRIB2 subset per UTC hour under
    `HRRR/raw/<year>/<month>/<day>`. Each file contains 10 m U/V wind, 2 m
    temperature, and boundary-layer height from the hourly `f00` analysis.
