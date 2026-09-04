@@ -73,16 +73,11 @@ HRRR_END_DATE = EMISSIONS_END_DATE
 # Dataset generation
 # ============================================================================
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
-IMAGES_DIR = os.path.join(DATASET_DIR, "images")  # saved image arrays (.npy)
+DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # per-record compressed delta NO2 rasters
+IMAGES_DIR = os.path.join(DATASET_DIR, "images")  # legacy NPY arrays used by the current model loader
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
 IMG_SIZE = 48  # image size in pixels (48x48)
-PLUME_FILTER_PERCENTILE = 0.30  # drop samples with plume heuristic below this percentile
-MAX_IMG_VAL = 1e17  # upper NO2 concentration clipping bound
-MIN_IMG_VAL = -2e16  # lower NO2 concentration clipping bound
-IMG_VAL_FILTER = 0.50  # max fraction of pixels at or above MAX_IMG_VAL
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
-IMG_CLOUD_FILTER = 0.50  # max fraction of pixels exceeding MIN_PIXEL_CLOUD
-IMG_QA_FILTER = 0.80  # min fraction of pixels with QA flag == 0
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
@@ -92,10 +87,11 @@ DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added t
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_PROXIMITY = 50  # minimum distance to nearest major city (km)
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
-SPLIT_SIZES = {"train": 18000, "val": 4000, "test": 4000}  # target sample count per split
-TRAIN_RECORD_SIZE = 1_000_000  # target train record count carried into image processing
-VAL_RECORD_SIZE = 200_000  # target validation record count carried into image processing
-TEST_RECORD_SIZE = 200_000  # target test record count carried into image processing
+LABEL_LOWER_QUANTILE = 0.01  # trim normalized labels below the 1st percentile
+LABEL_UPPER_QUANTILE = 0.99  # trim normalized labels above the 99th percentile
+TRAIN_RECORDS_SIZE = 100_000  # maximum train records carried into image processing
+VAL_RECORDS_SIZE = 20_000  # maximum validation records carried into image processing
+TEST_RECORDS_SIZE = 20_000  # maximum test records carried into image processing
 
 # ============================================================================
 # ML modeling

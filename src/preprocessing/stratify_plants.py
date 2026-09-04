@@ -9,13 +9,18 @@ from config import (
     DELTA_NOX_SCALE_COL,
     FULL_DATA_PARQUET,
     LABEL_COL,
+    LABEL_LOWER_QUANTILE,
+    LABEL_UPPER_QUANTILE,
     MIN_CITY_PROXIMITY,
     MIN_COVERAGE_PERCENT,
     NOX_MASS_COL,
     STRAT_BASE_DIR,
     TEST_RECORDS_CSV,
+    TEST_RECORDS_SIZE,
     TRAIN_RECORDS_CSV,
+    TRAIN_RECORDS_SIZE,
     VAL_RECORDS_CSV,
+    VAL_RECORDS_SIZE,
 )
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
@@ -39,6 +44,11 @@ from preprocessing.tempo_mapping import (
 TRAIN_FRACTION = 0.60
 VAL_FRACTION = 0.20
 SPLIT_SEED = 42
+SPLIT_RECORD_LIMITS = {
+    "train": TRAIN_RECORDS_SIZE,
+    "val": VAL_RECORDS_SIZE,
+    "test": TEST_RECORDS_SIZE,
+}
 
 OUTPUT_COLUMNS = [
     AOI_ID_COL,
@@ -84,6 +94,17 @@ REQUIRED_COLUMNS = [
 ]
 
 
+def _trim_label_outliers(frame: pl.DataFrame) -> pl.DataFrame:
+    # Compute one pair of bounds before assigning geographic splits
+    finite_labels = frame.filter(pl.col(LABEL_COL).is_finite())[LABEL_COL]
+    if finite_labels.is_empty():
+        raise ValueError("Cannot trim label outliers without finite normalized labels")
+
+    lower_bound = finite_labels.quantile(LABEL_LOWER_QUANTILE, interpolation="linear")
+    upper_bound = finite_labels.quantile(LABEL_UPPER_QUANTILE, interpolation="linear")
+    return frame.filter(pl.col(LABEL_COL).is_between(lower_bound, upper_bound, closed="both"))
+
+
 def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
     # Assign each geographic cluster to exactly one split
     if frame["cluster"].null_count() > 0:
@@ -102,6 +123,17 @@ def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
     }
     return {
         name: frame.join(split_clusters, on="cluster", how="inner") for name, split_clusters in cluster_splits.items()
+    }
+
+
+def _limit_splits(
+    splits: dict[str, pl.DataFrame],
+    limits: dict[str, int] = SPLIT_RECORD_LIMITS,
+) -> dict[str, pl.DataFrame]:
+    # Shuffle before truncation to avoid retaining only the earliest source rows
+    return {
+        name: split.sample(n=limits[name], shuffle=True, seed=SPLIT_SEED) if split.height > limits[name] else split
+        for name, split in splits.items()
     }
 
 
@@ -141,8 +173,9 @@ def main() -> None:
         (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT) & (pl.col(MAJOR_CITY_DIST_COL) >= MIN_CITY_PROXIMITY)
     )
     frame = serialize_tempo_path_lists(frame)
+    frame = _trim_label_outliers(frame)
 
-    splits = _split_by_cluster(frame)
+    splits = _limit_splits(_split_by_cluster(frame))
     del frame
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
