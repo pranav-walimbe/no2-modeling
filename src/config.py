@@ -42,6 +42,8 @@ TEMPO_SRF_EXPONENT_STEP = 3.0  # shape exponent along the east-west mirror-step 
 TEMPO_SRF_EXPONENT_OUTER = 1.0  # outer exponent applied to the summed radial term
 TEMPO_SRF_INFLATE = 1.0  # multiplier stretching each pixel response beyond its footprint
 TEMPO_CELL_WEIGHT_FLOOR = 0.01  # cells below this total weight are not observed
+TEMPO_RESPONSE_CUTOFF = 1e-6  # response below this does not reach a cell
+TEMPO_EFFECTIVE_SAMPLE_FLOOR = 0.0  # disabled until the paired-cell survival sweep settles a value
 
 # ============================================================================
 # Stratification
