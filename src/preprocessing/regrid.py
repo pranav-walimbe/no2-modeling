@@ -162,9 +162,6 @@ def read_granule_pixels(
 ) -> GranulePixels:
     """Read one granule and keep the native pixels that pass the science filters.
 
-    A granule covers many AOIs, so call this once per file and reuse the result
-    across every AOI it covers rather than reopening it per AOI.
-
     Args:
         path: Path to a TEMPO NO2 V04 Level 2 granule.
         max_cloud_fraction: Upper limit on effective cloud fraction.
@@ -294,10 +291,6 @@ def oversample(
 ) -> RegriddedRaster:
     """Integrate every pixel's spatial response over the AOI grid.
 
-    Each native pixel is represented by a 2-D super-Gaussian rather than a
-    uniform polygon, so a cell receives a share of the pixel's value in
-    proportion to the instrument sensitivity that falls in it.
-
     Args:
         pixels: Quality-filtered pixels, already restricted to the AOI.
         grid: Fixed AOI grid that both scans of a pair must share.
@@ -334,9 +327,6 @@ def oversample(
 
 def aggregate_fine_raster(raster: RegriddedRaster, grid: AoiGrid, factor: int) -> RegriddedRaster:
     """Reduce a raster oversampled at a finer grid onto the output AOI grid.
-
-    Fine cells are combined with their own sample weights, so a well-sampled
-    corner of an output cell carries more of that cell's value than a sparse one.
 
     Args:
         raster: Raster built on a grid `factor` times finer than the output.
@@ -389,10 +379,6 @@ def regrid_aoi_raster(
 ) -> RegriddedRaster:
     """Build one AOI raster the way the pilot settled on.
 
-    Oversampling to a finer grid and aggregating beat the direct grid against
-    NASA Level 3 in 19 of 20 AOI scans, so that is the default path. Cells whose
-    total weight falls below the floor are returned as unobserved.
-
     Args:
         pixels: Quality-filtered pixels, already restricted to the AOI.
         grid: Fixed output grid that both scans of a pair must share.
@@ -423,9 +409,6 @@ def regrid_aoi_scan(
     **regrid_options: float,
 ) -> RegriddedRaster:
     """Build one AOI raster from the granules of a single scan.
-
-    This reopens each granule, so callers regridding many AOIs from the same
-    granule should call `read_granule_pixels` themselves and reuse the result.
 
     Args:
         granule_paths: Granules of one scan that cover the AOI.

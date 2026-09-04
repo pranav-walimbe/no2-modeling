@@ -74,11 +74,6 @@ def add_major_city_distance(frame: pl.DataFrame, cities: pl.DataFrame | None = N
 def add_hrrr_files(frame: pl.DataFrame) -> pl.DataFrame:
     """Attach the HRRR storage-root-relative GRIB2 path to AOI-hour rows.
 
-    The path is keyed on the same UTC date and hour that select the TEMPO
-    tiles, so both sources describe one clock hour. One file holds every
-    configured field, so wind, temperature, and boundary-layer height share
-    this column.
-
     Args:
         frame: AOI-hour rows carrying UTC date and hour columns.
 
@@ -204,16 +199,11 @@ def add_previous_quarter_same_hour_averages(hourly: pl.LazyFrame) -> pl.LazyFram
 def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
     """Add hourly NOx changes normalized by the prior completed quarter.
 
-    The label is ``asinh(delta / scale)`` rather than ``delta / scale``. Dividing
-    is unbounded, so an AOI-quarter whose scale understates the current regime
-    produced labels in the thousands: on the first full run, 99.5% of the squared
-    loss came from the largest 1% of rows. ``asinh`` is linear while the delta
-    sits inside the scale and logarithmic beyond it, so a misjudged scale costs
-    accuracy instead of swamping the objective. It is monotone, so anomaly
-    ranking within an AOI is unchanged, and ``sinh`` recovers the mass.
+    Args:
+        hourly: AOI-hour rows containing dates, hours, and aggregate NOx mass.
 
-    The scale keeps its ``DELTA_SCALE_LEVEL_FRACTION`` term, which now serves
-    only to hold the divisor above zero for AOI-quarters whose MAD is zero.
+    Returns:
+        Rows with raw NOx changes, lagged scales, and transformed labels.
     """
     with_deltas = (
         hourly.with_columns((pl.col("date").cast(pl.Datetime) + pl.duration(hours=pl.col("hour"))).alias("_hour_start"))
