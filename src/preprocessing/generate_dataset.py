@@ -14,6 +14,7 @@ from config import (
     DATASET_DF,
     IMAGES_DIR,
     LABEL_COL,
+    MIN_CITY_POPULATION,
     NUM_CORES,
     PLUME_FILTER_PERCENTILE,
     SPLIT_SIZES,
@@ -94,7 +95,8 @@ def main() -> None:
     """Generate image and tabular datasets for every split."""
     os.makedirs(IMAGES_DIR, exist_ok=True)
     os.makedirs(DATASET_DF, exist_ok=True)
-    cities_gdf = gpd.read_file(CITIES_URL).to_crs("EPSG:5070")
+    cities = gpd.read_file(CITIES_URL)
+    cities_gdf = cities[cities["pop_max"] >= MIN_CITY_POPULATION].to_crs("EPSG:5070")
     splits = {
         "train": pd.read_csv(TRAIN_RECORDS_CSV),
         "val": pd.read_csv(VAL_RECORDS_CSV),

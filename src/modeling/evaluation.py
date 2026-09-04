@@ -16,9 +16,7 @@ def plant_metrics(df: pd.DataFrame) -> pd.DataFrame:
                 {
                     "rmse": np.sqrt(((group["y_pred"] - group["y_true"]) ** 2).mean()),
                     "mae": (group["y_pred"] - group["y_true"]).abs().mean(),
-                    "mape": (
-                        (group["y_pred"] - group["y_true"]).abs() / group["y_true"].replace(0, np.nan)
-                    ).mean()
+                    "mape": ((group["y_pred"] - group["y_true"]).abs() / group["y_true"].replace(0, np.nan)).mean()
                     * 100,
                     "mean_y_true": group["y_true"].mean(),
                 }
