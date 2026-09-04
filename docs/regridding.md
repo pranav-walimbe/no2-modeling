@@ -39,13 +39,24 @@ visible. Each output contains:
 Only `no2` is changed by cell masking. The raw diagnostics remain available so
 the support rule can be revised without rerunning tessellation.
 
-## Remaining decisions
+## EDA decisions
 
-The EDA compares the implementation with an independent polygon-overlap
-reference, uses NASA Level 3 as a secondary comparison, measures the impact of
-0.20 versus 0.10 cloud filtering, compares area-only with experimental
-uncertainty weighting, measures paired-cell survival under candidate overlap
-and effective-sample floors, and reports runtime and memory.
+Job 38571783 validated the implementation on 12 fixed scans and 40 sampled
+scan pairs. Production uses:
+
+- cloud fraction at most 0.20;
+- overlap area alone for the NO2 weights;
+- an accepted-overlap floor of 0.25 km2; and
+- no additional effective-sample floor.
+
+The 0.25 km2 floor reduced paired-cell survival from 58.0 percent to 57.0
+percent while removing very small edge overlaps. An effective-sample floor of
+1.25 reduced survival to 21.1 percent and was rejected. Area-only weighting had
+lower median normalized RMS disagreement with Level 3 than linear or squared
+inverse-uncertainty weighting.
+
+The vectorized implementation matched the independent overlap reference to
+floating-point precision. Warm tessellation took 0.13 to 0.16 seconds per AOI.
 
 NASA Level 3 is not treated as ground truth because it uses a geographic grid
 and different input filtering. Its similarity is useful for catching geometry,
