@@ -14,6 +14,8 @@ from config import (
     IMG_SIZE,
     MIN_PIXEL_CLOUD,
     TEMPO_CELL_WEIGHT_FLOOR,
+    TEMPO_EFFECTIVE_SAMPLE_FLOOR,
+    TEMPO_RESPONSE_CUTOFF,
     TEMPO_SRF_EXPONENT_OUTER,
     TEMPO_SRF_EXPONENT_STEP,
     TEMPO_SRF_EXPONENT_XTRACK,
@@ -109,19 +111,21 @@ class RegriddedRaster:
 
     aoi_id: int
     no2: np.ndarray
-    weight: np.ndarray
+    sum_weight: np.ndarray
+    sum_weight_squared: np.ndarray
+    effective_sample_size: np.ndarray
     count: np.ndarray
     native_pixel_count: int
 
 
 @dataclass(frozen=True)
 class _PixelResponse:
-    # Projected super-Gaussian parameters for every contributing pixel
+    # Projective transform and super-Gaussian widths for every contributing pixel
     centre: np.ndarray
-    unit_xtrack: np.ndarray
-    unit_step: np.ndarray
+    transform: np.ndarray
     width_xtrack: np.ndarray
     width_step: np.ndarray
+    support_radius: np.ndarray
     values: np.ndarray
 
 
@@ -218,14 +222,29 @@ def read_granule_pixels(
     )
 
 
-def _edge_midpoints(corner_x: np.ndarray, corner_y: np.ndarray, first: int, second: int) -> np.ndarray:
-    # Take the midpoint of one footprint edge for every pixel
-    return np.stack([corner_x[:, first] + corner_x[:, second], corner_y[:, first] + corner_y[:, second]], axis=1) / 2
+def _homography(source: np.ndarray, destination: np.ndarray) -> np.ndarray:
+    # Fit one projective map per pixel with the lower-right coefficient fixed to one
+    count = source.shape[0]
+    source_u, source_v = source[:, :, 0], source[:, :, 1]
+    target_x, target_y = destination[:, :, 0], destination[:, :, 1]
+    matrix = np.zeros((count, 8, 8), dtype=np.float64)
+    matrix[:, 0::2, 0] = source_u
+    matrix[:, 0::2, 1] = source_v
+    matrix[:, 0::2, 2] = 1.0
+    matrix[:, 0::2, 6] = -target_x * source_u
+    matrix[:, 0::2, 7] = -target_x * source_v
+    matrix[:, 1::2, 3] = source_u
+    matrix[:, 1::2, 4] = source_v
+    matrix[:, 1::2, 5] = 1.0
+    matrix[:, 1::2, 6] = -target_y * source_u
+    matrix[:, 1::2, 7] = -target_y * source_v
+    coefficients = np.linalg.solve(matrix, destination.reshape(count, 8))
+    return np.concatenate([coefficients, np.ones((count, 1))], axis=1).reshape(count, 3, 3)
 
 
-def _super_gaussian_width(fwhm: np.ndarray, exponent: float, outer_exponent: float, inflate: float) -> np.ndarray:
-    # Convert a full width at half maximum into the super-Gaussian scale parameter
-    return inflate * fwhm / (2 * np.log(2) ** (1 / (exponent * outer_exponent)))
+def _width_fraction(exponent: float, outer_exponent: float, inflate: float) -> float:
+    # Super-Gaussian scale parameter as a fraction of the full width at half maximum
+    return inflate / (2 * np.log(2) ** (1 / (exponent * outer_exponent)))
 
 
 def _build_pixel_response(
@@ -234,47 +253,71 @@ def _build_pixel_response(
     exponent_step: float,
     exponent_outer: float,
     inflate: float,
+    response_cutoff: float,
 ) -> _PixelResponse:
-    # Project footprint corners into response axes and super-Gaussian widths
+    # Map each footprint quadrilateral onto its own response rectangle
     corner_x, corner_y = WGS84_TO_CONUS.transform(pixels.corner_longitudes, pixels.corner_latitudes)
-    corner_x, corner_y = np.asarray(corner_x), np.asarray(corner_y)
-    north_edge = _edge_midpoints(corner_x, corner_y, 0, 1)
-    south_edge = _edge_midpoints(corner_x, corner_y, 2, 3)
-    west_edge = _edge_midpoints(corner_x, corner_y, 1, 2)
-    east_edge = _edge_midpoints(corner_x, corner_y, 3, 0)
-    axis_xtrack = south_edge - north_edge
-    axis_step = east_edge - west_edge
-    fwhm_xtrack = np.linalg.norm(axis_xtrack, axis=1)
-    fwhm_step = np.linalg.norm(axis_step, axis=1)
+    centre_x, centre_y = WGS84_TO_CONUS.transform(pixels.longitudes, pixels.latitudes)
+    corners = np.stack([np.asarray(corner_x), np.asarray(corner_y)], axis=2)
+    centre = np.column_stack([np.asarray(centre_x), np.asarray(centre_y)])
+    offsets = corners - centre[:, None, :]
+    fwhm_xtrack = np.linalg.norm(offsets[:, 2:4].mean(axis=1) - offsets[:, 0:2].mean(axis=1), axis=1)
+    fwhm_step = np.linalg.norm(offsets[:, 1:3].mean(axis=1) - offsets[:, [0, 3]].mean(axis=1), axis=1)
 
-    usable = (fwhm_xtrack > 0) & (fwhm_step > 0)
+    usable = np.isfinite(offsets).all(axis=(1, 2)) & (fwhm_xtrack > 0) & (fwhm_step > 0)
+    offsets, centre = offsets[usable], centre[usable]
     fwhm_xtrack, fwhm_step = fwhm_xtrack[usable], fwhm_step[usable]
+    rectangle = np.stack([np.array([-1.0, -1.0, 1.0, 1.0]), np.array([-1.0, 1.0, 1.0, -1.0])], axis=1)
+    destination = rectangle[None, :, :] * np.column_stack([fwhm_xtrack, fwhm_step])[:, None, :] / 2
+
+    fraction_xtrack = _width_fraction(exponent_xtrack, exponent_outer, inflate)
+    fraction_step = _width_fraction(exponent_step, exponent_outer, inflate)
     return _PixelResponse(
-        centre=((north_edge + south_edge) / 2)[usable],
-        unit_xtrack=axis_xtrack[usable] / fwhm_xtrack[:, None],
-        unit_step=axis_step[usable] / fwhm_step[:, None],
-        width_xtrack=_super_gaussian_width(fwhm_xtrack, exponent_xtrack, exponent_outer, inflate),
-        width_step=_super_gaussian_width(fwhm_step, exponent_step, exponent_outer, inflate),
+        centre=centre,
+        transform=_homography(offsets, destination),
+        width_xtrack=fwhm_xtrack * fraction_xtrack,
+        width_step=fwhm_step * fraction_step,
+        support_radius=_support_radius(
+            offsets, exponent_xtrack, exponent_step, exponent_outer, inflate, response_cutoff
+        ),
         values=pixels.values[usable],
     )
 
 
-def _response_weights(
-    response: _PixelResponse,
-    grid: AoiGrid,
+def _support_radius(
+    offsets: np.ndarray,
     exponent_xtrack: float,
     exponent_step: float,
     exponent_outer: float,
+    inflate: float,
+    response_cutoff: float,
 ) -> np.ndarray:
-    # Evaluate every pixel response on every grid cell
-    grid_x, grid_y = grid.cell_centres()
-    offset_x = grid_x.ravel()[None, :] - response.centre[:, 0, None]
-    offset_y = grid_y.ravel()[None, :] - response.centre[:, 1, None]
-    local_xtrack = offset_x * response.unit_xtrack[:, 0, None] + offset_y * response.unit_xtrack[:, 1, None]
-    local_step = offset_x * response.unit_step[:, 0, None] + offset_y * response.unit_step[:, 1, None]
-    radial = np.abs(local_xtrack / response.width_xtrack[:, None]) ** exponent_xtrack
-    radial += np.abs(local_step / response.width_step[:, None]) ** exponent_step
-    return np.exp(-(radial**exponent_outer))
+    # Bound the distance at which a footprint can still clear the response cutoff
+    if response_cutoff <= 0:
+        return np.full(offsets.shape[0], np.inf)
+    decay = -np.log(response_cutoff)
+    limit_xtrack = _width_fraction(exponent_xtrack, exponent_outer, inflate) * decay ** (
+        1 / (exponent_xtrack * exponent_outer)
+    )
+    limit_step = _width_fraction(exponent_step, exponent_outer, inflate) * decay ** (
+        1 / (exponent_step * exponent_outer)
+    )
+    footprint_radius = np.linalg.norm(offsets, axis=2).max(axis=1)
+    return footprint_radius * 2 * max(limit_xtrack, limit_step)
+
+
+def _cell_window(grid: AoiGrid, centre: np.ndarray, radius: float) -> tuple[slice, slice]:
+    # Index the smallest block of cells covering one pixel's support disc
+    if not np.isfinite(radius):
+        return slice(0, grid.size), slice(0, grid.size)
+    origin = (grid.size - 1) / 2
+    first_column = np.floor((centre[0] - radius - grid.x_m) / grid.cell_size_m + origin)
+    last_column = np.ceil((centre[0] + radius - grid.x_m) / grid.cell_size_m + origin)
+    first_row = np.floor((grid.y_m - centre[1] - radius) / grid.cell_size_m + origin)
+    last_row = np.ceil((grid.y_m - centre[1] + radius) / grid.cell_size_m + origin)
+    columns = slice(max(0, int(first_column)), min(grid.size, int(last_column) + 1))
+    rows = slice(max(0, int(first_row)), min(grid.size, int(last_row) + 1))
+    return rows, columns
 
 
 def _unobserved_raster(grid: AoiGrid) -> RegriddedRaster:
@@ -283,7 +326,9 @@ def _unobserved_raster(grid: AoiGrid) -> RegriddedRaster:
     return RegriddedRaster(
         aoi_id=grid.aoi_id,
         no2=np.full(shape, np.nan),
-        weight=np.zeros(shape),
+        sum_weight=np.zeros(shape),
+        sum_weight_squared=np.zeros(shape),
+        effective_sample_size=np.zeros(shape),
         count=np.zeros(shape, dtype=np.int64),
         native_pixel_count=0,
     )
@@ -298,6 +343,7 @@ def oversample(
     exponent_outer: float = TEMPO_SRF_EXPONENT_OUTER,
     inflate: float = TEMPO_SRF_INFLATE,
     min_weight: float = SRF_MIN_WEIGHT,
+    response_cutoff: float = TEMPO_RESPONSE_CUTOFF,
 ) -> RegriddedRaster:
     """Integrate every pixel's spatial response over the AOI grid.
 
@@ -309,30 +355,84 @@ def oversample(
         exponent_outer: Outer exponent applied to the summed radial term.
         inflate: Multiplier stretching each response beyond its footprint.
         min_weight: Response below which a pixel does not count toward a cell.
+        response_cutoff: Response below which a pixel does not reach a cell at all.
 
     Returns:
-        The weighted-mean NO2 raster with per-cell weight and sample count.
+        The weighted-mean NO2 raster with per-cell weight sums and sample count.
     """
+    if not 0 <= response_cutoff < 1:
+        raise ValueError("response_cutoff must be in [0, 1)")
     if len(pixels) == 0:
         return _unobserved_raster(grid)
-    response = _build_pixel_response(pixels, exponent_xtrack, exponent_step, exponent_outer, inflate)
+    response = _build_pixel_response(
+        pixels, exponent_xtrack, exponent_step, exponent_outer, inflate, response_cutoff
+    )
     if response.values.size == 0:
         return _unobserved_raster(grid)
 
-    weights = _response_weights(response, grid, exponent_xtrack, exponent_step, exponent_outer)
-    weight_sum = weights.sum(axis=0)
-    observed = weight_sum > 0
-    no2 = np.full(weight_sum.shape, np.nan)
-    no2[observed] = (weights.T @ response.values)[observed] / weight_sum[observed]
-
     shape = (grid.size, grid.size)
+    grid_x, grid_y = grid.cell_centres()
+    sum_weight = np.zeros(shape)
+    sum_weight_squared = np.zeros(shape)
+    sum_weighted_value = np.zeros(shape)
+    count = np.zeros(shape, dtype=np.int64)
+    for index in range(response.values.size):
+        centre = response.centre[index]
+        radius = response.support_radius[index]
+        rows, columns = _cell_window(grid, centre, radius)
+        if rows.start >= rows.stop or columns.start >= columns.stop:
+            continue
+        offset_x = grid_x[rows, columns] - centre[0]
+        offset_y = grid_y[rows, columns] - centre[1]
+        reached = (
+            np.ones(offset_x.shape, dtype=bool)
+            if not np.isfinite(radius)
+            else np.hypot(offset_x, offset_y) <= radius
+        )
+        if not reached.any():
+            continue
+        weights = _window_weights(
+            response, index, offset_x[reached], offset_y[reached], exponent_xtrack, exponent_step, exponent_outer
+        )
+        weights[weights < response_cutoff] = 0.0
+        # These slices are views into the full rasters
+        sum_weight[rows, columns][reached] += weights
+        sum_weight_squared[rows, columns][reached] += np.square(weights)
+        sum_weighted_value[rows, columns][reached] += weights * response.values[index]
+        count[rows, columns][reached] += weights >= min_weight
+
+    observed = sum_weight > 0
+    no2 = np.full(shape, np.nan)
+    no2[observed] = sum_weighted_value[observed] / sum_weight[observed]
+    effective = np.zeros(shape)
+    effective[observed] = np.square(sum_weight[observed]) / sum_weight_squared[observed]
     return RegriddedRaster(
         aoi_id=grid.aoi_id,
-        no2=no2.reshape(shape),
-        weight=weight_sum.reshape(shape),
-        count=(weights >= min_weight).sum(axis=0).reshape(shape).astype(np.int64),
+        no2=no2,
+        sum_weight=sum_weight,
+        sum_weight_squared=sum_weight_squared,
+        effective_sample_size=effective,
+        count=count,
         native_pixel_count=int(response.values.size),
     )
+
+
+def _window_weights(
+    response: _PixelResponse,
+    index: int,
+    offset_x: np.ndarray,
+    offset_y: np.ndarray,
+    exponent_xtrack: float,
+    exponent_step: float,
+    exponent_outer: float,
+) -> np.ndarray:
+    # Evaluate one pixel's super-Gaussian response on the cells inside its window
+    transform = response.transform[index]
+    # POPY v0.4 skips the homogeneous divide whose horizon can flip the sign outside the footprint
+    local = np.column_stack([offset_x, offset_y, np.ones(offset_x.size)]) @ transform[:2].T
+    radial = np.abs(local[:, 0] / response.width_xtrack[index]) ** exponent_xtrack
+    radial += np.abs(local[:, 1] / response.width_step[index]) ** exponent_step
+    return np.exp(-(radial**exponent_outer))
 
 
 def aggregate_fine_raster(raster: RegriddedRaster, grid: AoiGrid, factor: int) -> RegriddedRaster:
@@ -349,31 +449,55 @@ def aggregate_fine_raster(raster: RegriddedRaster, grid: AoiGrid, factor: int) -
     size = grid.size
     blocks = (size, factor, size, factor)
     filled = np.where(np.isfinite(raster.no2), raster.no2, 0.0)
-    weighted = (filled * raster.weight).reshape(blocks).sum(axis=(1, 3))
-    total = raster.weight.reshape(blocks).sum(axis=(1, 3))
+    weighted = (filled * raster.sum_weight).reshape(blocks).sum(axis=(1, 3))
+    total = raster.sum_weight.reshape(blocks).sum(axis=(1, 3))
     observed = total > 0
     no2 = np.full((size, size), np.nan)
     no2[observed] = weighted[observed] / total[observed]
+    # Mean keeps both sums on the same scale as a directly sampled cell
+    sum_weight = raster.sum_weight.reshape(blocks).mean(axis=(1, 3))
+    sum_weight_squared = raster.sum_weight_squared.reshape(blocks).mean(axis=(1, 3))
+    effective = np.zeros((size, size))
+    # Recomputed from the aggregated sums rather than averaged
+    effective[observed] = np.square(sum_weight[observed]) / sum_weight_squared[observed]
     return RegriddedRaster(
         aoi_id=raster.aoi_id,
         no2=no2,
-        # Mean keeps weight on the same scale as a directly sampled cell
-        weight=raster.weight.reshape(blocks).mean(axis=(1, 3)),
-        # Peak rather than sum, because one pixel reaches many fine cells
+        sum_weight=sum_weight,
+        sum_weight_squared=sum_weight_squared,
+        effective_sample_size=effective,
+        # Peak rather than sum because one pixel reaches many fine cells
         count=raster.count.reshape(blocks).max(axis=(1, 3)),
         native_pixel_count=raster.native_pixel_count,
     )
 
 
-def apply_weight_floor(raster: RegriddedRaster, weight_floor: float) -> RegriddedRaster:
-    """Mark cells whose total response weight falls below the floor as unobserved."""
-    if weight_floor <= 0:
+def apply_cell_mask(
+    raster: RegriddedRaster,
+    weight_floor: float,
+    effective_sample_floor: float = TEMPO_EFFECTIVE_SAMPLE_FLOOR,
+) -> RegriddedRaster:
+    """Mark cells below the total-weight or effective-sample floor as unobserved.
+
+    Args:
+        raster: Raster carrying its weight sums and effective sample sizes.
+        weight_floor: Total response weight below which a cell is unobserved.
+        effective_sample_floor: Effective sample size below which a cell is unobserved.
+
+    Returns:
+        The raster with masked cells set to NaN and every diagnostic retained.
+    """
+    if weight_floor <= 0 and effective_sample_floor <= 0:
         return raster
-    masked = np.where(raster.weight >= weight_floor, raster.no2, np.nan)
+    keep = raster.sum_weight >= weight_floor
+    if effective_sample_floor > 0:
+        keep &= raster.effective_sample_size >= effective_sample_floor
     return RegriddedRaster(
         aoi_id=raster.aoi_id,
-        no2=masked,
-        weight=raster.weight,
+        no2=np.where(keep, raster.no2, np.nan),
+        sum_weight=raster.sum_weight,
+        sum_weight_squared=raster.sum_weight_squared,
+        effective_sample_size=raster.effective_sample_size,
         count=raster.count,
         native_pixel_count=raster.native_pixel_count,
     )
@@ -402,12 +526,12 @@ def regrid_aoi_raster(
     if factor < 1:
         raise ValueError("factor must be at least 1")
     if factor == 1:
-        return apply_weight_floor(oversample(pixels, grid, **oversample_options), weight_floor)
+        return apply_cell_mask(oversample(pixels, grid, **oversample_options), weight_floor)
     fine_grid = AoiGrid(
         aoi_id=grid.aoi_id, x_m=grid.x_m, y_m=grid.y_m, size=grid.size * factor, extent_km=grid.extent_km
     )
     fine = oversample(pixels, fine_grid, **oversample_options)
-    return apply_weight_floor(aggregate_fine_raster(fine, grid, factor), weight_floor)
+    return apply_cell_mask(aggregate_fine_raster(fine, grid, factor), weight_floor)
 
 
 def regrid_aoi_scan(
