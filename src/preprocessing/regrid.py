@@ -14,19 +14,19 @@ from config import (
     IMG_SIZE,
     MIN_PIXEL_CLOUD,
     TEMPO_CELL_WEIGHT_FLOOR,
-    TEMPO_OVERSAMPLE_FACTOR,
-    TEMPO_SELECTION_MARGIN_KM,
     TEMPO_SRF_EXPONENT_OUTER,
     TEMPO_SRF_EXPONENT_STEP,
     TEMPO_SRF_EXPONENT_XTRACK,
     TEMPO_SRF_INFLATE,
-    TEMPO_SRF_MIN_WEIGHT,
 )
 from preprocessing.stratify_utils import CONUS_TO_WGS84, WGS84_TO_CONUS
 
 METRES_PER_KM = 1000.0
 CORNER_COUNT = 4
 QUALITY_FLAG_GOOD = 0
+SRF_MIN_WEIGHT = 1e-3  # response below this does not count a pixel toward a cell
+SELECTION_MARGIN_KM = 8.0  # keep pixels centred this far outside the AOI grid
+OVERSAMPLE_FACTOR = 3  # fine cells per output cell along each axis
 
 
 @dataclass(frozen=True)
@@ -290,7 +290,7 @@ def oversample(
     exponent_step: float = TEMPO_SRF_EXPONENT_STEP,
     exponent_outer: float = TEMPO_SRF_EXPONENT_OUTER,
     inflate: float = TEMPO_SRF_INFLATE,
-    min_weight: float = TEMPO_SRF_MIN_WEIGHT,
+    min_weight: float = SRF_MIN_WEIGHT,
 ) -> RegriddedRaster:
     """Integrate every pixel's spatial response over the AOI grid.
 
@@ -383,7 +383,7 @@ def regrid_aoi_raster(
     pixels: GranulePixels,
     grid: AoiGrid,
     *,
-    factor: int = TEMPO_OVERSAMPLE_FACTOR,
+    factor: int = OVERSAMPLE_FACTOR,
     weight_floor: float = TEMPO_CELL_WEIGHT_FLOOR,
     **oversample_options: float,
 ) -> RegriddedRaster:
@@ -418,7 +418,7 @@ def regrid_aoi_scan(
     granule_paths: list[str],
     grid: AoiGrid,
     *,
-    margin_km: float = TEMPO_SELECTION_MARGIN_KM,
+    margin_km: float = SELECTION_MARGIN_KM,
     max_cloud_fraction: float = MIN_PIXEL_CLOUD,
     **regrid_options: float,
 ) -> RegriddedRaster:

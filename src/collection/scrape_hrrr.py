@@ -13,10 +13,11 @@ from typing import Iterator
 
 import requests
 
-from config import HRRR_DIR, HRRR_END_DATE, HRRR_MAX_WORKERS, HRRR_START_DATE
+from config import HRRR_DIR, HRRR_END_DATE, HRRR_START_DATE
 
 ARCHIVE_URL = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
 PRODUCT = "wrfsfcf00"
+MAX_WORKERS = 4  # concurrent archive downloads
 MAX_RETRIES = 5
 INITIAL_RETRY_DELAY_SECONDS = 2
 REQUEST_TIMEOUT_SECONDS = 120
@@ -243,7 +244,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-date", type=date.fromisoformat, default=HRRR_START_DATE)
     parser.add_argument("--end-date", type=date.fromisoformat, default=HRRR_END_DATE)
     parser.add_argument("--output-dir", type=Path, default=Path(HRRR_DIR))
-    parser.add_argument("--workers", type=int, default=HRRR_MAX_WORKERS)
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
