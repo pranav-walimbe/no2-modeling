@@ -1,6 +1,9 @@
 """Tessellate TEMPO Level 2 footprints onto fixed equal-area AOI grids."""
 
+import os
+import tempfile
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import netCDF4 as nc
 import numpy as np
@@ -19,6 +22,13 @@ from preprocessing.stratify_utils import CONUS_TO_WGS84, WGS84_TO_CONUS
 METRES_PER_KM = 1000.0
 CORNER_COUNT = 4
 QUALITY_FILL_VALUE = -1
+SAVED_RASTER_NAMES = (
+    "no2",
+    "weighted_cloud_fraction",
+    "good_quality_fraction",
+    "retrieval_uncertainty",
+    "sum_weight",
+)
 
 
 @dataclass(frozen=True)
@@ -413,6 +423,42 @@ def apply_cell_mask(
     if effective_sample_floor > 0:
         keep &= raster.effective_sample_size >= effective_sample_floor
     return replace(raster, no2=np.where(keep, raster.no2, np.nan))
+
+
+def write_raster_npz(raster: RegriddedRaster, destination: str | Path) -> None:
+    """Atomically save the five modeling rasters as compressed float32 arrays.
+
+    Args:
+        raster: Regridded AOI scan with its internal diagnostics.
+        destination: Output `.npz` path.
+    """
+    output_path = Path(destination)
+    if output_path.suffix != ".npz":
+        raise ValueError("destination must end in .npz")
+    arrays = {name: np.asarray(getattr(raster, name), dtype=np.float32) for name in SAVED_RASTER_NAMES}
+    expected_shape = raster.no2.shape
+    if expected_shape != (IMG_SIZE, IMG_SIZE):
+        raise ValueError(f"raster shape must be {(IMG_SIZE, IMG_SIZE)}, found {expected_shape}")
+    if any(array.shape != expected_shape for array in arrays.values()):
+        raise ValueError("all saved rasters must share the NO2 shape")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            np.savez_compressed(temporary, **arrays)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, output_path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
 
 
 def regrid_aoi_raster(
