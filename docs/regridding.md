@@ -47,7 +47,8 @@ cache. The cache is deleted when the run exits. Each successful model record
 persists one compressed NPZ containing a `float32` `delta_no2` raster. A cell
 is finite only when both input scans have finite NO2 at that location.
 
-The companion split CSV contains the NPZ path and these derived features:
+Every row in the companion split CSV contains its NPZ path in
+`delta_no2_path` and these derived features:
 
 - `plume_score`, computed from finite delta pixels as
   `(p99 - p50) / (p50 - p10)`;

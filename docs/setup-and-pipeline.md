@@ -165,10 +165,19 @@ source .venv/bin/activate
    `preprocessing.generate_dataset` regrids the current and previous TEMPO
    scans onto the same AOI grid, requires finite NO2 in both scans, and writes
    one compressed delta-NO2 NPZ per retained record. It caches each unique AOI
-   scan for the lifetime of the run. The split CSVs carry the raster path,
+   scan for the lifetime of the run. Every successful split-CSV row carries
+   its relative `delta_no2_path`,
    plume score, paired cloud and quality means, and nearest-grid-point HRRR
    temperature, wind, and boundary-layer height. On Savio, the CLI defaults to
-   `SLURM_CPUS_PER_TASK` workers through `NUM_CORES`.
+   `SLURM_CPUS_PER_TASK` workers through `NUM_CORES` and refuses to create more
+   workers than that allocation.
+
+   Train, validation, and test contain disjoint geographic clusters, so they
+   have no useful cross-split AOI-scan cache sharing. A three-task Slurm array
+   can therefore run them concurrently without redundant regridding. Array
+   indices 0, 1, and 2 automatically select `train`, `val`, and `test`, so each
+   task can invoke `python -u -m preprocessing.generate_dataset`. Outside an
+   array, use `--split` for one split or omit it to process all splits.
 
 5. Train and evaluate the model:
 

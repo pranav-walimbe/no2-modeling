@@ -38,8 +38,11 @@ SPLIT_PATHS = {
     "val": VAL_RECORDS_CSV,
     "test": TEST_RECORDS_CSV,
 }
+ARRAY_SPLITS = tuple(SPLIT_PATHS)
 MAX_PENDING_FACTOR = 2
 PROGRESS_INTERVAL = 1_000
+SOURCE_RECORD_INDEX_COL = "_source_record_index"
+DELTA_NO2_PATH_COL = "delta_no2_path"
 
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")
@@ -51,11 +54,13 @@ class PreparedRecord:
 
     split: str
     record_index: int
-    row: dict[str, object]
+    aoi_id: int
+    lat: float
+    lon: float
     current_scan_key: str
     previous_scan_key: str
     hrrr_path: str
-    raster_path: str
+    delta_no2_path: str
 
 
 def _bounded_parallel_map(
@@ -84,13 +89,15 @@ def _bounded_parallel_map(
                     pass
 
 
-def _load_splits() -> dict[str, pl.DataFrame]:
+def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
     # Validate inputs before starting expensive worker processes
     splits: dict[str, pl.DataFrame] = {}
-    for split, path in SPLIT_PATHS.items():
+    for split, path in split_paths.items():
         if not Path(path).is_file():
             raise FileNotFoundError(f"Missing {split} records: {path}")
-        splits[split] = pl.read_csv(path, try_parse_dates=True)
+        splits[split] = (
+            pl.scan_csv(path, try_parse_dates=True).with_row_index(SOURCE_RECORD_INDEX_COL).collect(engine="streaming")
+        )
     return splits
 
 
@@ -105,21 +112,24 @@ def _prepare_records(
     for split, frame in splits.items():
         output_dir = Path(DATASET_RASTER_DIR) / split
         output_dir.mkdir(parents=True, exist_ok=True)
-        for record_index, row in enumerate(frame.iter_rows(named=True)):
+        for row in frame.iter_rows(named=True):
+            record_index = int(row[SOURCE_RECORD_INDEX_COL])
             try:
                 current = make_scan_task(row, "tempo", Path(TEMPO_DIR), cache_dir)
                 previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), cache_dir)
                 hrrr_path = Path(HRRR_DIR) / str(row["hrrr"])
-                raster_path = output_dir / f"{record_index:06d}.npz"
+                delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
                     PreparedRecord(
                         split=split,
                         record_index=record_index,
-                        row=row,
+                        aoi_id=int(row["aoi_id"]),
+                        lat=float(row["lat"]),
+                        lon=float(row["lon"]),
                         current_scan_key=current.cache_key,
                         previous_scan_key=previous.cache_key,
                         hrrr_path=str(hrrr_path),
-                        raster_path=str(raster_path),
+                        delta_no2_path=str(delta_no2_path),
                     )
                 )
                 scans.setdefault(current.cache_key, current)
@@ -149,8 +159,7 @@ def _hrrr_grid_indices(records: list[PreparedRecord]) -> dict[int, int]:
     locations: dict[int, tuple[float, float]] = {}
     reference_path: str | None = None
     for record in records:
-        aoi_id = int(record.row["aoi_id"])
-        locations.setdefault(aoi_id, (float(record.row["lat"]), float(record.row["lon"])))
+        locations.setdefault(record.aoi_id, (record.lat, record.lon))
         if reference_path is None and Path(record.hrrr_path).is_file():
             reference_path = record.hrrr_path
     if reference_path is None:
@@ -183,8 +192,8 @@ def _record_tasks(
                 current_cache_path=cache_paths[record.current_scan_key],
                 previous_cache_path=cache_paths[record.previous_scan_key],
                 hrrr_path=record.hrrr_path,
-                hrrr_grid_index=hrrr_indices[int(record.row["aoi_id"])],
-                output_path=record.raster_path,
+                hrrr_grid_index=hrrr_indices[record.aoi_id],
+                output_path=record.delta_no2_path,
             )
         )
     return tasks, records_by_id
@@ -197,7 +206,7 @@ def _run_record_processing(
     workers: int,
 ) -> dict[str, list[dict[str, object]]]:
     # Derive delta rasters and scalar features in parallel
-    output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in SPLIT_PATHS}
+    output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in failures}
     total = len(tasks)
     for completed, result in enumerate(_bounded_parallel_map(process_record, tasks, workers), start=1):
         record_id = (result.split, result.record_index)
@@ -205,9 +214,11 @@ def _run_record_processing(
             failures[result.split].append({"record_index": result.record_index, "error": result.error})
         else:
             record = records_by_id[record_id]
-            output_row = dict(record.row)
+            output_row: dict[str, object] = {
+                SOURCE_RECORD_INDEX_COL: result.record_index,
+                DELTA_NO2_PATH_COL: str(Path(record.delta_no2_path).relative_to(DATASET_DIR)),
+            }
             output_row.update(result.features)
-            output_row["raster_path"] = os.path.relpath(record.raster_path, DATASET_DIR)
             output_rows[result.split].append(output_row)
         if completed % PROGRESS_INTERVAL == 0 or completed == total:
             print(f"Processed {completed:,}/{total:,} paired records")
@@ -220,20 +231,20 @@ def _write_outputs(
     source_splits: dict[str, pl.DataFrame],
 ) -> None:
     # Sort asynchronous results back into source-record order
-    for split in SPLIT_PATHS:
-        rows = sorted(output_rows[split], key=lambda row: str(row["raster_path"]))
+    feature_schema = {
+        SOURCE_RECORD_INDEX_COL: pl.UInt32,
+        DELTA_NO2_PATH_COL: pl.String,
+        **{name: pl.Float64 for name in TABULAR_FEATURE_NAMES},
+    }
+    for split, source_frame in source_splits.items():
+        rows = output_rows[split]
         failure_rows = sorted(failures[split], key=lambda row: int(row["record_index"]))
-        if rows:
-            output_frame = pl.DataFrame(rows)
-        else:
-            output_frame = (
-                source_splits[split]
-                .head(0)
-                .with_columns(
-                    *(pl.lit(None, dtype=pl.Float64).alias(name) for name in TABULAR_FEATURE_NAMES),
-                    pl.lit(None, dtype=pl.String).alias("raster_path"),
-                )
-            )
+        features = pl.DataFrame(rows, schema=feature_schema)
+        output_frame = (
+            source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left")
+            .sort(SOURCE_RECORD_INDEX_COL)
+            .drop(SOURCE_RECORD_INDEX_COL)
+        )
         write_csv_atomic(output_frame, Path(DATASET_DF) / f"{split}_df.csv")
         write_csv_atomic(
             pl.DataFrame(failure_rows, schema={"record_index": pl.Int64, "error": pl.String}),
@@ -246,26 +257,52 @@ def parse_args() -> argparse.Namespace:
     """Parse dataset-generation command-line options."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=NUM_CORES)
+    parser.add_argument("--split", choices=("all", *SPLIT_PATHS), default=_default_split())
     return parser.parse_args()
+
+
+def _default_split() -> str:
+    # A three-task Slurm array maps directly to train, validation, and test
+    task_id = os.getenv("SLURM_ARRAY_TASK_ID")
+    if task_id is None:
+        return "all"
+    try:
+        return ARRAY_SPLITS[int(task_id)]
+    except (IndexError, ValueError) as error:
+        raise ValueError("SLURM_ARRAY_TASK_ID must be 0, 1, or 2 for dataset generation") from error
+
+
+def _selected_split_paths(split: str) -> dict[str, str]:
+    # A split-per-array-task layout preserves every useful cache hit
+    return SPLIT_PATHS if split == "all" else {split: SPLIT_PATHS[split]}
+
+
+def _worker_count(requested_workers: int) -> int:
+    # NUM_CORES reflects SLURM_CPUS_PER_TASK inside a Savio allocation
+    if requested_workers < 1:
+        raise ValueError("workers must be at least one")
+    workers = min(requested_workers, NUM_CORES)
+    if workers < requested_workers:
+        print(f"Capping workers at the allocated core count: {workers}")
+    return workers
 
 
 def main() -> None:
     """Generate paired raster NPZ files and metadata CSVs for all splits."""
     args = parse_args()
-    if args.workers < 1:
-        raise ValueError("workers must be at least one")
+    workers = _worker_count(args.workers)
 
     Path(DATASET_DIR).mkdir(parents=True, exist_ok=True)
     Path(DATASET_DF).mkdir(parents=True, exist_ok=True)
     Path(DATASET_RASTER_DIR).mkdir(parents=True, exist_ok=True)
-    splits = _load_splits()
+    splits = _load_splits(_selected_split_paths(args.split))
     with tempfile.TemporaryDirectory(prefix=".regrid-cache-", dir=DATASET_DIR) as temporary_dir:
         records, scans, failures = _prepare_records(splits, Path(temporary_dir))
         print(f"Planned {len(records):,} records using {len(scans):,} unique AOI scans")
-        cache_paths, scan_failures = _run_scan_regridding(scans, args.workers)
+        cache_paths, scan_failures = _run_scan_regridding(scans, workers)
         hrrr_indices = _hrrr_grid_indices(records)
         tasks, records_by_id = _record_tasks(records, cache_paths, scan_failures, hrrr_indices, failures)
-        output_rows = _run_record_processing(tasks, records_by_id, failures, args.workers)
+        output_rows = _run_record_processing(tasks, records_by_id, failures, workers)
         _write_outputs(output_rows, failures, splits)
 
 
