@@ -1,7 +1,6 @@
 """Build the TEMPO granule index and AOI-observation mapping."""
 
 import argparse
-import json
 import multiprocessing
 import os
 import re
@@ -84,6 +83,7 @@ OBSERVATION_SCHEMA = {
     "sampled_pixel_count": pl.Int64,
 }
 AOI_COLUMNS = ["facilityId", "lat", "lon"]
+PAIRING_COLUMNS = [AOI_ID_COL, "tempo_time", "granule_paths"]
 
 
 def _empty_frame(schema: dict[str, pl.DataType]) -> pl.DataFrame:
@@ -193,16 +193,19 @@ def build_granule_index(
     if overwrite and mapping_root.exists():
         shutil.rmtree(mapping_root)
     discovered: dict[tuple[int, int], list[Path]] = defaultdict(list)
-    for path in tempo_root.rglob("*.nc"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(tempo_root)
-        try:
-            year, month = int(relative.parts[0]), int(relative.parts[1])
-        except (IndexError, ValueError):
-            print(f"WARNING: skipping file outside year/month layout: {relative}")
-            continue
-        discovered[(year, month)].append(path)
+    # Classify entries from readdir instead of one stat per granule
+    for directory, _, filenames in os.walk(tempo_root):
+        for filename in filenames:
+            if not filename.endswith(".nc"):
+                continue
+            path = Path(directory) / filename
+            relative = path.relative_to(tempo_root)
+            try:
+                year, month = int(relative.parts[0]), int(relative.parts[1])
+            except (IndexError, ValueError):
+                print(f"WARNING: skipping file outside year/month layout: {relative}")
+                continue
+            discovered[(year, month)].append(path)
 
     tasks: list[tuple[str, str, int, int]] = []
     for (year, month), paths in sorted(discovered.items()):
@@ -270,6 +273,7 @@ def _combine_scan_rows(rows: list[dict[str, object]]) -> dict[str, object]:
     scan_end = max(row["time_coverage_end"] for row in ordered)
     footprints = shapely.from_wkb([row["footprint_wkb"] for row in ordered])
     union = shapely.union_all(footprints)
+    granules = [{**row, "footprint": footprint} for row, footprint in zip(ordered, footprints)]
     return {
         "scan_id": f"{scan_start.isoformat()}_S{int(ordered[0]['scan_num']):03d}",
         "scan_num": int(ordered[0]["scan_num"]),
@@ -277,7 +281,7 @@ def _combine_scan_rows(rows: list[dict[str, object]]) -> dict[str, object]:
         "scan_midpoint": scan_start + (scan_end - scan_start) / 2,
         "scan_end": scan_end,
         "footprint": union,
-        "granules": ordered,
+        "granules": granules,
     }
 
 
@@ -302,6 +306,11 @@ def _covered_aoi_scans(aois: pl.DataFrame, scans: list[dict[str, object]]) -> li
         scans_by_date[scan["scan_start"].date()].append(scan)
     for date_scans in scans_by_date.values():
         scan_by_id = {scan["scan_id"]: scan for scan in date_scans}
+        covering_by_id = {}
+        for scan_id, scan in scan_by_id.items():
+            covering = scan["footprint"].buffer(COVERAGE_TOLERANCE_DEGREES)
+            shapely.prepare(covering)
+            covering_by_id[scan_id] = covering
         spatial_rows = [
             {
                 "spatial_id": f"aoi:{aoi_id}",
@@ -323,14 +332,13 @@ def _covered_aoi_scans(aois: pl.DataFrame, scans: list[dict[str, object]]) -> li
             if not aoi_key.startswith("aoi:") or not scan_key.startswith("scan:"):
                 continue
             aoi_id = int(aoi_key.removeprefix("aoi:"))
-            scan = scan_by_id[scan_key.removeprefix("scan:")]
+            scan_id = scan_key.removeprefix("scan:")
+            scan = scan_by_id[scan_id]
             aoi_geometry = aoi_geometries[aoi_id]
-            if not scan["footprint"].buffer(COVERAGE_TOLERANCE_DEGREES).covers(aoi_geometry):
+            if not covering_by_id[scan_id].covers(aoi_geometry):
                 continue
             covering_granules = [
-                granule
-                for granule in scan["granules"]
-                if shapely.from_wkb(granule["footprint_wkb"]).intersection(aoi_geometry).area > 0
+                granule for granule in scan["granules"] if granule["footprint"].intersection(aoi_geometry).area > 0
             ]
             covered.append(
                 {
@@ -383,56 +391,73 @@ def _read_geolocation_arrays(geolocation: nc.Group, stride: int) -> tuple[np.nda
     return times, latitudes, longitudes
 
 
-def _sample_granule_steps(
-    path: Path,
-    bounds: tuple[float, float, float, float],
-    stride: int,
-) -> tuple[np.ndarray, np.ndarray, int, int] | None:
-    # Count sampled AOI pixels for each mirror-step time
+def _read_granule_geolocation(path: Path, stride: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    # Open one granule once and validate its geolocation shapes
     with nc.Dataset(path) as dataset:
-        geolocation = dataset.groups["geolocation"]
-        times, latitudes, longitudes = _read_geolocation_arrays(geolocation, stride)
+        times, latitudes, longitudes = _read_geolocation_arrays(dataset.groups["geolocation"], stride)
     if times.ndim != 1 or latitudes.ndim != 2 or longitudes.shape != latitudes.shape:
         raise ValueError(f"Unexpected geolocation shapes in {path}")
     if latitudes.shape[0] != times.size:
         raise ValueError(f"No geolocation dimension matches time in {path}")
+    return times, latitudes, longitudes
 
+
+def _sample_aoi_steps(
+    latitudes: np.ndarray,
+    longitudes: np.ndarray,
+    finite: np.ndarray,
+    bounds: tuple[float, float, float, float],
+) -> tuple[np.ndarray, int, int] | None:
+    # Count sampled AOI pixels for each mirror step
     lon_min, lat_min, lon_max, lat_max = bounds
-    valid = np.isfinite(latitudes) & np.isfinite(longitudes)
-    inside = valid & (latitudes >= lat_min) & (latitudes <= lat_max) & (longitudes >= lon_min) & (longitudes <= lon_max)
+    inside = (
+        finite & (latitudes >= lat_min) & (latitudes <= lat_max) & (longitudes >= lon_min) & (longitudes <= lon_max)
+    )
     counts = inside.sum(axis=1, dtype=np.int64)
-    counts = np.where(np.isfinite(times), counts, 0)
-    valid_steps = np.flatnonzero((counts > 0) & np.isfinite(times))
+    valid_steps = np.flatnonzero(counts > 0)
     if valid_steps.size == 0:
         return None
-    return times, counts, int(valid_steps.min()), int(valid_steps.max())
+    return counts, int(valid_steps.min()), int(valid_steps.max())
 
 
-def _compute_observation(candidate: dict[str, object], tempo_root: Path, stride: int) -> dict[str, object] | None:
-    # Combine time samples from every granule covering one AOI scan
-    weighted_time = 0.0
-    total_count = 0
-    paths: list[str] = []
-    starts: list[int | None] = []
-    ends: list[int | None] = []
-    for granule in candidate["granules"]:
-        relative_path = str(granule["relative_path"])
-        sample = _sample_granule_steps(tempo_root / relative_path, candidate["bounds"], stride)
-        if sample is None and stride > 1:
-            sample = _sample_granule_steps(tempo_root / relative_path, candidate["bounds"], 1)
-        paths.append(relative_path)
-        if sample is None:
-            starts.append(None)
-            ends.append(None)
-            continue
-        times, counts, step_start, step_end = sample
-        weighted_time += float(np.dot(times, counts))
-        total_count += int(counts.sum())
-        starts.append(step_start)
-        ends.append(step_end)
+def _accumulate_granule_samples(
+    path: Path,
+    relative_path: str,
+    stride: int,
+    candidate_indices: list[int],
+    candidates: list[dict[str, object]],
+    accumulators: list[dict[str, object]],
+) -> None:
+    # Score every AOI that needs this granule while its geolocation is in memory
+    pending = candidate_indices
+    for read_stride in (stride, 1) if stride > 1 else (stride,):
+        times, latitudes, longitudes = _read_granule_geolocation(path, read_stride)
+        finite_times = np.isfinite(times)
+        finite = np.isfinite(latitudes) & np.isfinite(longitudes) & finite_times[:, None]
+        step_times = np.where(finite_times, times, 0.0)
+        missed: list[int] = []
+        for index in pending:
+            sample = _sample_aoi_steps(latitudes, longitudes, finite, candidates[index]["bounds"])
+            if sample is None:
+                missed.append(index)
+                continue
+            counts, step_start, step_end = sample
+            accumulator = accumulators[index]
+            accumulator["weighted_time"] += float(np.dot(step_times, counts))
+            accumulator["total_count"] += int(counts.sum())
+            accumulator["steps"][relative_path] = (step_start, step_end)
+        pending = missed
+        if not pending:
+            return
+
+
+def _build_observation(candidate: dict[str, object], accumulator: dict[str, object]) -> dict[str, object] | None:
+    # Assemble one AOI scan row from its accumulated granule samples
+    total_count = int(accumulator["total_count"])
     if total_count == 0:
         return None
-    observation_time = gps_seconds_to_utc(weighted_time / total_count)
+    steps = accumulator["steps"]
+    paths = [str(granule["relative_path"]) for granule in candidate["granules"]]
     scan_start = candidate["scan_start"]
     return {
         AOI_ID_COL: candidate[AOI_ID_COL],
@@ -441,26 +466,50 @@ def _compute_observation(candidate: dict[str, object], tempo_root: Path, stride:
         "scan_start": scan_start,
         "scan_midpoint": candidate["scan_midpoint"],
         "scan_end": candidate["scan_end"],
-        "tempo_time": observation_time,
+        "tempo_time": gps_seconds_to_utc(accumulator["weighted_time"] / total_count),
         "granule_paths": paths,
-        "mirror_step_starts": starts,
-        "mirror_step_ends": ends,
+        "mirror_step_starts": [steps[path][0] if path in steps else None for path in paths],
+        "mirror_step_ends": [steps[path][1] if path in steps else None for path in paths],
         "sampled_pixel_count": total_count,
     }
+
+
+def _observations_for_date(
+    tempo_root: Path,
+    stride: int,
+    candidates: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    # Invert the AOI and granule loops so one date opens each granule once
+    accumulators: list[dict[str, object]] = [{"weighted_time": 0.0, "total_count": 0, "steps": {}} for _ in candidates]
+    indices_by_granule: dict[str, list[int]] = defaultdict(list)
+    for index, candidate in enumerate(candidates):
+        for granule in candidate["granules"]:
+            indices_by_granule[str(granule["relative_path"])].append(index)
+
+    failed: set[int] = set()
+    for relative_path, indices in sorted(indices_by_granule.items()):
+        try:
+            _accumulate_granule_samples(
+                tempo_root / relative_path, relative_path, stride, indices, candidates, accumulators
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            print(f"WARNING: skipping granule {relative_path}: {error}")
+            failed.update(indices)
+
+    observations: list[dict[str, object]] = []
+    for index, candidate in enumerate(candidates):
+        if index in failed:
+            continue
+        observation = _build_observation(candidate, accumulators[index])
+        if observation is not None:
+            observations.append(observation)
+    return observations
 
 
 def _write_observation_day(task: tuple[str, str, int, list[dict[str, object]]]) -> str:
     # Compute one date independently and publish its shard atomically
     tempo_dir, destination_text, stride, candidates = task
-    rows: list[dict[str, object]] = []
-    for candidate in candidates:
-        try:
-            result = _compute_observation(candidate, Path(tempo_dir), stride)
-        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-            print(f"WARNING: skipping AOI {candidate[AOI_ID_COL]} scan {candidate['scan_start'].isoformat()}: {error}")
-            continue
-        if result is not None:
-            rows.append(result)
+    rows = _observations_for_date(Path(tempo_dir), stride, candidates)
     frame = pl.DataFrame(rows, schema=OBSERVATION_SCHEMA) if rows else _empty_frame(OBSERVATION_SCHEMA)
     _write_parquet_atomic(frame.sort(AOI_ID_COL, "tempo_time"), Path(destination_text))
     return destination_text
@@ -551,9 +600,26 @@ def build_aoi_mapping(
         list(executor.map(_write_observation_day, tasks, chunksize=1))
 
 
-def read_aoi_mapping(mapping_dir: str | Path = TEMPO_AOI_MAPPING) -> pl.DataFrame:
-    """Read all daily AOI-observation shards into one Polars frame."""
-    return _read_parquet_files(Path(mapping_dir).rglob("date=*.parquet"), OBSERVATION_SCHEMA)
+def read_aoi_mapping(
+    mapping_dir: str | Path = TEMPO_AOI_MAPPING,
+    columns: list[str] | None = None,
+) -> pl.DataFrame:
+    """Read all daily AOI-observation shards into one Polars frame.
+
+    Args:
+        mapping_dir: Root holding the daily observation shards.
+        columns: Optional subset to project, which avoids reading unused
+            list columns across the whole archive.
+
+    Returns:
+        Every observation row, restricted to the requested columns.
+    """
+    paths = sorted(Path(mapping_dir).rglob("date=*.parquet"))
+    if not paths:
+        empty = _empty_frame(OBSERVATION_SCHEMA)
+        return empty.select(columns) if columns else empty
+    scan = pl.scan_parquet(paths)
+    return (scan.select(columns) if columns else scan).collect()
 
 
 def load_tempo_mapping() -> pl.DataFrame:
@@ -562,7 +628,7 @@ def load_tempo_mapping() -> pl.DataFrame:
         raise FileNotFoundError("TEMPO granule index is missing; run the TEMPO mapping jobs first")
     if not list(Path(TEMPO_AOI_MAPPING).rglob("date=*.parquet")):
         raise FileNotFoundError("TEMPO AOI mapping is missing; run the TEMPO mapping jobs first")
-    return read_aoi_mapping(TEMPO_AOI_MAPPING)
+    return read_aoi_mapping(TEMPO_AOI_MAPPING, columns=PAIRING_COLUMNS)
 
 
 def add_tempo_observations(frame: pl.DataFrame, observations: pl.DataFrame) -> pl.DataFrame:
@@ -576,13 +642,12 @@ def add_tempo_observations(frame: pl.DataFrame, observations: pl.DataFrame) -> p
             pl.lit(None, dtype=pl.Float64).alias("tempo_delta_minutes"),
             pl.lit(None, dtype=pl.Float64).alias("coverage_percent"),
         )
+    # Pair on scalar columns only, then rejoin the path lists to survivors
     windows = (
-        observations.sort(AOI_ID_COL, "tempo_time")
-        .with_columns(
-            pl.col("tempo_time").shift(1).over(AOI_ID_COL).alias("prev_tempo_time"),
-            pl.col("granule_paths").shift(1).over(AOI_ID_COL).alias("prev_tempo"),
-        )
-        .rename({"granule_paths": "tempo"})
+        observations.lazy()
+        .select(AOI_ID_COL, "tempo_time")
+        .sort(AOI_ID_COL, "tempo_time")
+        .with_columns(pl.col("tempo_time").shift(1).over(AOI_ID_COL).alias("prev_tempo_time"))
         .with_columns(
             ((pl.col("tempo_time") - pl.col("prev_tempo_time")).dt.total_seconds() / SECONDS_PER_MINUTE).alias(
                 "tempo_delta_minutes"
@@ -620,13 +685,21 @@ def add_tempo_observations(frame: pl.DataFrame, observations: pl.DataFrame) -> p
             AOI_ID_COL,
             "date",
             "hour",
-            "tempo",
-            "prev_tempo",
             "tempo_time",
             "prev_tempo_time",
             "tempo_delta_minutes",
             "coverage_percent",
         )
+    )
+    paths = observations.lazy().select(AOI_ID_COL, "tempo_time", "granule_paths")
+    windows = (
+        windows.join(paths.rename({"granule_paths": "tempo"}), on=[AOI_ID_COL, "tempo_time"], how="left")
+        .join(
+            paths.rename({"granule_paths": "prev_tempo", "tempo_time": "prev_tempo_time"}),
+            on=[AOI_ID_COL, "prev_tempo_time"],
+            how="left",
+        )
+        .collect()
     )
     return frame.join(windows, on=[AOI_ID_COL, "date", "hour"], how="left")
 
@@ -635,7 +708,10 @@ def serialize_tempo_path_lists(frame: pl.DataFrame) -> pl.DataFrame:
     """Encode stitched granule path lists as JSON for CSV output."""
     return frame.with_columns(
         [
-            pl.col(column).map_elements(lambda paths: json.dumps(paths.to_list()), return_dtype=pl.String).alias(column)
+            pl.when(pl.col(column).list.len() == 0)
+            .then(pl.lit("[]"))
+            .otherwise(pl.concat_str(pl.lit('["'), pl.col(column).list.join('", "'), pl.lit('"]')))
+            .alias(column)
             for column in ("tempo", "prev_tempo")
         ]
     )
