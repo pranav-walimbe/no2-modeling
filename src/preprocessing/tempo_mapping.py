@@ -717,12 +717,14 @@ def serialize_tempo_path_lists(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _load_aois() -> pl.DataFrame:
+def _load_aois(aoi_ids: set[int] | None = None) -> pl.DataFrame:
     # Rebuild the same AOI definitions used by stratify_plants
     source = pl.scan_parquet(FULL_DATA_PARQUET)
     missing = set(AOI_COLUMNS).difference(source.collect_schema().names())
     if missing:
         raise ValueError(f"Full emissions data is missing AOI columns: {', '.join(sorted(missing))}")
+    if aoi_ids is not None:
+        source = source.filter(pl.col("facilityId").is_in(aoi_ids))
     facilities = source.select(AOI_COLUMNS).drop_nulls().unique(subset="facilityId").collect()
     return add_aoi_bounds(build_aois(facilities))
 
