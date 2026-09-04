@@ -70,20 +70,40 @@ For each pixel the code does four things.
 
 1. Project the four corners into EPSG:5070 metres, so distances are in metres
    and not degrees.
-2. Build two axes from the footprint: one along the detector array
-   (north to south) and one along the mirror step (east to west).
-3. Along each axis, define a falloff curve that is 1 at the pixel centre and
-   drops to half at the footprint edge. The curve is a super-Gaussian, which is
-   a Gaussian with an adjustable exponent. A low exponent gives a soft, bell-like
-   blob. A high exponent gives something closer to a box with rounded corners.
-4. Evaluate that curve at every grid cell centre. The result is that cell's
-   weight for that pixel.
+2. Fit a transform that maps that lopsided quadrilateral onto a plain rectangle.
+   Every later step works in the rectangle's coordinates, which is what lets one
+   formula handle pixels of any shape or tilt.
+3. Along each axis of the rectangle, define a falloff curve that is 1 at the
+   pixel centre and drops to half at the footprint edge. The curve is a
+   super-Gaussian, which is a Gaussian with an adjustable exponent. A low
+   exponent gives a soft, bell-like blob. A high exponent gives something closer
+   to a box with rounded corners.
+4. Evaluate that curve at the grid cell centres near the pixel. The result is
+   each cell's weight for that pixel.
 
 Then each output cell takes the weighted mean of every pixel that reached it.
 A cell's value is the sum of `weight x NO2` divided by the sum of `weight`.
 
 The exponents live in `config.py` as `TEMPO_SRF_EXPONENT_XTRACK = 2.0` and
 `TEMPO_SRF_EXPONENT_STEP = 3.0`. They control how boxy the blob is on each axis.
+
+### One wrinkle in the transform
+
+The textbook version of this transform ends with a division. That division is
+what makes the four corners land exactly on the rectangle's corners, and it is
+correct close to the pixel.
+
+It misbehaves further out. Every such transform has a line where the divisor
+hits zero, and past that line the map folds over and the response comes back
+with the wrong sign. For a typical TEMPO footprint that line sits about 23 km
+away, while the code evaluates the response out to about 12 km. Skewed pixels
+pull the line in closer, and some of them pull it inside the range we use.
+
+POPY v0.4 skips the division, so the map stays well behaved everywhere, at the
+cost of the corners not landing exactly on the rectangle. The pipeline follows
+POPY here, and a test pins the two implementations together. The divided form
+still exists in `eda/popy_reference.py` as `quadrilateral_coordinates`, used
+only to check corner recovery.
 
 ### Why we oversample by 3x
 
@@ -96,10 +116,19 @@ The EDA checked this against a 6x grid. Sampling at 1x is off by about 3 percent
 of a typical column. Sampling at 3x is off by 0.3 percent. So 3x is converged and
 6x buys nothing.
 
-The catch is memory. The current code builds one dense array of every pixel
-against every fine cell, which costs about 1.1 MB per native pixel, or a gigabyte
-for a well-covered AOI scan. That is the single biggest inefficiency in the
-regridder today.
+### Why each pixel only looks at nearby cells
+
+A pixel's response fades with distance, so past some point its weight is too
+small to matter. `TEMPO_RESPONSE_CUTOFF` sets that point at 1e-6, and the code
+turns it into a radius: the block of grid cells a given pixel can reach at all.
+Each pixel is then evaluated inside its own small block instead of against the
+whole grid.
+
+This is what keeps the regridder small. An earlier version built one array of
+every pixel against every fine cell, which for a well-covered AOI scan meant
+about 123 MB per array and roughly a gigabyte once intermediates were counted.
+The windowed version peaks near 2 MB of tracked allocation for the same input,
+and runs a little faster.
 
 ## The settings, and what each one trades
 
@@ -108,7 +137,8 @@ regridder today.
 | `MIN_PIXEL_CLOUD` | 0.20 | Coverage against value accuracy. See below. |
 | snow and ice filter | off | Nothing measurable in warm-season scans. |
 | `SELECTION_MARGIN_KM` | 8.0 | Runtime against edge accuracy. |
-| `OVERSAMPLE_FACTOR` | 3 | Memory and time against integration accuracy. |
+| `OVERSAMPLE_FACTOR` | 3 | Time against integration accuracy. |
+| `TEMPO_RESPONSE_CUTOFF` | 1e-6 | Window size against truncation error. |
 | `TEMPO_CELL_WEIGHT_FLOOR` | 0.01 | Cell count against cell reliability. |
 | `SRF_MIN_WEIGHT` | 1e-3 | Only affects the reported pixel count per cell. |
 
@@ -191,26 +221,30 @@ The training label is the change between two scans an hour apart, so a cell need
 a valid value in *both* rasters. A cell that passes the mask in one scan and
 fails in the other produces no delta.
 
-That makes per-raster survival misleading. Requiring an effective sample size of
-2 keeps 33 percent of cells in one raster, but the number that matters is the
-overlap across the pair, which is smaller. The EDA has not measured it yet.
+That makes per-raster survival misleading. The EDA now measures both: how many
+cells clear a floor in one raster, and how many clear it in both scans of a
+delta. `apply_cell_mask` applies a total-weight floor and an effective-sample
+floor together, and `TEMPO_EFFECTIVE_SAMPLE_FLOOR` stays at zero until that
+measurement picks a value.
 
 ## What is still open
 
-- **Footprint geometry.** The code builds its response axes from footprint edge
-  midpoints. POPY uses a perspective transform of the quadrilateral. The pixel
-  centres agree to within a few metres, but the rasters disagree by about 10
-  percent of a typical column, and by much more where coverage is thin. Moving
-  to the perspective transform is the largest correctness item left.
-- **Memory.** The dense pixel-by-cell array should become per-pixel local
-  windows.
 - **Response exponents.** Fitting them against NASA Level 3 cannot distinguish
   a step exponent of 3 from 4, 6, or 8. They all score within 0.002 of each
   other. Level 3 is itself tessellated, so fitting to it partly fits the
   reference rather than the instrument. The current values stand until an
   instrument-based source settles them.
 - **Mask rule.** No weight floor or effective-sample floor has been chosen on
-  evidence yet, and the paired-cell survival rate is unmeasured.
+  evidence yet. The harness now measures paired-cell survival, so the next run
+  can settle it.
+- **Cutoff bound.** The 1e-6 cutoff has not been bounded against an untruncated
+  calculation. The earlier sweep compared a different set of cells at each
+  cutoff, which made it unusable. The harness now reports value error and lost
+  coverage separately.
+- **Area weighting.** POPY divides each response by its footprint area. The EDA
+  measured that at under 1 percent, so the pipeline leaves it out for now.
+- **Selection margin.** 8 km is measured as safe but is still a fixed number
+  rather than one derived per footprint.
 
 The full task list lives in `AGENTS.md`.
 
@@ -224,4 +258,5 @@ The full task list lives in `AGENTS.md`.
 | `scripts/slurm/regrid_eda.sh` | Savio job that produces the EDA report. |
 
 Numbers in this document come from EDA job 38562491, run on 2026-09-04 over 12
-fixed AOI scans, plus a 250-scan coverage sample.
+fixed AOI scans, plus a 250-scan coverage sample. The geometry and memory
+figures postdate that job and come from the rewrite described above.
