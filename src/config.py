@@ -38,8 +38,8 @@ TEMPO_START_DATE = "2023-08-02 00:00:00"  # beginning of the TEMPO science recor
 TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
 
 TEMPO_GOOD_QUALITY_FLAG = 0  # V04 main_data_quality_flag value accepted into the NO2 mean
-TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.0  # disabled until paired-scan EDA selects accepted overlap-area support
-TEMPO_EFFECTIVE_SAMPLE_FLOOR = 0.0  # disabled until the paired-cell survival sweep settles a value
+TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.25  # removes edge slivers with about 1 percentage point paired-coverage loss
+TEMPO_EFFECTIVE_SAMPLE_FLOOR = 0.0  # ESS 1.25 cut paired-cell coverage from 58 percent to 21 percent
 
 # ============================================================================
 # Stratification
