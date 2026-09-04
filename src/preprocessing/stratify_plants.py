@@ -10,6 +10,8 @@ from config import (
     DELTA_NOX_SCALE_COL,
     FULL_DATA_PARQUET,
     LABEL_COL,
+    MIN_CITY_PROXIMITY,
+    MIN_COVERAGE_PERCENT,
     NOX_MASS_COL,
     STRAT_BASE_DIR,
     TEST_RECORDS_CSV,
@@ -18,8 +20,10 @@ from config import (
 )
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
+    MAJOR_CITY_DIST_COL,
     add_aoi_bounds,
     add_hrrr_files,
+    add_major_city_distance,
     aggregate_aoi_hours,
     build_aoi_membership,
     build_aoi_spatial_frame,
@@ -33,8 +37,8 @@ from preprocessing.tempo_mapping import (
     serialize_tempo_path_lists,
 )
 
-TRAIN_FRACTION = 0.70
-VAL_FRACTION = 0.15
+TRAIN_FRACTION = 0.60
+VAL_FRACTION = 0.20
 SPLIT_SEED = 42
 
 OUTPUT_COLUMNS = [
@@ -45,6 +49,7 @@ OUTPUT_COLUMNS = [
     "lat_max",
     "lon_min",
     "lon_max",
+    MAJOR_CITY_DIST_COL,
     "num_coal_units",
     "num_ng_units",
     "date",
@@ -130,16 +135,22 @@ def main() -> None:
     frame = frame.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
     frame = add_tempo_observations(frame, observations)
     frame = frame.filter(pl.col("tempo").is_not_null() & pl.col("prev_tempo").is_not_null())
-    bounds = bounded_aois.select(AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max")
+    bounds = add_major_city_distance(bounded_aois).select(
+        AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
+    )
     frame = add_hrrr_files(frame.join(bounds, on=AOI_ID_COL, how="left"))
+    frame = frame.filter(
+        (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT) & (pl.col(MAJOR_CITY_DIST_COL) >= MIN_CITY_PROXIMITY)
+    )
     frame = serialize_tempo_path_lists(frame)
 
-    splits = {name: split.select(OUTPUT_COLUMNS) for name, split in _split_by_cluster(frame).items()}
+    splits = _split_by_cluster(frame)
+    del frame
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
-    splits["train"].write_csv(TRAIN_RECORDS_CSV)
-    splits["val"].write_csv(VAL_RECORDS_CSV)
-    splits["test"].write_csv(TEST_RECORDS_CSV)
+    # Project and write one split at a time so the copies never coexist
+    for name, destination in (("train", TRAIN_RECORDS_CSV), ("val", VAL_RECORDS_CSV), ("test", TEST_RECORDS_CSV)):
+        splits.pop(name).select(OUTPUT_COLUMNS).write_csv(destination)
 
 
 if __name__ == "__main__":

@@ -1,28 +1,75 @@
 """Utilities for building and splitting AOI-hour records."""
 
+import geopandas as gpd
 import numpy as np
 import polars as pl
 import shapely
-from pycanopy import SpatialFrame
+from pycanopy import SpatialFrame, distance_to_point
 from pyproj import Transformer
 
 from config import (
+    CITIES_URL,
     DELTA_NOX_MASS_COL,
     DELTA_NOX_MED_COL,
     DELTA_NOX_SCALE_COL,
+    DELTA_SCALE_LEVEL_FRACTION,
     IMG_RANGE,
     LABEL_COL,
     MAD_NORMAL_SCALE,
+    MIN_CITY_POPULATION,
     MIN_DELTA_HISTORY,
-    MIN_DELTA_SCALE_LB,
     NOX_MASS_COL,
 )
 
 AOI_ID_COL = "aoi_id"
+MAJOR_CITY_DIST_COL = "major_city_dist"
+METERS_PER_KM = 1000.0
 HRRR_PRODUCT = "wrfsfcf00"  # hourly surface analysis product named in every HRRR filename
 HRRR_FIELD_SLUG = "wind-temp-blh"  # field subset named in every HRRR filename
 WGS84_TO_CONUS = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
 CONUS_TO_WGS84 = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True)
+
+
+def load_major_cities(url: str = CITIES_URL) -> pl.DataFrame:
+    """Load centroids of populated places meeting the major-city population threshold.
+
+    Args:
+        url: Source of the populated-places shapefile.
+
+    Returns:
+        One row per major city carrying WGS84 ``lon`` and ``lat``.
+    """
+    cities = gpd.read_file(url).to_crs("EPSG:4326")
+    cities = cities[cities["pop_max"] >= MIN_CITY_POPULATION]
+    return pl.DataFrame(
+        {
+            "lon": cities.geometry.x.to_numpy().astype(np.float64),
+            "lat": cities.geometry.y.to_numpy().astype(np.float64),
+        }
+    )
+
+
+def add_major_city_distance(frame: pl.DataFrame, cities: pl.DataFrame | None = None) -> pl.DataFrame:
+    """Add the great-circle distance in km from each AOI centroid to the nearest major city.
+
+    Args:
+        frame: AOI rows carrying centroid ``lat`` and ``lon`` columns.
+        cities: City centroids defaulting to the configured populated-places shapefile.
+
+    Returns:
+        The input frame with a ``major_city_dist`` column.
+    """
+    city_frame = load_major_cities() if cities is None else cities
+    if frame.is_empty() or city_frame.is_empty():
+        return frame.with_columns(pl.lit(None, dtype=pl.Float64).alias(MAJOR_CITY_DIST_COL))
+    longitudes = frame["lon"].to_numpy().astype(np.float64)
+    latitudes = frame["lat"].to_numpy().astype(np.float64)
+    nearest_m = np.full(longitudes.shape, np.inf, dtype=np.float64)
+    # Haversine metres to one city per pass keeps the running minimum exact
+    for city_lon, city_lat in zip(city_frame["lon"], city_frame["lat"], strict=True):
+        distances_m = distance_to_point(longitudes, latitudes, city_lon, city_lat, coordinate_system="geographic")
+        np.minimum(nearest_m, distances_m, out=nearest_m)
+    return frame.with_columns(pl.Series(MAJOR_CITY_DIST_COL, nearest_m / METERS_PER_KM, dtype=pl.Float64))
 
 
 def add_hrrr_files(frame: pl.DataFrame) -> pl.DataFrame:
@@ -177,6 +224,7 @@ def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
         .group_by(AOI_ID_COL, "_year", "_quarter")
         .agg(
             pl.col(DELTA_NOX_MASS_COL).median().alias(DELTA_NOX_MED_COL),
+            pl.col(NOX_MASS_COL).median().alias("_median_nox_mass"),
             pl.len().alias("_delta_history_count"),
         )
     )
@@ -186,13 +234,15 @@ def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
         .group_by(AOI_ID_COL, "_year", "_quarter")
         .agg(
             pl.col(DELTA_NOX_MED_COL).first(),
+            pl.col("_median_nox_mass").first(),
             pl.col("_delta_history_count").first(),
             (pl.col(DELTA_NOX_MASS_COL) - pl.col(DELTA_NOX_MED_COL)).abs().median().alias("_delta_nox_mad"),
         )
         .with_columns(
-            pl.max_horizontal(pl.col("_delta_nox_mad") * MAD_NORMAL_SCALE, pl.lit(MIN_DELTA_SCALE_LB)).alias(
-                DELTA_NOX_SCALE_COL
-            ),
+            (
+                pl.col("_delta_nox_mad") * MAD_NORMAL_SCALE
+                + pl.col("_median_nox_mass").abs() * DELTA_SCALE_LEVEL_FRACTION
+            ).alias(DELTA_NOX_SCALE_COL),
             pl.when(pl.col("_quarter") == 4).then(pl.col("_year") + 1).otherwise(pl.col("_year")).alias("_year"),
             pl.when(pl.col("_quarter") == 4).then(1).otherwise(pl.col("_quarter") + 1).alias("_quarter"),
         )
@@ -200,7 +250,7 @@ def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
     return (
         with_deltas.join(quarter_stats, on=[AOI_ID_COL, "_year", "_quarter"], how="left")
         .with_columns(
-            pl.when(pl.col("_delta_history_count") >= MIN_DELTA_HISTORY)
+            pl.when((pl.col("_delta_history_count") >= MIN_DELTA_HISTORY) & (pl.col(DELTA_NOX_SCALE_COL) > 0))
             .then((pl.col(DELTA_NOX_MASS_COL) - pl.col(DELTA_NOX_MED_COL)) / pl.col(DELTA_NOX_SCALE_COL))
             .alias(LABEL_COL)
         )
@@ -211,6 +261,7 @@ def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
             "_year",
             "_quarter",
             "_delta_nox_mad",
+            "_median_nox_mass",
             "_delta_history_count",
         )
     )
