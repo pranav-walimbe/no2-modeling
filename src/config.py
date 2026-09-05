@@ -100,12 +100,10 @@ OUTLIER_FILTER_COLUMNS = (  # excludes coordinates, counts, time, and already bo
     LABEL_COL,
 )
 
-# These are the user-facing final dataset-size controls. Stratification emits
-# an overdraw pool because paired TEMPO coverage rejects many metadata records.
 TRAIN_SIZE = 12_000
 VAL_SIZE = 4_000
 TEST_SIZE = 4_000
-STRATIFY_CANDIDATE_MULTIPLIER = 3
+STRATIFY_CANDIDATE_MULTIPLIER = 3  # overdraw for paired TEMPO coverage rejection
 TRAIN_RECORDS_SIZE = TRAIN_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 VAL_RECORDS_SIZE = VAL_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
