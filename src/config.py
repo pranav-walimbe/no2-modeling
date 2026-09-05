@@ -19,8 +19,8 @@ EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 EMISSIONS_START_DATE = date(2023, 8, 1)  # start of CAMPD hourly emissions pull
 EMISSIONS_END_DATE = date.today()  # request through the latest date available from CAMPD
 EMISSIONS_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_emissions"  # HPC output directory for emissions
-EMISSIONS_RECORDS_PARQUET = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_all.parquet")  # hourly records, any status
-FULL_DATA_PARQUET = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.parquet")  # emissions with plant metadata
+EMISSIONS_RECORDS_PARQUET = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_all.parquet")  # source hours in local standard time
+FULL_DATA_PARQUET = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.parquet")  # enriched emissions with UTC date and hour
 
 # ============================================================================
 # TEMPO data scraping

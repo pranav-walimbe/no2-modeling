@@ -29,6 +29,7 @@ dependencies = [
     "scipy",
     "seaborn",
     "shapely",
+    "timezonefinder>=8.2.0",
     "torch==2.3.1",
 ]
 
