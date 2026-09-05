@@ -1,4 +1,4 @@
-"""Evaluation for signed normalized and physical NOx-mass changes."""
+"""Evaluation utilities for signed normalized and physical NOx-mass changes."""
 
 import json
 from pathlib import Path

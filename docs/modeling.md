@@ -115,6 +115,13 @@ validation-loss scheduling, and early stopping. Huber is quadratic for common
 small errors and linear for larger errors, making it smoother than MAE without
 giving extreme records the leverage of pure MSE.
 
+`config.py` owns only the shared modeling data contract: paths, raster key and
+channels, image clipping, and input-feature definitions. Training defaults live
+in `modeling/train.py`, while architecture defaults live in `modeling/resnet.py`;
+both are exposed through training CLI flags. This keeps preprocessing and
+collection code independent of a particular training run while ensuring each
+run records its resolved settings.
+
 CUDA runs use automatic mixed precision for convolutions and linear layers,
 with gradient scaling. PyTorch documents AMP as selecting lower precision for
 eligible high-throughput operations while retaining float32 where its range is
@@ -180,7 +187,7 @@ Each UTC-stamped directory under `RUNS_DIR` contains:
 Run training on a compute node with
 
 ```bash
-python -u -m modeling.training
+python -u -m modeling.train
 ```
 
 Use `--workers`, `--batch-size`, and `--epochs` for allocation-specific

@@ -111,10 +111,9 @@ VAL_RECORDS_SIZE = VAL_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 
 # ============================================================================
-# ML modeling
+# Modeling data contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-BATCH_SIZE = 128  # training batch size
 MODEL_IMAGE_KEY = "delta_no2"  # array stored in each per-record NPZ bundle
 MODEL_IMAGE_CHANNELS = 2  # standardized delta NO2 plus a binary finite-data mask
 MODEL_IMAGE_CLIP_Z = 8.0  # bound rare raster extremes after train-only standardization
@@ -136,19 +135,6 @@ MODEL_LOG1P_FEATURES = (  # stabilize strongly right-skewed, nonnegative quantit
     "boundary_layer_height_m",
 )
 MODEL_CYCLIC_FEATURES = ("hour", "day_of_year")  # each expands to sine and cosine
-MODEL_NUM_WORKERS = 4  # per-training-process readers for many small compressed NPZ files
-MODEL_PREFETCH_FACTOR = 2  # batches queued by each DataLoader worker
-MODEL_SEED = 42
-HEAD_DIM = 128  # hidden dimension of MLP regression head
-LR = 3e-4  # AdamW learning rate
-NUM_EPOCHS = 300  # maximum training epochs
-SCHEDULER_PATIENCE = 10  # epochs without val improvement before LR reduction
-SCHEDULER_FACTOR = 0.50  # LR multiplier applied on plateau
-EARLY_STOP_PATIENCE = 25  # epochs without val improvement before early stopping
-WEIGHT_DECAY = 1e-4  # regularization strength
-DROPOUT = 0.30  # dropout rate in regression head
-HUBER_DELTA = 1.0  # quadratic-to-linear transition in standardized target units
-GRADIENT_CLIP_NORM = 5.0  # guard against rare unstable updates
 
 # ============================================================================
 # Other

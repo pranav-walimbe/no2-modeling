@@ -3,7 +3,10 @@
 import torch
 from torch import nn
 
-from config import DROPOUT, HEAD_DIM, MODEL_IMAGE_CHANNELS
+from config import MODEL_IMAGE_CHANNELS
+
+DEFAULT_HEAD_DIM = 128
+DEFAULT_DROPOUT = 0.30
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -40,12 +43,24 @@ class ResBlock(nn.Module):
 class NOxModel(nn.Module):
     """Fuse a mask-aware delta-NO2 encoder with leakage-safe scalar features."""
 
-    def __init__(self, n_tabular_features: int, *, use_image: bool = True, use_tabular: bool = True) -> None:
+    def __init__(
+        self,
+        n_tabular_features: int,
+        *,
+        use_image: bool = True,
+        use_tabular: bool = True,
+        head_dim: int = DEFAULT_HEAD_DIM,
+        dropout: float = DEFAULT_DROPOUT,
+    ) -> None:
         super().__init__()
         if n_tabular_features < 1:
             raise ValueError("n_tabular_features must be positive")
         if not use_image and not use_tabular:
             raise ValueError("At least one model input branch must be enabled")
+        if head_dim < 1:
+            raise ValueError("head_dim must be positive")
+        if not 0 <= dropout < 1:
+            raise ValueError("dropout must be in [0, 1)")
         self.use_image = use_image
         self.use_tabular = use_tabular
 
@@ -73,7 +88,7 @@ class NOxModel(nn.Module):
                 nn.Linear(192 * 10, 256),
                 nn.LayerNorm(256),
                 nn.SiLU(inplace=True),
-                nn.Dropout(DROPOUT),
+                nn.Dropout(dropout),
             )
         if use_tabular:
             self.tabular_projection = nn.Sequential(
@@ -85,11 +100,11 @@ class NOxModel(nn.Module):
             )
         fusion_features = 256 * int(use_image) + 64 * int(use_tabular)
         self.head = nn.Sequential(
-            nn.Linear(fusion_features, HEAD_DIM),
-            nn.LayerNorm(HEAD_DIM),
+            nn.Linear(fusion_features, head_dim),
+            nn.LayerNorm(head_dim),
             nn.SiLU(inplace=True),
-            nn.Dropout(DROPOUT),
-            nn.Linear(HEAD_DIM, 1),
+            nn.Dropout(dropout),
+            nn.Linear(head_dim, 1),
         )
 
     def forward(self, image: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:

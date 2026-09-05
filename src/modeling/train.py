@@ -12,23 +12,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from config import (
-    BATCH_SIZE,
-    EARLY_STOP_PATIENCE,
-    GRADIENT_CLIP_NORM,
-    HUBER_DELTA,
-    LR,
-    MODEL_IMAGE_CLIP_Z,
-    MODEL_NUM_WORKERS,
-    MODEL_PREFETCH_FACTOR,
-    MODEL_SEED,
-    NUM_CORES,
-    NUM_EPOCHS,
-    RUNS_DIR,
-    SCHEDULER_FACTOR,
-    SCHEDULER_PATIENCE,
-    WEIGHT_DECAY,
-)
+from config import MODEL_IMAGE_CLIP_Z, NUM_CORES, RUNS_DIR
 from modeling.dataset import (
     MODEL_FEATURE_NAMES,
     NormalizationStats,
@@ -38,16 +22,40 @@ from modeling.dataset import (
     load_stats,
     save_stats,
 )
-from modeling.evaluation import NORMALIZED_PRED_COL, NORMALIZED_TRUE_COL, add_mass_change_predictions, save_results
-from modeling.plotting import plot_loss_curve, plot_pred_vs_true, plot_residuals, plot_spatial_error
-from modeling.resnet import NOxModel
+from modeling.eval_utils import NORMALIZED_PRED_COL, NORMALIZED_TRUE_COL, add_mass_change_predictions, save_results
+from modeling.plot_utils import plot_loss_curve, plot_pred_vs_true, plot_residuals, plot_spatial_error
+from modeling.resnet import DEFAULT_DROPOUT, DEFAULT_HEAD_DIM, NOxModel
+
+DEFAULT_BATCH_SIZE = 128
+DEFAULT_EPOCHS = 300
+DEFAULT_WORKERS = 4
+DEFAULT_PREFETCH_FACTOR = 2
+DEFAULT_SEED = 42
+DEFAULT_LEARNING_RATE = 3e-4
+DEFAULT_WEIGHT_DECAY = 1e-4
+DEFAULT_HUBER_DELTA = 1.0
+DEFAULT_GRADIENT_CLIP_NORM = 5.0
+DEFAULT_SCHEDULER_PATIENCE = 10
+DEFAULT_SCHEDULER_FACTOR = 0.50
+DEFAULT_EARLY_STOP_PATIENCE = 25
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS)
-    parser.add_argument("--workers", type=int, default=min(MODEL_NUM_WORKERS, NUM_CORES))
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--workers", type=int, default=min(DEFAULT_WORKERS, NUM_CORES))
+    parser.add_argument("--prefetch-factor", type=int, default=DEFAULT_PREFETCH_FACTOR)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--head-dim", type=int, default=DEFAULT_HEAD_DIM)
+    parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
+    parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
+    parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
+    parser.add_argument("--huber-delta", type=float, default=DEFAULT_HUBER_DELTA)
+    parser.add_argument("--gradient-clip-norm", type=float, default=DEFAULT_GRADIENT_CLIP_NORM)
+    parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
+    parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
+    parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
     parser.add_argument("--stats", type=Path, help="Reuse normalization_stats.json from a compatible training split")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--inputs", choices=("full", "image", "tabular"), default="full")
@@ -63,12 +71,25 @@ def _device(requested: str) -> torch.device:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if args.batch_size < 1 or args.epochs < 1:
-        raise ValueError("batch size and epochs must be positive")
+    positive_integer_names = ("batch_size", "epochs", "prefetch_factor", "head_dim")
+    if any(getattr(args, name) < 1 for name in positive_integer_names):
+        raise ValueError(f"These arguments must be positive: {', '.join(positive_integer_names)}")
+    if args.seed < 0 or args.scheduler_patience < 0:
+        raise ValueError("seed and scheduler patience cannot be negative")
     if args.workers < 0:
         raise ValueError("workers cannot be negative")
     if args.workers > NUM_CORES:
         raise ValueError(f"workers cannot exceed the allocated CPU count ({NUM_CORES})")
+    if args.learning_rate <= 0 or args.huber_delta <= 0 or args.gradient_clip_norm <= 0:
+        raise ValueError("learning rate, Huber delta, and gradient clip norm must be positive")
+    if args.weight_decay < 0:
+        raise ValueError("weight decay cannot be negative")
+    if not 0 <= args.dropout < 1:
+        raise ValueError("dropout must be in [0, 1)")
+    if not 0 < args.scheduler_factor < 1:
+        raise ValueError("scheduler factor must be in (0, 1)")
+    if args.early_stop_patience <= args.scheduler_patience:
+        raise ValueError("early-stop patience must exceed scheduler patience")
 
 
 def _seed_everything(seed: int) -> None:
@@ -97,6 +118,7 @@ def train_epoch(
     criterion: nn.Module,
     scaler: torch.cuda.amp.GradScaler,
     device: torch.device,
+    gradient_clip_norm: float,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -109,7 +131,7 @@ def train_epoch(
             loss = criterion(prediction, target)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
+        nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
         scaler.step(optimizer)
         scaler.update()
         total_loss += loss.detach().item() * target.numel()
@@ -151,10 +173,10 @@ def _loader(dataset: NOxDataset, *, shuffle: bool, args: argparse.Namespace, dev
         "drop_last": False,
         "num_workers": args.workers,
         "pin_memory": device.type == "cuda",
-        "generator": torch.Generator().manual_seed(MODEL_SEED),
+        "generator": torch.Generator().manual_seed(args.seed),
     }
     if args.workers:
-        options.update(persistent_workers=True, prefetch_factor=MODEL_PREFETCH_FACTOR)
+        options.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
     return DataLoader(dataset, **options)
 
 
@@ -173,7 +195,7 @@ def _prediction_frame(
 def main() -> None:
     args = parse_args()
     _validate_args(args)
-    _seed_everything(MODEL_SEED)
+    _seed_everything(args.seed)
     device = _device(args.device)
 
     stats = load_stats(args.stats) if args.stats else compute_stats("train")
@@ -195,14 +217,16 @@ def main() -> None:
         n_tabular_features=len(MODEL_FEATURE_NAMES),
         use_image=args.inputs in ("full", "image"),
         use_tabular=args.inputs in ("full", "tabular"),
+        head_dim=args.head_dim,
+        dropout=args.dropout,
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    criterion = nn.HuberLoss(delta=HUBER_DELTA)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    criterion = nn.HuberLoss(delta=args.huber_delta)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
-        patience=SCHEDULER_PATIENCE,
-        factor=SCHEDULER_FACTOR,
+        patience=args.scheduler_patience,
+        factor=args.scheduler_factor,
     )
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
     best_path = checkpoint_dir / "best_model.pt"
@@ -217,10 +241,17 @@ def main() -> None:
         "batch_size": args.batch_size,
         "workers": args.workers,
         "maximum_epochs": args.epochs,
-        "seed": MODEL_SEED,
-        "learning_rate": LR,
-        "weight_decay": WEIGHT_DECAY,
-        "huber_delta": HUBER_DELTA,
+        "prefetch_factor": args.prefetch_factor,
+        "seed": args.seed,
+        "head_dim": args.head_dim,
+        "dropout": args.dropout,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "huber_delta": args.huber_delta,
+        "gradient_clip_norm": args.gradient_clip_norm,
+        "scheduler_patience": args.scheduler_patience,
+        "scheduler_factor": args.scheduler_factor,
+        "early_stop_patience": args.early_stop_patience,
         "image_clip_z": MODEL_IMAGE_CLIP_Z,
         "tabular_features": list(MODEL_FEATURE_NAMES),
         "model_parameters": model.num_params(),
@@ -230,7 +261,15 @@ def main() -> None:
     print(f"Training {model.num_params():,} parameters on {device}; outputs: {run_dir}")
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, scaler, device)
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            scaler,
+            device,
+            args.gradient_clip_norm,
+        )
         validation_loss = val_epoch(model, eval_loaders["val"], criterion, device)
         scheduler.step(validation_loss)
         train_losses.append(train_loss)
@@ -254,7 +293,7 @@ def main() -> None:
             )
         else:
             epochs_without_improvement += 1
-            if epochs_without_improvement >= EARLY_STOP_PATIENCE:
+            if epochs_without_improvement >= args.early_stop_patience:
                 print(f"Early stopping at epoch {epoch}")
                 break
 

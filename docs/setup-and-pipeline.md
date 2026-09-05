@@ -186,7 +186,7 @@ source .venv/bin/activate
 5. Train and evaluate the model:
 
    ```bash
-   python -u -m modeling.training
+   python -u -m modeling.train
    ```
 
    The trainer lazily reads each selected `delta_no2` NPZ, represents missing

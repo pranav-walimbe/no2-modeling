@@ -1,4 +1,4 @@
-"""Create training and signed-target evaluation visualizations."""
+"""Plotting utilities for training and signed-target evaluation."""
 
 from pathlib import Path
 
@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from modeling.evaluation import (
+from modeling.eval_utils import (
     MASS_PRED_COL,
     MASS_TRUE_COL,
     NORMALIZED_PRED_COL,
