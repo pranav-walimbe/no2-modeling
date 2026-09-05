@@ -27,7 +27,8 @@ from config import (
 )
 
 RASTER_PATH_COL = "delta_no2_path"
-STATS_VERSION = 1
+IMAGE_TRANSFORM = "asinh"
+STATS_VERSION = 2
 MIN_SCALE = 1e-12
 
 
@@ -46,6 +47,8 @@ class NormalizationStats:
     """JSON-safe train-split preprocessing state used by every data split."""
 
     version: int
+    image_transform: str
+    image_scale: float
     image_mean: float
     image_std: float
     image_finite_pixels: int
@@ -63,8 +66,10 @@ class NormalizationStats:
     def from_dict(cls, values: dict[str, object]) -> "NormalizationStats":
         if int(values.get("version", -1)) != STATS_VERSION:
             raise ValueError(f"Unsupported normalization-statistics version: {values.get('version')}")
-        return cls(
+        stats = cls(
             version=int(values["version"]),
+            image_transform=str(values["image_transform"]),
+            image_scale=float(values["image_scale"]),
             image_mean=float(values["image_mean"]),
             image_std=float(values["image_std"]),
             image_finite_pixels=int(values["image_finite_pixels"]),
@@ -75,6 +80,11 @@ class NormalizationStats:
             target_std=float(values["target_std"]),
             training_records=int(values["training_records"]),
         )
+        if stats.image_transform != IMAGE_TRANSFORM:
+            raise ValueError(f"Unsupported image transform: {stats.image_transform}")
+        if not math.isfinite(stats.image_scale) or stats.image_scale <= MIN_SCALE:
+            raise ValueError("Image transform scale must be finite and positive")
+        return stats
 
 
 def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
@@ -143,6 +153,11 @@ def _safe_scale(values: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(values) & (values > MIN_SCALE), values, 1.0)
 
 
+def _asinh_transform(values: np.ndarray, scale: float) -> np.ndarray:
+    """Compress both signed tails while remaining approximately linear near zero."""
+    return np.arcsinh(values / scale)
+
+
 def compute_stats(
     split: str = "train",
     *,
@@ -150,11 +165,12 @@ def compute_stats(
     dataframe_dir: str | Path = DATASET_DF,
     progress_interval: int = 1_000,
 ) -> NormalizationStats:
-    """Compute constant-memory normalization statistics from one split.
+    """Compute memory-bounded normalization statistics from one split.
 
-    Raster mean and variance use a numerically stable, batch-combined Welford
-    update over finite pixels only. Images are opened one at a time, so peak
-    memory is independent of dataset size.
+    The robust asinh scale is the median of per-raster median absolute finite
+    values, giving every training record equal influence regardless of its
+    coverage. A second streaming pass computes transformed-pixel mean and
+    variance with a numerically stable, batch-combined Welford update.
     """
     root = Path(dataset_dir)
     frame = _read_split_frame(split, Path(dataframe_dir))
@@ -163,14 +179,28 @@ def compute_stats(
     if not np.isfinite(labels).all():
         raise ValueError(f"{LABEL_COL} contains non-finite values in {split}")
 
-    count = 0
-    mean = 0.0
-    sum_squared_deviation = 0.0
-    for index, serialized_path in enumerate(frame[RASTER_PATH_COL], start=1):
+    raster_paths = frame[RASTER_PATH_COL].to_numpy(dtype=str)
+    median_absolute_values = np.empty(len(raster_paths), dtype=np.float64)
+    for index, serialized_path in enumerate(raster_paths, start=1):
         raster = _load_delta_raster(_raster_path(serialized_path, root))
         values = raster[np.isfinite(raster)].astype(np.float64, copy=False)
         if not values.size:
             raise ValueError(f"Raster has no finite {MODEL_IMAGE_KEY} values: {serialized_path}")
+        median_absolute_values[index - 1] = np.median(np.abs(values))
+        if progress_interval > 0 and (index % progress_interval == 0 or index == len(frame)):
+            print(f"Robust-scale scan: {index:,}/{len(frame):,} rasters")
+
+    image_scale = float(np.median(median_absolute_values))
+    if not math.isfinite(image_scale) or image_scale <= MIN_SCALE:
+        raise ValueError("Training raster asinh scale is zero or non-finite")
+
+    count = 0
+    mean = 0.0
+    sum_squared_deviation = 0.0
+    for index, serialized_path in enumerate(raster_paths, start=1):
+        raster = _load_delta_raster(_raster_path(serialized_path, root))
+        values = raster[np.isfinite(raster)].astype(np.float64, copy=False)
+        values = _asinh_transform(values, image_scale)
         batch_count = int(values.size)
         batch_mean = float(values.mean())
         batch_squared_deviation = float(np.square(values - batch_mean).sum())
@@ -189,6 +219,8 @@ def compute_stats(
     target_std = float(_safe_scale(np.asarray([labels.std()]))[0])
     return NormalizationStats(
         version=STATS_VERSION,
+        image_transform=IMAGE_TRANSFORM,
+        image_scale=image_scale,
         image_mean=mean,
         image_std=image_std,
         image_finite_pixels=count,
@@ -272,7 +304,8 @@ class NOxDataset(Dataset):
             raster = _load_delta_raster(_raster_path(self.raster_paths[index], self.dataset_dir))
             finite = np.isfinite(raster)
             normalized = np.zeros_like(raster, dtype=np.float32)
-            normalized[finite] = (raster[finite] - self.stats.image_mean) / self.stats.image_std
+            transformed = _asinh_transform(raster[finite], self.stats.image_scale)
+            normalized[finite] = (transformed - self.stats.image_mean) / self.stats.image_std
             np.clip(normalized, -MODEL_IMAGE_CLIP_Z, MODEL_IMAGE_CLIP_Z, out=normalized)
             image = torch.from_numpy(np.stack((normalized, finite.astype(np.float32, copy=False)), axis=0))
         else:

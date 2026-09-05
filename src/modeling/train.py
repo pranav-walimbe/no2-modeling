@@ -252,6 +252,8 @@ def main() -> None:
         "scheduler_patience": args.scheduler_patience,
         "scheduler_factor": args.scheduler_factor,
         "early_stop_patience": args.early_stop_patience,
+        "image_transform": stats.image_transform,
+        "image_scale": stats.image_scale,
         "image_clip_z": MODEL_IMAGE_CLIP_Z,
         "tabular_features": list(MODEL_FEATURE_NAMES),
         "model_parameters": model.num_params(),
