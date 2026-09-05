@@ -190,7 +190,7 @@ source .venv/bin/activate
    ```
 
    The trainer lazily reads each selected `delta_no2` NPZ, represents missing
-   pixels with an explicit mask channel, and computes constant-memory
+   pixels with an explicit mask channel, and computes memory-bounded robust
    normalization statistics from the training split only. It predicts the
    signed `delta_nox_norm` target and reports both normalized and physical
    NOx-mass-change metrics. See `docs/modeling.md` for the feature, leakage,

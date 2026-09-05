@@ -52,38 +52,53 @@ already gives the network spatial coverage information.
 
 The model receives two channels:
 
-1. finite delta-NO2 values standardized with one global training-pixel mean
-   and standard deviation, clipped to plus or minus 8 standard deviations;
+1. finite delta-NO2 values transformed with a robust signed asinh, standardized
+   with the transformed training-pixel mean and standard deviation, and clipped
+   to plus or minus 8 standard deviations;
 2. a binary mask whose value is one where both TEMPO scans supplied accepted
    NO2 and zero elsewhere.
 
+The transform is
+
+```text
+transformed = asinh(delta_no2 / image_scale)
+normalized = (transformed - transformed_train_mean) / transformed_train_std
+```
+
+`image_scale` is the median of each training raster's median absolute finite
+value. This record-balanced definition prevents high-coverage rasters from
+dominating the scale and stores only one scalar per raster. Asinh preserves
+sign, is approximately linear for weak changes, and becomes logarithmic in
+both tails.
+
 After standardization, missing values in the first channel are filled with
-zero. Zero is the training mean, not a claim that the physical NO2 change was
-zero, and the second channel makes the distinction explicit. This follows the
-general missing-image principle that the validity mask is information rather
-than an implementation detail; specialized mask-updating partial convolutions
-remain an experiment rather than part of this baseline. See the original
-[partial-convolution paper](https://arxiv.org/abs/1804.07723).
+zero. Zero is the transformed training mean, not a claim that the physical NO2
+change was zero, and the second channel makes the distinction explicit. This
+follows the general missing-image principle that the validity mask is
+information rather than an implementation detail; specialized mask-updating
+partial convolutions remain an experiment rather than part of this baseline.
+See the original [partial-convolution paper](https://arxiv.org/abs/1804.07723).
 
-Statistics are accumulated over finite training pixels with a numerically
-stable combined-Welford update. The loader opens only one compressed NPZ at a
-time, making peak statistics memory constant with respect to dataset size. It
-does not concatenate the approximately 28 million training pixels or build a
-second dense image archive. The JSON statistics file is stored with every run
-and used unchanged for validation, test, and later inference.
+Normalization uses two sequential training-raster passes. The first derives
+the robust scale; the second accumulates transformed finite-pixel mean and
+variance with a numerically stable combined-Welford update. Only one compressed
+NPZ is open at a time, and the implementation never concatenates the roughly
+28 million training pixels or builds another dense image archive. The JSON
+statistics file stores the transform name, scale, mean, and standard deviation
+and is used unchanged for validation, test, and later inference.
 
-The global mean/std plus clipping compromise was selected over these options:
+Asinh plus global standardization was selected over these options:
 
 - Per-image normalization was rejected because absolute enhancement magnitude
   is part of the emissions signal.
 - Treating NaN as an ordinary zero without a mask was rejected because scan
   coverage would be indistinguishable from measured zero change.
-- Exact percentile or median/MAD raster normalization would require retaining
-  or repeatedly scanning many pixels. It may be worth an ablation, but it is
-  not the efficient default.
-- An image-level asinh transform could suppress real strong enhancements. The
-  bounded z-score already prevents a few extreme pixels from dominating
-  gradients while leaving the common range linear.
+- Raw z-scoring is cheaper by one scan but lets extreme retrieval differences
+  exert more influence on its mean, variance, and gradients.
+- Signed `log1p` also compresses both tails but has a less direct smooth signed
+  formulation than asinh around zero.
+- Percentile min-max scaling depends strongly on chosen endpoints and can hide
+  distribution shift by saturating all values outside the training range.
 
 The 8-sigma bound is intentionally conservative. Tune it only on training and
 validation data and record the retained-pixel distribution before changing it.
