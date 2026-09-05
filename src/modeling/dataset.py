@@ -1,4 +1,4 @@
-"""Dataset loading and train-only normalization for delta-NO2 modeling."""
+"""Dataset loading and train-only normalization for TEMPO raster modeling."""
 
 from __future__ import annotations
 
@@ -21,14 +21,16 @@ from config import (
     LABEL_COL,
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_Z,
-    MODEL_IMAGE_KEY,
+    MODEL_IMAGE_KEYS,
     MODEL_LOG1P_FEATURES,
     MODEL_RAW_FEATURES,
+    MODEL_VALID_MASK_KEY,
 )
 
 RASTER_PATH_COL = "delta_no2_path"
+LABEL_MODE_COL = "label_mode"
 IMAGE_TRANSFORM = "asinh"
-STATS_VERSION = 2
+STATS_VERSION = 3
 MIN_SCALE = 1e-12
 
 
@@ -48,10 +50,11 @@ class NormalizationStats:
 
     version: int
     image_transform: str
-    image_scale: float
-    image_mean: float
-    image_std: float
-    image_finite_pixels: int
+    image_keys: tuple[str, ...]
+    image_scale: tuple[float, ...]
+    image_mean: tuple[float, ...]
+    image_std: tuple[float, ...]
+    image_finite_pixels: tuple[int, ...]
     feature_names: tuple[str, ...]
     feature_mean: tuple[float, ...]
     feature_std: tuple[float, ...]
@@ -69,10 +72,11 @@ class NormalizationStats:
         stats = cls(
             version=int(values["version"]),
             image_transform=str(values["image_transform"]),
-            image_scale=float(values["image_scale"]),
-            image_mean=float(values["image_mean"]),
-            image_std=float(values["image_std"]),
-            image_finite_pixels=int(values["image_finite_pixels"]),
+            image_keys=tuple(str(name) for name in values["image_keys"]),
+            image_scale=tuple(float(value) for value in values["image_scale"]),
+            image_mean=tuple(float(value) for value in values["image_mean"]),
+            image_std=tuple(float(value) for value in values["image_std"]),
+            image_finite_pixels=tuple(int(value) for value in values["image_finite_pixels"]),
             feature_names=tuple(str(name) for name in values["feature_names"]),
             feature_mean=tuple(float(value) for value in values["feature_mean"]),
             feature_std=tuple(float(value) for value in values["feature_std"]),
@@ -82,8 +86,18 @@ class NormalizationStats:
         )
         if stats.image_transform != IMAGE_TRANSFORM:
             raise ValueError(f"Unsupported image transform: {stats.image_transform}")
-        if not math.isfinite(stats.image_scale) or stats.image_scale <= MIN_SCALE:
-            raise ValueError("Image transform scale must be finite and positive")
+        if stats.image_keys != MODEL_IMAGE_KEYS:
+            raise ValueError("Normalization image order does not match the configured raster channels")
+        channel_count = len(MODEL_IMAGE_KEYS)
+        if not all(
+            len(values) == channel_count
+            for values in (stats.image_scale, stats.image_mean, stats.image_std, stats.image_finite_pixels)
+        ):
+            raise ValueError("Normalization image statistics do not match the configured raster channels")
+        if not all(math.isfinite(value) and value > MIN_SCALE for value in stats.image_scale):
+            raise ValueError("Image transform scales must be finite and positive")
+        if not all(math.isfinite(value) and value > MIN_SCALE for value in stats.image_std):
+            raise ValueError("Image standard deviations must be finite and positive")
         return stats
 
 
@@ -92,12 +106,14 @@ def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
     if not path.is_file():
         raise FileNotFoundError(f"Missing {split} dataframe: {path}")
     frame = pd.read_csv(path)
-    required = {RASTER_PATH_COL, LABEL_COL, "date", "hour", *MODEL_RAW_FEATURES}
+    required = {RASTER_PATH_COL, LABEL_COL, LABEL_MODE_COL, "date", "hour", *MODEL_RAW_FEATURES}
     missing = required.difference(frame.columns)
     if missing:
         raise ValueError(f"{split} dataframe is missing model columns: {', '.join(sorted(missing))}")
     if frame.empty:
         raise ValueError(f"{split} dataframe is empty")
+    if frame[LABEL_MODE_COL].nunique() != 1:
+        raise ValueError(f"{split} dataframe must contain exactly one target label mode")
     return frame
 
 
@@ -138,15 +154,31 @@ def _raster_path(serialized_path: object, dataset_dir: Path) -> Path:
     return path if path.is_absolute() else dataset_dir / path
 
 
-def _load_delta_raster(path: Path) -> np.ndarray:
+def _load_raster_bundle(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load paired numeric rasters and validate their stored support mask."""
     try:
         with np.load(path, allow_pickle=False) as bundle:
-            raster = np.asarray(bundle[MODEL_IMAGE_KEY], dtype=np.float32)
+            rasters = np.stack(
+                [np.asarray(bundle[name], dtype=np.float32) for name in MODEL_IMAGE_KEYS],
+                axis=0,
+            )
+            mask = np.asarray(bundle[MODEL_VALID_MASK_KEY], dtype=np.float32)
     except KeyError as error:
-        raise ValueError(f"Raster bundle is missing {MODEL_IMAGE_KEY}: {path}") from error
-    if raster.shape != (IMG_SIZE, IMG_SIZE):
-        raise ValueError(f"Expected {(IMG_SIZE, IMG_SIZE)} raster at {path}, found {raster.shape}")
-    return raster
+        raise ValueError(f"Raster bundle is missing a configured model channel: {path}") from error
+    expected_raster_shape = (len(MODEL_IMAGE_KEYS), IMG_SIZE, IMG_SIZE)
+    if rasters.shape != expected_raster_shape or mask.shape != (IMG_SIZE, IMG_SIZE):
+        raise ValueError(
+            f"Expected numeric rasters {expected_raster_shape} and mask {(IMG_SIZE, IMG_SIZE)} "
+            f"at {path}, found {rasters.shape} and {mask.shape}"
+        )
+    if not np.isfinite(mask).all() or not np.isin(mask, (0.0, 1.0)).all():
+        raise ValueError(f"Raster valid mask must contain only finite zero and one values: {path}")
+    finite = np.isfinite(rasters).all(axis=0)
+    if not np.array_equal(mask.astype(bool), finite):
+        raise ValueError(f"Raster valid mask does not match paired numeric support: {path}")
+    if not finite.any():
+        raise ValueError(f"Raster bundle has no paired finite NO2 values: {path}")
+    return rasters, mask
 
 
 def _safe_scale(values: np.ndarray) -> np.ndarray:
@@ -167,10 +199,10 @@ def compute_stats(
 ) -> NormalizationStats:
     """Compute memory-bounded normalization statistics from one split.
 
-    The robust asinh scale is the median of per-raster median absolute finite
-    values, giving every training record equal influence regardless of its
-    coverage. A second streaming pass computes transformed-pixel mean and
-    variance with a numerically stable, batch-combined Welford update.
+    Each robust asinh scale is the median of per-raster median absolute finite
+    values for one numeric channel. This gives every training record equal
+    influence regardless of coverage. A second streaming pass computes
+    transformed-pixel means and variances with a batch-combined Welford update.
     """
     root = Path(dataset_dir)
     frame = _read_split_frame(split, Path(dataframe_dir))
@@ -180,50 +212,60 @@ def compute_stats(
         raise ValueError(f"{LABEL_COL} contains non-finite values in {split}")
 
     raster_paths = frame[RASTER_PATH_COL].to_numpy(dtype=str)
-    median_absolute_values = np.empty(len(raster_paths), dtype=np.float64)
+    channel_count = len(MODEL_IMAGE_KEYS)
+    median_absolute_values = np.empty((len(raster_paths), channel_count), dtype=np.float64)
     for index, serialized_path in enumerate(raster_paths, start=1):
-        raster = _load_delta_raster(_raster_path(serialized_path, root))
-        values = raster[np.isfinite(raster)].astype(np.float64, copy=False)
-        if not values.size:
-            raise ValueError(f"Raster has no finite {MODEL_IMAGE_KEY} values: {serialized_path}")
-        median_absolute_values[index - 1] = np.median(np.abs(values))
+        rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
+        for channel in range(channel_count):
+            values = rasters[channel, mask.astype(bool)].astype(np.float64, copy=False)
+            median_absolute_values[index - 1, channel] = np.median(np.abs(values))
         if progress_interval > 0 and (index % progress_interval == 0 or index == len(frame)):
             print(f"Robust-scale scan: {index:,}/{len(frame):,} rasters")
 
-    image_scale = float(np.median(median_absolute_values))
-    if not math.isfinite(image_scale) or image_scale <= MIN_SCALE:
-        raise ValueError("Training raster asinh scale is zero or non-finite")
+    image_scale = np.median(median_absolute_values, axis=0)
+    invalid_scale = ~np.isfinite(image_scale) | (image_scale <= MIN_SCALE)
+    if invalid_scale.any():
+        names = [MODEL_IMAGE_KEYS[index] for index in np.flatnonzero(invalid_scale)]
+        raise ValueError(f"Training raster asinh scale is zero or non-finite for: {', '.join(names)}")
 
-    count = 0
-    mean = 0.0
-    sum_squared_deviation = 0.0
+    count = np.zeros(channel_count, dtype=np.int64)
+    mean = np.zeros(channel_count, dtype=np.float64)
+    sum_squared_deviation = np.zeros(channel_count, dtype=np.float64)
     for index, serialized_path in enumerate(raster_paths, start=1):
-        raster = _load_delta_raster(_raster_path(serialized_path, root))
-        values = raster[np.isfinite(raster)].astype(np.float64, copy=False)
-        values = _asinh_transform(values, image_scale)
-        batch_count = int(values.size)
-        batch_mean = float(values.mean())
-        batch_squared_deviation = float(np.square(values - batch_mean).sum())
-        combined_count = count + batch_count
-        delta = batch_mean - mean
-        mean += delta * batch_count / combined_count
-        sum_squared_deviation += batch_squared_deviation + delta * delta * count * batch_count / combined_count
-        count = combined_count
+        rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
+        finite = mask.astype(bool)
+        for channel in range(channel_count):
+            values = rasters[channel, finite].astype(np.float64, copy=False)
+            values = _asinh_transform(values, float(image_scale[channel]))
+            batch_count = int(values.size)
+            batch_mean = float(values.mean())
+            batch_squared_deviation = float(np.square(values - batch_mean).sum())
+            combined_count = count[channel] + batch_count
+            delta = batch_mean - mean[channel]
+            mean[channel] += delta * batch_count / combined_count
+            sum_squared_deviation[channel] += (
+                batch_squared_deviation
+                + delta * delta * count[channel] * batch_count / combined_count
+            )
+            count[channel] = combined_count
         if progress_interval > 0 and (index % progress_interval == 0 or index == len(frame)):
             print(f"Normalization scan: {index:,}/{len(frame):,} rasters")
 
-    image_std = math.sqrt(sum_squared_deviation / count)
-    if not math.isfinite(image_std) or image_std <= MIN_SCALE:
-        raise ValueError("Training raster standard deviation is zero or non-finite")
+    image_std = np.sqrt(sum_squared_deviation / count)
+    invalid_std = ~np.isfinite(image_std) | (image_std <= MIN_SCALE)
+    if invalid_std.any():
+        names = [MODEL_IMAGE_KEYS[index] for index in np.flatnonzero(invalid_std)]
+        raise ValueError(f"Training raster standard deviation is zero or non-finite for: {', '.join(names)}")
     feature_std = _safe_scale(features.std(axis=0))
     target_std = float(_safe_scale(np.asarray([labels.std()]))[0])
     return NormalizationStats(
         version=STATS_VERSION,
         image_transform=IMAGE_TRANSFORM,
-        image_scale=image_scale,
-        image_mean=mean,
-        image_std=image_std,
-        image_finite_pixels=count,
+        image_keys=MODEL_IMAGE_KEYS,
+        image_scale=tuple(float(value) for value in image_scale),
+        image_mean=tuple(float(value) for value in mean),
+        image_std=tuple(float(value) for value in image_std),
+        image_finite_pixels=tuple(int(value) for value in count),
         feature_names=MODEL_FEATURE_NAMES,
         feature_mean=tuple(float(value) for value in features.mean(axis=0)),
         feature_std=tuple(float(value) for value in feature_std),
@@ -270,7 +312,7 @@ def denormalize_target(values: np.ndarray, stats: NormalizationStats) -> np.ndar
 
 
 class NOxDataset(Dataset):
-    """Lazy per-record delta-NO2 raster and tabular dataset."""
+    """Lazy per-record TEMPO raster and tabular dataset."""
 
     def __init__(
         self,
@@ -301,13 +343,16 @@ class NOxDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         if self.load_images:
-            raster = _load_delta_raster(_raster_path(self.raster_paths[index], self.dataset_dir))
-            finite = np.isfinite(raster)
-            normalized = np.zeros_like(raster, dtype=np.float32)
-            transformed = _asinh_transform(raster[finite], self.stats.image_scale)
-            normalized[finite] = (transformed - self.stats.image_mean) / self.stats.image_std
+            rasters, mask = _load_raster_bundle(_raster_path(self.raster_paths[index], self.dataset_dir))
+            finite = mask.astype(bool)
+            normalized = np.zeros_like(rasters, dtype=np.float32)
+            for channel in range(len(MODEL_IMAGE_KEYS)):
+                transformed = _asinh_transform(rasters[channel, finite], self.stats.image_scale[channel])
+                normalized[channel, finite] = (
+                    transformed - self.stats.image_mean[channel]
+                ) / self.stats.image_std[channel]
             np.clip(normalized, -MODEL_IMAGE_CLIP_Z, MODEL_IMAGE_CLIP_Z, out=normalized)
-            image = torch.from_numpy(np.stack((normalized, finite.astype(np.float32, copy=False)), axis=0))
+            image = torch.from_numpy(np.concatenate((normalized, mask[None, ...]), axis=0))
         else:
             image = torch.empty(0, dtype=torch.float32)
         return (

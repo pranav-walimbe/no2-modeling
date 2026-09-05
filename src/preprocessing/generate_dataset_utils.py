@@ -22,14 +22,19 @@ from config import (
     IMG_SIZE,
     MIN_CENTRAL_FINITE_FRACTION,
     MIN_PAIRED_FINITE_FRACTION,
+    MODEL_IMAGE_KEYS,
+    MODEL_VALID_MASK_KEY,
+    RASTER_UNCERTAINTY_WEIGHT,
 )
 from preprocessing.regrid import AoiGrid, regrid_aoi_scan, write_raster_npz
 from preprocessing.stratify_utils import AOI_ID_COL
 
-DELTA_RASTER_NAME = "delta_no2"
+CURRENT_RASTER_NAME, DELTA_RASTER_NAME = MODEL_IMAGE_KEYS
+VALID_MASK_NAME = MODEL_VALID_MASK_KEY
 NO_PAIRED_FINITE_NO2_ERROR = "Paired TEMPO scans have no cells with finite NO2 in both rasters"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
 CENTRAL_FINITE_FRACTION_COL = "central_finite_fraction"
+MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
 RASTER_QUALITY_SCORE_COL = "raster_quality_score"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
@@ -51,6 +56,7 @@ TABULAR_FEATURE_NAMES = (
     CENTRAL_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
+    MEAN_RETRIEVAL_UNCERTAINTY_COL,
     *HRRR_FIELDS.values(),
 )
 
@@ -61,6 +67,8 @@ def validate_coverage_config() -> None:
         raise ValueError("MIN_PAIRED_FINITE_FRACTION must be in [0, 1]")
     if not 0 <= MIN_CENTRAL_FINITE_FRACTION <= 1:
         raise ValueError("MIN_CENTRAL_FINITE_FRACTION must be in [0, 1]")
+    if not 0 <= RASTER_UNCERTAINTY_WEIGHT <= 1:
+        raise ValueError("RASTER_UNCERTAINTY_WEIGHT must be in [0, 1]")
     if not 1 <= CENTRAL_COVERAGE_WINDOW_SIZE <= IMG_SIZE or (IMG_SIZE - CENTRAL_COVERAGE_WINDOW_SIZE) % 2:
         raise ValueError("CENTRAL_COVERAGE_WINDOW_SIZE must be centred within the configured raster")
 
@@ -74,19 +82,42 @@ def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
     clearest scenes would distort the modeling population.
     """
     validate_coverage_config()
-    required = {PAIRED_FINITE_FRACTION_COL, CENTRAL_FINITE_FRACTION_COL}
+    required = {
+        PAIRED_FINITE_FRACTION_COL,
+        CENTRAL_FINITE_FRACTION_COL,
+        MEAN_RETRIEVAL_UNCERTAINTY_COL,
+    }
     missing = required.difference(frame.columns)
     if missing:
-        raise ValueError(f"Generated records are missing coverage columns: {', '.join(sorted(missing))}")
+        raise ValueError(f"Generated records are missing quality columns: {', '.join(sorted(missing))}")
 
     paired = pl.col(PAIRED_FINITE_FRACTION_COL)
     central = pl.col(CENTRAL_FINITE_FRACTION_COL)
-    return frame.filter(
+    keep = (
         paired.is_finite()
         & central.is_finite()
         & (paired >= MIN_PAIRED_FINITE_FRACTION)
         & (central >= MIN_CENTRAL_FINITE_FRACTION)
-    ).with_columns((2 * paired * central / (paired + central)).alias(RASTER_QUALITY_SCORE_COL))
+    )
+    if RASTER_UNCERTAINTY_WEIGHT > 0:
+        keep &= pl.col(MEAN_RETRIEVAL_UNCERTAINTY_COL).is_finite()
+    eligible = frame.filter(keep)
+    coverage_quality = 2 * paired * central / (paired + central)
+    if RASTER_UNCERTAINTY_WEIGHT == 0:
+        uncertainty_quality = pl.lit(0.0)
+    elif eligible.height == 1:
+        uncertainty_quality = pl.lit(1.0)
+    else:
+        uncertainty_quality = 1 - (
+            (pl.col(MEAN_RETRIEVAL_UNCERTAINTY_COL).rank(method="average") - 1)
+            / (eligible.height - 1)
+        )
+    return eligible.with_columns(
+        (
+            (1 - RASTER_UNCERTAINTY_WEIGHT) * coverage_quality
+            + RASTER_UNCERTAINTY_WEIGHT * uncertainty_quality
+        ).alias(RASTER_QUALITY_SCORE_COL)
+    )
 
 
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
@@ -317,18 +348,19 @@ def _paired_mean(current: np.ndarray, previous: np.ndarray, valid: np.ndarray) -
     return float(np.mean(finite)) if finite.size else float("nan")
 
 
-def derive_delta_features(
+def derive_raster_features(
     current_path: str,
     previous_path: str,
-) -> tuple[np.ndarray, dict[str, float]]:
-    """Derive a paired NO2 delta and scan-quality scalar features.
+) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """Derive paired model rasters and scan-quality scalar features.
 
     Args:
         current_path: Cached five-raster bundle for the current scan.
         previous_path: Cached five-raster bundle for the prior scan.
 
     Returns:
-        Delta NO2 raster and its plume, cloud, and quality summaries.
+        Model raster arrays and their plume, cloud, quality, and uncertainty
+        summaries.
     """
     with np.load(current_path, allow_pickle=False) as current, np.load(previous_path, allow_pickle=False) as previous:
         current_no2 = current["no2"]
@@ -343,6 +375,8 @@ def derive_delta_features(
         centre_stop = centre_start + CENTRAL_COVERAGE_WINDOW_SIZE
         central_valid = valid[centre_start:centre_stop, centre_start:centre_stop]
 
+        paired_current_no2 = np.full(current_no2.shape, np.nan, dtype=np.float32)
+        paired_current_no2[valid] = current_no2[valid].astype(np.float32)
         delta_no2 = np.full(current_no2.shape, np.nan, dtype=np.float32)
         delta_values = current_no2[valid].astype(np.float64) - previous_no2[valid].astype(np.float64)
         delta_no2[valid] = delta_values.astype(np.float32)
@@ -359,10 +393,23 @@ def derive_delta_features(
             "mean_good_quality_fraction": _paired_mean(
                 current["good_quality_fraction"], previous["good_quality_fraction"], valid
             ),
+            MEAN_RETRIEVAL_UNCERTAINTY_COL: _paired_mean(
+                current["retrieval_uncertainty"], previous["retrieval_uncertainty"], valid
+            ),
         }
-    if not all(np.isfinite(value) for value in features.values()):
+    required_finite = [
+        value
+        for name, value in features.items()
+        if name != MEAN_RETRIEVAL_UNCERTAINTY_COL
+    ]
+    if not all(np.isfinite(value) for value in required_finite):
         raise ValueError("Derived TEMPO features contain non-finite values")
-    return delta_no2, features
+    rasters = {
+        CURRENT_RASTER_NAME: paired_current_no2,
+        DELTA_RASTER_NAME: delta_no2,
+        VALID_MASK_NAME: valid.astype(np.float32),
+    }
+    return rasters, features
 
 
 def _write_npz_atomic(destination: str, **arrays: np.ndarray) -> None:
@@ -388,7 +435,7 @@ def _write_npz_atomic(destination: str, **arrays: np.ndarray) -> None:
 
 
 def process_record(task: RecordTask) -> RecordResult:
-    """Create one persistent delta raster and its tabular features.
+    """Create one persistent model raster bundle and its tabular features.
 
     Args:
         task: Cached TEMPO, HRRR, and output locations for one record.
@@ -397,9 +444,9 @@ def process_record(task: RecordTask) -> RecordResult:
         Derived scalar features or contextual failure text.
     """
     try:
-        delta_no2, features = derive_delta_features(task.current_cache_path, task.previous_cache_path)
+        rasters, features = derive_raster_features(task.current_cache_path, task.previous_cache_path)
         features.update(extract_hrrr_features(task.hrrr_path, task.hrrr_grid_index))
-        _write_npz_atomic(task.output_path, **{DELTA_RASTER_NAME: delta_no2})
+        _write_npz_atomic(task.output_path, **rasters)
         return RecordResult(task.split, task.record_index, features, None)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         return RecordResult(task.split, task.record_index, {}, f"Record processing failed: {error}")

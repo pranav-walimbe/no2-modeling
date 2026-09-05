@@ -21,10 +21,13 @@ from config import (
     OUTLIER_FILTER_COLUMNS,
     OUTLIER_LOWER_QUANTILE,
     OUTLIER_UPPER_QUANTILE,
+    TARGET_LABEL_MODE,
 )
 
 AOI_ID_COL = "aoi_id"
 MAJOR_CITY_DIST_COL = "major_city_dist"
+LABEL_MODE_COL = "label_mode"
+SUPPORTED_LABEL_MODES = frozenset({"hard_hour", "overlap_weighted"})
 METERS_PER_KM = 1000.0
 MAD_NORMAL_SCALE = 1.4826  # puts MAD on a standard-deviation scale under normality
 HRRR_PRODUCT = "wrfsfcf00"  # hourly surface analysis product named in every HRRR filename
@@ -323,6 +326,93 @@ def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
             "_median_nox_mass",
             "_delta_history_count",
         )
+    )
+
+
+def apply_target_label_mode(
+    frame: pl.DataFrame,
+    mode: str = TARGET_LABEL_MODE,
+) -> pl.DataFrame:
+    """Select hard-hour or scan-overlap-weighted NOx-change labels.
+
+    Args:
+        frame: AOI-hour rows after TEMPO observation pairing.
+        mode: Configured target construction method.
+
+    Returns:
+        Rows with the selected raw and normalized target and its mode.
+    """
+    if mode not in SUPPORTED_LABEL_MODES:
+        raise ValueError(f"Unsupported target label mode: {mode}")
+    if mode == "hard_hour":
+        return frame.with_columns(pl.lit(mode).alias(LABEL_MODE_COL))
+
+    required = {
+        AOI_ID_COL,
+        EMISSIONS_HOUR_UTC_COL,
+        "tempo_time",
+        "prev_tempo_time",
+        DELTA_NOX_MASS_COL,
+        DELTA_NOX_SCALE_COL,
+    }
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"Cannot construct overlap-weighted labels without: {', '.join(sorted(missing))}")
+
+    indexed = frame.with_row_index("_label_row")
+    label_lookup = indexed.select(
+        AOI_ID_COL,
+        pl.col(EMISSIONS_HOUR_UTC_COL).alias("_contribution_hour"),
+        pl.col(DELTA_NOX_MASS_COL).alias("_contribution_delta"),
+    )
+    contributions = (
+        indexed.filter(pl.col("tempo_time").is_not_null() & pl.col("prev_tempo_time").is_not_null())
+        .select("_label_row", AOI_ID_COL, "tempo_time", "prev_tempo_time")
+        .with_columns(
+            pl.datetime_ranges(
+                pl.col("prev_tempo_time").dt.truncate("1h"),
+                (pl.col("tempo_time") - pl.duration(microseconds=1)).dt.truncate("1h"),
+                interval="1h",
+                time_zone="UTC",
+            ).alias("_contribution_hour")
+        )
+        .explode("_contribution_hour", empty_as_null=True)
+        .with_columns(
+            (
+                pl.min_horizontal("tempo_time", pl.col("_contribution_hour") + pl.duration(hours=1))
+                - pl.max_horizontal("prev_tempo_time", "_contribution_hour")
+            )
+            .dt.total_seconds()
+            .alias("_overlap_seconds")
+        )
+        .join(label_lookup, on=[AOI_ID_COL, "_contribution_hour"], how="left")
+        .group_by("_label_row")
+        .agg(
+            pl.col("_overlap_seconds").sum().alias("_total_overlap_seconds"),
+            pl.col("_overlap_seconds")
+            .filter(pl.col("_contribution_delta").is_finite())
+            .sum()
+            .alias("_valid_overlap_seconds"),
+            (pl.col("_contribution_delta") * pl.col("_overlap_seconds"))
+            .filter(pl.col("_contribution_delta").is_finite())
+            .sum()
+            .alias("_weighted_delta_sum"),
+        )
+        .with_columns(
+            pl.when(pl.col("_valid_overlap_seconds") == pl.col("_total_overlap_seconds"))
+            .then(pl.col("_weighted_delta_sum") / pl.col("_total_overlap_seconds"))
+            .alias("_weighted_delta_nox_mass")
+        )
+        .select("_label_row", "_weighted_delta_nox_mass")
+    )
+    return (
+        indexed.join(contributions, on="_label_row", how="left")
+        .with_columns(
+            pl.col("_weighted_delta_nox_mass").alias(DELTA_NOX_MASS_COL),
+            (pl.col("_weighted_delta_nox_mass") / pl.col(DELTA_NOX_SCALE_COL)).arcsinh().alias(LABEL_COL),
+            pl.lit(mode).alias(LABEL_MODE_COL),
+        )
+        .drop("_label_row", "_weighted_delta_nox_mass")
     )
 
 
