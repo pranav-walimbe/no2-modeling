@@ -73,22 +73,25 @@ HRRR_END_DATE = EMISSIONS_END_DATE
 # Dataset generation
 # ============================================================================
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
-DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # per-record compressed delta NO2 rasters
+DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # per-record compressed TEMPO raster bundles
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
 IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_PAIRED_FINITE_FRACTION = 0.50  # least share of cells finite in both scans
 CENTRAL_COVERAGE_WINDOW_SIZE = 8  # centred 12 km window; even because the 48-cell grid centre is an intersection
 MIN_CENTRAL_FINITE_FRACTION = 0.50  # least paired-finite share in the central window
+RASTER_UNCERTAINTY_WEIGHT = 0.25  # share of final raster ranking assigned to low retrieval uncertainty
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
 LABEL_COL = "delta_nox_norm"
+TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_DELTA_HISTORY = 168
 DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added to its scale
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
-MIN_CITY_PROXIMITY = 50  # minimum distance to nearest major city (km)
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
+STRATIFY_POWER_PRIORITY_WEIGHT = 1.0  # unitless weight on prior-quarter power-generation percentile
+STRATIFY_ISOLATION_PRIORITY_WEIGHT = 1.0  # unitless weight on major-city-distance percentile
 OUTLIER_LOWER_QUANTILE = 0.01  # learn continuous-variable lower bounds from the training split
 OUTLIER_UPPER_QUANTILE = 0.99  # learn continuous-variable upper bounds from the training split
 OUTLIER_FILTER_COLUMNS = (  # excludes coordinates, counts, time, and already bounded coverage
@@ -112,8 +115,9 @@ TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 # Modeling data contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-MODEL_IMAGE_KEY = "delta_no2"  # array stored in each per-record NPZ bundle
-MODEL_IMAGE_CHANNELS = 2  # standardized delta NO2 plus a binary finite-data mask
+MODEL_IMAGE_KEYS = ("current_no2", "delta_no2")  # numeric arrays normalized independently
+MODEL_VALID_MASK_KEY = "valid_mask"  # paired finite-NO2 support stored with each sample
+MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS) + 1  # numeric channels plus the paired-valid mask
 MODEL_IMAGE_CLIP_Z = 8.0  # bound rare raster extremes after train-only standardization
 MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
     "num_coal_units",

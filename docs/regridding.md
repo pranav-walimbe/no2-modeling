@@ -44,8 +44,11 @@ forming a delta.
 `preprocessing.generate_dataset` deduplicates AOI-scan work across all three
 splits and writes the five-raster bundles above to a run-scoped temporary
 cache. The cache is deleted when the run exits. Each successful model record
-persists one compressed NPZ containing a `float32` `delta_no2` raster. A cell
-is finite only when both input scans have finite NO2 at that location.
+persists one compressed NPZ containing three aligned `float32` arrays:
+
+- `current_no2`, current-scan NO2 restricted to paired-valid support;
+- `delta_no2`, current minus previous NO2 on the same support; and
+- `valid_mask`, one on paired-valid support and zero elsewhere.
 
 Every row in the companion split CSV contains its NPZ path in
 `delta_no2_path` and these derived features:
@@ -54,10 +57,11 @@ Every row in the companion split CSV contains its NPZ path in
   `(p99 - p50) / (p50 - p10)`;
 - `paired_finite_fraction`, the share of the 48 by 48 grid finite in both scans;
 - `central_finite_fraction`, the paired-finite share of the central 8 by 8 cells;
-- `raster_quality_score`, the harmonic mean of whole-grid and central paired
-  coverage for records selected into the final split;
+- `raster_quality_score`, the configured blend of paired coverage quality and
+  inverse retrieval-uncertainty rank for records selected into the final split;
 - `mean_weighted_cloud_fraction` and `mean_good_quality_fraction`, each
   averaged over both scans at paired-valid delta cells;
+- `mean_retrieval_uncertainty`, averaged over both scans at paired-valid cells;
 - `temperature_2m_k`, `wind_u_10m_mps`, `wind_v_10m_mps`, and
   `boundary_layer_height_m` from the native HRRR grid point nearest the AOI
   centroid.
@@ -83,8 +87,10 @@ scan pairs. Production uses:
 - no additional effective-sample floor.
 
 Dataset generation subsequently requires both paired coverage fractions to be
-at least 0.50. These are record-level gates after two scans are paired; they do
-not change the per-scan tessellation or its 0.25 km2 cell-support floor. Plume,
+at least 0.50 and, when uncertainty ranking is enabled, requires finite mean
+retrieval uncertainty. Its final quality score blends coverage with inverse
+uncertainty rank. These record-level rules
+do not change per-scan tessellation or its 0.25 km2 cell-support floor. Plume,
 cloud, and quality summaries remain diagnostics and do not rank candidates.
 
 The 0.25 km2 floor reduced paired-cell survival from 58.0 percent to 57.0

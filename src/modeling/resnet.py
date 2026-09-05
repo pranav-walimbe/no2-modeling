@@ -41,7 +41,7 @@ class ResBlock(nn.Module):
 
 
 class NOxModel(nn.Module):
-    """Fuse a mask-aware delta-NO2 encoder with leakage-safe scalar features."""
+    """Fuse mask-aware TEMPO rasters with leakage-safe scalar features."""
 
     def __init__(
         self,

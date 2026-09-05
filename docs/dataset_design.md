@@ -48,8 +48,10 @@ Before expensive image processing, a candidate must have:
 - usable CAMPD measurements and enough prior-quarter history for its label;
 - current and previous TEMPO observations separated by 50 to 70 minutes;
 - at least 50 percent temporal overlap with the assigned emissions hour;
-- a mapped HRRR analysis path (file existence is checked during generation); and
-- at least 50 km distance from a city of 500,000 or more people.
+- a mapped HRRR analysis path (file existence is checked during generation);
+  and
+- finite prior-quarter power generation and distance to a city of 500,000 or
+  more people for priority sampling.
 
 The 1st and 99th percentiles are learned only from the training split for these
 continuous variables:
@@ -86,17 +88,18 @@ transform preserves sign, compresses extreme changes, and makes changes at
 different-sized plants more comparable. Exact zero-change records are valid
 and remain in the population.
 
-The image is current regridded NO2 minus the previous regridded NO2 on the same
-fixed grid. A cell is finite only if both scans have accepted support there.
+Each sample stores current regridded NO2, current minus previous NO2, and a
+paired-valid mask on the same fixed grid. Both numeric rasters are finite only
+where both scans have accepted support.
 HRRR temperature, 10 m wind components, and boundary-layer height use the
 native grid point nearest the AOI centre. Prior-quarter heat input and power
 generation avoid contemporaneous operational leakage.
 
-The current hard clock-hour label is a baseline. A future experiment should
-compare it with an overlap-weighted combination of adjacent hourly emission
-changes when the TEMPO interval straddles a clock boundary. That experiment
-must be resolved before interpreting `coverage_percent` as anything stronger
-than a temporal-alignment diagnostic.
+`TARGET_LABEL_MODE` selects the target construction. `hard_hour` retains the
+change for the clock hour with the best scan overlap. `overlap_weighted`
+averages every hourly change touched by the scan interval using overlap seconds
+and requires complete label coverage across that interval. Keep `hard_hour` as
+the default until both modes have been compared on frozen splits.
 
 ## Raster-quality gates
 
@@ -114,13 +117,25 @@ even 48-cell raster lies at the intersection of its middle four cells. This
 gate prevents a scan-edge fragment far from the modeled AOI centre from making
 a record appear usable.
 
-Eligible records receive the bounded harmonic-mean score
+Eligible records first receive the bounded harmonic-mean coverage score
 
 ```text
-raster_quality_score = 2 * paired * central / (paired + central)
+coverage_quality = 2 * paired * central / (paired + central)
 ```
 
-which penalizes weak coverage in either region.
+Retrieval uncertainty is averaged across both scans on paired-valid cells.
+When the configured weight is positive, candidates without a finite uncertainty
+summary are rejected. Remaining candidates receive an inverse uncertainty
+percentile within their split, then the final ranking is
+
+```text
+raster_quality_score =
+    (1 - RASTER_UNCERTAINTY_WEIGHT) * coverage_quality
+    + RASTER_UNCERTAINTY_WEIGHT * uncertainty_quality
+```
+
+The configured uncertainty weight is 0.25. This changes final ranking without
+uncertainty-weighting the NO2 tessellation itself.
 
 `coverage_percent` and `paired_finite_fraction` are not interchangeable. The
 first measures temporal overlap with a CAMPD clock hour; the second measures
@@ -133,11 +148,9 @@ Selecting visible plumes would condition the dataset on an easily observed
 satellite response and bias evaluation toward easy cases. Its percentile-ratio
 definition also becomes unstable when the lower spread approaches zero.
 
-Mean cloud and quality fractions are also diagnostics rather than additional
+Mean cloud and quality fractions remain diagnostics rather than additional
 ranking terms. Native cloud and quality filtering already determines whether
-NO2 is accepted, while paired-finite coverage captures whether enough usable
-image remains. Selecting only the clearest scenes would change the deployment
-population.
+NO2 is accepted.
 
 ## Final selection
 
@@ -149,8 +162,14 @@ Quality-gated candidates are selected deterministically:
    period are deferred.
 4. Round-robin globally across AOIs so each available AOI receives one record
    before any receives its next.
-5. Use raster quality to break competition within each round and stop at the
-   exact configured split size.
+5. Use coverage-plus-uncertainty quality to break competition within each round
+   and stop at the exact configured split size.
+
+Before raster generation, seeded weighted sampling prioritizes records with
+higher prior-quarter average power generation and AOIs farther from major
+cities. Each variable contributes its within-split percentile to a positive
+sampling weight. The two unitless strengths live in `config.py`. They remain
+soft preferences, so lower-output and city-adjacent AOIs stay eligible.
 
 This prefers strong rasters while retaining plant and temporal diversity. It
 does not balance on the target label, so validation and test remain suitable

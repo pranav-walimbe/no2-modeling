@@ -171,10 +171,10 @@ source .venv/bin/activate
 
    `preprocessing.generate_dataset` regrids the current and previous TEMPO
    scans onto the same AOI grid, requires finite NO2 in both scans, and writes
-   one compressed delta-NO2 NPZ per retained record. It caches each unique AOI
-   scan for the lifetime of the run. Every successful split-CSV row carries
-   its relative `delta_no2_path`,
-   plume score, paired cloud and quality means, and nearest-grid-point HRRR
+   one compressed three-channel NPZ per retained record. It caches each unique
+   AOI scan for the lifetime of the run. Every successful split-CSV row carries
+   its relative `delta_no2_path`, plume score, paired cloud, quality, and
+   retrieval-uncertainty means, and nearest-grid-point HRRR
    temperature, wind, and boundary-layer height. It requires at least 50
    percent paired-finite coverage over both the full raster and the central 8
    by 8 cells, then selects the exact configured size using AOI-balanced,
@@ -195,8 +195,8 @@ source .venv/bin/activate
    python -u -m modeling.train
    ```
 
-   The trainer lazily reads each selected `delta_no2` NPZ, represents missing
-   pixels with an explicit mask channel, and computes memory-bounded robust
+   The trainer lazily reads current NO2, delta NO2, and the paired-valid mask
+   from each selected NPZ and computes memory-bounded robust
    normalization statistics from the training split only. It predicts the
    signed `delta_nox_norm` target and reports both normalized and physical
    NOx-mass-change metrics. See `docs/modeling.md` for the feature, leakage,

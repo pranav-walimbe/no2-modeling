@@ -30,8 +30,8 @@ This is a change model, not an absolute-emissions model. Current `nox_mass`,
 
 ## Inputs and leakage policy
 
-Each sample has one 48 by 48 delta-NO2 raster and scalar context. The scalar
-inputs are:
+Each sample has three aligned 48 by 48 raster channels and scalar context. The
+scalar inputs are:
 
 - coal and natural-gas unit counts;
 - previous-quarter average heat input and power generation;
@@ -51,9 +51,8 @@ Validation, test, and inference reuse those statistics.
 | None | coal and gas unit counts, temperature, U/V wind | Counts retain their discrete spacing, temperature has a moderate range, and wind components can be negative. |
 | Sine and cosine | UTC hour, day of year | Circular encoding keeps adjacent boundary values close, such as hours 23 and 0. |
 
-The signed target and delta-NO2 raster use `asinh` because both can cross zero.
-`asinh` stays close to linear near zero and compresses positive and negative
-tails.
+The signed target and both numeric NO2 rasters use `asinh`. The transform stays
+close to linear near zero and compresses positive and negative tails.
 
 Coordinates, AOI IDs, current emissions, plume score, and raster-quality scores
 are excluded. This prevents geographic memorization, direct target leakage,
@@ -63,37 +62,39 @@ already gives the network spatial coverage information.
 
 ## Image representation and normalization
 
-The model receives two channels:
+The model receives three channels:
 
-1. finite delta-NO2 values transformed with a robust signed asinh, standardized
-   with the transformed training-pixel mean and standard deviation, and clipped
-   to plus or minus 8 standard deviations;
-2. a binary mask whose value is one where both TEMPO scans supplied accepted
-   NO2 and zero elsewhere.
+1. paired-valid current NO2 transformed with a robust signed asinh;
+2. paired-valid delta NO2 transformed with a separate robust signed asinh; and
+3. a binary mask whose value is one where both scans supplied accepted NO2.
+
+Each numeric channel uses its own training-pixel mean, standard deviation, and
+robust scale, then clips to plus or minus 8 standard deviations. The mask stays
+binary and unstandardized.
 
 The transform is
 
 ```text
-transformed = asinh(delta_no2 / image_scale)
-normalized = (transformed - transformed_train_mean) / transformed_train_std
+transformed[channel] = asinh(raster[channel] / image_scale[channel])
+normalized[channel] =
+    (transformed[channel] - train_mean[channel]) / train_std[channel]
 ```
 
-`image_scale` is the median of each training raster's median absolute finite
-value. This record-balanced definition prevents high-coverage rasters from
-dominating the scale and stores only one scalar per raster. Asinh preserves
-sign, is approximately linear for weak changes, and becomes logarithmic in
-both tails.
+Each `image_scale` is the median of that channel's per-record median absolute
+finite value. This record-balanced definition prevents high-coverage rasters
+from dominating either scale. Asinh preserves sign, is approximately linear
+for weak values, and becomes logarithmic in both tails.
 
-After standardization, missing values in the first channel are filled with
-zero. Zero is the transformed training mean, not a claim that the physical NO2
-change was zero, and the second channel makes the distinction explicit. This
+After standardization, missing values in both numeric channels are filled with
+zero. Zero is the transformed training mean, not a claim that physical NO2 was
+zero, and the mask channel makes the distinction explicit. This
 follows the general missing-image principle that the validity mask is
 information rather than an implementation detail; specialized mask-updating
 partial convolutions remain an experiment rather than part of this baseline.
 See the original [partial-convolution paper](https://arxiv.org/abs/1804.07723).
 
-Normalization uses two sequential training-raster passes. The first derives
-the robust scale; the second accumulates transformed finite-pixel mean and
+Normalization uses two sequential training-bundle passes. The first derives
+both robust scales; the second accumulates transformed finite-pixel means and
 variance with a numerically stable combined-Welford update. Only one compressed
 NPZ is open at a time, and the implementation never concatenates the roughly
 28 million training pixels or builds another dense image archive. The JSON
@@ -193,7 +194,8 @@ Before treating the CNN as scientifically useful, compare it with:
 2. a tabular-only MLP with the same scalar features;
 3. an image-only model;
 4. the full image-plus-tabular model;
-5. a mask ablation, while keeping the same eligible records.
+5. a delta-plus-mask versus current-plus-delta-plus-mask ablation; and
+6. a mask ablation, while keeping the same eligible records.
 
 Report all comparisons on the same frozen validation and test records. The
 full model is justified only if image information improves held-out-AOI error

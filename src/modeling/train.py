@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from config import MODEL_IMAGE_CLIP_Z, NUM_CORES, RUNS_DIR
 from modeling.dataset import (
+    LABEL_MODE_COL,
     MODEL_FEATURE_NAMES,
     NormalizationStats,
     NOxDataset,
@@ -208,6 +209,10 @@ def main() -> None:
     datasets = {
         split: NOxDataset(split, stats, load_images=args.inputs != "tabular") for split in ("train", "val", "test")
     }
+    label_modes = {str(dataset.frame[LABEL_MODE_COL].iloc[0]) for dataset in datasets.values()}
+    if len(label_modes) != 1:
+        raise ValueError("Train, validation, and test must use the same target label mode")
+    target_label_mode = label_modes.pop()
     train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
     eval_loaders = {
         split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in datasets.items()
@@ -253,8 +258,10 @@ def main() -> None:
         "scheduler_factor": args.scheduler_factor,
         "early_stop_patience": args.early_stop_patience,
         "image_transform": stats.image_transform,
-        "image_scale": stats.image_scale,
+        "image_keys": list(stats.image_keys),
+        "image_scale": list(stats.image_scale),
         "image_clip_z": MODEL_IMAGE_CLIP_Z,
+        "target_label_mode": target_label_mode,
         "tabular_features": list(MODEL_FEATURE_NAMES),
         "model_parameters": model.num_params(),
     }

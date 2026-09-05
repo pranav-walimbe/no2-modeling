@@ -2,6 +2,7 @@
 
 import os
 
+import numpy as np
 import polars as pl
 
 from collection.emissions_schema import EMISSIONS_HOUR_UTC_COL
@@ -10,10 +11,11 @@ from config import (
     DELTA_NOX_SCALE_COL,
     FULL_DATA_PARQUET,
     LABEL_COL,
-    MIN_CITY_PROXIMITY,
     MIN_COVERAGE_PERCENT,
     NOX_MASS_COL,
     STRAT_BASE_DIR,
+    STRATIFY_ISOLATION_PRIORITY_WEIGHT,
+    STRATIFY_POWER_PRIORITY_WEIGHT,
     TEST_RECORDS_CSV,
     TEST_RECORDS_SIZE,
     TRAIN_RECORDS_CSV,
@@ -23,11 +25,13 @@ from config import (
 )
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
+    LABEL_MODE_COL,
     MAJOR_CITY_DIST_COL,
     add_aoi_bounds,
     add_hrrr_files,
     add_major_city_distance,
     aggregate_aoi_hours,
+    apply_target_label_mode,
     build_aoi_membership,
     build_aoi_spatial_frame,
     build_aois,
@@ -78,6 +82,7 @@ OUTPUT_COLUMNS = [
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
     LABEL_COL,
+    LABEL_MODE_COL,
 ]
 REQUIRED_COLUMNS = [
     "facilityId",
@@ -121,11 +126,49 @@ def _limit_splits(
     splits: dict[str, pl.DataFrame],
     limits: dict[str, int] = SPLIT_RECORD_LIMITS,
 ) -> dict[str, pl.DataFrame]:
-    # Shuffle before truncation to avoid retaining only the earliest source rows
-    return {
-        name: split.sample(n=limits[name], shuffle=True, seed=SPLIT_SEED) if split.height > limits[name] else split
-        for name, split in splits.items()
-    }
+    """Soft-prioritize strong, city-distant AOIs during seeded subsampling."""
+    if STRATIFY_POWER_PRIORITY_WEIGHT < 0 or STRATIFY_ISOLATION_PRIORITY_WEIGHT < 0:
+        raise ValueError("Stratification priority weights must be nonnegative")
+
+    limited: dict[str, pl.DataFrame] = {}
+    for split_index, (name, split) in enumerate(splits.items()):
+        limit = limits[name]
+        if limit < 1:
+            raise ValueError(f"{name} split limit must be positive")
+        if split.height <= limit:
+            limited[name] = split
+            continue
+        required = {AOI_ID_COL, "avg_pwr_gen", MAJOR_CITY_DIST_COL}
+        missing = required.difference(split.columns)
+        if missing:
+            raise ValueError(f"Cannot prioritize split without columns: {', '.join(sorted(missing))}")
+
+        priority_values = split.with_columns(
+            pl.col("avg_pwr_gen").median().over(AOI_ID_COL).alias("_aoi_avg_pwr_gen")
+        )
+        percentiles = priority_values.select(
+            (pl.col("_aoi_avg_pwr_gen").rank(method="average") / pl.len()).alias("power"),
+            (pl.col(MAJOR_CITY_DIST_COL).rank(method="average") / pl.len()).alias("isolation"),
+        )
+        weights = (
+            1.0
+            + STRATIFY_POWER_PRIORITY_WEIGHT * percentiles["power"].to_numpy()
+            + STRATIFY_ISOLATION_PRIORITY_WEIGHT * percentiles["isolation"].to_numpy()
+        )
+        random = np.random.default_rng(SPLIT_SEED + split_index)
+        priority = np.log(random.random(split.height)) / weights
+        selected = np.argpartition(priority, -limit)[-limit:]
+        limited[name] = split.with_row_index("_priority_row").filter(
+            pl.col("_priority_row").is_in(selected)
+        ).drop("_priority_row")
+        print(
+            f"[{name}] priority-sampled {limit:,}/{split.height:,} records; "
+            f"median prior power {split['avg_pwr_gen'].median():.3g} -> "
+            f"{limited[name]['avg_pwr_gen'].median():.3g}; "
+            f"median city distance {split[MAJOR_CITY_DIST_COL].median():.3g} -> "
+            f"{limited[name][MAJOR_CITY_DIST_COL].median():.3g} km"
+        )
+    return limited
 
 
 def main() -> None:
@@ -154,14 +197,16 @@ def main() -> None:
         pl.col("avg_heat_input").is_not_null() & pl.col("avg_pwr_gen").is_not_null() & pl.col(LABEL_COL).is_not_null()
     )
     frame = frame.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
-    frame = add_tempo_observations(frame, observations)
+    frame = apply_target_label_mode(add_tempo_observations(frame, observations))
     frame = frame.filter(pl.col("tempo").is_not_null() & pl.col("prev_tempo").is_not_null())
     bounds = add_major_city_distance(bounded_aois).select(
         AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
     )
     frame = add_hrrr_files(frame.join(bounds, on=AOI_ID_COL, how="left"))
     frame = frame.filter(
-        (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT) & (pl.col(MAJOR_CITY_DIST_COL) >= MIN_CITY_PROXIMITY)
+        (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT)
+        & pl.col("avg_pwr_gen").is_finite()
+        & pl.col(MAJOR_CITY_DIST_COL).is_finite()
     )
     frame = serialize_tempo_path_lists(frame)
     splits = _limit_splits(filter_quantitative_outliers(_split_by_cluster(frame)))

@@ -259,7 +259,7 @@ def _write_outputs(
         output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
         print(
             f"[{split}] {candidates.height:,} regridded; "
-            f"{eligible_count:,} passed coverage QC; {output_frame.height:,} selected"
+            f"{eligible_count:,} passed raster QC; {output_frame.height:,} selected"
         )
         output_frame = _install_selected_rasters(split, output_frame)
         write_csv_atomic(
