@@ -255,6 +255,98 @@ def _convert_local_standard_hours_to_utc(frame: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
+def add_emissions_utc_fields(
+    frame: pl.LazyFrame,
+    facility_locations: pl.DataFrame,
+) -> pl.LazyFrame:
+    """Add stable local-standard and UTC time fields to emissions rows.
+
+    Args:
+        frame: Hourly emissions with facility identifiers and source clock fields.
+        facility_locations: One latitude and longitude per facility.
+
+    Returns:
+        Emissions with source clock fields preserved and UTC date and hour active.
+    """
+    schema_names = set(frame.collect_schema().names())
+    source_date = LOCAL_STANDARD_DATE_COL if LOCAL_STANDARD_DATE_COL in schema_names else "date"
+    source_hour = LOCAL_STANDARD_HOUR_COL if LOCAL_STANDARD_HOUR_COL in schema_names else "hour"
+    required_columns = {"facilityId", source_date, source_hour}
+    missing_columns = required_columns.difference(schema_names)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Hourly emissions are missing required time columns: {missing}")
+
+    located_facilities = _add_facility_time_zones(facility_locations).select(
+        "facilityId", TIME_ZONE_COL, UTC_STANDARD_OFFSET_HOURS_COL
+    )
+    replaceable_columns = [
+        column
+        for column in (EMISSIONS_HOUR_UTC_COL, TIME_ZONE_COL, UTC_STANDARD_OFFSET_HOURS_COL)
+        if column in schema_names
+    ]
+    normalized = frame.with_columns(
+        pl.col(source_date).alias("date"),
+        pl.col(source_hour).alias("hour"),
+    )
+    if replaceable_columns:
+        normalized = normalized.drop(replaceable_columns)
+    return normalized.join(
+        located_facilities.lazy(),
+        on="facilityId",
+        how="left",
+        maintain_order="left",
+    ).pipe(_convert_local_standard_hours_to_utc)
+
+
+def backfill_emissions_utc(path: Path) -> int:
+    """Atomically add UTC time fields to an existing enriched Parquet file.
+
+    Args:
+        path: Enriched emissions Parquet to update in place.
+
+    Returns:
+        Number of rows written.
+    """
+    source = pl.scan_parquet(path)
+    schema_names = set(source.collect_schema().names())
+    required_columns = {"facilityId", "lat", "lon", "date", "hour"}
+    missing_columns = required_columns.difference(schema_names)
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Enriched emissions are missing required columns: {missing}")
+
+    source_row_count = source.select(pl.len()).collect().item()
+    facility_locations = (
+        source.select("facilityId", "lat", "lon")
+        .drop_nulls()
+        .unique(subset="facilityId", keep="first", maintain_order=True)
+        .collect()
+    )
+    facility_count = source.select(pl.col("facilityId").n_unique()).collect().item()
+    if facility_locations.height != facility_count:
+        raise ValueError("Every facility must have latitude and longitude for UTC conversion")
+
+    temporary_path = path.with_suffix(path.suffix + ".utc-backfill.part")
+    temporary_path.unlink(missing_ok=True)
+    converted = add_emissions_utc_fields(source, facility_locations)
+    try:
+        converted.sink_parquet(
+            temporary_path,
+            compression="zstd",
+            statistics=True,
+            row_group_size=ROW_GROUP_SIZE,
+        )
+        row_count = pl.scan_parquet(temporary_path).select(pl.len()).collect().item()
+        if row_count != source_row_count:
+            raise RuntimeError(f"UTC backfill changed row count from {source_row_count:,} to {row_count:,}")
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return row_count
+
+
 def write_augmented_parquet(
     input_path: Path,
     output_path: Path,
@@ -284,19 +376,18 @@ def write_augmented_parquet(
 
     unit_id = pl.col("unitId").cast(pl.String, strict=False).str.strip_chars()
     source_row_count = source.select(pl.len()).collect().item()
-    located_facilities = _add_facility_time_zones(facility_attributes)
     augmented = (
         source.with_columns(
             pl.col("facilityId").cast(pl.Int64, strict=False),
             unit_id.alias("unitId"),
             unit_id.alias("unitIdKey"),
         )
-        .join(located_facilities.lazy(), on="facilityId", how="left")
+        .join(facility_attributes.lazy(), on="facilityId", how="left")
         .join(unit_attributes.lazy(), on=["facilityId", "unitIdKey"], how="left")
         .drop("unitIdKey")
         .drop_nulls(["lat", "lon", "epaRegion"])
-        .pipe(_convert_local_standard_hours_to_utc)
     )
+    augmented = add_emissions_utc_fields(augmented, facility_attributes)
 
     try:
         augmented.sink_parquet(
