@@ -89,9 +89,9 @@ MIN_CITY_PROXIMITY = 50  # minimum distance to nearest major city (km)
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 LABEL_LOWER_QUANTILE = 0.01  # trim normalized labels below the 1st percentile
 LABEL_UPPER_QUANTILE = 0.99  # trim normalized labels above the 99th percentile
-TRAIN_RECORDS_SIZE = 100_000  # maximum train records carried into image processing
-VAL_RECORDS_SIZE = 20_000  # maximum validation records carried into image processing
-TEST_RECORDS_SIZE = 20_000  # maximum test records carried into image processing
+TRAIN_RECORDS_SIZE = 10_000  # maximum train records carried into dataset generation
+VAL_RECORDS_SIZE = 2_000  # maximum validation records carried into dataset generation
+TEST_RECORDS_SIZE = 2_000  # maximum test records carried into dataset generation
 
 # ============================================================================
 # ML modeling
