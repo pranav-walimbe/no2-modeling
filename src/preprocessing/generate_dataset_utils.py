@@ -27,6 +27,7 @@ from preprocessing.regrid import AoiGrid, regrid_aoi_scan, write_raster_npz
 from preprocessing.stratify_utils import AOI_ID_COL
 
 DELTA_RASTER_NAME = "delta_no2"
+NO_PAIRED_FINITE_NO2_ERROR = "Paired TEMPO scans have no cells with finite NO2 in both rasters"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
 CENTRAL_FINITE_FRACTION_COL = "central_finite_fraction"
 RASTER_QUALITY_SCORE_COL = "raster_quality_score"
@@ -336,7 +337,7 @@ def derive_delta_features(
             raise ValueError("Paired TEMPO rasters do not share the configured grid shape")
         valid = np.isfinite(current_no2) & np.isfinite(previous_no2)
         if not valid.any():
-            raise ValueError("Paired TEMPO scans have no cells with finite NO2 in both rasters")
+            raise ValueError(NO_PAIRED_FINITE_NO2_ERROR)
 
         centre_start = (IMG_SIZE - CENTRAL_COVERAGE_WINDOW_SIZE) // 2
         centre_stop = centre_start + CENTRAL_COVERAGE_WINDOW_SIZE

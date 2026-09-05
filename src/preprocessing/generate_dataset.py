@@ -27,6 +27,7 @@ from config import (
     VAL_SIZE,
 )
 from preprocessing.generate_dataset_utils import (
+    NO_PAIRED_FINITE_NO2_ERROR,
     TABULAR_FEATURE_NAMES,
     RecordTask,
     ScanTask,
@@ -52,6 +53,7 @@ SOURCE_RECORD_INDEX_COL = "_source_record_index"
 DELTA_NO2_PATH_COL = "delta_no2_path"
 CANDIDATE_RASTER_PATH_COL = "_candidate_raster_path"
 FINAL_SPLIT_SIZES = {"train": TRAIN_SIZE, "val": VAL_SIZE, "test": TEST_SIZE}
+NO_PAIRED_FINITE_NO2_FAILURE = f"Record processing failed: {NO_PAIRED_FINITE_NO2_ERROR}"
 
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")
@@ -268,7 +270,18 @@ def _write_outputs(
             pl.DataFrame(failure_rows, schema={"record_index": pl.Int64, "error": pl.String}),
             Path(DATASET_DF) / f"{split}_failures.csv",
         )
-        print(f"[{split}] wrote {output_frame.height:,} records; {len(failure_rows):,} processing failures")
+        no_paired_coverage, processing_failures = _count_failure_outcomes(failure_rows)
+        print(
+            f"[{split}] wrote {output_frame.height:,} records; "
+            f"{no_paired_coverage:,} rejected with no paired finite NO2; "
+            f"{processing_failures:,} processing failures"
+        )
+
+
+def _count_failure_outcomes(failure_rows: list[dict[str, object]]) -> tuple[int, int]:
+    # Separate expected coverage rejection from operational failures
+    no_paired_coverage = sum(row.get("error") == NO_PAIRED_FINITE_NO2_FAILURE for row in failure_rows)
+    return no_paired_coverage, len(failure_rows) - no_paired_coverage
 
 
 def _install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:

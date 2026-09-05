@@ -39,9 +39,22 @@ inputs are:
 - coincident HRRR 2 m temperature, 10 m U/V wind, and boundary-layer height;
 - sine/cosine encodings of UTC hour and day of year.
 
-Heat input, power generation, the change scale, and boundary-layer height use
-`log1p` before standardization because they are nonnegative and strongly
-right-skewed. Every scalar is then standardized from training-only statistics.
+### Feature transformations
+
+The pipeline transforms each scalar according to its distribution, then
+standardizes every scalar with the training-split mean and standard deviation.
+Validation, test, and inference reuse those statistics.
+
+| Transform before standardization | Features | Reason |
+|---|---|---|
+| `log1p` | heat input, power generation, NOx-change scale, boundary-layer height | These nonnegative features have long right tails; compression limits the influence of extreme values and preserves zero. |
+| None | coal and gas unit counts, temperature, U/V wind | Counts retain their discrete spacing, temperature has a moderate range, and wind components can be negative. |
+| Sine and cosine | UTC hour, day of year | Circular encoding keeps adjacent boundary values close, such as hours 23 and 0. |
+
+The signed target and delta-NO2 raster use `asinh` because both can cross zero.
+`asinh` stays close to linear near zero and compresses positive and negative
+tails.
+
 Coordinates, AOI IDs, current emissions, plume score, and raster-quality scores
 are excluded. This prevents geographic memorization, direct target leakage,
 and conditioning predictions on a diagnostic extracted from the response
