@@ -74,7 +74,6 @@ HRRR_END_DATE = EMISSIONS_END_DATE
 # ============================================================================
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
 DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # per-record compressed delta NO2 rasters
-IMAGES_DIR = os.path.join(DATASET_DIR, "images")  # legacy NPY arrays used by the current model loader
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
 IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
@@ -116,17 +115,40 @@ TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
 BATCH_SIZE = 128  # training batch size
+MODEL_IMAGE_KEY = "delta_no2"  # array stored in each per-record NPZ bundle
+MODEL_IMAGE_CHANNELS = 2  # standardized delta NO2 plus a binary finite-data mask
+MODEL_IMAGE_CLIP_Z = 8.0  # bound rare raster extremes after train-only standardization
+MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
+    "num_coal_units",
+    "num_ng_units",
+    "avg_heat_input",
+    "avg_pwr_gen",
+    DELTA_NOX_SCALE_COL,
+    "temperature_2m_k",
+    "wind_u_10m_mps",
+    "wind_v_10m_mps",
+    "boundary_layer_height_m",
+)
+MODEL_LOG1P_FEATURES = (  # stabilize strongly right-skewed, nonnegative quantities before z-scoring
+    "avg_heat_input",
+    "avg_pwr_gen",
+    DELTA_NOX_SCALE_COL,
+    "boundary_layer_height_m",
+)
+MODEL_CYCLIC_FEATURES = ("hour", "day_of_year")  # each expands to sine and cosine
+MODEL_NUM_WORKERS = 4  # per-training-process readers for many small compressed NPZ files
+MODEL_PREFETCH_FACTOR = 2  # batches queued by each DataLoader worker
+MODEL_SEED = 42
 HEAD_DIM = 128  # hidden dimension of MLP regression head
-LR = 1e-4  # Adam learning rate
+LR = 3e-4  # AdamW learning rate
 NUM_EPOCHS = 300  # maximum training epochs
 SCHEDULER_PATIENCE = 10  # epochs without val improvement before LR reduction
 SCHEDULER_FACTOR = 0.50  # LR multiplier applied on plateau
 EARLY_STOP_PATIENCE = 25  # epochs without val improvement before early stopping
-KERNEL_SIZE = 3  # conv kernel size
-STRIDE = 1  # conv stride
-PADDING = 1  # conv padding (maintains spatial dimensions with kernel=3)
 WEIGHT_DECAY = 1e-4  # regularization strength
 DROPOUT = 0.30  # dropout rate in regression head
+HUBER_DELTA = 1.0  # quadratic-to-linear transition in standardized target units
+GRADIENT_CLIP_NORM = 5.0  # guard against rare unstable updates
 
 # ============================================================================
 # Other

@@ -189,6 +189,13 @@ source .venv/bin/activate
    python -u -m modeling.training
    ```
 
+   The trainer lazily reads each selected `delta_no2` NPZ, represents missing
+   pixels with an explicit mask channel, and computes constant-memory
+   normalization statistics from the training split only. It predicts the
+   signed `delta_nox_norm` target and reports both normalized and physical
+   NOx-mass-change metrics. See `docs/modeling.md` for the feature, leakage,
+   architecture, normalization, and evaluation decisions.
+
 Each stage depends on the outputs of the preceding stage. The scripts currently
 resume only where their individual implementation explicitly supports it; check
 existing output files before rerunning a large collection or generation job.
