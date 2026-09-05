@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from config import DATASET_DF, IMAGES_DIR, LABEL_COL, MAX_IMG_VAL
+from config import DATASET_DF, IMAGES_DIR, LABEL_COL
 
 
 def compute_stats(split: str, batch_size: int = 512) -> dict:
@@ -26,7 +26,6 @@ def compute_stats(split: str, batch_size: int = 512) -> dict:
     sums = np.zeros(n_channels, dtype=np.float64)
     for index in range(0, n, batch_size):
         batch = images[index : index + batch_size].astype(np.float64)
-        batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
         total += batch.shape[0] * batch.shape[2] * batch.shape[3]
         sums += batch.sum(axis=(0, 2, 3))
     means = sums / total
@@ -34,7 +33,6 @@ def compute_stats(split: str, batch_size: int = 512) -> dict:
     sum_sq_diffs = np.zeros(n_channels, dtype=np.float64)
     for index in range(0, n, batch_size):
         batch = images[index : index + batch_size].astype(np.float64)
-        batch[:, 0] = np.clip(batch[:, 0], None, MAX_IMG_VAL)
         sum_sq_diffs += ((batch - means[np.newaxis, :, np.newaxis, np.newaxis]) ** 2).sum(axis=(0, 2, 3))
     stds = np.sqrt(sum_sq_diffs / total)
 
@@ -73,9 +71,6 @@ class NOxDataset(Dataset):
         prev_qtr_mass = torch.tensor([self.prev_qtr_mass[idx]])
         u10 = torch.tensor([self.u10[idx]])
         v10 = torch.tensor([self.v10[idx]])
-
-        # apply ceiling on no2 concentration values
-        image[0] = torch.clamp(image[0], max=MAX_IMG_VAL)
 
         if self.stats is not None:
             image = (image - self.stats["image_mean"]) / self.stats["image_std"]

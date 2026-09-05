@@ -157,11 +157,27 @@ source .venv/bin/activate
    `preprocessing.stratify_plants` only reads the prebuilt TEMPO mapping before
    matching observations and writing splits.
    The stratifier computes consecutive-hour AOI NOx mass changes and normalizes
-   them with the previous completed quarter's median and MAD. Overlapping AOI
-   clusters are assigned intact to the 70/15/15 train, validation, and test
-   splits without resampling.
-   Raster oversampling in `generate_dataset` remains separate work; the
-   stratifier only reads and matches the prebuilt TEMPO mapping at this stage.
+   them with the previous completed quarter's median and MAD. It removes values
+   below the 1st or above the 99th normalized-label percentile. Overlapping AOI
+   clusters are assigned intact to the 60/20/20 train, validation, and test
+   splits, which are capped at 100,000, 20,000, and 20,000 records.
+
+   `preprocessing.generate_dataset` regrids the current and previous TEMPO
+   scans onto the same AOI grid, requires finite NO2 in both scans, and writes
+   one compressed delta-NO2 NPZ per retained record. It caches each unique AOI
+   scan for the lifetime of the run. Every successful split-CSV row carries
+   its relative `delta_no2_path`,
+   plume score, paired cloud and quality means, and nearest-grid-point HRRR
+   temperature, wind, and boundary-layer height. On Savio, the CLI defaults to
+   `SLURM_CPUS_PER_TASK` workers through `NUM_CORES` and refuses to create more
+   workers than that allocation.
+
+   Train, validation, and test contain disjoint geographic clusters, so they
+   have no useful cross-split AOI-scan cache sharing. A three-task Slurm array
+   can therefore run them concurrently without redundant regridding. Array
+   indices 0, 1, and 2 automatically select `train`, `val`, and `test`, so each
+   task can invoke `python -u -m preprocessing.generate_dataset`. Outside an
+   array, use `--split` for one split or omit it to process all splits.
 
 5. Train and evaluate the model:
 

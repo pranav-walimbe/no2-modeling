@@ -39,6 +39,31 @@ information about cloudy or low-overlap cells. Downstream code uses finite
 `no2` values as the validity mask and requires both scans to be finite before
 forming a delta.
 
+## Dataset-generation output
+
+`preprocessing.generate_dataset` deduplicates AOI-scan work across all three
+splits and writes the five-raster bundles above to a run-scoped temporary
+cache. The cache is deleted when the run exits. Each successful model record
+persists one compressed NPZ containing a `float32` `delta_no2` raster. A cell
+is finite only when both input scans have finite NO2 at that location.
+
+Every row in the companion split CSV contains its NPZ path in
+`delta_no2_path` and these derived features:
+
+- `plume_score`, computed from finite delta pixels as
+  `(p99 - p50) / (p50 - p10)`;
+- `mean_weighted_cloud_fraction` and `mean_good_quality_fraction`, each
+  averaged over both scans at paired-valid delta cells;
+- `temperature_2m_k`, `wind_u_10m_mps`, `wind_v_10m_mps`, and
+  `boundary_layer_height_m` from the native HRRR grid point nearest the AOI
+  centroid.
+
+NOAA describes HRRR as a 3 km model. The downloaded surface files identify a
+1,799 by 1,059 Lambert grid with 3,000 m spacing. Dataset generation verifies
+that spacing from GRIB metadata and computes the nearest grid element once per
+AOI, then reuses its index for every hourly file. See the
+[NOAA Global Systems Laboratory HRRR overview](https://rapidrefresh.noaa.gov/).
+
 The regridder also calculates squared weight, effective sample size, total
 overlap area, contributor counts, and worst quality internally. These values
 support masking and validation but are not persisted in the modeling bundle.
