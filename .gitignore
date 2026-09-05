@@ -211,12 +211,6 @@ CLAUDE.md
 
 # Local analysis and batch scripts
 /scripts/
-!/scripts/
-/scripts/*
-!/scripts/backfill_emissions_utc.py
-!/scripts/slurm/
-/scripts/slurm/*
-!/scripts/slurm/backfill_emissions_utc.sh
 /src/eda/
 /src/collection/map_plant_zones.py
 /src/collection/plant_zone_mapping.py
