@@ -2,12 +2,22 @@
 
 import os
 import time
-from datetime import date
+from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import requests
+from timezonefinder import TimezoneFinder
 
+from collection.emissions_schema import (
+    EMISSIONS_HOUR_UTC_COL,
+    LOCAL_STANDARD_DATE_COL,
+    LOCAL_STANDARD_HOUR_COL,
+    TIME_ZONE_COL,
+    UTC_STANDARD_OFFSET_HOURS_COL,
+)
 from config import EMISSIONS_RECORDS_PARQUET, EMISSIONS_START_DATE, FULL_DATA_PARQUET
 from prerequisites import require_campd_credentials
 
@@ -19,6 +29,7 @@ INITIAL_RETRY_DELAY_SECONDS = 30
 MAX_RETRY_DELAY_SECONDS = 300
 RATE_LIMIT_WAIT_SECONDS = 3_600
 ROW_GROUP_SIZE = 250_000
+STANDARD_OFFSET_REFERENCE = datetime(2025, 1, 1, 12)
 
 FACILITY_ATTRIBUTE_COLUMNS = {
     "year": "facilityAttributeYear",
@@ -192,6 +203,58 @@ def _build_attribute_frames(records: list[dict[str, object]]) -> tuple[pl.DataFr
     return facility_attributes, unit_attributes
 
 
+@lru_cache(maxsize=1)
+def _timezone_finder() -> TimezoneFinder:
+    # Load timezone boundaries once per enrichment process
+    return TimezoneFinder(in_memory=True)
+
+
+def _standard_utc_offset_hours(time_zone_name: str) -> int:
+    # Remove daylight saving time because Part 75 hours use local standard time
+    local_time = STANDARD_OFFSET_REFERENCE.replace(tzinfo=ZoneInfo(time_zone_name))
+    standard_offset = local_time.utcoffset() - local_time.dst()
+    offset_hours, remainder = divmod(int(standard_offset.total_seconds()), 3_600)
+    if remainder:
+        raise ValueError(f"Timezone {time_zone_name} does not have a whole-hour standard UTC offset")
+    return offset_hours
+
+
+def _add_facility_time_zones(facility_attributes: pl.DataFrame) -> pl.DataFrame:
+    # Resolve each facility coordinate before joining the large hourly table
+    finder = _timezone_finder()
+    time_zone_names: list[str] = []
+    standard_offsets: list[int] = []
+    for facility_id, latitude, longitude in facility_attributes.select("facilityId", "lat", "lon").iter_rows():
+        if latitude is None or longitude is None:
+            raise ValueError(f"Facility {facility_id} is missing coordinates for timezone lookup")
+        time_zone_name = finder.timezone_at_land(lng=float(longitude), lat=float(latitude))
+        if time_zone_name is None:
+            raise ValueError(f"Facility {facility_id} does not map to a land timezone")
+        time_zone_names.append(time_zone_name)
+        standard_offsets.append(_standard_utc_offset_hours(time_zone_name))
+    return facility_attributes.with_columns(
+        pl.Series(TIME_ZONE_COL, time_zone_names, dtype=pl.String),
+        pl.Series(UTC_STANDARD_OFFSET_HOURS_COL, standard_offsets, dtype=pl.Int8),
+    )
+
+
+def _convert_local_standard_hours_to_utc(frame: pl.LazyFrame) -> pl.LazyFrame:
+    # Preserve source clock fields and expose one unambiguous UTC timestamp
+    local_hour_start = pl.col("date").cast(pl.Datetime) + pl.duration(hours=pl.col("hour"))
+    utc_hour_start = local_hour_start - pl.duration(hours=pl.col(UTC_STANDARD_OFFSET_HOURS_COL))
+    return (
+        frame.with_columns(
+            pl.col("date").alias(LOCAL_STANDARD_DATE_COL),
+            pl.col("hour").alias(LOCAL_STANDARD_HOUR_COL),
+            utc_hour_start.dt.replace_time_zone("UTC").alias(EMISSIONS_HOUR_UTC_COL),
+        )
+        .with_columns(
+            pl.col(EMISSIONS_HOUR_UTC_COL).dt.date().alias("date"),
+            pl.col(EMISSIONS_HOUR_UTC_COL).dt.hour().cast(pl.Int8).alias("hour"),
+        )
+    )
+
+
 def write_augmented_parquet(
     input_path: Path,
     output_path: Path,
@@ -221,16 +284,18 @@ def write_augmented_parquet(
 
     unit_id = pl.col("unitId").cast(pl.String, strict=False).str.strip_chars()
     source_row_count = source.select(pl.len()).collect().item()
+    located_facilities = _add_facility_time_zones(facility_attributes)
     augmented = (
         source.with_columns(
             pl.col("facilityId").cast(pl.Int64, strict=False),
             unit_id.alias("unitId"),
             unit_id.alias("unitIdKey"),
         )
-        .join(facility_attributes.lazy(), on="facilityId", how="left")
+        .join(located_facilities.lazy(), on="facilityId", how="left")
         .join(unit_attributes.lazy(), on=["facilityId", "unitIdKey"], how="left")
         .drop("unitIdKey")
         .drop_nulls(["lat", "lon", "epaRegion"])
+        .pipe(_convert_local_standard_hours_to_utc)
     )
 
     try:

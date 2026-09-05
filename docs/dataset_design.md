@@ -69,6 +69,12 @@ real subpopulations or already have meaningful hard bounds.
 
 ## Label and tabular features
 
+All emission hours are converted from CAMPD local standard time to UTC during
+facility-location enrichment. AOI aggregation, TEMPO pairing, HRRR lookup, and
+the emitted modeling `date` and `hour` therefore share one UTC clock. The
+enriched emissions archive retains the source local-standard fields and each
+facility's resolved timezone and standard offset for auditability.
+
 The current target is
 
 ```text

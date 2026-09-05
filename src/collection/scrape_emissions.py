@@ -1,4 +1,4 @@
-"""Download CAMPD hourly records into compressed Parquet."""
+"""Download CAMPD local-standard-time hourly records into compressed Parquet."""
 
 import calendar
 import json
@@ -234,13 +234,15 @@ def fetch_chunk(state: str, begin: str, end: str) -> list[dict[str, object]]:
 
 
 def normalize_hourly_records(records: list[dict[str, object]]) -> pl.DataFrame:
-    """Normalize one API response to the stable hourly Parquet schema.
+    """Normalize one API response to the stable source-time Parquet schema.
 
     Args:
         records: Hourly records returned by the CAMPD API.
 
     Returns:
-        Records with stable column order and data types.
+        Records with stable column order and data types. The ``date`` and
+        ``hour`` fields remain in CAMPD local standard time until facility
+        coordinates are attached during location enrichment.
     """
     frame = pl.DataFrame(records, infer_schema_length=None)
     missing_required = REQUIRED_RESPONSE_COLUMNS.difference(frame.columns)

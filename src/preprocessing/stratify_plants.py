@@ -4,6 +4,7 @@ import os
 
 import polars as pl
 
+from collection.emissions_schema import EMISSIONS_HOUR_UTC_COL
 from config import (
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
@@ -62,6 +63,7 @@ OUTPUT_COLUMNS = [
     "num_ng_units",
     "date",
     "hour",
+    EMISSIONS_HOUR_UTC_COL,
     "cluster",
     "tempo",
     "prev_tempo",
@@ -84,6 +86,7 @@ REQUIRED_COLUMNS = [
     "lon",
     "date",
     "hour",
+    EMISSIONS_HOUR_UTC_COL,
     "noxMass",
     "grossLoad",
     "heatInput",

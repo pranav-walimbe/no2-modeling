@@ -7,6 +7,7 @@ import shapely
 from pycanopy import SpatialFrame, distance_to_point
 from pyproj import Transformer
 
+from collection.emissions_schema import EMISSIONS_HOUR_UTC_COL
 from config import (
     CITIES_URL,
     DELTA_NOX_MASS_COL,
@@ -255,13 +256,14 @@ def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
     """Add hourly NOx changes normalized by the prior completed quarter.
 
     Args:
-        hourly: AOI-hour rows containing dates, hours, and aggregate NOx mass.
+        hourly: AOI-hour rows containing a UTC timestamp, date, hour, and
+            aggregate NOx mass.
 
     Returns:
         Rows with raw NOx changes, lagged scales, and transformed labels.
     """
     with_deltas = (
-        hourly.with_columns((pl.col("date").cast(pl.Datetime) + pl.duration(hours=pl.col("hour"))).alias("_hour_start"))
+        hourly.with_columns(pl.col(EMISSIONS_HOUR_UTC_COL).alias("_hour_start"))
         .sort(AOI_ID_COL, "_hour_start")
         .with_columns(
             pl.col(NOX_MASS_COL).shift(1).over(AOI_ID_COL).alias("_previous_nox_mass"),
@@ -345,11 +347,15 @@ def aggregate_aoi_hours(
     )
     hourly = (
         records_lazy.join(membership.lazy(), on="facilityId", how="inner")
-        .group_by(AOI_ID_COL, "date", "hour")
+        .group_by(AOI_ID_COL, EMISSIONS_HOUR_UTC_COL)
         .agg(
             pl.col("noxMass").sum().alias(NOX_MASS_COL),
             pl.col("heatInput").mean().alias("_hourly_avg_heat_input"),
             pl.col("grossLoad").mean().alias("_hourly_avg_pwr_gen"),
+        )
+        .with_columns(
+            pl.col(EMISSIONS_HOUR_UTC_COL).dt.date().alias("date"),
+            pl.col(EMISSIONS_HOUR_UTC_COL).dt.hour().cast(pl.Int8).alias("hour"),
         )
     )
     return (
