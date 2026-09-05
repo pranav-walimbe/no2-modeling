@@ -157,10 +157,11 @@ source .venv/bin/activate
    `preprocessing.stratify_plants` only reads the prebuilt TEMPO mapping before
    matching observations and writing splits.
    The stratifier computes consecutive-hour AOI NOx mass changes and normalizes
-   them with the previous completed quarter's median and MAD. It removes values
-   below the 1st or above the 99th normalized-label percentile. Overlapping AOI
-   clusters are assigned intact to the 60/20/20 train, validation, and test
-   splits, which are capped at 100,000, 20,000, and 20,000 records.
+   them with the previous completed quarter's median and MAD. Training-split
+   1st/99th percentile bounds prune continuous operating variables and the
+   label consistently across all three splits. Overlapping AOI clusters are
+   assigned intact to the 60/20/20 train, validation, and test splits. Each
+   split emits three times its configured final size as raster candidates.
 
    `preprocessing.generate_dataset` regrids the current and previous TEMPO
    scans onto the same AOI grid, requires finite NO2 in both scans, and writes
@@ -168,7 +169,10 @@ source .venv/bin/activate
    scan for the lifetime of the run. Every successful split-CSV row carries
    its relative `delta_no2_path`,
    plume score, paired cloud and quality means, and nearest-grid-point HRRR
-   temperature, wind, and boundary-layer height. On Savio, the CLI defaults to
+   temperature, wind, and boundary-layer height. It requires at least 50
+   percent paired-finite coverage over both the full raster and the central 8
+   by 8 cells, then selects the exact configured size using AOI-balanced,
+   temporally diverse quality ranking. On Savio, the CLI defaults to
    `SLURM_CPUS_PER_TASK` workers through `NUM_CORES` and refuses to create more
    workers than that allocation.
 

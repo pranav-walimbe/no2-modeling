@@ -17,10 +17,26 @@ from eccodes import (
     codes_release,
 )
 
-from config import IMG_SIZE
+from config import (
+    CENTRAL_COVERAGE_WINDOW_SIZE,
+    IMG_SIZE,
+    MIN_CENTRAL_FINITE_FRACTION,
+    MIN_PAIRED_FINITE_FRACTION,
+)
 from preprocessing.regrid import AoiGrid, regrid_aoi_scan, write_raster_npz
+from preprocessing.stratify_utils import AOI_ID_COL
 
 DELTA_RASTER_NAME = "delta_no2"
+PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
+CENTRAL_FINITE_FRACTION_COL = "central_finite_fraction"
+RASTER_QUALITY_SCORE_COL = "raster_quality_score"
+SELECTION_HELPER_COLUMNS = (
+    "_selection_year",
+    "_selection_quarter",
+    "_selection_hour_bin",
+    "_stratum_rank",
+    "_aoi_round",
+)
 HRRR_GRID_SPACING_M = 3_000.0
 HRRR_FIELDS = {
     "2t": "temperature_2m_k",
@@ -30,10 +46,93 @@ HRRR_FIELDS = {
 }
 TABULAR_FEATURE_NAMES = (
     "plume_score",
+    PAIRED_FINITE_FRACTION_COL,
+    CENTRAL_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
     *HRRR_FIELDS.values(),
 )
+
+
+def validate_coverage_config() -> None:
+    """Validate raster-coverage thresholds before expensive generation starts."""
+    if not 0 <= MIN_PAIRED_FINITE_FRACTION <= 1:
+        raise ValueError("MIN_PAIRED_FINITE_FRACTION must be in [0, 1]")
+    if not 0 <= MIN_CENTRAL_FINITE_FRACTION <= 1:
+        raise ValueError("MIN_CENTRAL_FINITE_FRACTION must be in [0, 1]")
+    if not 1 <= CENTRAL_COVERAGE_WINDOW_SIZE <= IMG_SIZE or (IMG_SIZE - CENTRAL_COVERAGE_WINDOW_SIZE) % 2:
+        raise ValueError("CENTRAL_COVERAGE_WINDOW_SIZE must be centred within the configured raster")
+
+
+def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
+    """Apply hard raster-quality gates and add a bounded quality score.
+
+    The harmonic mean rewards broad and central paired coverage while strongly
+    penalizing a weakness in either. Cloud and QA are deliberately absent from
+    this score: native filtering already enforces them, and ranking only the
+    clearest scenes would distort the modeling population.
+    """
+    validate_coverage_config()
+    required = {PAIRED_FINITE_FRACTION_COL, CENTRAL_FINITE_FRACTION_COL}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"Generated records are missing coverage columns: {', '.join(sorted(missing))}")
+
+    paired = pl.col(PAIRED_FINITE_FRACTION_COL)
+    central = pl.col(CENTRAL_FINITE_FRACTION_COL)
+    return frame.filter(
+        paired.is_finite()
+        & central.is_finite()
+        & (paired >= MIN_PAIRED_FINITE_FRACTION)
+        & (central >= MIN_CENTRAL_FINITE_FRACTION)
+    ).with_columns((2 * paired * central / (paired + central)).alias(RASTER_QUALITY_SCORE_COL))
+
+
+def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
+    """Choose an exact, high-quality, temporally diverse, AOI-balanced subset.
+
+    Candidates first compete within AOI/year/quarter/four-hour strata. The
+    global AOI round then gives each AOI one record before any AOI receives its
+    second, subject to availability. Quality breaks ties at both levels.
+    """
+    if size < 1:
+        raise ValueError("Final dataset size must be positive")
+    required = {AOI_ID_COL, "date", "hour"}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"Generated records are missing selection columns: {', '.join(sorted(missing))}")
+
+    eligible = eligible_generated_records(frame)
+    if eligible.height < size:
+        raise ValueError(
+            f"Only {eligible.height:,} records pass raster-quality gates; "
+            f"cannot produce the requested {size:,} records"
+        )
+
+    strata = [AOI_ID_COL, "_selection_year", "_selection_quarter", "_selection_hour_bin"]
+    ranked = (
+        eligible.with_columns(
+            pl.col("date").dt.year().alias("_selection_year"),
+            pl.col("date").dt.quarter().alias("_selection_quarter"),
+            (pl.col("hour") // 4).alias("_selection_hour_bin"),
+        )
+        .sort(
+            [*strata, RASTER_QUALITY_SCORE_COL, "date", "hour"],
+            descending=[False, False, False, False, True, False, False],
+        )
+        .with_columns(pl.col(AOI_ID_COL).cum_count().over(strata).alias("_stratum_rank"))
+        .sort(
+            [AOI_ID_COL, "_stratum_rank", RASTER_QUALITY_SCORE_COL, "date", "hour"],
+            descending=[False, False, True, False, False],
+        )
+        .with_columns(pl.col(AOI_ID_COL).cum_count().over(AOI_ID_COL).alias("_aoi_round"))
+        .sort(
+            ["_aoi_round", RASTER_QUALITY_SCORE_COL, AOI_ID_COL, "date", "hour"],
+            descending=[False, True, False, False, False],
+        )
+        .head(size)
+    )
+    return ranked.drop(*SELECTION_HELPER_COLUMNS)
 
 
 @dataclass(frozen=True)
@@ -239,6 +338,10 @@ def derive_delta_features(
         if not valid.any():
             raise ValueError("Paired TEMPO scans have no cells with finite NO2 in both rasters")
 
+        centre_start = (IMG_SIZE - CENTRAL_COVERAGE_WINDOW_SIZE) // 2
+        centre_stop = centre_start + CENTRAL_COVERAGE_WINDOW_SIZE
+        central_valid = valid[centre_start:centre_stop, centre_start:centre_stop]
+
         delta_no2 = np.full(current_no2.shape, np.nan, dtype=np.float32)
         delta_values = current_no2[valid].astype(np.float64) - previous_no2[valid].astype(np.float64)
         delta_no2[valid] = delta_values.astype(np.float32)
@@ -247,6 +350,8 @@ def derive_delta_features(
         epsilon = np.finfo(np.float64).eps * max(abs(p10), abs(p50), 1.0)
         features = {
             "plume_score": float((p99 - p50) / max(denominator, epsilon)),
+            PAIRED_FINITE_FRACTION_COL: float(np.mean(valid)),
+            CENTRAL_FINITE_FRACTION_COL: float(np.mean(central_valid)),
             "mean_weighted_cloud_fraction": _paired_mean(
                 current["weighted_cloud_fraction"], previous["weighted_cloud_fraction"], valid
             ),

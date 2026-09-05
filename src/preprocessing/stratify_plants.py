@@ -9,8 +9,6 @@ from config import (
     DELTA_NOX_SCALE_COL,
     FULL_DATA_PARQUET,
     LABEL_COL,
-    LABEL_LOWER_QUANTILE,
-    LABEL_UPPER_QUANTILE,
     MIN_CITY_PROXIMITY,
     MIN_COVERAGE_PERCENT,
     NOX_MASS_COL,
@@ -33,6 +31,7 @@ from preprocessing.stratify_utils import (
     build_aoi_spatial_frame,
     build_aois,
     cluster_aois,
+    filter_quantitative_outliers,
     filter_usable_nox_measurements,
 )
 from preprocessing.tempo_mapping import (
@@ -92,17 +91,6 @@ REQUIRED_COLUMNS = [
     "primaryFuelInfo",
     "attributePrimaryFuelInfo",
 ]
-
-
-def _trim_label_outliers(frame: pl.DataFrame) -> pl.DataFrame:
-    # Compute one pair of bounds before assigning geographic splits
-    finite_labels = frame.filter(pl.col(LABEL_COL).is_finite())[LABEL_COL]
-    if finite_labels.is_empty():
-        raise ValueError("Cannot trim label outliers without finite normalized labels")
-
-    lower_bound = finite_labels.quantile(LABEL_LOWER_QUANTILE, interpolation="linear")
-    upper_bound = finite_labels.quantile(LABEL_UPPER_QUANTILE, interpolation="linear")
-    return frame.filter(pl.col(LABEL_COL).is_between(lower_bound, upper_bound, closed="both"))
 
 
 def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
@@ -173,9 +161,7 @@ def main() -> None:
         (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT) & (pl.col(MAJOR_CITY_DIST_COL) >= MIN_CITY_PROXIMITY)
     )
     frame = serialize_tempo_path_lists(frame)
-    frame = _trim_label_outliers(frame)
-
-    splits = _limit_splits(_split_by_cluster(frame))
+    splits = _limit_splits(filter_quantitative_outliers(_split_by_cluster(frame)))
     del frame
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)

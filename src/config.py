@@ -78,6 +78,9 @@ IMAGES_DIR = os.path.join(DATASET_DIR, "images")  # legacy NPY arrays used by th
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
 IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
+MIN_PAIRED_FINITE_FRACTION = 0.50  # least share of cells finite in both scans
+CENTRAL_COVERAGE_WINDOW_SIZE = 8  # centred 12 km window; even because the 48-cell grid centre is an intersection
+MIN_CENTRAL_FINITE_FRACTION = 0.50  # least paired-finite share in the central window
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
@@ -87,11 +90,26 @@ DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added t
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_PROXIMITY = 50  # minimum distance to nearest major city (km)
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
-LABEL_LOWER_QUANTILE = 0.01  # trim normalized labels below the 1st percentile
-LABEL_UPPER_QUANTILE = 0.99  # trim normalized labels above the 99th percentile
-TRAIN_RECORDS_SIZE = 10_000  # maximum train records carried into dataset generation
-VAL_RECORDS_SIZE = 2_000  # maximum validation records carried into dataset generation
-TEST_RECORDS_SIZE = 2_000  # maximum test records carried into dataset generation
+OUTLIER_LOWER_QUANTILE = 0.01  # learn continuous-variable lower bounds from the training split
+OUTLIER_UPPER_QUANTILE = 0.99  # learn continuous-variable upper bounds from the training split
+OUTLIER_FILTER_COLUMNS = (  # excludes coordinates, counts, time, and already bounded coverage
+    "avg_heat_input",
+    "avg_pwr_gen",
+    NOX_MASS_COL,
+    DELTA_NOX_MASS_COL,
+    DELTA_NOX_SCALE_COL,
+    LABEL_COL,
+)
+
+# These are the user-facing final dataset-size controls. Stratification emits
+# an overdraw pool because paired TEMPO coverage rejects many metadata records.
+TRAIN_SIZE = 12_000
+VAL_SIZE = 4_000
+TEST_SIZE = 4_000
+STRATIFY_CANDIDATE_MULTIPLIER = 3
+TRAIN_RECORDS_SIZE = TRAIN_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
+VAL_RECORDS_SIZE = VAL_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
+TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 
 # ============================================================================
 # ML modeling

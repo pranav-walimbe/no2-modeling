@@ -17,6 +17,9 @@ from config import (
     MIN_CITY_POPULATION,
     MIN_DELTA_HISTORY,
     NOX_MASS_COL,
+    OUTLIER_FILTER_COLUMNS,
+    OUTLIER_LOWER_QUANTILE,
+    OUTLIER_UPPER_QUANTILE,
 )
 
 AOI_ID_COL = "aoi_id"
@@ -27,6 +30,58 @@ HRRR_PRODUCT = "wrfsfcf00"  # hourly surface analysis product named in every HRR
 HRRR_FIELD_SLUG = "wind-temp-blh"  # field subset named in every HRRR filename
 WGS84_TO_CONUS = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
 CONUS_TO_WGS84 = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True)
+
+
+def filter_quantitative_outliers(
+    splits: dict[str, pl.DataFrame],
+    columns: tuple[str, ...] = OUTLIER_FILTER_COLUMNS,
+) -> dict[str, pl.DataFrame]:
+    """Apply training-derived 1st/99th percentile bounds to every split.
+
+    Coordinates, integer counts, clock fields, and bounded quality measures are
+    intentionally excluded. Their tails are meaningful populations rather
+    than obvious continuous-variable anomalies.
+    """
+    train = splits["train"]
+    missing = set(columns).difference(train.columns)
+    if missing:
+        raise ValueError(f"Cannot filter missing quantitative columns: {', '.join(sorted(missing))}")
+
+    statistics = train.select(
+        *(
+            expression
+            for column in columns
+            for expression in (
+                pl.col(column)
+                .filter(pl.col(column).is_finite())
+                .quantile(OUTLIER_LOWER_QUANTILE, interpolation="linear")
+                .alias(f"{column}_lower"),
+                pl.col(column)
+                .filter(pl.col(column).is_finite())
+                .quantile(OUTLIER_UPPER_QUANTILE, interpolation="linear")
+                .alias(f"{column}_upper"),
+            )
+        )
+    ).row(0, named=True)
+    bounds = {
+        column: (statistics[f"{column}_lower"], statistics[f"{column}_upper"])
+        for column in columns
+    }
+    empty = [column for column, (lower, upper) in bounds.items() if lower is None or upper is None]
+    if empty:
+        raise ValueError(f"Cannot calculate outlier bounds without finite values for: {', '.join(empty)}")
+    print("Training-derived quantitative outlier bounds:")
+    for column, (lower, upper) in bounds.items():
+        print(f"  {column}: [{lower:.6g}, {upper:.6g}]")
+
+    keep = pl.all_horizontal(
+        pl.col(column).is_between(lower, upper, closed="both")
+        for column, (lower, upper) in bounds.items()
+    )
+    filtered = {name: split.filter(keep) for name, split in splits.items()}
+    for name, split in splits.items():
+        print(f"[{name}] quantitative outliers retained {filtered[name].height:,}/{split.height:,} records")
+    return filtered
 
 
 def load_major_cities(url: str = CITIES_URL) -> pl.DataFrame:

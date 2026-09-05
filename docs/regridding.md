@@ -52,6 +52,10 @@ Every row in the companion split CSV contains its NPZ path in
 
 - `plume_score`, computed from finite delta pixels as
   `(p99 - p50) / (p50 - p10)`;
+- `paired_finite_fraction`, the share of the 48 by 48 grid finite in both scans;
+- `central_finite_fraction`, the paired-finite share of the central 8 by 8 cells;
+- `raster_quality_score`, the harmonic mean of whole-grid and central paired
+  coverage for records selected into the final split;
 - `mean_weighted_cloud_fraction` and `mean_good_quality_fraction`, each
   averaged over both scans at paired-valid delta cells;
 - `temperature_2m_k`, `wind_u_10m_mps`, `wind_v_10m_mps`, and
@@ -77,6 +81,11 @@ scan pairs. Production uses:
 - overlap area alone for the NO2 weights;
 - an accepted-overlap floor of 0.25 km2; and
 - no additional effective-sample floor.
+
+Dataset generation subsequently requires both paired coverage fractions to be
+at least 0.50. These are record-level gates after two scans are paired; they do
+not change the per-scan tessellation or its 0.25 km2 cell-support floor. Plume,
+cloud, and quality summaries remain diagnostics and do not rank candidates.
 
 The 0.25 km2 floor reduced paired-cell survival from 58.0 percent to 57.0
 percent while removing very small edge overlaps. An effective-sample floor of

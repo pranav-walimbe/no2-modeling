@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import shutil
 import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
@@ -19,17 +20,23 @@ from config import (
     NUM_CORES,
     TEMPO_DIR,
     TEST_RECORDS_CSV,
+    TEST_SIZE,
     TRAIN_RECORDS_CSV,
+    TRAIN_SIZE,
     VAL_RECORDS_CSV,
+    VAL_SIZE,
 )
 from preprocessing.generate_dataset_utils import (
     TABULAR_FEATURE_NAMES,
     RecordTask,
     ScanTask,
     build_hrrr_grid_indices,
+    eligible_generated_records,
     make_scan_task,
     process_record,
     process_scan,
+    select_final_records,
+    validate_coverage_config,
     write_csv_atomic,
 )
 
@@ -43,6 +50,8 @@ MAX_PENDING_FACTOR = 2
 PROGRESS_INTERVAL = 1_000
 SOURCE_RECORD_INDEX_COL = "_source_record_index"
 DELTA_NO2_PATH_COL = "delta_no2_path"
+CANDIDATE_RASTER_PATH_COL = "_candidate_raster_path"
+FINAL_SPLIT_SIZES = {"train": TRAIN_SIZE, "val": VAL_SIZE, "test": TEST_SIZE}
 
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")
@@ -110,7 +119,7 @@ def _prepare_records(
     scans: dict[str, ScanTask] = {}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in splits}
     for split, frame in splits.items():
-        output_dir = Path(DATASET_RASTER_DIR) / split
+        output_dir = cache_dir / "record-rasters" / split
         output_dir.mkdir(parents=True, exist_ok=True)
         for row in frame.iter_rows(named=True):
             record_index = int(row[SOURCE_RECORD_INDEX_COL])
@@ -216,7 +225,7 @@ def _run_record_processing(
             record = records_by_id[record_id]
             output_row: dict[str, object] = {
                 SOURCE_RECORD_INDEX_COL: result.record_index,
-                DELTA_NO2_PATH_COL: str(Path(record.delta_no2_path).relative_to(DATASET_DIR)),
+                CANDIDATE_RASTER_PATH_COL: record.delta_no2_path,
             }
             output_row.update(result.features)
             output_rows[result.split].append(output_row)
@@ -233,24 +242,69 @@ def _write_outputs(
     # Sort asynchronous results back into source-record order
     feature_schema = {
         SOURCE_RECORD_INDEX_COL: pl.UInt32,
-        DELTA_NO2_PATH_COL: pl.String,
+        CANDIDATE_RASTER_PATH_COL: pl.String,
         **{name: pl.Float64 for name in TABULAR_FEATURE_NAMES},
     }
     for split, source_frame in source_splits.items():
         rows = output_rows[split]
         failure_rows = sorted(failures[split], key=lambda row: int(row["record_index"]))
         features = pl.DataFrame(rows, schema=feature_schema)
-        output_frame = (
+        candidates = (
             source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left")
             .sort(SOURCE_RECORD_INDEX_COL)
-            .drop(SOURCE_RECORD_INDEX_COL)
         )
-        write_csv_atomic(output_frame, Path(DATASET_DF) / f"{split}_df.csv")
+        eligible_count = eligible_generated_records(candidates).height
+        output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
+        print(
+            f"[{split}] {candidates.height:,} regridded; "
+            f"{eligible_count:,} passed coverage QC; {output_frame.height:,} selected"
+        )
+        output_frame = _install_selected_rasters(split, output_frame)
+        write_csv_atomic(
+            output_frame.drop(SOURCE_RECORD_INDEX_COL, CANDIDATE_RASTER_PATH_COL),
+            Path(DATASET_DF) / f"{split}_df.csv",
+        )
         write_csv_atomic(
             pl.DataFrame(failure_rows, schema={"record_index": pl.Int64, "error": pl.String}),
             Path(DATASET_DF) / f"{split}_failures.csv",
         )
-        print(f"[{split}] wrote {len(rows):,} records; {len(failure_rows):,} failed")
+        print(f"[{split}] wrote {output_frame.height:,} records; {len(failure_rows):,} processing failures")
+
+
+def _install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:
+    """Atomically replace one split's raster directory with selected files."""
+    raster_root = Path(DATASET_RASTER_DIR)
+    raster_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{split}-staging-", dir=raster_root))
+    final_dir = raster_root / split
+    backup = Path(tempfile.mkdtemp(prefix=f".{split}-backup-", dir=raster_root))
+    backup.rmdir()
+    had_previous = final_dir.exists()
+    relative_paths = []
+    try:
+        for output_index, candidate_path in enumerate(frame[CANDIDATE_RASTER_PATH_COL].to_list()):
+            filename = f"{output_index:06d}.npz"
+            os.replace(candidate_path, staging / filename)
+            relative_paths.append(str(Path("rasters") / split / filename))
+        if had_previous:
+            os.replace(final_dir, backup)
+        os.replace(staging, final_dir)
+    except Exception:
+        if final_dir.exists() and had_previous and backup.exists():
+            shutil.rmtree(final_dir)
+            os.replace(backup, final_dir)
+        elif had_previous and backup.exists():
+            os.replace(backup, final_dir)
+        raise
+    else:
+        if backup.exists():
+            shutil.rmtree(backup)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+        if backup.exists() and not had_previous:
+            shutil.rmtree(backup)
+    return frame.with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
 
 
 def parse_args() -> argparse.Namespace:
@@ -291,6 +345,7 @@ def main() -> None:
     """Generate paired raster NPZ files and metadata CSVs for all splits."""
     args = parse_args()
     workers = _worker_count(args.workers)
+    validate_coverage_config()
 
     Path(DATASET_DIR).mkdir(parents=True, exist_ok=True)
     Path(DATASET_DF).mkdir(parents=True, exist_ok=True)
