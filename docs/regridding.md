@@ -41,10 +41,15 @@ forming a delta.
 
 ## Dataset-generation output
 
-`preprocessing.generate_dataset` deduplicates AOI-scan work across all three
-splits and writes the five-raster bundles above to a run-scoped temporary
-cache. The cache is deleted when the run exits. Each successful model record
-persists one compressed NPZ containing three aligned `float32` arrays:
+`preprocessing.generate_dataset` deduplicates AOI-scan work and writes the
+five-raster bundles above to a versioned persistent cache under `DATASET_DIR`.
+The cache key includes the AOI, source granules, grid definition, native-pixel
+filters, and cell-support thresholds. The generator validates each bundle
+before reuse. Pass `--regenerate-cache` to rebuild the entries required by the
+selected split, or increment `DATASET_SCAN_CACHE_VERSION` after an incompatible
+change. Scans with the same granule set run as one batch, which lets a worker
+open each large NetCDF granule once for several AOIs. Each successful model
+record persists one compressed NPZ containing three aligned `float32` arrays:
 
 - `current_no2`, current-scan NO2 restricted to paired-valid support;
 - `delta_no2`, current minus previous NO2 on the same support; and

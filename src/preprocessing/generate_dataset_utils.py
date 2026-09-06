@@ -19,14 +19,28 @@ from eccodes import (
 
 from config import (
     CENTRAL_COVERAGE_WINDOW_SIZE,
+    DATASET_SCAN_CACHE_VERSION,
+    IMG_RANGE,
     IMG_SIZE,
     MIN_CENTRAL_FINITE_FRACTION,
     MIN_PAIRED_FINITE_FRACTION,
+    MIN_PIXEL_CLOUD,
     MODEL_IMAGE_KEYS,
     MODEL_VALID_MASK_KEY,
     RASTER_UNCERTAINTY_WEIGHT,
+    TEMPO_CELL_OVERLAP_FLOOR_KM2,
+    TEMPO_EFFECTIVE_SAMPLE_FLOOR,
+    TEMPO_GOOD_QUALITY_FLAG,
 )
-from preprocessing.regrid import AoiGrid, regrid_aoi_scan, write_raster_npz
+from preprocessing.regrid import (
+    SAVED_RASTER_NAMES,
+    AoiGrid,
+    build_granule_spatial_index,
+    concatenate_pixels,
+    read_granule_pixels,
+    regrid_aoi_raster,
+    write_raster_npz,
+)
 from preprocessing.stratify_utils import AOI_ID_COL
 
 CURRENT_RASTER_NAME, DELTA_RASTER_NAME = MODEL_IMAGE_KEYS
@@ -169,7 +183,7 @@ def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
 
 @dataclass(frozen=True)
 class ScanTask:
-    """One unique AOI scan to regrid into the run cache."""
+    """One unique AOI scan to regrid into the persistent cache."""
 
     cache_key: str
     aoi_id: int
@@ -186,6 +200,14 @@ class ScanResult:
     cache_key: str
     cache_path: str
     error: str | None
+
+
+@dataclass(frozen=True)
+class ScanBatchTask:
+    """AOI scans that can reuse the same loaded TEMPO granules."""
+
+    granule_paths: tuple[str, ...]
+    scans: tuple[ScanTask, ...]
 
 
 @dataclass(frozen=True)
@@ -241,7 +263,7 @@ def make_scan_task(row: dict[str, object], path_column: str, tempo_root: Path, c
         row: Stratified record carrying AOI coordinates and granule paths.
         path_column: Either the current or previous TEMPO path-list column.
         tempo_root: Root of the configured TEMPO archive.
-        cache_dir: Run-scoped directory for regridded scan bundles.
+        cache_dir: Persistent directory for regridded scan bundles.
 
     Returns:
         Deduplicatable scan task with a content-derived cache key.
@@ -250,7 +272,17 @@ def make_scan_task(row: dict[str, object], path_column: str, tempo_root: Path, c
     lon = float(row["lon"])
     lat = float(row["lat"])
     granule_paths = parse_tempo_paths(row[path_column], tempo_root)
-    identity = json.dumps([aoi_id, lon, lat, granule_paths], separators=(",", ":"))
+    cache_contract = {
+        "version": DATASET_SCAN_CACHE_VERSION,
+        "aoi": [aoi_id, lon, lat],
+        "granules": granule_paths,
+        "grid": [IMG_SIZE, IMG_RANGE],
+        "pixel_cloud_max": MIN_PIXEL_CLOUD,
+        "good_quality_flag": TEMPO_GOOD_QUALITY_FLAG,
+        "cell_overlap_floor_km2": TEMPO_CELL_OVERLAP_FLOOR_KM2,
+        "effective_sample_floor": TEMPO_EFFECTIVE_SAMPLE_FLOOR,
+    }
+    identity = json.dumps(cache_contract, sort_keys=True, separators=(",", ":"))
     cache_key = hashlib.sha256(identity.encode()).hexdigest()
     return ScanTask(
         cache_key=cache_key,
@@ -262,8 +294,57 @@ def make_scan_task(row: dict[str, object], path_column: str, tempo_root: Path, c
     )
 
 
+def scan_cache_is_valid(path: str | Path) -> bool:
+    """Return whether a cached scan has the complete raster contract.
+
+    Args:
+        path: Candidate persistent scan bundle.
+
+    Returns:
+        True when all expected arrays have the configured shape and dtype.
+    """
+    try:
+        with np.load(path, allow_pickle=False) as bundle:
+            return set(bundle.files) == set(SAVED_RASTER_NAMES) and all(
+                bundle[name].shape == (IMG_SIZE, IMG_SIZE) and bundle[name].dtype == np.float32
+                for name in SAVED_RASTER_NAMES
+            )
+    except (OSError, ValueError):
+        return False
+
+
+def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
+    """Regrid several AOIs while loading each shared granule once.
+
+    Args:
+        batch: Scans sharing an identical set of TEMPO granules.
+
+    Returns:
+        One cache location or contextual failure for every scan.
+    """
+    try:
+        granule_indices = [build_granule_spatial_index(read_granule_pixels(path)) for path in batch.granule_paths]
+    except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        message = f"TEMPO granule read failed: {error}"
+        return [ScanResult(task.cache_key, task.cache_path, message) for task in batch.scans]
+
+    results: list[ScanResult] = []
+    for task in batch.scans:
+        try:
+            grid = AoiGrid.from_lon_lat(task.aoi_id, task.lon, task.lat)
+            pixels = concatenate_pixels([index.select_grid(grid) for index in granule_indices])
+            raster = regrid_aoi_raster(pixels, grid)
+            write_raster_npz(raster, task.cache_path)
+            results.append(ScanResult(task.cache_key, task.cache_path, None))
+        except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            results.append(
+                ScanResult(task.cache_key, task.cache_path, f"TEMPO regridding failed: {error}")
+            )
+    return results
+
+
 def process_scan(task: ScanTask) -> ScanResult:
-    """Regrid one unique AOI scan and persist it in the run cache.
+    """Regrid one AOI scan through the shared batch implementation.
 
     Args:
         task: Unique scan description and cache destination.
@@ -271,13 +352,7 @@ def process_scan(task: ScanTask) -> ScanResult:
     Returns:
         Cache location or contextual failure text.
     """
-    try:
-        grid = AoiGrid.from_lon_lat(task.aoi_id, task.lon, task.lat)
-        raster = regrid_aoi_scan(list(task.granule_paths), grid)
-        write_raster_npz(raster, task.cache_path)
-        return ScanResult(task.cache_key, task.cache_path, None)
-    except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-        return ScanResult(task.cache_key, task.cache_path, f"TEMPO regridding failed: {error}")
+    return process_scan_batch(ScanBatchTask(task.granule_paths, (task,)))[0]
 
 
 def build_hrrr_grid_indices(

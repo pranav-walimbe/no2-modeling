@@ -106,15 +106,48 @@ class GranulePixels:
 
     def select_grid(self, grid: AoiGrid) -> "GranulePixels":
         """Keep footprints whose projected bounds intersect an AOI grid."""
-        corner_x, corner_y = WGS84_TO_CONUS.transform(self.corner_longitudes, self.corner_latitudes)
+        return build_granule_spatial_index(self).select_grid(grid)
+
+
+@dataclass(frozen=True)
+class GranuleSpatialIndex:
+    """Native pixels with projected footprint bounds computed once."""
+
+    pixels: GranulePixels
+    min_x: np.ndarray
+    max_x: np.ndarray
+    min_y: np.ndarray
+    max_y: np.ndarray
+
+    def select_grid(self, grid: AoiGrid) -> GranulePixels:
+        """Keep footprints whose projected bounds intersect an AOI grid."""
         half_extent = grid.extent_km * METRES_PER_KM / 2
         keep = (
-            (np.min(corner_x, axis=1) <= grid.x_m + half_extent)
-            & (np.max(corner_x, axis=1) >= grid.x_m - half_extent)
-            & (np.min(corner_y, axis=1) <= grid.y_m + half_extent)
-            & (np.max(corner_y, axis=1) >= grid.y_m - half_extent)
+            (self.min_x <= grid.x_m + half_extent)
+            & (self.max_x >= grid.x_m - half_extent)
+            & (self.min_y <= grid.y_m + half_extent)
+            & (self.max_y >= grid.y_m - half_extent)
         )
-        return _select_pixels(self, keep)
+        return _select_pixels(self.pixels, keep)
+
+
+def build_granule_spatial_index(pixels: GranulePixels) -> GranuleSpatialIndex:
+    """Project footprint bounds once for repeated AOI selection.
+
+    Args:
+        pixels: Geometrically valid native granule pixels.
+
+    Returns:
+        Pixels paired with their projected footprint bounding boxes.
+    """
+    corner_x, corner_y = WGS84_TO_CONUS.transform(pixels.corner_longitudes, pixels.corner_latitudes)
+    return GranuleSpatialIndex(
+        pixels=pixels,
+        min_x=np.min(corner_x, axis=1),
+        max_x=np.max(corner_x, axis=1),
+        min_y=np.min(corner_y, axis=1),
+        max_y=np.max(corner_y, axis=1),
+    )
 
 
 @dataclass(frozen=True)
