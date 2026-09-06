@@ -91,8 +91,9 @@ MIN_DELTA_HISTORY = 168
 DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added to its scale
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
+MIN_MAJOR_CITY_DISTANCE_KM = 50.0  # minimum eligible plant distance from a major city in kilometers
 STRATIFY_POWER_PRIORITY_WEIGHT = 1.0  # unitless weight on prior-quarter power-generation percentile
-STRATIFY_ISOLATION_PRIORITY_WEIGHT = 1.0  # unitless weight on major-city-distance percentile
+STRATIFY_COAL_PRIORITY_WEIGHT = 1.0  # unitless weight on coal-unit-count percentile
 OUTLIER_LOWER_QUANTILE = 0.01  # learn continuous-variable lower bounds from the training split
 OUTLIER_UPPER_QUANTILE = 0.99  # learn continuous-variable upper bounds from the training split
 OUTLIER_FILTER_COLUMNS = (  # excludes coordinates, counts, time, and already bounded coverage
@@ -120,6 +121,8 @@ MODEL_IMAGE_KEYS = ("current_no2", "delta_no2")  # numeric arrays normalized ind
 MODEL_VALID_MASK_KEY = "valid_mask"  # paired finite-NO2 support stored with each sample
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS) + 1  # numeric channels plus the paired-valid mask
 MODEL_IMAGE_CLIP_Z = 8.0  # bound rare raster extremes after train-only standardization
+LABEL_WEIGHT_BIN_COUNT = 20  # signed bins give about 600 training records per bin before imbalance
+LABEL_WEIGHT_CAP = 5.0  # maximum inverse-frequency multiplier in the training loss
 MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
     "num_coal_units",
     "num_ng_units",

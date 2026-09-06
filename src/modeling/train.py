@@ -12,7 +12,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from config import MODEL_IMAGE_CLIP_Z, NUM_CORES, RUNS_DIR
+from config import LABEL_COL, LABEL_WEIGHT_BIN_COUNT, LABEL_WEIGHT_CAP, MODEL_IMAGE_CLIP_Z, NUM_CORES, RUNS_DIR
 from modeling.dataset import (
     LABEL_MODE_COL,
     MODEL_FEATURE_NAMES,
@@ -24,6 +24,7 @@ from modeling.dataset import (
     save_stats,
 )
 from modeling.eval_utils import NORMALIZED_PRED_COL, NORMALIZED_TRUE_COL, add_mass_change_predictions, save_results
+from modeling.losses import HistogramWeightedHuberLoss, build_histogram_weight_config
 from modeling.plot_utils import plot_loss_curve, plot_pred_vs_true, plot_residuals, plot_spatial_error
 from modeling.resnet import DEFAULT_DROPOUT, DEFAULT_HEAD_DIM, NOxModel
 
@@ -53,6 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--huber-delta", type=float, default=DEFAULT_HUBER_DELTA)
+    parser.add_argument("--label-bins", type=int, default=LABEL_WEIGHT_BIN_COUNT)
+    parser.add_argument("--max-label-weight", type=float, default=LABEL_WEIGHT_CAP)
     parser.add_argument("--gradient-clip-norm", type=float, default=DEFAULT_GRADIENT_CLIP_NORM)
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
     parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
@@ -72,7 +75,7 @@ def _device(requested: str) -> torch.device:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    positive_integer_names = ("batch_size", "epochs", "prefetch_factor", "head_dim")
+    positive_integer_names = ("batch_size", "epochs", "prefetch_factor", "head_dim", "label_bins")
     if any(getattr(args, name) < 1 for name in positive_integer_names):
         raise ValueError(f"These arguments must be positive: {', '.join(positive_integer_names)}")
     if args.seed < 0 or args.scheduler_patience < 0:
@@ -83,6 +86,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"workers cannot exceed the allocated CPU count ({NUM_CORES})")
     if args.learning_rate <= 0 or args.huber_delta <= 0 or args.gradient_clip_norm <= 0:
         raise ValueError("learning rate, Huber delta, and gradient clip norm must be positive")
+    if args.label_bins % 2:
+        raise ValueError("label bins must be even to keep negative and positive labels separate")
+    if args.max_label_weight <= 0:
+        raise ValueError("maximum label weight must be positive")
     if args.weight_decay < 0:
         raise ValueError("weight decay cannot be negative")
     if not 0 <= args.dropout < 1:
@@ -226,7 +233,18 @@ def main() -> None:
         dropout=args.dropout,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    criterion = nn.HuberLoss(delta=args.huber_delta)
+    loss_weight_config = build_histogram_weight_config(
+        datasets["train"].frame[LABEL_COL].to_numpy(dtype=np.float64),
+        bin_count=args.label_bins,
+        weight_cap=args.max_label_weight,
+    )
+    train_criterion = HistogramWeightedHuberLoss(
+        loss_weight_config,
+        delta=args.huber_delta,
+        target_mean=stats.target_mean,
+        target_std=stats.target_std,
+    ).to(device)
+    eval_criterion = nn.HuberLoss(delta=args.huber_delta)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -253,6 +271,7 @@ def main() -> None:
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "huber_delta": args.huber_delta,
+        "label_weighting": loss_weight_config.to_dict(),
         "gradient_clip_norm": args.gradient_clip_norm,
         "scheduler_patience": args.scheduler_patience,
         "scheduler_factor": args.scheduler_factor,
@@ -267,6 +286,8 @@ def main() -> None:
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
+    with (run_dir / "loss_weights.json").open("w") as destination:
+        json.dump(loss_weight_config.to_dict(), destination, indent=2)
     print(f"Training {model.num_params():,} parameters on {device}; outputs: {run_dir}")
 
     for epoch in range(1, args.epochs + 1):
@@ -274,12 +295,12 @@ def main() -> None:
             model,
             train_loader,
             optimizer,
-            criterion,
+            train_criterion,
             scaler,
             device,
             args.gradient_clip_norm,
         )
-        validation_loss = val_epoch(model, eval_loaders["val"], criterion, device)
+        validation_loss = val_epoch(model, eval_loaders["val"], eval_criterion, device)
         scheduler.step(validation_loss)
         train_losses.append(train_loss)
         val_losses.append(validation_loss)
