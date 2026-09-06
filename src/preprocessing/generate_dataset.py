@@ -16,6 +16,7 @@ from config import (
     DATASET_DF,
     DATASET_DIR,
     DATASET_RASTER_DIR,
+    DATASET_SCAN_CACHE_DIR,
     HRRR_DIR,
     NUM_CORES,
     TEMPO_DIR,
@@ -30,12 +31,14 @@ from preprocessing.generate_dataset_utils import (
     NO_PAIRED_FINITE_NO2_ERROR,
     TABULAR_FEATURE_NAMES,
     RecordTask,
+    ScanBatchTask,
     ScanTask,
     build_hrrr_grid_indices,
     eligible_generated_records,
     make_scan_task,
     process_record,
-    process_scan,
+    process_scan_batch,
+    scan_cache_is_valid,
     select_final_records,
     validate_coverage_config,
     write_csv_atomic,
@@ -114,20 +117,21 @@ def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
 
 def _prepare_records(
     splits: dict[str, pl.DataFrame],
-    cache_dir: Path,
+    scan_cache_dir: Path,
+    run_dir: Path,
 ) -> tuple[list[PreparedRecord], dict[str, ScanTask], dict[str, list[dict[str, object]]]]:
     # Build one global scan plan across train, validation, and test
     records: list[PreparedRecord] = []
     scans: dict[str, ScanTask] = {}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in splits}
     for split, frame in splits.items():
-        output_dir = cache_dir / "record-rasters" / split
+        output_dir = run_dir / "record-rasters" / split
         output_dir.mkdir(parents=True, exist_ok=True)
         for row in frame.iter_rows(named=True):
             record_index = int(row[SOURCE_RECORD_INDEX_COL])
             try:
-                current = make_scan_task(row, "tempo", Path(TEMPO_DIR), cache_dir)
-                previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), cache_dir)
+                current = make_scan_task(row, "tempo", Path(TEMPO_DIR), scan_cache_dir)
+                previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), scan_cache_dir)
                 hrrr_path = Path(HRRR_DIR) / str(row["hrrr"])
                 delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
@@ -150,18 +154,43 @@ def _prepare_records(
     return records, scans, failures
 
 
-def _run_scan_regridding(scans: dict[str, ScanTask], workers: int) -> tuple[dict[str, str], dict[str, str]]:
-    # Cache every unique AOI scan once for this process run
-    cache_paths: dict[str, str] = {}
+def _scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
+    # Group AOIs by source files so each worker reads a granule set once
+    grouped: dict[tuple[str, ...], list[ScanTask]] = {}
+    for scan in scans:
+        grouped.setdefault(scan.granule_paths, []).append(scan)
+    return [ScanBatchTask(paths, tuple(group)) for paths, group in grouped.items()]
+
+
+def _run_scan_regridding(
+    scans: dict[str, ScanTask],
+    workers: int,
+    regenerate_cache: bool,
+) -> tuple[dict[str, str], dict[str, str]]:
+    # Reuse complete persistent entries and batch only cache misses
+    cache_paths = {
+        key: task.cache_path
+        for key, task in scans.items()
+        if not regenerate_cache and scan_cache_is_valid(task.cache_path)
+    }
     failures: dict[str, str] = {}
-    total = len(scans)
-    for completed, result in enumerate(_bounded_parallel_map(process_scan, scans.values(), workers), start=1):
-        if result.error is None:
-            cache_paths[result.cache_key] = result.cache_path
-        else:
-            failures[result.cache_key] = result.error
-        if completed % PROGRESS_INTERVAL == 0 or completed == total:
-            print(f"Regridded {completed:,}/{total:,} unique AOI scans")
+    missing = [task for key, task in scans.items() if key not in cache_paths]
+    print(f"Scan cache: {len(cache_paths):,} hits; {len(missing):,} scans to generate")
+    if not missing:
+        return cache_paths, failures
+    batches = _scan_batches(missing)
+    granule_reads = sum(len(batch.granule_paths) for batch in batches)
+    print(f"Grouped cache misses into {len(batches):,} batches requiring {granule_reads:,} granule reads")
+    completed = 0
+    for batch_results in _bounded_parallel_map(process_scan_batch, batches, workers):
+        for result in batch_results:
+            completed += 1
+            if result.error is None:
+                cache_paths[result.cache_key] = result.cache_path
+            else:
+                failures[result.cache_key] = result.error
+        if completed % PROGRESS_INTERVAL < len(batch_results) or completed == len(missing):
+            print(f"Regridded {completed:,}/{len(missing):,} cache-missing AOI scans")
     return cache_paths, failures
 
 
@@ -325,6 +354,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=NUM_CORES)
     parser.add_argument("--split", choices=("all", *SPLIT_PATHS), default=_default_split())
+    parser.add_argument(
+        "--regenerate-cache",
+        action="store_true",
+        help="rebuild required persistent scan-cache entries even when valid files exist",
+    )
     return parser.parse_args()
 
 
@@ -363,11 +397,13 @@ def main() -> None:
     Path(DATASET_DIR).mkdir(parents=True, exist_ok=True)
     Path(DATASET_DF).mkdir(parents=True, exist_ok=True)
     Path(DATASET_RASTER_DIR).mkdir(parents=True, exist_ok=True)
+    scan_cache_dir = Path(DATASET_SCAN_CACHE_DIR)
+    scan_cache_dir.mkdir(parents=True, exist_ok=True)
     splits = _load_splits(_selected_split_paths(args.split))
-    with tempfile.TemporaryDirectory(prefix=".regrid-cache-", dir=DATASET_DIR) as temporary_dir:
-        records, scans, failures = _prepare_records(splits, Path(temporary_dir))
+    with tempfile.TemporaryDirectory(prefix=".dataset-run-", dir=DATASET_DIR) as temporary_dir:
+        records, scans, failures = _prepare_records(splits, scan_cache_dir, Path(temporary_dir))
         print(f"Planned {len(records):,} records using {len(scans):,} unique AOI scans")
-        cache_paths, scan_failures = _run_scan_regridding(scans, workers)
+        cache_paths, scan_failures = _run_scan_regridding(scans, workers, args.regenerate_cache)
         hrrr_indices = _hrrr_grid_indices(records)
         tasks, records_by_id = _record_tasks(records, cache_paths, scan_failures, hrrr_indices, failures)
         output_rows = _run_record_processing(tasks, records_by_id, failures, workers)

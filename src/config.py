@@ -75,6 +75,7 @@ HRRR_END_DATE = EMISSIONS_END_DATE
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
 DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # per-record compressed TEMPO raster bundles
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
+DATASET_SCAN_CACHE_DIR = os.path.join(DATASET_DIR, "scan-cache")  # persistent AOI-scan regridding cache
 IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_PAIRED_FINITE_FRACTION = 0.50  # least share of cells finite in both scans

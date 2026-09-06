@@ -171,8 +171,9 @@ source .venv/bin/activate
 
    `preprocessing.generate_dataset` regrids the current and previous TEMPO
    scans onto the same AOI grid, requires finite NO2 in both scans, and writes
-   one compressed three-channel NPZ per retained record. It caches each unique
-   AOI scan for the lifetime of the run. Every successful split-CSV row carries
+   one compressed three-channel NPZ per retained record. It stores each unique
+   AOI scan in a persistent cache and groups AOIs by TEMPO granule set
+   so workers reuse each NetCDF read. Every successful split-CSV row carries
    its relative `delta_no2_path`, plume score, paired cloud, quality, and
    retrieval-uncertainty means, and nearest-grid-point HRRR
    temperature, wind, and boundary-layer height. It requires at least 50
@@ -182,12 +183,13 @@ source .venv/bin/activate
    `SLURM_CPUS_PER_TASK` workers through `NUM_CORES` and refuses to create more
    workers than that allocation.
 
-   Train, validation, and test contain disjoint geographic clusters, so they
-   have no useful cross-split AOI-scan cache sharing. A three-task Slurm array
-   can therefore run them concurrently without redundant regridding. Array
+   Train, validation, and test contain disjoint geographic clusters. A
+   three-task Slurm array can therefore run them concurrently. Array
    indices 0, 1, and 2 automatically select `train`, `val`, and `test`, so each
    task can invoke `python -u -m preprocessing.generate_dataset`. Outside an
-   array, use `--split` for one split or omit it to process all splits.
+   array, use `--split` for one split or omit it to process all splits. Pass
+   `--regenerate-cache` after a cache-incompatible code or configuration change
+   to rebuild the scan entries required by the selected split.
 
 5. Train and evaluate the model:
 
@@ -202,9 +204,10 @@ source .venv/bin/activate
    NOx-mass-change metrics. See `docs/modeling.md` for the feature, leakage,
    architecture, normalization, and evaluation decisions.
 
-Each stage depends on the outputs of the preceding stage. The scripts currently
-resume only where their individual implementation explicitly supports it; check
-existing output files before rerunning a large collection or generation job.
+Each stage depends on the outputs of the preceding stage. Dataset generation
+resumes from valid scan-cache entries. Other scripts resume only where their
+implementation supports it; check existing output files before rerunning a
+large collection or generation job.
 
 ## Savio jobs
 
