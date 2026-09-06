@@ -12,9 +12,10 @@ from config import (
     FULL_DATA_PARQUET,
     LABEL_COL,
     MIN_COVERAGE_PERCENT,
+    MIN_MAJOR_CITY_DISTANCE_KM,
     NOX_MASS_COL,
     STRAT_BASE_DIR,
-    STRATIFY_ISOLATION_PRIORITY_WEIGHT,
+    STRATIFY_COAL_PRIORITY_WEIGHT,
     STRATIFY_POWER_PRIORITY_WEIGHT,
     TEST_RECORDS_CSV,
     TEST_RECORDS_SIZE,
@@ -126,8 +127,8 @@ def _limit_splits(
     splits: dict[str, pl.DataFrame],
     limits: dict[str, int] = SPLIT_RECORD_LIMITS,
 ) -> dict[str, pl.DataFrame]:
-    """Soft-prioritize strong, city-distant AOIs during seeded subsampling."""
-    if STRATIFY_POWER_PRIORITY_WEIGHT < 0 or STRATIFY_ISOLATION_PRIORITY_WEIGHT < 0:
+    """Prioritize high-power coal AOIs in training and sample held-out splits uniformly."""
+    if STRATIFY_POWER_PRIORITY_WEIGHT < 0 or STRATIFY_COAL_PRIORITY_WEIGHT < 0:
         raise ValueError("Stratification priority weights must be nonnegative")
 
     limited: dict[str, pl.DataFrame] = {}
@@ -138,36 +139,40 @@ def _limit_splits(
         if split.height <= limit:
             limited[name] = split
             continue
-        required = {AOI_ID_COL, "avg_pwr_gen", MAJOR_CITY_DIST_COL}
-        missing = required.difference(split.columns)
-        if missing:
-            raise ValueError(f"Cannot prioritize split without columns: {', '.join(sorted(missing))}")
-
-        priority_values = split.with_columns(
-            pl.col("avg_pwr_gen").median().over(AOI_ID_COL).alias("_aoi_avg_pwr_gen")
-        )
-        percentiles = priority_values.select(
-            (pl.col("_aoi_avg_pwr_gen").rank(method="average") / pl.len()).alias("power"),
-            (pl.col(MAJOR_CITY_DIST_COL).rank(method="average") / pl.len()).alias("isolation"),
-        )
-        weights = (
-            1.0
-            + STRATIFY_POWER_PRIORITY_WEIGHT * percentiles["power"].to_numpy()
-            + STRATIFY_ISOLATION_PRIORITY_WEIGHT * percentiles["isolation"].to_numpy()
-        )
         random = np.random.default_rng(SPLIT_SEED + split_index)
-        priority = np.log(random.random(split.height)) / weights
-        selected = np.argpartition(priority, -limit)[-limit:]
+        if name == "train":
+            required = {AOI_ID_COL, "avg_pwr_gen", "num_coal_units"}
+            missing = required.difference(split.columns)
+            if missing:
+                raise ValueError(f"Cannot prioritize training split without columns: {', '.join(sorted(missing))}")
+            aoi_priority = (
+                split.group_by(AOI_ID_COL)
+                .agg(
+                    pl.col("avg_pwr_gen").median().alias("_typical_power"),
+                    pl.col("num_coal_units").first().alias("_coal_units"),
+                )
+                .with_columns(
+                    (pl.col("_typical_power").rank(method="average") / pl.len()).alias("_power_percentile"),
+                    (pl.col("_coal_units").rank(method="average") / pl.len()).alias("_coal_percentile"),
+                )
+            )
+            candidates = split.join(aoi_priority, on=AOI_ID_COL, how="left")
+            weights = (
+                1.0
+                + STRATIFY_POWER_PRIORITY_WEIGHT * candidates["_power_percentile"].to_numpy()
+                + STRATIFY_COAL_PRIORITY_WEIGHT * candidates["_coal_percentile"].to_numpy()
+            )
+            priority = np.log(random.random(split.height)) / weights
+            selected = np.argpartition(priority, -limit)[-limit:]
+            message = "power-and-coal priority-sampled"
+        else:
+            candidates = split
+            selected = random.choice(split.height, size=limit, replace=False)
+            message = "uniformly sampled"
         limited[name] = split.with_row_index("_priority_row").filter(
             pl.col("_priority_row").is_in(selected)
         ).drop("_priority_row")
-        print(
-            f"[{name}] priority-sampled {limit:,}/{split.height:,} records; "
-            f"median prior power {split['avg_pwr_gen'].median():.3g} -> "
-            f"{limited[name]['avg_pwr_gen'].median():.3g}; "
-            f"median city distance {split[MAJOR_CITY_DIST_COL].median():.3g} -> "
-            f"{limited[name][MAJOR_CITY_DIST_COL].median():.3g} km"
-        )
+        print(f"[{name}] {message} {limit:,}/{split.height:,} records")
     return limited
 
 
@@ -205,6 +210,7 @@ def main() -> None:
     frame = add_hrrr_files(frame.join(bounds, on=AOI_ID_COL, how="left"))
     frame = frame.filter(
         (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT)
+        & (pl.col(MAJOR_CITY_DIST_COL) >= MIN_MAJOR_CITY_DISTANCE_KM)
         & pl.col("avg_pwr_gen").is_finite()
         & pl.col(MAJOR_CITY_DIST_COL).is_finite()
     )

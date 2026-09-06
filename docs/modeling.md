@@ -139,10 +139,12 @@ future experiment only with those transformations implemented together.
 
 ## Optimization and I/O
 
-Training uses AdamW, Huber loss in standardized-target units, gradient clipping,
-validation-loss scheduling, and early stopping. Huber is quadratic for common
-small errors and linear for larger errors, making it smoother than MAE without
-giving extreme records the leverage of pure MSE.
+Training uses AdamW, weighted Huber loss in standardized-target units, gradient
+clipping, validation-loss scheduling, and early stopping. Twenty train-derived
+signed histogram bins keep negative and positive labels separate. Each bin gets
+an inverse-frequency weight capped at 5. Validation and test loss remain
+unweighted. Every run saves the bin edges, counts, and weights in
+`loss_weights.json`.
 
 `config.py` owns only the shared modeling data contract: paths, raster key and
 channels, image clipping, and input-feature definitions. Training defaults live

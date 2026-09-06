@@ -165,11 +165,12 @@ Quality-gated candidates are selected deterministically:
 5. Use coverage-plus-uncertainty quality to break competition within each round
    and stop at the exact configured split size.
 
-Before raster generation, seeded weighted sampling prioritizes records with
-higher prior-quarter average power generation and AOIs farther from major
-cities. Each variable contributes its within-split percentile to a positive
-sampling weight. The two unitless strengths live in `config.py`. They remain
-soft preferences, so lower-output and city-adjacent AOIs stay eligible.
+Before raster generation, seeded weighted sampling of training candidates
+prioritizes AOIs with higher median prior-quarter power generation and more
+coal units. Each AOI-level percentile contributes to a positive sampling
+weight. The two unitless strengths live in `config.py`, and lower-priority AOIs
+remain eligible. Validation and test candidate subsampling is uniform. Every
+AOI must also lie at least 50 km from a major city.
 
 This prefers strong rasters while retaining plant and temporal diversity. It
 does not balance on the target label, so validation and test remain suitable
