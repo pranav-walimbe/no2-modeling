@@ -172,7 +172,7 @@ source .venv/bin/activate
    `preprocessing.generate_dataset` regrids the current and previous TEMPO
    scans onto the same AOI grid, requires finite NO2 in both scans, and writes
    one compressed three-channel NPZ per retained record. It stores each unique
-   AOI scan in a versioned persistent cache and groups AOIs by TEMPO granule set
+   AOI scan in a persistent cache and groups AOIs by TEMPO granule set
    so workers reuse each NetCDF read. Every successful split-CSV row carries
    its relative `delta_no2_path`, plume score, paired cloud, quality, and
    retrieval-uncertainty means, and nearest-grid-point HRRR
@@ -189,8 +189,7 @@ source .venv/bin/activate
    task can invoke `python -u -m preprocessing.generate_dataset`. Outside an
    array, use `--split` for one split or omit it to process all splits. Pass
    `--regenerate-cache` after a cache-incompatible code or configuration change
-   to rebuild the scan entries required by the selected split. Increment
-   `DATASET_SCAN_CACHE_VERSION` when old and new cache entries must coexist.
+   to rebuild the scan entries required by the selected split.
 
 5. Train and evaluate the model:
 

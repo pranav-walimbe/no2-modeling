@@ -19,7 +19,6 @@ from eccodes import (
 
 from config import (
     CENTRAL_COVERAGE_WINDOW_SIZE,
-    DATASET_SCAN_CACHE_VERSION,
     IMG_RANGE,
     IMG_SIZE,
     MIN_CENTRAL_FINITE_FRACTION,
@@ -273,7 +272,6 @@ def make_scan_task(row: dict[str, object], path_column: str, tempo_root: Path, c
     lat = float(row["lat"])
     granule_paths = parse_tempo_paths(row[path_column], tempo_root)
     cache_contract = {
-        "version": DATASET_SCAN_CACHE_VERSION,
         "aoi": [aoi_id, lon, lat],
         "granules": granule_paths,
         "grid": [IMG_SIZE, IMG_RANGE],
