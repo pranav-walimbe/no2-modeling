@@ -1,4 +1,4 @@
-"""Raster, meteorology, and persistence utilities for dataset generation."""
+"""Utilities for raster meteorology and dataset persistence."""
 
 import hashlib
 import json
@@ -87,12 +87,13 @@ def validate_coverage_config() -> None:
 
 
 def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
-    """Apply hard raster-quality gates and add a bounded quality score.
+    """Filter records by raster quality and add a bounded score.
 
-    The harmonic mean rewards broad and central paired coverage while strongly
-    penalizing a weakness in either. Cloud and QA are deliberately absent from
-    this score: native filtering already enforces them, and ranking only the
-    clearest scenes would distort the modeling population.
+    Args:
+        frame: Generated candidate records with raster-quality summaries.
+
+    Returns:
+        Eligible records carrying a bounded raster-quality score.
     """
     validate_coverage_config()
     required = {
@@ -134,11 +135,14 @@ def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
-    """Choose an exact, high-quality, temporally diverse, AOI-balanced subset.
+    """Select a quality-ranked AOI-balanced subset.
 
-    Candidates first compete within AOI/year/quarter/four-hour strata. The
-    global AOI round then gives each AOI one record before any AOI receives its
-    second, subject to availability. Quality breaks ties at both levels.
+    Args:
+        frame: Generated candidate records eligible for final selection.
+        size: Exact number of records to select.
+
+    Returns:
+        Selected records without temporary ranking columns.
     """
     if size < 1:
         raise ValueError("Final dataset size must be positive")
@@ -358,9 +362,6 @@ def build_hrrr_grid_indices(
     locations: dict[int, tuple[float, float]],
 ) -> dict[int, int]:
     """Find the nearest native HRRR grid element for each AOI centroid.
-
-    HRRR's CONUS surface product uses a 3 km Lambert grid. The grid is fixed
-    across the analysis hours in this dataset, so each AOI index can be reused.
 
     Args:
         reference_path: Any available HRRR surface-analysis subset.
