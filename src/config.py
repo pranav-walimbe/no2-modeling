@@ -136,9 +136,7 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
 )
 MODEL_LOG1P_FEATURES = (  # stabilize strongly right-skewed, nonnegative quantities before z-scoring
     "avg_heat_input",
-    "avg_pwr_gen",
     DELTA_NOX_SCALE_COL,
-    "boundary_layer_height_m",
 )
 MODEL_CYCLIC_FEATURES = ("hour", "day_of_year")  # each expands to sine and cosine
 
