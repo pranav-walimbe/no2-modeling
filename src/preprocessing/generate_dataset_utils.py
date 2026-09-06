@@ -80,6 +80,12 @@ def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
     penalizing a weakness in either. Cloud and QA are deliberately absent from
     this score: native filtering already enforces them, and ranking only the
     clearest scenes would distort the modeling population.
+
+    Args:
+        frame: Generated candidate records with raster-quality summaries.
+
+    Returns:
+        Eligible records carrying a bounded raster-quality score.
     """
     validate_coverage_config()
     required = {
@@ -126,6 +132,13 @@ def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
     Candidates first compete within AOI/year/quarter/four-hour strata. The
     global AOI round then gives each AOI one record before any AOI receives its
     second, subject to availability. Quality breaks ties at both levels.
+
+    Args:
+        frame: Generated candidate records eligible for final selection.
+        size: Exact number of records to select.
+
+    Returns:
+        Selected records without temporary ranking columns.
     """
     if size < 1:
         raise ValueError("Final dataset size must be positive")
