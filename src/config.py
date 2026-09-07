@@ -93,8 +93,7 @@ NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
 LABEL_COL = "delta_nox_class"
-DEADBAND_THRESHOLD_COL = "delta_nox_deadband_threshold"
-DEADBAND_TRAIN_FRACTION = 0.20  # discard the lowest training absolute raw changes
+DELTA_THRESHOLD = 50.0  # least raw delta-NOx magnitude kept as a labeled class
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_DELTA_HISTORY = 168
 DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added to its scale
@@ -122,10 +121,10 @@ TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
 MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "wind_u_10m_mps", "wind_v_10m_mps")
-MODEL_IMAGE_TRANSFORMS = ("asinh", "asinh", "linear", "linear")
+MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2")
 MODEL_VALID_MASK_KEY = "valid_mask"  # paired finite-NO2 support stored with each sample
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS) + 1  # numeric channels plus the paired-valid mask
-MODEL_IMAGE_CLIP_Z = 8.0  # bound rare raster extremes after train-only standardization
+MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
 MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
     "num_coal_units",
     "num_ng_units",

@@ -11,10 +11,9 @@ from collection.emissions_schema import (
     TOTAL_NAMEPLATE_CAPACITY_MW_COL,
 )
 from config import (
-    DEADBAND_THRESHOLD_COL,
-    DEADBAND_TRAIN_FRACTION,
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
+    DELTA_THRESHOLD,
     FULL_DATA_PARQUET,
     LABEL_COL,
     MIN_COVERAGE_PERCENT,
@@ -92,7 +91,6 @@ OUTPUT_COLUMNS = [
     NOX_MASS_COL,
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
-    DEADBAND_THRESHOLD_COL,
     LABEL_COL,
     LABEL_MODE_COL,
 ]
@@ -224,15 +222,14 @@ def main() -> None:
     )
     frame = serialize_tempo_path_lists(frame)
     filtered_splits = filter_quantitative_outliers(_split_by_cluster(frame))
-    labeled_splits, threshold = apply_binary_target(filtered_splits)
+    labeled_splits = apply_binary_target(filtered_splits)
     splits = _limit_splits(labeled_splits)
     del frame
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     summary = {
         "deadband": {
-            "training_fraction": DEADBAND_TRAIN_FRACTION,
-            "raw_delta_nox_threshold": threshold,
+            "raw_delta_nox_threshold": DELTA_THRESHOLD,
             "retained_rule": "abs(delta_nox_mass) > threshold",
         },
         "splits": {

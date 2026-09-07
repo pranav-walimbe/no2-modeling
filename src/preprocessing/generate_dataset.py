@@ -18,7 +18,7 @@ from config import (
     DATASET_RASTER_DIR,
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WIND_CACHE_DIR,
-    DEADBAND_THRESHOLD_COL,
+    DELTA_THRESHOLD,
     HRRR_DIR,
     NUM_CORES,
     TEMPO_DIR,
@@ -316,10 +316,9 @@ def _write_outputs(
             f"[{split}] {candidates.height:,} regridded; "
             f"{eligible.height:,} passed raster QC; {output_frame.height:,} selected"
         )
-        thresholds = candidates[DEADBAND_THRESHOLD_COL].unique()
         classification_report = {
             "split": split,
-            "raw_delta_nox_threshold": float(thresholds.item()),
+            "raw_delta_nox_threshold": DELTA_THRESHOLD,
             "raster_qc": classification_summary(candidates, eligible),
             "final_balance": classification_summary(eligible, output_frame),
         }

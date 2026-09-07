@@ -14,11 +14,10 @@ from collection.emissions_schema import (
 )
 from config import (
     CITIES_URL,
-    DEADBAND_THRESHOLD_COL,
-    DEADBAND_TRAIN_FRACTION,
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
     DELTA_SCALE_LEVEL_FRACTION,
+    DELTA_THRESHOLD,
     IMG_RANGE,
     LABEL_COL,
     MIN_CITY_POPULATION,
@@ -90,29 +89,22 @@ def filter_quantitative_outliers(
 
 def apply_binary_target(
     splits: dict[str, pl.DataFrame],
-    deadband_fraction: float = DEADBAND_TRAIN_FRACTION,
-) -> tuple[dict[str, pl.DataFrame], float]:
-    """Apply one train-derived symmetric deadband and sign label to every split.
+    threshold: float = DELTA_THRESHOLD,
+) -> dict[str, pl.DataFrame]:
+    """Apply one fixed symmetric deadband and sign label to every split.
 
     Args:
         splits: Geographic data partitions carrying raw delta-NOx values.
-        deadband_fraction: Training fraction targeted for removal around zero.
+        threshold: Least raw delta-NOx magnitude retained as a labeled class.
 
     Returns:
-        Filtered labeled splits and the frozen raw-magnitude cutoff.
+        Filtered labeled splits.
     """
-    training_values = splits["train"].filter(pl.col(DELTA_NOX_MASS_COL).is_finite())
-    threshold = training_values.select(
-        pl.col(DELTA_NOX_MASS_COL)
-        .abs()
-        .quantile(deadband_fraction, interpolation="linear")
-    ).item()
     labeled: dict[str, pl.DataFrame] = {}
     for name, split in splits.items():
         finite = split.filter(pl.col(DELTA_NOX_MASS_COL).is_finite())
         labeled[name] = finite.filter(pl.col(DELTA_NOX_MASS_COL).abs() > threshold).with_columns(
             (pl.col(DELTA_NOX_MASS_COL) > 0).cast(pl.UInt8).alias(LABEL_COL),
-            pl.lit(float(threshold)).alias(DEADBAND_THRESHOLD_COL),
         )
         negative = labeled[name].filter(pl.col(LABEL_COL) == 0).height
         positive = labeled[name].filter(pl.col(LABEL_COL) == 1).height
@@ -120,8 +112,8 @@ def apply_binary_target(
             f"[{name}] deadband retained {labeled[name].height:,}/{finite.height:,} records; "
             f"class 0: {negative:,}; class 1: {positive:,}"
         )
-    print(f"Training-derived raw delta-NOx deadband: [-{threshold:.6g}, {threshold:.6g}]")
-    return labeled, float(threshold)
+    print(f"Raw delta-NOx deadband: [-{threshold:.6g}, {threshold:.6g}]")
+    return labeled
 
 
 def classification_summary(source: pl.DataFrame, retained: pl.DataFrame) -> dict[str, object]:
