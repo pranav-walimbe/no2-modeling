@@ -53,21 +53,12 @@ Before expensive image processing, a candidate must have:
 - finite prior-quarter power generation and distance to a city of 500,000 or
   more people for priority sampling.
 
-The 1st and 99th percentiles are learned only from the training split for these
-continuous variables:
-
-- prior-quarter average heat input;
-- prior-quarter average power generation;
-- AOI NOx mass;
-- hourly change in AOI NOx mass;
-- the robust NOx-change scale; and
-- the normalized target.
-
-The same numerical bounds are then applied unchanged to every split. Applying
-six independent bounds can remove more than two percent of rows overall; that
-is expected. Coordinates, dates, hours, unit counts, city distance, and
-coverage percentages are not percentile-trimmed because their tails describe
-real subpopulations or already have meaningful hard bounds.
+- Fit 1st/99th percentile bounds on training data only for prior-quarter heat
+  input, prior-quarter power generation, and the robust NOx-change scale.
+- Freeze and reuse those bounds for validation and test.
+- Do not trim coordinates, time fields, unit counts, city distance, target
+  values, or coverage percentages.
+- Independent filters can remove more than two percent of rows overall.
 
 ## Label and tabular features
 
@@ -159,7 +150,20 @@ Mean cloud and quality fractions remain diagnostics rather than additional
 ranking terms. Native cloud and quality filtering already determines whether
 NO2 is accepted.
 
-## Final selection
+## Candidate selection
+
+Before raster generation, apply these rules to every split:
+
+- Require each AOI to be at least 50 km from a major city.
+- Average each unit's previous-quarter output, then sum the unit averages by
+  AOI.
+- Select records from AOIs with positive coal-unit output first, ranked by coal
+  output.
+- Fill any remaining slots from the general pool, ranked by total AOI power.
+- Round-robin across AOIs within each pool.
+- Do not use current-quarter output or target values.
+
+## Final raster selection
 
 Quality-gated candidates are selected deterministically:
 
@@ -172,18 +176,8 @@ Quality-gated candidates are selected deterministically:
 5. Use coverage-plus-uncertainty quality to break competition within each round
    and stop at the exact configured split size.
 
-Before raster generation, seeded weighted sampling of training candidates
-prioritizes AOIs with higher median prior-quarter power generation and more
-coal units. Each AOI-level percentile contributes to a positive sampling
-weight. The two unitless strengths live in `config.py`, and lower-priority AOIs
-remain eligible. Validation and test candidate subsampling is uniform. Every
-AOI must also lie at least 50 km from a major city.
-
-This prefers strong rasters while retaining plant and temporal diversity. It
-does not balance on the target label, so validation and test remain suitable
-for estimating performance on the quality-eligible population. If rare target
-ranges need more training emphasis, use training-time sample weights or a
-sampler and continue reporting unweighted validation and test metrics.
+Selection does not balance target labels. Report unweighted validation and test
+metrics. Handle rare training targets with training-only weights or sampling.
 
 ## Performance and persistence
 

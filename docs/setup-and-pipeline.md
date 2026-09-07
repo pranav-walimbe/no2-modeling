@@ -156,22 +156,24 @@ source .venv/bin/activate
    python -u -m preprocessing.generate_dataset
    ```
 
-   `preprocessing.tempo_mapping` owns TEMPO mapping construction. Its index job
-   builds monthly granule-index Parquet files. A dependent job array owns
-   disjoint months and builds daily AOI-observation shards containing stitched
-   granule paths, mirror-step ranges, and observation times. Existing populated
-   month directories are skipped. Pass `--overwrite` to rebuild the index and
-   AOI mappings from scratch; the submit wrapper forwards it to both jobs. Each
-   task uses `NUM_CORES`, which reads `SLURM_CPUS_PER_TASK`.
+   `preprocessing.tempo_mapping`:
 
-   `preprocessing.stratify_plants` only reads the prebuilt TEMPO mapping before
-   matching observations and writing splits.
-   The stratifier computes consecutive-hour AOI NOx mass changes and normalizes
-   them with the previous completed quarter's median and MAD. Training-split
-   1st/99th percentile bounds prune continuous operating variables and the
-   label consistently across all three splits. Overlapping AOI clusters are
-   assigned intact to the 60/20/20 train, validation, and test splits. Each
-   split emits three times its configured final size as raster candidates.
+   - builds monthly granule-index Parquet files;
+   - assigns disjoint months to a dependent job array;
+   - writes daily AOI-observation shards;
+   - skips populated month directories unless passed `--overwrite`; and
+   - uses `NUM_CORES`, sourced from `SLURM_CPUS_PER_TASK`.
+
+   `preprocessing.stratify_plants`:
+
+   - reads the prebuilt TEMPO mapping;
+   - normalizes consecutive-hour AOI NOx changes with the previous completed
+     quarter's median and MAD;
+   - assigns overlapping AOI clusters intact to 60/20/20 splits;
+   - fits historical-variable percentile bounds on training only;
+   - selects lagged coal-output AOIs first, then the general pool by lagged
+     total power, without target or current-quarter output; and
+   - emits three times each configured final size as raster candidates.
 
    `preprocessing.generate_dataset` regrids the current and previous TEMPO
    scans onto the same AOI grid, requires finite NO2 in both scans, and writes

@@ -2,7 +2,6 @@
 
 import os
 
-import numpy as np
 import polars as pl
 
 from collection.emissions_schema import (
@@ -19,8 +18,6 @@ from config import (
     MIN_MAJOR_CITY_DISTANCE_KM,
     NOX_MASS_COL,
     STRAT_BASE_DIR,
-    STRATIFY_COAL_PRIORITY_WEIGHT,
-    STRATIFY_POWER_PRIORITY_WEIGHT,
     TEST_RECORDS_CSV,
     TEST_RECORDS_SIZE,
     TRAIN_RECORDS_CSV,
@@ -32,6 +29,8 @@ from preprocessing.stratify_utils import (
     AOI_ID_COL,
     LABEL_MODE_COL,
     MAJOR_CITY_DIST_COL,
+    PREVIOUS_QUARTER_COAL_POWER_COL,
+    PREVIOUS_QUARTER_POWER_COL,
     add_aoi_bounds,
     add_hrrr_files,
     add_major_city_distance,
@@ -133,53 +132,59 @@ def _limit_splits(
     splits: dict[str, pl.DataFrame],
     limits: dict[str, int] = SPLIT_RECORD_LIMITS,
 ) -> dict[str, pl.DataFrame]:
-    """Prioritize high-power coal AOIs in training and sample held-out splits uniformly."""
-    if STRATIFY_POWER_PRIORITY_WEIGHT < 0 or STRATIFY_COAL_PRIORITY_WEIGHT < 0:
-        raise ValueError("Stratification priority weights must be nonnegative")
-
+    # Select coal-output records first and rank the remainder by lagged power
     limited: dict[str, pl.DataFrame] = {}
-    for split_index, (name, split) in enumerate(splits.items()):
+    required = {AOI_ID_COL, "date", "hour", PREVIOUS_QUARTER_COAL_POWER_COL, PREVIOUS_QUARTER_POWER_COL}
+    for name, split in splits.items():
         limit = limits[name]
         if limit < 1:
             raise ValueError(f"{name} split limit must be positive")
         if split.height <= limit:
             limited[name] = split
             continue
-        random = np.random.default_rng(SPLIT_SEED + split_index)
-        if name == "train":
-            required = {AOI_ID_COL, "avg_pwr_gen", "num_coal_units"}
-            missing = required.difference(split.columns)
-            if missing:
-                raise ValueError(f"Cannot prioritize training split without columns: {', '.join(sorted(missing))}")
-            aoi_priority = (
-                split.group_by(AOI_ID_COL)
-                .agg(
-                    pl.col("avg_pwr_gen").median().alias("_typical_power"),
-                    pl.col("num_coal_units").first().alias("_coal_units"),
-                )
-                .with_columns(
-                    (pl.col("_typical_power").rank(method="average") / pl.len()).alias("_power_percentile"),
-                    (pl.col("_coal_units").rank(method="average") / pl.len()).alias("_coal_percentile"),
-                )
-            )
-            candidates = split.join(aoi_priority, on=AOI_ID_COL, how="left")
-            weights = (
-                1.0
-                + STRATIFY_POWER_PRIORITY_WEIGHT * candidates["_power_percentile"].to_numpy()
-                + STRATIFY_COAL_PRIORITY_WEIGHT * candidates["_coal_percentile"].to_numpy()
-            )
-            priority = np.log(random.random(split.height)) / weights
-            selected = np.argpartition(priority, -limit)[-limit:]
-            message = "power-and-coal priority-sampled"
+        missing = required.difference(split.columns)
+        if missing:
+            raise ValueError(f"Cannot prioritize {name} split without columns: {', '.join(sorted(missing))}")
+        indexed = split.with_row_index("_priority_row").with_columns(
+            split.select(AOI_ID_COL, "date", "hour").hash_rows(seed=SPLIT_SEED).alias("_priority_hash")
+        )
+        coal_pool = indexed.filter(
+            pl.col(PREVIOUS_QUARTER_COAL_POWER_COL).is_finite()
+            & (pl.col(PREVIOUS_QUARTER_COAL_POWER_COL) > 0)
+        )
+        selected_coal = _rank_priority_pool(coal_pool, PREVIOUS_QUARTER_COAL_POWER_COL).head(limit)
+        remaining_count = limit - selected_coal.height
+        if remaining_count:
+            general_pool = indexed.join(selected_coal.select("_priority_row"), on="_priority_row", how="anti")
+            selected_general = _rank_priority_pool(general_pool, PREVIOUS_QUARTER_POWER_COL).head(remaining_count)
+            selected = pl.concat((selected_coal, selected_general), how="vertical")
         else:
-            candidates = split
-            selected = random.choice(split.height, size=limit, replace=False)
-            message = "uniformly sampled"
-        limited[name] = split.with_row_index("_priority_row").filter(
-            pl.col("_priority_row").is_in(selected)
-        ).drop("_priority_row")
-        print(f"[{name}] {message} {limit:,}/{split.height:,} records")
+            selected = selected_coal
+        if selected.height < limit:
+            raise ValueError(f"Only {selected.height:,} records are available for the requested {name} limit {limit:,}")
+        limited[name] = selected.sort("_priority_row").drop("_priority_row", "_priority_hash", "_priority_round")
+        print(
+            f"[{name}] selected {selected_coal.height:,} coal-priority and "
+            f"{remaining_count:,} general records from {split.height:,} candidates"
+        )
     return limited
+
+
+def _rank_priority_pool(frame: pl.DataFrame, priority_column: str) -> pl.DataFrame:
+    # Round-robin across AOIs before taking another record from the same AOI
+    return (
+        frame.sort(
+            [AOI_ID_COL, priority_column, PREVIOUS_QUARTER_POWER_COL, "_priority_hash"],
+            descending=[False, True, True, False],
+            nulls_last=True,
+        )
+        .with_columns(pl.col(AOI_ID_COL).cum_count().over(AOI_ID_COL).alias("_priority_round"))
+        .sort(
+            ["_priority_round", priority_column, PREVIOUS_QUARTER_POWER_COL, AOI_ID_COL, "_priority_hash"],
+            descending=[False, True, True, False, False],
+            nulls_last=True,
+        )
+    )
 
 
 def main() -> None:

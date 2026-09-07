@@ -94,17 +94,12 @@ DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added t
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 MIN_MAJOR_CITY_DISTANCE_KM = 50.0  # minimum eligible plant distance from a major city in kilometers
-STRATIFY_POWER_PRIORITY_WEIGHT = 1.0  # unitless weight on prior-quarter power-generation percentile
-STRATIFY_COAL_PRIORITY_WEIGHT = 1.0  # unitless weight on coal-unit-count percentile
 OUTLIER_LOWER_QUANTILE = 0.01  # learn continuous-variable lower bounds from the training split
 OUTLIER_UPPER_QUANTILE = 0.99  # learn continuous-variable upper bounds from the training split
 OUTLIER_FILTER_COLUMNS = (  # excludes coordinates, counts, time, and already bounded coverage
     "avg_heat_input",
     "avg_pwr_gen",
-    NOX_MASS_COL,
-    DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
-    LABEL_COL,
 )
 
 TRAIN_SIZE = 12_000
