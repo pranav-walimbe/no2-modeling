@@ -7,9 +7,7 @@ CODEX ?= $(HOME)/.local/bin/codex
 CODEX_HOME ?= $(HOME)/.codex
 CODEX_LOCAL ?= /tmp/$(USER)/.codex
 CODEX_SEED ?= $(HOME)/.codex_seed
-# Durable directories the seed owns and the node-local tree reaches by symlink
 CODEX_SHARED := packages plugins skills sessions cache
-# Small files mirrored both ways so every node keeps a usable copy
 CODEX_MIRRORED := auth.json config.toml installation_id
 
 .PHONY: help setup check clean fix-codex
@@ -32,13 +30,6 @@ clean:
 	find src -type d -name __pycache__ -prune -exec rm -rf {} +
 	rm -rf build dist src/*.egg-info .pytest_cache .ruff_cache
 
-# Codex stores runtime state in SQLite and NFS home directories cannot provide
-# the file locks SQLite needs. That is the "(code: 15) locking protocol"
-# startup failure. $(CODEX_HOME) also holds the installed release binaries so
-# the tree is split rather than relocated wholesale. $(CODEX_SEED) keeps the
-# durable parts on NFS. $(CODEX_LOCAL) holds the SQLite databases on node-local
-# disk. $(CODEX_HOME) becomes a symlink at the local tree whose shared
-# directories link back to the seed. Pass V=1 to see the full doctor report.
 fix-codex:
 	@set -e; \
 	report=$$(mktemp); trap 'rm -f $$report' EXIT; \
