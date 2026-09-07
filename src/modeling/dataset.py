@@ -21,6 +21,7 @@ from config import (
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_Z,
     MODEL_IMAGE_KEYS,
+    MODEL_IMAGE_TRANSFORMS,
     MODEL_LOG1P_FEATURES,
     MODEL_RAW_FEATURES,
     MODEL_VALID_MASK_KEY,
@@ -28,7 +29,6 @@ from config import (
 
 RASTER_PATH_COL = "delta_no2_path"
 LABEL_MODE_COL = "label_mode"
-IMAGE_TRANSFORM = "asinh"
 MIN_SCALE = 1e-12
 
 
@@ -46,7 +46,7 @@ MODEL_FEATURE_NAMES = _model_feature_names()
 class NormalizationStats:
     """JSON-safe train-split preprocessing state used by every data split."""
 
-    image_transform: str
+    image_transforms: tuple[str, ...]
     image_keys: tuple[str, ...]
     image_scale: tuple[float, ...]
     image_mean: tuple[float, ...]
@@ -64,7 +64,7 @@ class NormalizationStats:
     @classmethod
     def from_dict(cls, values: dict[str, object]) -> "NormalizationStats":
         return cls(
-            image_transform=str(values["image_transform"]),
+            image_transforms=tuple(str(name) for name in values["image_transforms"]),
             image_keys=tuple(str(name) for name in values["image_keys"]),
             image_scale=tuple(float(value) for value in values["image_scale"]),
             image_mean=tuple(float(value) for value in values["image_mean"]),
@@ -126,9 +126,9 @@ def _safe_scale(values: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(values) & (values > MIN_SCALE), values, 1.0)
 
 
-def _asinh_transform(values: np.ndarray, scale: float) -> np.ndarray:
-    """Compress both signed tails while remaining approximately linear near zero."""
-    return np.arcsinh(values / scale)
+def _image_transform(values: np.ndarray, transform: str, scale: float) -> np.ndarray:
+    # Apply the configured transform for one image channel
+    return np.arcsinh(values / scale) if transform == "asinh" else values
 
 
 def compute_stats(
@@ -140,10 +140,8 @@ def compute_stats(
 ) -> NormalizationStats:
     """Compute memory-bounded normalization statistics from one split.
 
-    Each robust asinh scale is the median of per-raster median absolute finite
-    values for one numeric channel. This gives every training record equal
-    influence regardless of coverage. A second streaming pass computes
-    transformed-pixel means and variances with a batch-combined Welford update.
+    NO2 asinh scales use record-balanced median absolute values. A second
+    streaming pass computes per-channel means and variances.
     """
     root = Path(dataset_dir)
     frame = _read_split_frame(split, Path(dataframe_dir))
@@ -154,10 +152,12 @@ def compute_stats(
     channel_count = len(MODEL_IMAGE_KEYS)
     median_absolute_values = np.empty((len(raster_paths), channel_count), dtype=np.float64)
     for index, serialized_path in enumerate(raster_paths, start=1):
-        rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
+        rasters, _ = _load_raster_bundle(_raster_path(serialized_path, root))
         for channel in range(channel_count):
-            values = rasters[channel, mask.astype(bool)].astype(np.float64, copy=False)
-            median_absolute_values[index - 1, channel] = np.median(np.abs(values))
+            values = rasters[channel, np.isfinite(rasters[channel])].astype(np.float64, copy=False)
+            median_absolute_values[index - 1, channel] = (
+                np.median(np.abs(values)) if MODEL_IMAGE_TRANSFORMS[channel] == "asinh" else 1.0
+            )
         if progress_interval > 0 and (index % progress_interval == 0 or index == len(frame)):
             print(f"Robust-scale scan: {index:,}/{len(frame):,} rasters")
 
@@ -168,11 +168,11 @@ def compute_stats(
     mean = np.zeros(channel_count, dtype=np.float64)
     sum_squared_deviation = np.zeros(channel_count, dtype=np.float64)
     for index, serialized_path in enumerate(raster_paths, start=1):
-        rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
-        finite = mask.astype(bool)
+        rasters, _ = _load_raster_bundle(_raster_path(serialized_path, root))
         for channel in range(channel_count):
+            finite = np.isfinite(rasters[channel])
             values = rasters[channel, finite].astype(np.float64, copy=False)
-            values = _asinh_transform(values, float(image_scale[channel]))
+            values = _image_transform(values, MODEL_IMAGE_TRANSFORMS[channel], float(image_scale[channel]))
             batch_count = int(values.size)
             batch_mean = float(values.mean())
             batch_squared_deviation = float(np.square(values - batch_mean).sum())
@@ -180,8 +180,7 @@ def compute_stats(
             delta = batch_mean - mean[channel]
             mean[channel] += delta * batch_count / combined_count
             sum_squared_deviation[channel] += (
-                batch_squared_deviation
-                + delta * delta * count[channel] * batch_count / combined_count
+                batch_squared_deviation + delta * delta * count[channel] * batch_count / combined_count
             )
             count[channel] = combined_count
         if progress_interval > 0 and (index % progress_interval == 0 or index == len(frame)):
@@ -191,7 +190,7 @@ def compute_stats(
     image_std = _safe_scale(image_std)
     feature_std = _safe_scale(features.std(axis=0))
     return NormalizationStats(
-        image_transform=IMAGE_TRANSFORM,
+        image_transforms=MODEL_IMAGE_TRANSFORMS,
         image_keys=MODEL_IMAGE_KEYS,
         image_scale=tuple(float(value) for value in image_scale),
         image_mean=tuple(float(value) for value in mean),
@@ -265,11 +264,15 @@ class NOxDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         if self.load_images:
             rasters, mask = _load_raster_bundle(_raster_path(self.raster_paths[index], self.dataset_dir))
-            finite = mask.astype(bool)
             normalized = np.zeros_like(rasters, dtype=np.float32)
             for channel in range(len(MODEL_IMAGE_KEYS)):
-                transformed = _asinh_transform(rasters[channel, finite], self.stats.image_scale[channel])
-                normalized[channel, finite] = (
+                channel_finite = np.isfinite(rasters[channel])
+                transformed = _image_transform(
+                    rasters[channel, channel_finite],
+                    self.stats.image_transforms[channel],
+                    self.stats.image_scale[channel],
+                )
+                normalized[channel, channel_finite] = (
                     transformed - self.stats.image_mean[channel]
                 ) / self.stats.image_std[channel]
             np.clip(normalized, -MODEL_IMAGE_CLIP_Z, MODEL_IMAGE_CLIP_Z, out=normalized)

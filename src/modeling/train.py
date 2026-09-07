@@ -261,7 +261,7 @@ def main() -> None:
         "scheduler_patience": args.scheduler_patience,
         "scheduler_factor": args.scheduler_factor,
         "early_stop_patience": args.early_stop_patience,
-        "image_transform": stats.image_transform,
+        "image_transforms": list(stats.image_transforms),
         "image_keys": list(stats.image_keys),
         "image_scale": list(stats.image_scale),
         "image_clip_z": MODEL_IMAGE_CLIP_Z,

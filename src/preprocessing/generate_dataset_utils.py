@@ -11,11 +11,12 @@ import numpy as np
 import polars as pl
 from eccodes import (
     codes_get,
-    codes_get_double_element,
-    codes_grib_find_nearest,
+    codes_get_array,
     codes_grib_new_from_file,
     codes_release,
 )
+from pyproj import CRS, Proj, Transformer
+from scipy.ndimage import map_coordinates
 
 from config import (
     CENTRAL_COVERAGE_WINDOW_SIZE,
@@ -37,7 +38,7 @@ from preprocessing.regrid import (
 )
 from preprocessing.stratify_utils import AOI_ID_COL
 
-CURRENT_RASTER_NAME, DELTA_RASTER_NAME = MODEL_IMAGE_KEYS
+CURRENT_RASTER_NAME, DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
 VALID_MASK_NAME = MODEL_VALID_MASK_KEY
 NO_PAIRED_FINITE_NO2_ERROR = "Paired TEMPO scans have no cells with finite NO2 in both rasters"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
@@ -53,8 +54,6 @@ SELECTION_HELPER_COLUMNS = (
 )
 HRRR_FIELDS = {
     "2t": "temperature_2m_k",
-    "10u": "wind_u_10m_mps",
-    "10v": "wind_v_10m_mps",
     "blh": "boundary_layer_height_m",
 }
 TABULAR_FEATURE_NAMES = (
@@ -95,14 +94,12 @@ def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
         uncertainty_quality = pl.lit(1.0)
     else:
         uncertainty_quality = 1 - (
-            (pl.col(MEAN_RETRIEVAL_UNCERTAINTY_COL).rank(method="average") - 1)
-            / (eligible.height - 1)
+            (pl.col(MEAN_RETRIEVAL_UNCERTAINTY_COL).rank(method="average") - 1) / (eligible.height - 1)
         )
     return eligible.with_columns(
-        (
-            (1 - RASTER_UNCERTAINTY_WEIGHT) * coverage_quality
-            + RASTER_UNCERTAINTY_WEIGHT * uncertainty_quality
-        ).alias(RASTER_QUALITY_SCORE_COL)
+        ((1 - RASTER_UNCERTAINTY_WEIGHT) * coverage_quality + RASTER_UNCERTAINTY_WEIGHT * uncertainty_quality).alias(
+            RASTER_QUALITY_SCORE_COL
+        )
     )
 
 
@@ -194,8 +191,7 @@ class RecordTask:
     record_index: int
     current_cache_path: str
     previous_cache_path: str
-    hrrr_path: str
-    hrrr_grid_index: int
+    wind_cache_path: str
     output_path: str
 
 
@@ -207,6 +203,48 @@ class RecordResult:
     record_index: int
     features: dict[str, float]
     error: str | None
+
+
+@dataclass(frozen=True)
+class WindTask:
+    """One AOI-hour wind raster and scalar meteorology cache entry."""
+
+    cache_key: str
+    aoi_id: int
+    lon: float
+    lat: float
+    hrrr_path: str
+    cache_path: str
+
+
+@dataclass(frozen=True)
+class WindResult:
+    """Outcome of one aligned wind-cache operation."""
+
+    cache_key: str
+    cache_path: str
+    error: str | None
+
+
+@dataclass(frozen=True)
+class WindBatchTask:
+    """AOI wind rasters sharing one HRRR source file."""
+
+    hrrr_path: str
+    winds: tuple[WindTask, ...]
+
+
+@dataclass(frozen=True)
+class _HrrrGrid:
+    """Projection and array layout shared by HRRR fields."""
+
+    crs: CRS
+    rows: int
+    columns: int
+    x_origin_m: float
+    y_origin_m: float
+    x_spacing_m: float
+    y_spacing_m: float
 
 
 def parse_tempo_paths(serialized_paths: object, tempo_root: Path) -> tuple[str, ...]:
@@ -255,11 +293,11 @@ def make_scan_task(row: dict[str, object], path_column: str, tempo_root: Path, c
     )
 
 
-def scan_cache_exists(path: str | Path) -> bool:
-    """Return whether a cached scan exists.
+def cache_exists(path: str | Path) -> bool:
+    """Return whether a cache entry exists.
 
     Args:
-        path: Candidate persistent scan bundle.
+        path: Candidate cache path.
 
     Returns:
         True when the cache path exists.
@@ -291,9 +329,7 @@ def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
             write_raster_npz(raster, task.cache_path)
             results.append(ScanResult(task.cache_key, task.cache_path, None))
         except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-            results.append(
-                ScanResult(task.cache_key, task.cache_path, f"TEMPO regridding failed: {error}")
-            )
+            results.append(ScanResult(task.cache_key, task.cache_path, f"TEMPO regridding failed: {error}"))
     return results
 
 
@@ -309,58 +345,171 @@ def process_scan(task: ScanTask) -> ScanResult:
     return process_scan_batch(ScanBatchTask(task.granule_paths, (task,)))[0]
 
 
-def build_hrrr_grid_indices(
-    reference_path: str,
-    locations: dict[int, tuple[float, float]],
-) -> dict[int, int]:
-    """Find the nearest native HRRR grid element for each AOI centroid.
+def make_wind_task(row: dict[str, object], hrrr_root: Path, cache_dir: Path) -> WindTask:
+    """Create one persistent aligned-wind cache task.
 
     Args:
-        reference_path: Any available HRRR surface-analysis subset.
-        locations: AOI IDs mapped to latitude and longitude in degrees.
+        row: Stratified record carrying its AOI and HRRR relative path.
+        hrrr_root: Root of the HRRR archive.
+        cache_dir: Persistent aligned-wind cache directory.
 
     Returns:
-        AOI IDs mapped to flat native-grid element indices.
+        Deduplicatable AOI-hour wind task.
     """
-    with Path(reference_path).open("rb") as source:
-        message = codes_grib_new_from_file(source)
-        if message is None:
-            raise ValueError(f"HRRR file contains no GRIB messages: {reference_path}")
-        try:
-            return {
-                aoi_id: int(codes_grib_find_nearest(message, lat, lon, is_lsm=False, npoints=1)[0]["index"])
-                for aoi_id, (lat, lon) in locations.items()
-            }
-        finally:
-            codes_release(message)
+    aoi_id = int(row["aoi_id"])
+    lon = float(row["lon"])
+    lat = float(row["lat"])
+    hrrr_path = str(hrrr_root / str(row["hrrr"]))
+    identity = json.dumps(
+        {"aoi": [aoi_id, lon, lat], "hrrr": hrrr_path},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    cache_key = hashlib.sha256(identity.encode()).hexdigest()
+    return WindTask(cache_key, aoi_id, lon, lat, hrrr_path, str(cache_dir / f"{cache_key}.npz"))
 
 
-def extract_hrrr_features(path: str, grid_index: int) -> dict[str, float]:
-    """Read four meteorological values at one native HRRR grid element.
+def _longitude_180(longitude: float) -> float:
+    # Normalize GRIB longitudes for PROJ
+    return (longitude + 180.0) % 360.0 - 180.0
 
-    Args:
-        path: HRRR GRIB2 subset containing the configured four fields.
-        grid_index: Flat grid element nearest to the record's AOI centroid.
 
-    Returns:
-        Temperature, U/V wind, and boundary-layer-height features with units.
-    """
-    features: dict[str, float] = {}
+def _hrrr_grid(message: int) -> _HrrrGrid:
+    # Build the spherical Lambert grid declared by the GRIB message
+    central_longitude = _longitude_180(float(codes_get(message, "LoVInDegrees")))
+    latitude_origin = float(codes_get(message, "LaDInDegrees"))
+    standard_parallel_1 = float(codes_get(message, "Latin1InDegrees"))
+    standard_parallel_2 = float(codes_get(message, "Latin2InDegrees"))
+    radius = float(codes_get(message, "radiusInMetres"))
+    crs = CRS.from_proj4(
+        f"+proj=lcc +lat_1={standard_parallel_1} +lat_2={standard_parallel_2} "
+        f"+lat_0={latitude_origin} +lon_0={central_longitude} +R={radius} +units=m +no_defs"
+    )
+    first_longitude = _longitude_180(float(codes_get(message, "longitudeOfFirstGridPointInDegrees")))
+    first_latitude = float(codes_get(message, "latitudeOfFirstGridPointInDegrees"))
+    x_origin, y_origin = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform(
+        first_longitude,
+        first_latitude,
+    )
+    return _HrrrGrid(
+        crs=crs,
+        rows=int(codes_get(message, "Ny")),
+        columns=int(codes_get(message, "Nx")),
+        x_origin_m=float(x_origin),
+        y_origin_m=float(y_origin),
+        x_spacing_m=float(codes_get(message, "DxInMetres")),
+        y_spacing_m=float(codes_get(message, "DyInMetres")),
+    )
+
+
+def _read_hrrr_fields(path: str) -> tuple[_HrrrGrid, dict[str, np.ndarray]]:
+    # Read each required full-grid field once
+    fields: dict[str, np.ndarray] = {}
+    grid: _HrrrGrid | None = None
     with Path(path).open("rb") as source:
         while (message := codes_grib_new_from_file(source)) is not None:
             try:
                 short_name = str(codes_get(message, "shortName"))
-                output_name = HRRR_FIELDS.get(short_name)
-                if output_name is not None:
-                    features[output_name] = float(codes_get_double_element(message, "values", grid_index))
+                if short_name not in {"2t", "10u", "10v", "blh"}:
+                    continue
+                if grid is None:
+                    grid = _hrrr_grid(message)
+                fields[short_name] = np.asarray(codes_get_array(message, "values"), dtype=np.float32).reshape(
+                    grid.rows,
+                    grid.columns,
+                )
             finally:
                 codes_release(message)
-    missing = set(HRRR_FIELDS.values()).difference(features)
-    if missing:
-        raise ValueError(f"HRRR file is missing fields: {', '.join(sorted(missing))}")
-    if not all(np.isfinite(value) for value in features.values()):
-        raise ValueError("HRRR features contain non-finite values")
-    return features
+    return grid, fields
+
+
+def _hrrr_coordinates(grid: _HrrrGrid, x_m: np.ndarray, y_m: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # Express EPSG:5070 coordinates as fractional HRRR row and column positions
+    x_hrrr, y_hrrr = Transformer.from_crs("EPSG:5070", grid.crs, always_xy=True).transform(x_m, y_m)
+    rows = (y_hrrr - grid.y_origin_m) / grid.y_spacing_m
+    columns = (x_hrrr - grid.x_origin_m) / grid.x_spacing_m
+    return rows, columns
+
+
+def _interpolate_hrrr(field: np.ndarray, coordinates: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+    # Bilinearly sample a native HRRR field at target cell centres
+    return map_coordinates(field, coordinates, order=1, mode="nearest")
+
+
+def _align_wind(grid: _HrrrGrid, fields: dict[str, np.ndarray], task: WindTask) -> dict[str, np.ndarray]:
+    # Interpolate grid-relative wind then rotate it to geographic east and north
+    target_grid = AoiGrid.from_lon_lat(task.aoi_id, task.lon, task.lat)
+    x_m, y_m = target_grid.cell_centres()
+    coordinates = _hrrr_coordinates(grid, x_m, y_m)
+    grid_u = _interpolate_hrrr(fields["10u"], coordinates)
+    grid_v = _interpolate_hrrr(fields["10v"], coordinates)
+    longitudes, latitudes = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True).transform(x_m, y_m)
+    convergence = np.deg2rad(Proj(grid.crs).get_factors(longitudes, latitudes).meridian_convergence)
+    eastward = grid_u * np.cos(convergence) + grid_v * np.sin(convergence)
+    northward = -grid_u * np.sin(convergence) + grid_v * np.cos(convergence)
+    return {
+        WIND_U_RASTER_NAME: eastward.astype(np.float32),
+        WIND_V_RASTER_NAME: northward.astype(np.float32),
+    }
+
+
+def _centre_hrrr_features(grid: _HrrrGrid, fields: dict[str, np.ndarray], task: WindTask) -> dict[str, float]:
+    # Interpolate scalar weather fields at the AOI centre
+    target = AoiGrid.from_lon_lat(task.aoi_id, task.lon, task.lat)
+    coordinates = _hrrr_coordinates(
+        grid,
+        np.asarray([[target.x_m]]),
+        np.asarray([[target.y_m]]),
+    )
+    return {
+        output_name: float(_interpolate_hrrr(fields[short_name], coordinates).item())
+        for short_name, output_name in HRRR_FIELDS.items()
+    }
+
+
+def process_wind_batch(batch: WindBatchTask) -> list[WindResult]:
+    """Align all AOIs sharing one HRRR source file.
+
+    Args:
+        batch: Wind tasks sharing one HRRR analysis file.
+
+    Returns:
+        One cache result for each requested AOI-hour.
+    """
+    try:
+        grid, fields = _read_hrrr_fields(batch.hrrr_path)
+    except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        message = f"HRRR read failed: {error}"
+        return [WindResult(task.cache_key, task.cache_path, message) for task in batch.winds]
+
+    results = []
+    for task in batch.winds:
+        try:
+            arrays = _align_wind(grid, fields, task)
+            arrays.update(_centre_hrrr_features(grid, fields, task))
+            _write_npz_atomic(task.cache_path, **arrays)
+            results.append(WindResult(task.cache_key, task.cache_path, None))
+        except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            results.append(WindResult(task.cache_key, task.cache_path, f"HRRR alignment failed: {error}"))
+    return results
+
+
+def extract_wind_cache(path: str) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    """Read aligned wind rasters and scalar weather from one cache entry.
+
+    Args:
+        path: Persistent AOI-hour wind cache path.
+
+    Returns:
+        Eastward/northward rasters and scalar weather features.
+    """
+    with np.load(path, allow_pickle=False) as cache:
+        rasters = {
+            WIND_U_RASTER_NAME: np.asarray(cache[WIND_U_RASTER_NAME], dtype=np.float32),
+            WIND_V_RASTER_NAME: np.asarray(cache[WIND_V_RASTER_NAME], dtype=np.float32),
+        }
+        features = {name: float(cache[name]) for name in HRRR_FIELDS.values()}
+    return rasters, features
 
 
 def _paired_mean(current: np.ndarray, previous: np.ndarray, valid: np.ndarray) -> float:
@@ -425,7 +574,7 @@ def derive_raster_features(
     return rasters, features
 
 
-def _write_npz_atomic(destination: str, **arrays: np.ndarray) -> None:
+def _write_npz_atomic(destination: str, **arrays: np.ndarray | float) -> None:
     # Keep interrupted workers from leaving apparently complete samples
     output_path = Path(destination)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -458,7 +607,9 @@ def process_record(task: RecordTask) -> RecordResult:
     """
     try:
         rasters, features = derive_raster_features(task.current_cache_path, task.previous_cache_path)
-        features.update(extract_hrrr_features(task.hrrr_path, task.hrrr_grid_index))
+        wind_rasters, weather_features = extract_wind_cache(task.wind_cache_path)
+        rasters.update(wind_rasters)
+        features.update(weather_features)
         _write_npz_atomic(task.output_path, **rasters)
         return RecordResult(task.split, task.record_index, features, None)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:

@@ -17,6 +17,7 @@ from config import (
     DATASET_DIR,
     DATASET_RASTER_DIR,
     DATASET_SCAN_CACHE_DIR,
+    DATASET_WIND_CACHE_DIR,
     DEADBAND_THRESHOLD_COL,
     HRRR_DIR,
     NUM_CORES,
@@ -34,12 +35,15 @@ from preprocessing.generate_dataset_utils import (
     RecordTask,
     ScanBatchTask,
     ScanTask,
-    build_hrrr_grid_indices,
+    WindBatchTask,
+    WindTask,
+    cache_exists,
     eligible_generated_records,
     make_scan_task,
+    make_wind_task,
     process_record,
     process_scan_batch,
-    scan_cache_exists,
+    process_wind_batch,
     select_final_records,
     write_csv_atomic,
     write_json_atomic,
@@ -70,12 +74,9 @@ class PreparedRecord:
 
     split: str
     record_index: int
-    aoi_id: int
-    lat: float
-    lon: float
     current_scan_key: str
     previous_scan_key: str
-    hrrr_path: str
+    wind_cache_key: str
     delta_no2_path: str
 
 
@@ -118,11 +119,13 @@ def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
 def _prepare_records(
     splits: dict[str, pl.DataFrame],
     scan_cache_dir: Path,
+    wind_cache_dir: Path,
     run_dir: Path,
-) -> tuple[list[PreparedRecord], dict[str, ScanTask], dict[str, list[dict[str, object]]]]:
+) -> tuple[list[PreparedRecord], dict[str, ScanTask], dict[str, WindTask], dict[str, list[dict[str, object]]]]:
     # Build one global scan plan across train, validation, and test
     records: list[PreparedRecord] = []
     scans: dict[str, ScanTask] = {}
+    winds: dict[str, WindTask] = {}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in splits}
     for split, frame in splits.items():
         output_dir = run_dir / "record-rasters" / split
@@ -132,26 +135,24 @@ def _prepare_records(
             try:
                 current = make_scan_task(row, "tempo", Path(TEMPO_DIR), scan_cache_dir)
                 previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), scan_cache_dir)
-                hrrr_path = Path(HRRR_DIR) / str(row["hrrr"])
+                wind = make_wind_task(row, Path(HRRR_DIR), wind_cache_dir)
                 delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
                     PreparedRecord(
                         split=split,
                         record_index=record_index,
-                        aoi_id=int(row["aoi_id"]),
-                        lat=float(row["lat"]),
-                        lon=float(row["lon"]),
                         current_scan_key=current.cache_key,
                         previous_scan_key=previous.cache_key,
-                        hrrr_path=str(hrrr_path),
+                        wind_cache_key=wind.cache_key,
                         delta_no2_path=str(delta_no2_path),
                     )
                 )
                 scans.setdefault(current.cache_key, current)
                 scans.setdefault(previous.cache_key, previous)
+                winds.setdefault(wind.cache_key, wind)
             except (KeyError, TypeError, ValueError) as error:
                 failures[split].append({"record_index": record_index, "error": str(error)})
-    return records, scans, failures
+    return records, scans, winds, failures
 
 
 def _scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
@@ -167,11 +168,9 @@ def _run_scan_regridding(
     workers: int,
     refresh_cache: bool,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    # Reuse complete persistent entries and batch only cache misses
+    # Reuse existing entries and batch only cache misses
     cache_paths = {
-        key: task.cache_path
-        for key, task in scans.items()
-        if not refresh_cache and scan_cache_exists(task.cache_path)
+        key: task.cache_path for key, task in scans.items() if not refresh_cache and cache_exists(task.cache_path)
     }
     failures: dict[str, str] = {}
     missing = [task for key, task in scans.items() if key not in cache_paths]
@@ -194,24 +193,45 @@ def _run_scan_regridding(
     return cache_paths, failures
 
 
-def _hrrr_grid_indices(records: list[PreparedRecord]) -> dict[int, int]:
-    # HRRR uses one fixed CONUS grid across the archived analysis hours
-    locations: dict[int, tuple[float, float]] = {}
-    reference_path: str | None = None
-    for record in records:
-        locations.setdefault(record.aoi_id, (record.lat, record.lon))
-        if reference_path is None and Path(record.hrrr_path).is_file():
-            reference_path = record.hrrr_path
-    if reference_path is None:
-        raise FileNotFoundError("No HRRR file from the stratified records exists")
-    return build_hrrr_grid_indices(reference_path, locations)
+def _wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
+    # Group AOIs by HRRR hour so each full field is read once
+    grouped: dict[str, list[WindTask]] = {}
+    for wind in winds:
+        grouped.setdefault(wind.hrrr_path, []).append(wind)
+    return [WindBatchTask(path, tuple(group)) for path, group in grouped.items()]
+
+
+def _run_wind_alignment(
+    winds: dict[str, WindTask],
+    workers: int,
+    refresh_cache: bool,
+) -> tuple[dict[str, str], dict[str, str]]:
+    # Reuse cached AOI-hour wind rasters unless refresh is explicit
+    cache_paths = {
+        key: task.cache_path for key, task in winds.items() if not refresh_cache and cache_exists(task.cache_path)
+    }
+    failures: dict[str, str] = {}
+    missing = [task for key, task in winds.items() if key not in cache_paths]
+    print(f"Wind cache: {len(cache_paths):,} hits; {len(missing):,} AOI-hours to align")
+    completed = 0
+    for batch_results in _bounded_parallel_map(process_wind_batch, _wind_batches(missing), workers):
+        for result in batch_results:
+            completed += 1
+            if result.error is None:
+                cache_paths[result.cache_key] = result.cache_path
+            else:
+                failures[result.cache_key] = result.error
+        if completed % PROGRESS_INTERVAL < len(batch_results) or completed == len(missing):
+            print(f"Aligned {completed:,}/{len(missing):,} cache-missing AOI-hour winds")
+    return cache_paths, failures
 
 
 def _record_tasks(
     records: list[PreparedRecord],
     cache_paths: dict[str, str],
     scan_failures: dict[str, str],
-    hrrr_indices: dict[int, int],
+    wind_cache_paths: dict[str, str],
+    wind_failures: dict[str, str],
     failures: dict[str, list[dict[str, object]]],
 ) -> tuple[list[RecordTask], dict[tuple[str, int], PreparedRecord]]:
     # Exclude records whose current or previous scan failed to regrid
@@ -223,6 +243,10 @@ def _record_tasks(
             reasons = [scan_failures.get(key, "scan cache unavailable") for key in missing_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
+        if record.wind_cache_key not in wind_cache_paths:
+            reason = wind_failures.get(record.wind_cache_key, "wind cache unavailable")
+            failures[record.split].append({"record_index": record.record_index, "error": reason})
+            continue
         record_id = (record.split, record.record_index)
         records_by_id[record_id] = record
         tasks.append(
@@ -231,8 +255,7 @@ def _record_tasks(
                 record_index=record.record_index,
                 current_cache_path=cache_paths[record.current_scan_key],
                 previous_cache_path=cache_paths[record.previous_scan_key],
-                hrrr_path=record.hrrr_path,
-                hrrr_grid_index=hrrr_indices[record.aoi_id],
+                wind_cache_path=wind_cache_paths[record.wind_cache_key],
                 output_path=record.delta_no2_path,
             )
         )
@@ -280,9 +303,8 @@ def _write_outputs(
         rows = output_rows[split]
         failure_rows = sorted(failures[split], key=lambda row: int(row["record_index"]))
         features = pl.DataFrame(rows, schema=feature_schema)
-        candidates = (
-            source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left")
-            .sort(SOURCE_RECORD_INDEX_COL)
+        candidates = source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left").sort(
+            SOURCE_RECORD_INDEX_COL
         )
         eligible = eligible_generated_records(candidates)
         output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
@@ -367,7 +389,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=("all", *SPLIT_PATHS), default=_default_split())
     parser.add_argument(
         "--refresh-cache",
-        dest="refresh_cache",
         action="store_true",
         help="rebuild the selected split's cached image rasters",
     )
@@ -405,13 +426,27 @@ def main() -> None:
     Path(DATASET_RASTER_DIR).mkdir(parents=True, exist_ok=True)
     scan_cache_dir = Path(DATASET_SCAN_CACHE_DIR)
     scan_cache_dir.mkdir(parents=True, exist_ok=True)
+    wind_cache_dir = Path(DATASET_WIND_CACHE_DIR)
+    wind_cache_dir.mkdir(parents=True, exist_ok=True)
     splits = _load_splits(_selected_split_paths(args.split))
     with tempfile.TemporaryDirectory(prefix=".dataset-run-", dir=DATASET_DIR) as temporary_dir:
-        records, scans, failures = _prepare_records(splits, scan_cache_dir, Path(temporary_dir))
-        print(f"Planned {len(records):,} records using {len(scans):,} unique AOI scans")
+        records, scans, winds, failures = _prepare_records(
+            splits,
+            scan_cache_dir,
+            wind_cache_dir,
+            Path(temporary_dir),
+        )
+        print(f"Planned {len(records):,} records using {len(scans):,} TEMPO scans and {len(winds):,} wind rasters")
         cache_paths, scan_failures = _run_scan_regridding(scans, workers, args.refresh_cache)
-        hrrr_indices = _hrrr_grid_indices(records)
-        tasks, records_by_id = _record_tasks(records, cache_paths, scan_failures, hrrr_indices, failures)
+        wind_cache_paths, wind_failures = _run_wind_alignment(winds, workers, args.refresh_cache)
+        tasks, records_by_id = _record_tasks(
+            records,
+            cache_paths,
+            scan_failures,
+            wind_cache_paths,
+            wind_failures,
+            failures,
+        )
         output_rows = _run_record_processing(tasks, records_by_id, failures, workers)
         _write_outputs(output_rows, failures, splits)
 

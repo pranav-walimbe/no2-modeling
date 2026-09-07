@@ -15,14 +15,14 @@ NOx changes from paired TEMPO observations.
 
 ## Inputs and leakage policy
 
-Each sample has three aligned 48 by 48 raster channels and scalar context. The
+Each sample has five aligned 48 by 48 raster channels and scalar context. The
 scalar inputs are:
 
 - coal and natural-gas unit counts;
 - total generator nameplate capacity;
 - previous-quarter average heat input and power generation;
 - the historical NOx-change variability from the prior completed quarter;
-- coincident HRRR 2 m temperature, 10 m U/V wind, and boundary-layer height;
+- coincident HRRR 2 m temperature and boundary-layer height;
 - sine/cosine encodings of UTC hour and day of year.
 
 ### Feature transformations
@@ -34,10 +34,11 @@ Validation, test, and inference reuse those statistics.
 | Transform before standardization | Features | Reason |
 |---|---|---|
 | `log1p` | nameplate capacity, heat input, power generation, NOx-change scale, boundary-layer height | These nonnegative features have long right tails; compression limits the influence of extreme values and preserves zero. |
-| None | coal and gas unit counts, temperature, U/V wind | Counts retain their discrete spacing, temperature has a moderate range, and wind components can be negative. |
+| None | coal and gas unit counts, temperature | Counts retain their discrete spacing, and temperature has a moderate range. |
 | Sine and cosine | UTC hour, day of year | Circular encoding keeps adjacent boundary values close, such as hours 23 and 0. |
 
-Both numeric NO2 rasters use `asinh` before standardization.
+Both numeric NO2 rasters use `asinh` before standardization. Wind rasters are
+standardized without a nonlinear transform.
 
 Coordinates, AOI IDs, current emissions, plume score, and raster-quality scores
 are excluded. This prevents geographic memorization, direct target leakage,
@@ -47,15 +48,17 @@ already gives the network spatial coverage information.
 
 ## Image representation and normalization
 
-The model receives three channels:
+The model receives five channels:
 
 1. paired-valid current NO2 transformed with a robust signed asinh;
-2. paired-valid delta NO2 transformed with a separate robust signed asinh; and
-3. a binary mask whose value is one where both scans supplied accepted NO2.
+2. paired-valid delta NO2 transformed with a separate robust signed asinh;
+3. geographic eastward wind aligned from the native HRRR grid;
+4. geographic northward wind aligned from the native HRRR grid; and
+5. a binary mask whose value is one where both scans supplied accepted NO2.
 
-Each numeric channel uses its own training-pixel mean, standard deviation, and
-robust scale, then clips to plus or minus 8 standard deviations. The mask stays
-binary and unstandardized.
+Each numeric channel uses its own training-pixel mean and standard deviation.
+The NO2 channels also use separate robust scales. All numeric channels clip to
+plus or minus 8 standard deviations; the mask stays binary and unstandardized.
 
 The transform is
 
@@ -70,7 +73,7 @@ finite value. This record-balanced definition prevents high-coverage rasters
 from dominating either scale. Asinh preserves sign, is approximately linear
 for weak values, and becomes logarithmic in both tails.
 
-After standardization, missing values in both numeric channels are filled with
+After standardization, missing values in the NO2 channels are filled with
 zero. Zero is the transformed training mean, not a claim that physical NO2 was
 zero, and the mask channel makes the distinction explicit. This
 follows the general missing-image principle that the validity mask is
@@ -83,8 +86,8 @@ both robust scales; the second accumulates transformed finite-pixel means and
 variance with a numerically stable combined-Welford update. Only one compressed
 NPZ is open at a time, and the implementation never concatenates the roughly
 28 million training pixels or builds another dense image archive. The JSON
-statistics file stores the transform name, scale, mean, and standard deviation
-and is used unchanged for validation, test, and later inference.
+statistics file stores each channel's transform, scale, mean, and standard
+deviation and is used unchanged for validation, test, and later inference.
 
 Asinh plus global standardization was selected over these options:
 
@@ -117,10 +120,10 @@ batches; this is the central result of the original
 in the MLP projections. The older DenseNet alternative was removed because it
 duplicated an obsolete input signature and was not selected by training.
 
-We do not rotate or flip rasters in the baseline. Grid direction is physical,
-wind U/V uses that direction, and arbitrary transforms would require exactly
-consistent wind and mask transformations. Spatial augmentation is a valid
-future experiment only with those transformations implemented together.
+We do not rotate or flip rasters in the baseline. HRRR grid-relative wind is
+rotated to geographic east and north during alignment. Any later spatial
+augmentation must transform the wind vector values along with the raster
+coordinates and mask.
 
 ## Optimization and I/O
 

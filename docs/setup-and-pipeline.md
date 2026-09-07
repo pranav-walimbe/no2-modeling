@@ -177,12 +177,12 @@ source .venv/bin/activate
 
    `preprocessing.generate_dataset` regrids the current and previous TEMPO
    scans onto the same AOI grid, requires finite NO2 in both scans, and writes
-   one compressed three-channel NPZ per retained record. It stores each unique
-   AOI scan in a persistent cache and groups AOIs by TEMPO granule set
-   so workers reuse each NetCDF read. Every successful split-CSV row carries
-   its relative `delta_no2_path`, plume score, paired cloud, quality, and
-   retrieval-uncertainty means, and nearest-grid-point HRRR
-   temperature, wind, and boundary-layer height. It requires at least 50
+   one compressed five-channel NPZ per retained record. It stores each unique
+   AOI scan and aligned AOI-hour wind raster in persistent caches, grouping
+   work so workers reuse each NetCDF or GRIB read. Every successful split-CSV
+   row carries its relative `delta_no2_path`, plume score, paired cloud,
+   quality, retrieval-uncertainty means, and centre-interpolated HRRR
+   temperature and boundary-layer height. It requires at least 50
    percent paired-finite coverage over both the full raster and the central 8
    by 8 cells, then selects the exact configured size using AOI-balanced,
    temporally diverse quality ranking. On Savio, the CLI defaults to

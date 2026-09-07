@@ -21,8 +21,12 @@ EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 EMISSIONS_START_DATE = date(2023, 8, 1)  # start of CAMPD hourly emissions pull
 EMISSIONS_END_DATE = date.today()  # request through the latest date available from CAMPD
 EMISSIONS_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_emissions"  # HPC output directory for emissions
-EMISSIONS_RECORDS_PARQUET = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_all.parquet")  # source hours in local standard time
-FULL_DATA_PARQUET = os.path.join(EMISSIONS_BASE_DIR, "nox_emissions_full.parquet")  # enriched emissions with UTC date and hour
+EMISSIONS_RECORDS_PARQUET = os.path.join(
+    EMISSIONS_BASE_DIR, "nox_emissions_all.parquet"
+)  # source hours in local standard time
+FULL_DATA_PARQUET = os.path.join(
+    EMISSIONS_BASE_DIR, "nox_emissions_full.parquet"
+)  # enriched emissions with UTC date and hour
 
 # ============================================================================
 # TEMPO data scraping
@@ -78,6 +82,7 @@ DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root out
 DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # per-record compressed TEMPO raster bundles
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
 DATASET_SCAN_CACHE_DIR = os.path.join(DATASET_DIR, "scan-cache")  # persistent AOI-scan regridding cache
+DATASET_WIND_CACHE_DIR = os.path.join(DATASET_DIR, "wind-cache")  # persistent aligned AOI-hour wind rasters
 IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_PAIRED_FINITE_FRACTION = 0.50  # least share of cells finite in both scans
@@ -116,7 +121,8 @@ TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 # Modeling data contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-MODEL_IMAGE_KEYS = ("current_no2", "delta_no2")  # numeric arrays normalized independently
+MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "wind_u_10m_mps", "wind_v_10m_mps")
+MODEL_IMAGE_TRANSFORMS = ("asinh", "asinh", "linear", "linear")
 MODEL_VALID_MASK_KEY = "valid_mask"  # paired finite-NO2 support stored with each sample
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS) + 1  # numeric channels plus the paired-valid mask
 MODEL_IMAGE_CLIP_Z = 8.0  # bound rare raster extremes after train-only standardization
@@ -128,8 +134,6 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
     "avg_pwr_gen",
     DELTA_NOX_SCALE_COL,
     "temperature_2m_k",
-    "wind_u_10m_mps",
-    "wind_v_10m_mps",
     "boundary_layer_height_m",
 )
 MODEL_LOG1P_FEATURES = (  # stabilize strongly right-skewed, nonnegative quantities before z-scoring
