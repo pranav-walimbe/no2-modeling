@@ -350,6 +350,45 @@ def _convert_local_standard_hours_to_utc(frame: pl.LazyFrame) -> pl.LazyFrame:
     )
 
 
+def _build_prediction_year_attribute_lookups(
+    prediction_years: pl.DataFrame,
+    facility_attributes: pl.DataFrame,
+    unit_attributes: pl.DataFrame,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    # Resolve temporal attributes on small lookup tables before the hourly joins
+    years = prediction_years.select(PREDICTION_YEAR_COL).unique().sort(PREDICTION_YEAR_COL)
+    located_facilities = _add_facility_time_zones(facility_attributes)
+    facility_lookup = (
+        located_facilities.select("facilityId")
+        .unique()
+        .join(years, how="cross")
+        .sort("facilityId", PREDICTION_YEAR_COL)
+        .join_asof(
+            located_facilities.sort("facilityId", FACILITY_ATTRIBUTE_YEAR_COL),
+            left_on=PREDICTION_YEAR_COL,
+            right_on=FACILITY_ATTRIBUTE_YEAR_COL,
+            by="facilityId",
+            strategy="backward",
+            check_sortedness=False,
+        )
+    )
+    unit_lookup = (
+        unit_attributes.select("facilityId", "unitIdKey")
+        .unique()
+        .join(years, how="cross")
+        .sort("facilityId", "unitIdKey", PREDICTION_YEAR_COL)
+        .join_asof(
+            unit_attributes.sort("facilityId", "unitIdKey", UNIT_ATTRIBUTE_YEAR_COL),
+            left_on=PREDICTION_YEAR_COL,
+            right_on=UNIT_ATTRIBUTE_YEAR_COL,
+            by=["facilityId", "unitIdKey"],
+            strategy="backward",
+            check_sortedness=False,
+        )
+    )
+    return facility_lookup, unit_lookup
+
+
 def write_augmented_parquet(
     input_path: Path,
     output_path: Path,
@@ -379,8 +418,17 @@ def write_augmented_parquet(
 
     unit_id = pl.col("unitId").cast(pl.String, strict=False).str.strip_chars()
     source_row_count = source.select(pl.len()).collect().item()
-    located_facilities = _add_facility_time_zones(facility_attributes).sort("facilityId", FACILITY_ATTRIBUTE_YEAR_COL)
-    sorted_unit_attributes = unit_attributes.sort("facilityId", "unitIdKey", UNIT_ATTRIBUTE_YEAR_COL)
+    prediction_years = (
+        source.select(pl.col("date").cast(pl.Date, strict=False).dt.year().alias(PREDICTION_YEAR_COL))
+        .drop_nulls()
+        .unique()
+        .collect()
+    )
+    facility_lookup, unit_lookup = _build_prediction_year_attribute_lookups(
+        prediction_years,
+        facility_attributes,
+        unit_attributes,
+    )
     augmented = (
         source.with_columns(
             pl.col("facilityId").cast(pl.Int64, strict=False),
@@ -388,23 +436,15 @@ def write_augmented_parquet(
             unit_id.alias("unitIdKey"),
             pl.col("date").cast(pl.Date, strict=False).dt.year().alias(PREDICTION_YEAR_COL),
         )
-        .sort("facilityId", PREDICTION_YEAR_COL)
-        .join_asof(
-            located_facilities.lazy(),
-            left_on=PREDICTION_YEAR_COL,
-            right_on=FACILITY_ATTRIBUTE_YEAR_COL,
-            by="facilityId",
-            strategy="backward",
-            check_sortedness=False,
+        .join(
+            facility_lookup.lazy(),
+            on=["facilityId", PREDICTION_YEAR_COL],
+            how="left",
         )
-        .sort("facilityId", "unitIdKey", PREDICTION_YEAR_COL)
-        .join_asof(
-            sorted_unit_attributes.lazy(),
-            left_on=PREDICTION_YEAR_COL,
-            right_on=UNIT_ATTRIBUTE_YEAR_COL,
-            by=["facilityId", "unitIdKey"],
-            strategy="backward",
-            check_sortedness=False,
+        .join(
+            unit_lookup.lazy(),
+            on=["facilityId", "unitIdKey", PREDICTION_YEAR_COL],
+            how="left",
         )
         .drop("unitIdKey", PREDICTION_YEAR_COL)
         .drop_nulls(["lat", "lon", "epaRegion"])
