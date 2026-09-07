@@ -14,7 +14,6 @@ from timezonefinder import TimezoneFinder
 
 from collection.emissions_schema import (
     EMISSIONS_HOUR_UTC_COL,
-    FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL,
     FACILITY_NAMEPLATE_CAPACITY_MW_COL,
     LOCAL_STANDARD_DATE_COL,
     LOCAL_STANDARD_HOUR_COL,
@@ -43,13 +42,10 @@ CAPACITY_ATTRIBUTE_SCHEMA = {
     "facilityId": pl.Int64,
     FACILITY_ATTRIBUTE_YEAR_COL: pl.Int64,
     FACILITY_NAMEPLATE_CAPACITY_MW_COL: pl.Float64,
-    FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL: pl.Float64,
 }
 
 FacilityYear = tuple[int, int]
 GeneratorValues = dict[FacilityYear, dict[str, set[float]]]
-UnitGenerators = dict[FacilityYear, dict[str, set[str]]]
-MalformedUnits = dict[FacilityYear, set[str]]
 
 FACILITY_ATTRIBUTE_COLUMNS = {
     "year": "facilityAttributeYear",
@@ -228,41 +224,32 @@ def _parse_generator_capacities(value: object) -> tuple[tuple[str, float], ...]:
     return tuple(entries)
 
 
-def _collect_capacity_values(attributes: pl.DataFrame) -> tuple[GeneratorValues, UnitGenerators, MalformedUnits]:
-    # Parse every unit field into facility-year generator groups
+def _collect_capacity_values(attributes: pl.DataFrame) -> tuple[GeneratorValues, set[FacilityYear]]:
+    # Parse every capacity field into facility-year generator groups
     generator_values: GeneratorValues = {}
-    unit_generators: UnitGenerators = {}
-    malformed_units: MalformedUnits = {}
-    for facility_id, year, unit_id, serialized in attributes.select(
-        "facilityId", "year", "unitId", "associatedGeneratorsAndNameplateCapacity"
+    facility_years: set[FacilityYear] = set()
+    for facility_id, year, serialized in attributes.select(
+        "facilityId", "year", "associatedGeneratorsAndNameplateCapacity"
     ).iter_rows():
-        if facility_id is None or year is None or unit_id is None:
-            raise ValueError("CAMPD capacity attributes require facility, year, and unit identifiers")
+        if facility_id is None or year is None:
+            raise ValueError("CAMPD capacity attributes require facility and year identifiers")
         facility_key = (int(facility_id), int(year))
-        normalized_unit_id = str(unit_id).strip()
-        if not normalized_unit_id:
-            raise ValueError("CAMPD capacity attributes contain an empty unit identifier")
-        generators_for_unit = unit_generators.setdefault(facility_key, {}).setdefault(normalized_unit_id, set())
+        facility_years.add(facility_key)
         try:
             entries = _parse_generator_capacities(serialized)
         except ValueError:
-            malformed_units.setdefault(facility_key, set()).add(normalized_unit_id)
             continue
-        generators_for_unit.update(generator_id for generator_id, _ in entries)
         facility_generators = generator_values.setdefault(facility_key, {})
         for generator_id, capacity_mw in entries:
             facility_generators.setdefault(generator_id, set()).add(capacity_mw)
-    return generator_values, unit_generators, malformed_units
+    return generator_values, facility_years
 
 
 def _summarize_capacity(
     facility_key: FacilityYear,
     generator_values: GeneratorValues,
-    unit_generators: UnitGenerators,
-    malformed_units: MalformedUnits,
 ) -> dict[str, int | float]:
-    # Exclude conflicting generators and count complete unit fields
-    units = unit_generators[facility_key]
+    # Exclude generators that have conflicting capacity values
     facility_generators = generator_values.get(facility_key, {})
     conflict_generators = {
         generator_id for generator_id, capacities in facility_generators.items() if len(capacities) > 1
@@ -272,25 +259,19 @@ def _summarize_capacity(
         for generator_id, capacities in facility_generators.items()
         if generator_id not in conflict_generators
     )
-    invalid_units = malformed_units.get(facility_key, set())
-    covered_units = sum(
-        bool(generators) and unit_id not in invalid_units and generators.isdisjoint(conflict_generators)
-        for unit_id, generators in units.items()
-    )
     return {
         "facilityId": facility_key[0],
         FACILITY_ATTRIBUTE_YEAR_COL: facility_key[1],
         FACILITY_NAMEPLATE_CAPACITY_MW_COL: float(resolved_capacity_mw),
-        FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL: covered_units / len(units),
     }
 
 
 def _build_capacity_attributes(attributes: pl.DataFrame) -> pl.DataFrame:
     # Resolve generators once per facility and attribute year
-    generator_values, unit_generators, malformed_units = _collect_capacity_values(attributes)
+    generator_values, facility_years = _collect_capacity_values(attributes)
     rows: list[dict[str, int | float]] = []
-    for facility_key in sorted(unit_generators):
-        rows.append(_summarize_capacity(facility_key, generator_values, unit_generators, malformed_units))
+    for facility_key in sorted(facility_years):
+        rows.append(_summarize_capacity(facility_key, generator_values))
     return pl.DataFrame(rows, schema=CAPACITY_ATTRIBUTE_SCHEMA)
 
 
@@ -482,8 +463,6 @@ def main() -> None:
     )
 
     facility_attributes, unit_attributes = _build_attribute_frames(attribute_records)
-    coverage_rate = facility_attributes[FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL].mean()
-    print(f"Mean facility generator-capacity coverage: {coverage_rate:.1%}")
     row_count = write_augmented_parquet(
         input_path=input_path,
         output_path=Path(FULL_DATA_PARQUET),

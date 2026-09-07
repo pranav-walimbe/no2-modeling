@@ -5,7 +5,7 @@ from datetime import date, datetime, timezone
 
 from dotenv import load_dotenv
 
-from collection.emissions_schema import NAMEPLATE_CAPACITY_COVERAGE_RATE_COL, TOTAL_NAMEPLATE_CAPACITY_MW_COL
+from collection.emissions_schema import TOTAL_NAMEPLATE_CAPACITY_MW_COL
 
 # ============================================================================
 # API
@@ -129,7 +129,6 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
     "num_coal_units",
     "num_ng_units",
     TOTAL_NAMEPLATE_CAPACITY_MW_COL,
-    NAMEPLATE_CAPACITY_COVERAGE_RATE_COL,
     "avg_heat_input",
     "avg_pwr_gen",
     DELTA_NOX_SCALE_COL,
