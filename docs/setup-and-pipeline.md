@@ -177,12 +177,12 @@ source .venv/bin/activate
 
    `preprocessing.generate_dataset` regrids the current and previous TEMPO
    scans onto the same AOI grid, requires finite NO2 in both scans, and writes
-   one compressed three-channel NPZ per retained record. It stores each unique
-   AOI scan in a persistent cache and groups AOIs by TEMPO granule set
-   so workers reuse each NetCDF read. Every successful split-CSV row carries
-   its relative `delta_no2_path`, plume score, paired cloud, quality, and
-   retrieval-uncertainty means, and nearest-grid-point HRRR
-   temperature, wind, and boundary-layer height. It requires at least 50
+   one compressed five-channel NPZ per retained record. It stores each unique
+   AOI scan and aligned AOI-hour wind raster in persistent caches, grouping
+   work so workers reuse each NetCDF or GRIB read. Every successful split-CSV
+   row carries its relative `delta_no2_path`, plume score, paired cloud,
+   quality, retrieval-uncertainty means, and centre-interpolated HRRR
+   temperature and boundary-layer height. It requires at least 50
    percent paired-finite coverage over both the full raster and the central 8
    by 8 cells, then selects the exact configured size using AOI-balanced,
    temporally diverse quality ranking. On Savio, the CLI defaults to
@@ -194,7 +194,8 @@ source .venv/bin/activate
    indices 0, 1, and 2 automatically select `train`, `val`, and `test`, so each
    task can invoke `python -u -m preprocessing.generate_dataset`. Outside an
    array, use `--split` for one split or omit it to process all splits. Pass
-   `--refresh-cache` after changing image-processing code or settings.
+   `--refresh-tempo` or `--refresh-wind` after changing the corresponding
+   image-processing code or settings.
 
 5. Train and evaluate the model:
 
@@ -202,16 +203,16 @@ source .venv/bin/activate
    python -u -m modeling.train
    ```
 
-   The trainer lazily reads current NO2, delta NO2, and the paired-valid mask
-   from each selected NPZ and computes memory-bounded robust
+   The trainer lazily reads current NO2, delta NO2, wind, and the paired-valid
+   mask from each selected NPZ and computes memory-bounded robust
    normalization statistics from the training split only. It predicts whether
    raw delta-NOx is negative or positive outside the frozen deadband and reports
    classification metrics. See `docs/modeling.md` for the full contract.
 
 Each stage depends on the outputs of the preceding stage. Dataset generation
-resumes from valid scan-cache entries. Other scripts resume only where their
-implementation supports it; check existing output files before rerunning a
-large collection or generation job.
+resumes from valid TEMPO-cache and wind-cache entries. Other scripts resume
+only where their implementation supports it; check existing output files
+before rerunning a large collection or generation job.
 
 ## Savio jobs
 

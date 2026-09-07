@@ -42,15 +42,21 @@ forming a delta.
 ## Dataset-generation output
 
 `preprocessing.generate_dataset` deduplicates AOI-scan work and writes the
-five-raster bundles above to a persistent cache under `DATASET_DIR`.
-The cache key identifies the AOI and source granules. Pass `--refresh-cache`
-after changing image-processing code or settings. Scans with the same granule
+five-raster bundles above to the persistent TEMPO cache under `DATASET_DIR`.
+The cache key identifies the AOI and source granules. Pass `--refresh-tempo`
+after changing TEMPO processing. Scans with the same granule
 set run as one batch, which lets a worker open each large NetCDF granule once
-for several AOIs. Each successful model record persists one compressed NPZ
-containing three aligned `float32` arrays:
+for several AOIs. Aligned wind has a separate persistent AOI-hour cache. HRRR
+files are grouped so each full grid is read once for several AOIs. Pass
+`--refresh-wind` after changing wind alignment.
+
+Each successful model record persists one compressed NPZ containing five
+aligned `float32` arrays:
 
 - `current_no2`, current-scan NO2 restricted to paired-valid support;
-- `delta_no2`, current minus previous NO2 on the same support; and
+- `delta_no2`, current minus previous NO2 on the same support;
+- `wind_u_10m_mps`, geographic eastward wind;
+- `wind_v_10m_mps`, geographic northward wind; and
 - `valid_mask`, one on paired-valid support and zero elsewhere.
 
 Every row in the companion split CSV contains its NPZ path in
@@ -65,14 +71,13 @@ Every row in the companion split CSV contains its NPZ path in
 - `mean_weighted_cloud_fraction` and `mean_good_quality_fraction`, each
   averaged over both scans at paired-valid delta cells;
 - `mean_retrieval_uncertainty`, averaged over both scans at paired-valid cells;
-- `temperature_2m_k`, `wind_u_10m_mps`, `wind_v_10m_mps`, and
-  `boundary_layer_height_m` from the native HRRR grid point nearest the AOI
-  centroid.
+- `temperature_2m_k` and `boundary_layer_height_m`, bilinearly interpolated at
+  the AOI centroid.
 
-NOAA describes HRRR as a 3 km model. The downloaded surface files identify a
-1,799 by 1,059 Lambert grid with 3,000 m spacing. Dataset generation verifies
-that spacing from GRIB metadata and computes the nearest grid element once per
-AOI, then reuses its index for every hourly file. See the
+NOAA describes HRRR as a 3 km model. Dataset generation projects the 48 by 48
+TEMPO cell centres onto the native Lambert grid and bilinearly interpolates the
+wind components. HRRR wind is grid-relative, so the aligned values are rotated
+to geographic east and north before caching. See the
 [NOAA Global Systems Laboratory HRRR overview](https://rapidrefresh.noaa.gov/).
 
 The regridder also calculates squared weight, effective sample size, total

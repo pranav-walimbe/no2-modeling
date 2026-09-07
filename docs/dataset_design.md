@@ -79,12 +79,13 @@ The binary target uses raw `delta_nox_mass`:
 Stratification and final generation write JSON summaries with overall and
 per-AOI retention, natural pre-balancing prevalence, and selected class counts.
 
-Each sample stores current regridded NO2, current minus previous NO2, and a
-paired-valid mask on the same fixed grid. Both numeric rasters are finite only
-where both scans have accepted support.
-HRRR temperature, 10 m wind components, and boundary-layer height use the
-native grid point nearest the AOI centre. Prior-quarter heat input and power
-generation avoid contemporaneous operational leakage.
+Each sample stores current regridded NO2, current minus previous NO2, geographic
+eastward and northward wind, and a paired-valid mask on the same fixed grid.
+Both NO2 rasters are finite only where both scans have accepted support. Wind
+is bilinearly aligned from the native HRRR grid and remains populated outside
+the NO2 mask. HRRR temperature and boundary-layer height are interpolated at
+the AOI centre. Prior-quarter heat input and power generation avoid
+contemporaneous operational leakage.
 
 Each AOI-hour also carries total generator nameplate capacity in MW. Collection
 parses each CAMPD generator-capacity pair and deduplicates generators within a
