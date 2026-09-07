@@ -95,6 +95,15 @@ HRRR temperature, 10 m wind components, and boundary-layer height use the
 native grid point nearest the AOI centre. Prior-quarter heat input and power
 generation avoid contemporaneous operational leakage.
 
+Each AOI-hour also carries total generator nameplate capacity in MW. Collection
+parses each CAMPD generator-capacity pair and deduplicates generators within a
+facility and attribute year. AOI aggregation then sums each member facility
+once. Conflicting values for one facility-generator pair do not contribute to
+the sum. The dataset retains capacity coverage, missing-unit, malformed-unit,
+and conflict counts. Both total capacity and coverage enter the model so a
+partial capacity sum is distinguishable from complete coverage. Each prediction
+uses the latest attribute year that does not exceed its year.
+
 `TARGET_LABEL_MODE` selects the target construction. `hard_hour` retains the
 change for the clock hour with the best scan overlap. `overlap_weighted`
 averages every hourly change touched by the scan interval using overlap seconds

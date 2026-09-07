@@ -7,7 +7,17 @@ import shapely
 from pycanopy import SpatialFrame, distance_to_point
 from pyproj import Transformer
 
-from collection.emissions_schema import EMISSIONS_HOUR_UTC_COL
+from collection.emissions_schema import (
+    EMISSIONS_HOUR_UTC_COL,
+    FACILITY_NAMEPLATE_CAPACITY_MW_COL,
+    GENERATOR_CAPACITY_CONFLICT_COUNT_COL,
+    GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL,
+    GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL,
+    GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL,
+    GENERATOR_CAPACITY_UNIT_COUNT_COL,
+    NAMEPLATE_CAPACITY_COVERAGE_RATE_COL,
+    TOTAL_NAMEPLATE_CAPACITY_MW_COL,
+)
 from config import (
     CITIES_URL,
     DELTA_NOX_MASS_COL,
@@ -421,7 +431,7 @@ def aggregate_aoi_hours(
     aois: pl.DataFrame,
     membership: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Aggregate unit observations and static unit counts to AOI-hour rows."""
+    """Aggregate unit observations and prediction-date attributes to AOI hours."""
     records_lazy = records.lazy() if isinstance(records, pl.DataFrame) else records
     coal, natural_gas = _fuel_flags()
     unit_counts = (
@@ -433,6 +443,35 @@ def aggregate_aoi_hours(
         .agg(
             pl.col("is_coal").sum().cast(pl.UInt32).alias("num_coal_units"),
             pl.col("is_ng").sum().cast(pl.UInt32).alias("num_ng_units"),
+        )
+    )
+    facility_capacity = (
+        records_lazy.select(
+            "facilityId",
+            EMISSIONS_HOUR_UTC_COL,
+            FACILITY_NAMEPLATE_CAPACITY_MW_COL,
+            GENERATOR_CAPACITY_UNIT_COUNT_COL,
+            GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL,
+            GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL,
+            GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL,
+            GENERATOR_CAPACITY_CONFLICT_COUNT_COL,
+        )
+        .unique(subset=["facilityId", EMISSIONS_HOUR_UTC_COL])
+        .join(membership.lazy(), on="facilityId", how="inner")
+        .group_by(AOI_ID_COL, EMISSIONS_HOUR_UTC_COL)
+        .agg(
+            pl.col(FACILITY_NAMEPLATE_CAPACITY_MW_COL).sum().alias(TOTAL_NAMEPLATE_CAPACITY_MW_COL),
+            pl.col(GENERATOR_CAPACITY_UNIT_COUNT_COL).sum(),
+            pl.col(GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL).sum(),
+            pl.col(GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL).sum(),
+            pl.col(GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL).sum(),
+            pl.col(GENERATOR_CAPACITY_CONFLICT_COUNT_COL).sum(),
+        )
+        .with_columns(
+            (
+                pl.col(GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL)
+                / pl.col(GENERATOR_CAPACITY_UNIT_COUNT_COL)
+            ).alias(NAMEPLATE_CAPACITY_COVERAGE_RATE_COL)
         )
     )
     hourly = (
@@ -450,6 +489,7 @@ def aggregate_aoi_hours(
     )
     return (
         add_delta_nox_targets(add_previous_quarter_same_hour_averages(hourly))
+        .join(facility_capacity, on=[AOI_ID_COL, EMISSIONS_HOUR_UTC_COL], how="left")
         .join(unit_counts, on=AOI_ID_COL, how="left")
         .join(aois.select(AOI_ID_COL, "lat", "lon", "x_m", "y_m").lazy(), on=AOI_ID_COL, how="left")
         .sort(AOI_ID_COL, "date", "hour")

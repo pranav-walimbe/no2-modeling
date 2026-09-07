@@ -132,16 +132,20 @@ source .venv/bin/activate
    python -u -m collection.scrape_locations
    ```
 
-   Facility attributes are fetched in nationwide pages for each year rather
-   than with one request per facility. The location stage stops without
-   replacing its existing output if CAMPD requests fail or if enrichment would
-   drop any hourly emissions rows. CAMPD source `date` and `hour` fields use
-   local standard time. Location enrichment resolves each facility's IANA
-   timezone from its coordinates, preserves the source fields as
-   `local_standard_date` and `local_standard_hour`, and writes an explicit
-   `emissions_hour_utc`. Its downstream `date` and `hour` columns are derived
-   from that UTC timestamp. Standard offsets are used year-round because the
-   EPA reporting clock does not observe daylight-saving time.
+   Facility attributes are fetched in nationwide pages for every prediction
+   year rather than with one request per facility. Each hourly record receives
+   the latest facility and unit record whose attribute year does not exceed the
+   prediction year. The location stage stops without replacing its existing
+   output if CAMPD requests fail or if enrichment would drop any hourly rows.
+   It also parses generator nameplate capacities, excludes conflicting
+   facility-generator values from the sum, and retains unit coverage and issue
+   counts. CAMPD source `date` and `hour` fields use local standard time.
+   Location enrichment resolves each facility's IANA timezone from its
+   coordinates, preserves the source fields as `local_standard_date` and
+   `local_standard_hour`, and writes an explicit `emissions_hour_utc`. Its
+   downstream `date` and `hour` columns come from that UTC timestamp. Standard
+   offsets are used year-round because the EPA reporting clock does not observe
+   daylight-saving time.
 
 4. Build the TEMPO mappings, partition plants, and generate model-ready datasets:
 
