@@ -5,9 +5,8 @@ NOx changes from paired TEMPO observations.
 
 ## Prediction target
 
-- Fit a symmetric cutoff at the training 20th percentile of
-  `abs(delta_nox_mass)`.
-- Freeze the cutoff for validation, test, and inference.
+- Apply the fixed symmetric `DELTA_THRESHOLD` cutoff on `abs(delta_nox_mass)`.
+- Use the same cutoff for train, validation, test, and inference.
 - Remove records inside the closed deadband.
 - Label negative changes as 0 and positive changes as 1.
 - Balance each split to equal label counts after raster QC.
@@ -174,7 +173,7 @@ The same trainer exposes these controlled ablations through `--inputs tabular`,
 
 Each UTC-stamped directory under `RUNS_DIR` contains:
 
-- `normalization_stats.json` with train-only preprocessing and the deadband;
+- `normalization_stats.json` with train-only preprocessing and the deadband cutoff;
 - `run_config.json` with features, settings, clipped-pixel fractions, and
   parameter count;
 - `checkpoints/best_model.pt` selected by validation loss;

@@ -207,7 +207,7 @@ source .venv/bin/activate
    mask from each selected NPZ and computes memory-bounded robust NO2
    normalization statistics from the training split only. It records clipped
    valid-pixel fractions by channel and split, then predicts whether
-   raw delta-NOx is negative or positive outside the frozen deadband and reports
+   raw delta-NOx is negative or positive outside the fixed deadband and reports
    classification metrics. See `docs/modeling.md` for the full contract.
 
 Each stage depends on the outputs of the preceding stage. Dataset generation

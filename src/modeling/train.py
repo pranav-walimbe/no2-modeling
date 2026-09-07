@@ -312,7 +312,7 @@ def main() -> None:
         "image_scale": list(stats.image_scale),
         "image_clip_range": [-MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS],
         "clipped_valid_pixel_fraction": clipped_fractions,
-        "raw_delta_nox_deadband_threshold": stats.deadband_threshold,
+        "raw_delta_nox_threshold": stats.delta_threshold,
         "target_label_mode": target_label_mode,
         "tabular_features": list(MODEL_FEATURE_NAMES),
         "model_parameters": model.num_params(),

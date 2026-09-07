@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 from config import (
     DATASET_DF,
     DATASET_DIR,
-    DEADBAND_THRESHOLD_COL,
+    DELTA_THRESHOLD,
     LABEL_COL,
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_ABS,
@@ -59,7 +59,7 @@ class NormalizationStats:
     feature_names: tuple[str, ...]
     feature_mean: tuple[float, ...]
     feature_std: tuple[float, ...]
-    deadband_threshold: float
+    delta_threshold: float
     training_records: int
 
     def to_dict(self) -> dict[str, object]:
@@ -88,7 +88,7 @@ class NormalizationStats:
             feature_names=tuple(str(name) for name in values["feature_names"]),
             feature_mean=tuple(float(value) for value in values["feature_mean"]),
             feature_std=tuple(float(value) for value in values["feature_std"]),
-            deadband_threshold=float(values["deadband_threshold"]),
+            delta_threshold=float(values["delta_threshold"]),
             training_records=int(values["training_records"]),
         )
 
@@ -265,8 +265,6 @@ def compute_stats(
     root = Path(dataset_dir)
     frame = _read_split_frame(split, Path(dataframe_dir))
     features = _feature_matrix(frame)
-    thresholds = pd.to_numeric(frame[DEADBAND_THRESHOLD_COL], errors="coerce").unique()
-
     raster_paths = frame[RASTER_PATH_COL].to_numpy(dtype=str)
     image_center, image_scale, image_valid_pixels = _fit_image_stats(raster_paths, root, progress_interval)
     feature_std = _safe_scale(features.std(axis=0))
@@ -278,7 +276,7 @@ def compute_stats(
         feature_names=MODEL_FEATURE_NAMES,
         feature_mean=tuple(float(value) for value in features.mean(axis=0)),
         feature_std=tuple(float(value) for value in feature_std),
-        deadband_threshold=float(thresholds[0]),
+        delta_threshold=DELTA_THRESHOLD,
         training_records=len(frame),
     )
 

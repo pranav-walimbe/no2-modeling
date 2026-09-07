@@ -70,11 +70,11 @@ facility's resolved timezone and standard offset for auditability.
 
 The binary target uses raw `delta_nox_mass`:
 
-- Fit one cutoff to the training split's 20th percentile of absolute change.
+- Read one fixed cutoff from the `DELTA_THRESHOLD` configuration constant.
 - Remove records with absolute change at or below that cutoff in every split.
 - Assign class 0 to negative changes and class 1 to positive changes.
 - Select equal class counts in every candidate and final split.
-- Store the cutoff with each record.
+- Record the cutoff in each stratification and generation summary.
 
 Stratification and final generation write JSON summaries with overall and
 per-AOI retention, natural pre-balancing prevalence, and selected class counts.
