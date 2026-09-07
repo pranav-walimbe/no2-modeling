@@ -14,12 +14,8 @@ from timezonefinder import TimezoneFinder
 
 from collection.emissions_schema import (
     EMISSIONS_HOUR_UTC_COL,
+    FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL,
     FACILITY_NAMEPLATE_CAPACITY_MW_COL,
-    GENERATOR_CAPACITY_CONFLICT_COUNT_COL,
-    GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL,
-    GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL,
-    GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL,
-    GENERATOR_CAPACITY_UNIT_COUNT_COL,
     LOCAL_STANDARD_DATE_COL,
     LOCAL_STANDARD_HOUR_COL,
     TIME_ZONE_COL,
@@ -47,11 +43,7 @@ CAPACITY_ATTRIBUTE_SCHEMA = {
     "facilityId": pl.Int64,
     FACILITY_ATTRIBUTE_YEAR_COL: pl.Int64,
     FACILITY_NAMEPLATE_CAPACITY_MW_COL: pl.Float64,
-    GENERATOR_CAPACITY_UNIT_COUNT_COL: pl.UInt32,
-    GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL: pl.UInt32,
-    GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL: pl.UInt32,
-    GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL: pl.UInt32,
-    GENERATOR_CAPACITY_CONFLICT_COUNT_COL: pl.UInt32,
+    FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL: pl.Float64,
 }
 
 FacilityYear = tuple[int, int]
@@ -289,13 +281,7 @@ def _summarize_capacity(
         "facilityId": facility_key[0],
         FACILITY_ATTRIBUTE_YEAR_COL: facility_key[1],
         FACILITY_NAMEPLATE_CAPACITY_MW_COL: float(resolved_capacity_mw),
-        GENERATOR_CAPACITY_UNIT_COUNT_COL: len(units),
-        GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL: covered_units,
-        GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL: sum(
-            not generators and unit_id not in invalid_units for unit_id, generators in units.items()
-        ),
-        GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL: len(invalid_units),
-        GENERATOR_CAPACITY_CONFLICT_COUNT_COL: len(conflict_generators),
+        FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL: covered_units / len(units),
     }
 
 
@@ -496,22 +482,8 @@ def main() -> None:
     )
 
     facility_attributes, unit_attributes = _build_attribute_frames(attribute_records)
-    capacity_totals = facility_attributes.select(
-        pl.col(GENERATOR_CAPACITY_UNIT_COUNT_COL).sum().alias("units"),
-        pl.col(GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL).sum().alias("covered"),
-        pl.col(GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL).sum().alias("missing"),
-        pl.col(GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL).sum().alias("malformed"),
-        pl.col(GENERATOR_CAPACITY_CONFLICT_COUNT_COL).sum().alias("conflicts"),
-    ).row(0, named=True)
-    unit_count = int(capacity_totals["units"])
-    coverage_rate = float(capacity_totals["covered"]) / unit_count if unit_count else 0.0
-    print(
-        f"Generator capacity coverage: {coverage_rate:.1%} "
-        f"({int(capacity_totals['covered']):,}/{unit_count:,} units); "
-        f"{int(capacity_totals['missing']):,} missing; "
-        f"{int(capacity_totals['malformed']):,} malformed; "
-        f"{int(capacity_totals['conflicts']):,} conflicting generators"
-    )
+    coverage_rate = facility_attributes[FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL].mean()
+    print(f"Mean facility generator-capacity coverage: {coverage_rate:.1%}")
     row_count = write_augmented_parquet(
         input_path=input_path,
         output_path=Path(FULL_DATA_PARQUET),

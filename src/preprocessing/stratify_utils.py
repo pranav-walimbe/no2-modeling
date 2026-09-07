@@ -9,12 +9,8 @@ from pyproj import Transformer
 
 from collection.emissions_schema import (
     EMISSIONS_HOUR_UTC_COL,
+    FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL,
     FACILITY_NAMEPLATE_CAPACITY_MW_COL,
-    GENERATOR_CAPACITY_CONFLICT_COUNT_COL,
-    GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL,
-    GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL,
-    GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL,
-    GENERATOR_CAPACITY_UNIT_COUNT_COL,
     NAMEPLATE_CAPACITY_COVERAGE_RATE_COL,
     TOTAL_NAMEPLATE_CAPACITY_MW_COL,
 )
@@ -450,28 +446,16 @@ def aggregate_aoi_hours(
             "facilityId",
             EMISSIONS_HOUR_UTC_COL,
             FACILITY_NAMEPLATE_CAPACITY_MW_COL,
-            GENERATOR_CAPACITY_UNIT_COUNT_COL,
-            GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL,
-            GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL,
-            GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL,
-            GENERATOR_CAPACITY_CONFLICT_COUNT_COL,
+            FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL,
         )
         .unique(subset=["facilityId", EMISSIONS_HOUR_UTC_COL])
         .join(membership.lazy(), on="facilityId", how="inner")
         .group_by(AOI_ID_COL, EMISSIONS_HOUR_UTC_COL)
         .agg(
             pl.col(FACILITY_NAMEPLATE_CAPACITY_MW_COL).sum().alias(TOTAL_NAMEPLATE_CAPACITY_MW_COL),
-            pl.col(GENERATOR_CAPACITY_UNIT_COUNT_COL).sum(),
-            pl.col(GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL).sum(),
-            pl.col(GENERATOR_CAPACITY_MISSING_UNIT_COUNT_COL).sum(),
-            pl.col(GENERATOR_CAPACITY_MALFORMED_UNIT_COUNT_COL).sum(),
-            pl.col(GENERATOR_CAPACITY_CONFLICT_COUNT_COL).sum(),
-        )
-        .with_columns(
-            (
-                pl.col(GENERATOR_CAPACITY_COVERED_UNIT_COUNT_COL)
-                / pl.col(GENERATOR_CAPACITY_UNIT_COUNT_COL)
-            ).alias(NAMEPLATE_CAPACITY_COVERAGE_RATE_COL)
+            pl.col(FACILITY_NAMEPLATE_CAPACITY_COVERAGE_RATE_COL)
+            .mean()
+            .alias(NAMEPLATE_CAPACITY_COVERAGE_RATE_COL),
         )
     )
     hourly = (

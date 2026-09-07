@@ -138,8 +138,8 @@ source .venv/bin/activate
    prediction year. The location stage stops without replacing its existing
    output if CAMPD requests fail or if enrichment would drop any hourly rows.
    It also parses generator nameplate capacities, excludes conflicting
-   facility-generator values from the sum, and retains unit coverage and issue
-   counts. CAMPD source `date` and `hour` fields use local standard time.
+   facility-generator values from the sum, and retains one capacity-coverage
+   rate. CAMPD source `date` and `hour` fields use local standard time.
    Location enrichment resolves each facility's IANA timezone from its
    coordinates, preserves the source fields as `local_standard_date` and
    `local_standard_hour`, and writes an explicit `emissions_hour_utc`. Its
