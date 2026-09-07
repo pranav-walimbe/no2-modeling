@@ -28,13 +28,6 @@ def classification_metrics(
     """
     truth = np.asarray(y_true)
     probability = np.asarray(positive_probability, dtype=np.float64)
-    if truth.shape != probability.shape or truth.ndim != 1 or not truth.size:
-        raise ValueError("Classification inputs must be non-empty one-dimensional arrays with equal shape")
-    if not np.isin(truth, (0, 1)).all():
-        raise ValueError("Classification labels must contain only zero and one")
-    if not np.isfinite(probability).all() or np.any((probability < 0) | (probability > 1)):
-        raise ValueError("Positive-class probabilities must be finite and lie in [0, 1]")
-
     prediction = (probability >= 0.5).astype(np.uint8)
     true_negative = int(np.sum((truth == 0) & (prediction == 0)))
     false_positive = int(np.sum((truth == 0) & (prediction == 1)))
@@ -75,11 +68,6 @@ def plant_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     Returns:
         One classification summary row per AOI.
     """
-    required = {"aoi_id", "lon", "lat", TRUE_CLASS_COL, POSITIVE_PROBABILITY_COL}
-    missing = required.difference(frame.columns)
-    if missing:
-        raise ValueError(f"Prediction frame is missing plant-metric columns: {', '.join(sorted(missing))}")
-
     rows = []
     for (aoi_id, lon, lat), group in frame.groupby(["aoi_id", "lon", "lat"], sort=True):
         metrics = classification_metrics(
@@ -113,8 +101,6 @@ def save_results(
     }
     results["dataset_classification_summaries"] = classification_summaries
     test = split_frames["test"]
-    if len(test) < 3:
-        raise ValueError("At least three test records are required for magnitude-sliced evaluation")
     magnitude = np.abs(test["delta_nox_mass"].to_numpy(dtype=np.float64))
     ordered_indices = np.argsort(magnitude, kind="stable")
     slices = {

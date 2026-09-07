@@ -50,9 +50,6 @@ def hourly_times(start: date, end: date) -> Iterator[datetime]:
     Yields:
         Consecutive timezone-aware UTC hours.
     """
-    if end < start:
-        raise ValueError(f"HRRR end date {end} precedes start date {start}")
-
     current = datetime.combine(start, datetime_time.min, tzinfo=timezone.utc)
     final = datetime.combine(end, datetime_time(hour=23), tzinfo=timezone.utc)
     while current <= final:
@@ -252,18 +249,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Download configured hourly HRRR analysis fields by UTC date."""
     args = parse_args()
-    if args.workers < 1:
-        raise ValueError("HRRR workers must be at least one")
-    if args.end_date < args.start_date:
-        raise ValueError(f"HRRR end date {args.end_date} precedes start date {args.start_date}")
 
     latest_complete_date = datetime.now(timezone.utc).date() - timedelta(days=1)
     effective_end_date = min(args.end_date, latest_complete_date)
     if effective_end_date < args.end_date:
         print(f"Capping HRRR end date at latest complete UTC date: {effective_end_date}")
-    if args.start_date > effective_end_date:
-        raise ValueError(f"No complete HRRR dates are available from {args.start_date} through {args.end_date}")
-
     downloaded = 0
     skipped = 0
     current_day = args.start_date

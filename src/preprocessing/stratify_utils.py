@@ -35,7 +35,6 @@ MAJOR_CITY_DIST_COL = "major_city_dist"
 LABEL_MODE_COL = "label_mode"
 PREVIOUS_QUARTER_COAL_POWER_COL = "_previous_quarter_coal_power"
 PREVIOUS_QUARTER_POWER_COL = "_previous_quarter_power"
-SUPPORTED_LABEL_MODES = frozenset({"hard_hour", "overlap_weighted"})
 METERS_PER_KM = 1000.0
 MAD_NORMAL_SCALE = 1.4826  # puts MAD on a standard-deviation scale under normality
 HRRR_PRODUCT = "wrfsfcf00"  # hourly surface analysis product named in every HRRR filename
@@ -55,10 +54,6 @@ def filter_quantitative_outliers(
     than obvious continuous-variable anomalies.
     """
     train = splits["train"]
-    missing = set(columns).difference(train.columns)
-    if missing:
-        raise ValueError(f"Cannot filter missing quantitative columns: {', '.join(sorted(missing))}")
-
     statistics = train.select(
         *(
             expression
@@ -79,9 +74,6 @@ def filter_quantitative_outliers(
         column: (statistics[f"{column}_lower"], statistics[f"{column}_upper"])
         for column in columns
     }
-    empty = [column for column, (lower, upper) in bounds.items() if lower is None or upper is None]
-    if empty:
-        raise ValueError(f"Cannot calculate outlier bounds without finite values for: {', '.join(empty)}")
     print("Training-derived quantitative outlier bounds:")
     for column, (lower, upper) in bounds.items():
         print(f"  {column}: [{lower:.6g}, {upper:.6g}]")
@@ -109,22 +101,12 @@ def apply_binary_target(
     Returns:
         Filtered labeled splits and the frozen raw-magnitude cutoff.
     """
-    if not 0 < deadband_fraction < 1:
-        raise ValueError("Deadband fraction must be between zero and one")
-    if "train" not in splits:
-        raise ValueError("Binary target construction requires a training split")
-
     training_values = splits["train"].filter(pl.col(DELTA_NOX_MASS_COL).is_finite())
-    if training_values.is_empty():
-        raise ValueError("Training split has no finite raw delta-NOx values")
     threshold = training_values.select(
         pl.col(DELTA_NOX_MASS_COL)
         .abs()
         .quantile(deadband_fraction, interpolation="linear")
     ).item()
-    if threshold is None or not np.isfinite(threshold) or threshold < 0:
-        raise ValueError("Training deadband threshold must be finite and nonnegative")
-
     labeled: dict[str, pl.DataFrame] = {}
     for name, split in splits.items():
         finite = split.filter(pl.col(DELTA_NOX_MASS_COL).is_finite())
@@ -484,22 +466,8 @@ def apply_target_label_mode(
     Returns:
         Rows with the selected raw target and its mode.
     """
-    if mode not in SUPPORTED_LABEL_MODES:
-        raise ValueError(f"Unsupported target label mode: {mode}")
     if mode == "hard_hour":
         return frame.with_columns(pl.lit(mode).alias(LABEL_MODE_COL))
-
-    required = {
-        AOI_ID_COL,
-        EMISSIONS_HOUR_UTC_COL,
-        "tempo_time",
-        "prev_tempo_time",
-        DELTA_NOX_MASS_COL,
-        DELTA_NOX_SCALE_COL,
-    }
-    missing = required.difference(frame.columns)
-    if missing:
-        raise ValueError(f"Cannot construct overlap-weighted labels without: {', '.join(sorted(missing))}")
 
     indexed = frame.with_row_index("_label_row")
     label_lookup = indexed.select(

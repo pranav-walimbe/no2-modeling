@@ -116,13 +116,7 @@ REQUIRED_COLUMNS = [
 
 def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
     # Assign each geographic cluster to exactly one split
-    if frame["cluster"].null_count() > 0:
-        raise ValueError("Cannot split records with missing cluster assignments")
-
     clusters = frame.select("cluster").unique().sort("cluster").sample(fraction=1.0, shuffle=True, seed=SPLIT_SEED)
-    if clusters.height < 3:
-        raise ValueError("At least three geographic clusters are required to create train, validation, and test splits")
-
     train_count = min(clusters.height - 2, max(1, int(clusters.height * TRAIN_FRACTION)))
     val_count = min(clusters.height - train_count - 1, max(1, int(clusters.height * VAL_FRACTION)))
     cluster_splits = {
@@ -141,21 +135,8 @@ def _limit_splits(
 ) -> dict[str, pl.DataFrame]:
     # Balance labels while retaining lagged power priority within each class
     limited: dict[str, pl.DataFrame] = {}
-    required = {
-        AOI_ID_COL,
-        "date",
-        "hour",
-        LABEL_COL,
-        PREVIOUS_QUARTER_COAL_POWER_COL,
-        PREVIOUS_QUARTER_POWER_COL,
-    }
     for name, split in splits.items():
         limit = limits[name]
-        if limit < 2 or limit % 2:
-            raise ValueError(f"{name} split limit must be a positive even integer")
-        missing = required.difference(split.columns)
-        if missing:
-            raise ValueError(f"Cannot prioritize {name} split without columns: {', '.join(sorted(missing))}")
         indexed = split.with_row_index("_priority_row").with_columns(
             split.select(AOI_ID_COL, "date", "hour").hash_rows(seed=SPLIT_SEED).alias("_priority_hash")
         )
@@ -210,13 +191,6 @@ def _rank_priority_pool(frame: pl.DataFrame, priority_column: str) -> pl.DataFra
 def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
     source = pl.scan_parquet(FULL_DATA_PARQUET)
-    missing_columns = set(REQUIRED_COLUMNS).difference(source.collect_schema().names())
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
-        raise ValueError(
-            f"Full emissions data is missing required AOI columns: {missing}. "
-            "Rerun collection.scrape_emissions and collection.scrape_locations."
-        )
     records = (
         source.select(REQUIRED_COLUMNS)
         .with_columns(pl.col("date").cast(pl.Date, strict=False))
@@ -256,7 +230,6 @@ def main() -> None:
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     summary = {
-        "version": 1,
         "deadband": {
             "training_fraction": DEADBAND_TRAIN_FRACTION,
             "raw_delta_nox_threshold": threshold,

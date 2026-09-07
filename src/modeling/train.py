@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import math
 import random
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,28 +78,6 @@ def _device(requested: str) -> torch.device:
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     return torch.device(requested)
-
-
-def _validate_args(args: argparse.Namespace) -> None:
-    positive_integer_names = ("batch_size", "epochs", "prefetch_factor", "head_dim")
-    if any(getattr(args, name) < 1 for name in positive_integer_names):
-        raise ValueError(f"These arguments must be positive: {', '.join(positive_integer_names)}")
-    if args.seed < 0 or args.scheduler_patience < 0:
-        raise ValueError("seed and scheduler patience cannot be negative")
-    if args.workers < 0:
-        raise ValueError("workers cannot be negative")
-    if args.workers > NUM_CORES:
-        raise ValueError(f"workers cannot exceed the allocated CPU count ({NUM_CORES})")
-    if args.learning_rate <= 0 or args.gradient_clip_norm <= 0:
-        raise ValueError("learning rate and gradient clip norm must be positive")
-    if args.weight_decay < 0:
-        raise ValueError("weight decay cannot be negative")
-    if not 0 <= args.dropout < 1:
-        raise ValueError("dropout must be in [0, 1)")
-    if not 0 < args.scheduler_factor < 1:
-        raise ValueError("scheduler factor must be in (0, 1)")
-    if args.early_stop_patience <= args.scheduler_patience:
-        raise ValueError("early-stop patience must exceed scheduler patience")
 
 
 def _seed_everything(seed: int) -> None:
@@ -207,47 +184,29 @@ def _prediction_frame(
 
 
 def _load_classification_summaries(
-    deadband_threshold: float,
     dataframe_dir: str | Path = DATASET_DF,
 ) -> dict[str, object]:
     # Preserve natural prevalence beside metrics from balanced splits
     stratification_path = Path(STRAT_BASE_DIR) / "classification_summary.json"
     with stratification_path.open() as source:
         stratification = json.load(source)
-    stratification_threshold = float(stratification["deadband"]["raw_delta_nox_threshold"])
-    if not math.isclose(
-        stratification_threshold,
-        deadband_threshold,
-        rel_tol=1e-12,
-        abs_tol=0.0,
-    ):
-        raise ValueError("Stratification summary does not match the training deadband threshold")
 
     generated = {}
     for split in ("train", "val", "test"):
         path = Path(dataframe_dir) / f"{split}_classification_summary.json"
         with path.open() as source:
             summary = json.load(source)
-        summary_threshold = float(summary["raw_delta_nox_threshold"])
-        if not math.isclose(
-            summary_threshold,
-            deadband_threshold,
-            rel_tol=1e-12,
-            abs_tol=0.0,
-        ):
-            raise ValueError(f"{split} classification summary does not match the training deadband threshold")
         generated[split] = summary
     return {"stratification": stratification, "generated_splits": generated}
 
 
 def main() -> None:
     args = parse_args()
-    _validate_args(args)
     _seed_everything(args.seed)
     device = _device(args.device)
 
     stats = load_stats(args.stats) if args.stats else compute_stats("train")
-    classification_summaries = _load_classification_summaries(stats.deadband_threshold)
+    classification_summaries = _load_classification_summaries()
     run_name = datetime.now(timezone.utc).strftime("delta_nox_classification_%Y%m%d_%H%M%S")
     run_dir = Path(RUNS_DIR) / run_name
     checkpoint_dir = run_dir / "checkpoints"
@@ -257,10 +216,7 @@ def main() -> None:
     datasets = {
         split: NOxDataset(split, stats, load_images=args.inputs != "tabular") for split in ("train", "val", "test")
     }
-    label_modes = {str(dataset.frame[LABEL_MODE_COL].iloc[0]) for dataset in datasets.values()}
-    if len(label_modes) != 1:
-        raise ValueError("Train, validation, and test must use the same target label mode")
-    target_label_mode = label_modes.pop()
+    target_label_mode = str(datasets["train"].frame[LABEL_MODE_COL].iloc[0])
     train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
     eval_loaders = {
         split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in datasets.items()

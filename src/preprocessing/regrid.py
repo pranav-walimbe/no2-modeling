@@ -329,8 +329,6 @@ def tessellate(
     Returns:
         Area-weighted NO2 and independent cell diagnostic rasters.
     """
-    if not 0 <= max_cloud_fraction <= 1:
-        raise ValueError("max_cloud_fraction must be in [0, 1]")
     if len(pixels) == 0:
         return _unobserved_raster(grid)
 
@@ -466,14 +464,7 @@ def write_raster_npz(raster: RegriddedRaster, destination: str | Path) -> None:
         destination: Output `.npz` path.
     """
     output_path = Path(destination)
-    if output_path.suffix != ".npz":
-        raise ValueError("destination must end in .npz")
     arrays = {name: np.asarray(getattr(raster, name), dtype=np.float32) for name in SAVED_RASTER_NAMES}
-    expected_shape = raster.no2.shape
-    if expected_shape != (IMG_SIZE, IMG_SIZE):
-        raise ValueError(f"raster shape must be {(IMG_SIZE, IMG_SIZE)}, found {expected_shape}")
-    if any(array.shape != expected_shape for array in arrays.values()):
-        raise ValueError("all saved rasters must share the NO2 shape")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import tempfile
 from dataclasses import asdict, dataclass
@@ -18,8 +17,6 @@ from config import (
     DATASET_DF,
     DATASET_DIR,
     DEADBAND_THRESHOLD_COL,
-    DELTA_NOX_MASS_COL,
-    IMG_SIZE,
     LABEL_COL,
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_Z,
@@ -32,7 +29,6 @@ from config import (
 RASTER_PATH_COL = "delta_no2_path"
 LABEL_MODE_COL = "label_mode"
 IMAGE_TRANSFORM = "asinh"
-STATS_VERSION = 4
 MIN_SCALE = 1e-12
 
 
@@ -50,7 +46,6 @@ MODEL_FEATURE_NAMES = _model_feature_names()
 class NormalizationStats:
     """JSON-safe train-split preprocessing state used by every data split."""
 
-    version: int
     image_transform: str
     image_keys: tuple[str, ...]
     image_scale: tuple[float, ...]
@@ -68,10 +63,7 @@ class NormalizationStats:
 
     @classmethod
     def from_dict(cls, values: dict[str, object]) -> "NormalizationStats":
-        if int(values.get("version", -1)) != STATS_VERSION:
-            raise ValueError(f"Unsupported normalization-statistics version: {values.get('version')}")
-        stats = cls(
-            version=int(values["version"]),
+        return cls(
             image_transform=str(values["image_transform"]),
             image_keys=tuple(str(name) for name in values["image_keys"]),
             image_scale=tuple(float(value) for value in values["image_scale"]),
@@ -84,62 +76,12 @@ class NormalizationStats:
             deadband_threshold=float(values["deadband_threshold"]),
             training_records=int(values["training_records"]),
         )
-        if stats.image_transform != IMAGE_TRANSFORM:
-            raise ValueError(f"Unsupported image transform: {stats.image_transform}")
-        if stats.image_keys != MODEL_IMAGE_KEYS:
-            raise ValueError("Normalization image order does not match the configured raster channels")
-        channel_count = len(MODEL_IMAGE_KEYS)
-        if not all(
-            len(values) == channel_count
-            for values in (stats.image_scale, stats.image_mean, stats.image_std, stats.image_finite_pixels)
-        ):
-            raise ValueError("Normalization image statistics do not match the configured raster channels")
-        if not all(math.isfinite(value) and value > MIN_SCALE for value in stats.image_scale):
-            raise ValueError("Image transform scales must be finite and positive")
-        if not all(math.isfinite(value) and value > MIN_SCALE for value in stats.image_std):
-            raise ValueError("Image standard deviations must be finite and positive")
-        if not math.isfinite(stats.deadband_threshold) or stats.deadband_threshold < 0:
-            raise ValueError("Deadband threshold must be finite and nonnegative")
-        return stats
 
 
 def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
+    # Load the split produced by dataset generation
     path = dataframe_dir / f"{split}_df.csv"
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing {split} dataframe: {path}")
-    frame = pd.read_csv(path)
-    required = {
-        RASTER_PATH_COL,
-        LABEL_COL,
-        LABEL_MODE_COL,
-        DEADBAND_THRESHOLD_COL,
-        DELTA_NOX_MASS_COL,
-        "date",
-        "hour",
-        *MODEL_RAW_FEATURES,
-    }
-    missing = required.difference(frame.columns)
-    if missing:
-        raise ValueError(f"{split} dataframe is missing model columns: {', '.join(sorted(missing))}")
-    if frame.empty:
-        raise ValueError(f"{split} dataframe is empty")
-    if frame[LABEL_MODE_COL].nunique() != 1:
-        raise ValueError(f"{split} dataframe must contain exactly one target label mode")
-    labels = pd.to_numeric(frame[LABEL_COL], errors="coerce").to_numpy(dtype=np.float64)
-    if not np.isin(labels, (0, 1)).all():
-        raise ValueError(f"{LABEL_COL} must contain only zero and one in {split}")
-    label_counts = np.bincount(labels.astype(np.uint8), minlength=2)
-    if label_counts[0] != label_counts[1]:
-        raise ValueError(f"{split} dataframe must contain equal binary-label counts")
-    thresholds = pd.to_numeric(frame[DEADBAND_THRESHOLD_COL], errors="coerce").to_numpy(dtype=np.float64)
-    if not np.isfinite(thresholds).all() or np.any(thresholds < 0) or not np.all(thresholds == thresholds[0]):
-        raise ValueError(f"{split} must contain one finite nonnegative deadband threshold")
-    raw_delta = pd.to_numeric(frame[DELTA_NOX_MASS_COL], errors="coerce").to_numpy(dtype=np.float64)
-    if not np.isfinite(raw_delta).all() or np.any(np.abs(raw_delta) <= thresholds[0]):
-        raise ValueError(f"{split} contains raw delta-NOx values inside the deadband")
-    if not np.array_equal(labels.astype(np.uint8), (raw_delta > 0).astype(np.uint8)):
-        raise ValueError(f"{split} labels do not match raw delta-NOx signs")
-    return frame
+    return pd.read_csv(path)
 
 
 def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
@@ -148,8 +90,6 @@ def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
     for name in MODEL_RAW_FEATURES:
         values = pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=np.float64)
         if name in MODEL_LOG1P_FEATURES:
-            if np.any(values < 0):
-                raise ValueError(f"Model feature {name} must be nonnegative before log1p")
             values = np.log1p(values)
         columns.append(values)
 
@@ -161,48 +101,24 @@ def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
             dates = pd.to_datetime(frame["date"], errors="coerce")
             values = dates.dt.dayofyear.to_numpy(dtype=np.float64)
             angle = 2 * np.pi * (values - 1.0) / 365.25
-        else:
-            raise ValueError(f"Unsupported cyclic model feature: {cyclic_feature}")
         columns.extend((np.sin(angle), np.cos(angle)))
 
-    matrix = np.column_stack(columns)
-    if not np.isfinite(matrix).all():
-        bad_columns = [MODEL_FEATURE_NAMES[index] for index in np.flatnonzero(~np.isfinite(matrix).all(axis=0))]
-        raise ValueError(f"Model features contain non-finite values: {', '.join(bad_columns)}")
-    return matrix
+    return np.column_stack(columns)
 
 
 def _raster_path(serialized_path: object, dataset_dir: Path) -> Path:
-    if not isinstance(serialized_path, str) or not serialized_path:
-        raise ValueError("delta_no2_path must be a non-empty string")
-    path = Path(serialized_path)
+    path = Path(str(serialized_path))
     return path if path.is_absolute() else dataset_dir / path
 
 
 def _load_raster_bundle(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load paired numeric rasters and validate their stored support mask."""
-    try:
-        with np.load(path, allow_pickle=False) as bundle:
-            rasters = np.stack(
-                [np.asarray(bundle[name], dtype=np.float32) for name in MODEL_IMAGE_KEYS],
-                axis=0,
-            )
-            mask = np.asarray(bundle[MODEL_VALID_MASK_KEY], dtype=np.float32)
-    except KeyError as error:
-        raise ValueError(f"Raster bundle is missing a configured model channel: {path}") from error
-    expected_raster_shape = (len(MODEL_IMAGE_KEYS), IMG_SIZE, IMG_SIZE)
-    if rasters.shape != expected_raster_shape or mask.shape != (IMG_SIZE, IMG_SIZE):
-        raise ValueError(
-            f"Expected numeric rasters {expected_raster_shape} and mask {(IMG_SIZE, IMG_SIZE)} "
-            f"at {path}, found {rasters.shape} and {mask.shape}"
+    """Load paired numeric rasters and their stored support mask."""
+    with np.load(path, allow_pickle=False) as bundle:
+        rasters = np.stack(
+            [np.asarray(bundle[name], dtype=np.float32) for name in MODEL_IMAGE_KEYS],
+            axis=0,
         )
-    if not np.isfinite(mask).all() or not np.isin(mask, (0.0, 1.0)).all():
-        raise ValueError(f"Raster valid mask must contain only finite zero and one values: {path}")
-    finite = np.isfinite(rasters).all(axis=0)
-    if not np.array_equal(mask.astype(bool), finite):
-        raise ValueError(f"Raster valid mask does not match paired numeric support: {path}")
-    if not finite.any():
-        raise ValueError(f"Raster bundle has no paired finite NO2 values: {path}")
+        mask = np.asarray(bundle[MODEL_VALID_MASK_KEY], dtype=np.float32)
     return rasters, mask
 
 
@@ -246,10 +162,7 @@ def compute_stats(
             print(f"Robust-scale scan: {index:,}/{len(frame):,} rasters")
 
     image_scale = np.median(median_absolute_values, axis=0)
-    invalid_scale = ~np.isfinite(image_scale) | (image_scale <= MIN_SCALE)
-    if invalid_scale.any():
-        names = [MODEL_IMAGE_KEYS[index] for index in np.flatnonzero(invalid_scale)]
-        raise ValueError(f"Training raster asinh scale is zero or non-finite for: {', '.join(names)}")
+    image_scale = _safe_scale(image_scale)
 
     count = np.zeros(channel_count, dtype=np.int64)
     mean = np.zeros(channel_count, dtype=np.float64)
@@ -275,13 +188,9 @@ def compute_stats(
             print(f"Normalization scan: {index:,}/{len(frame):,} rasters")
 
     image_std = np.sqrt(sum_squared_deviation / count)
-    invalid_std = ~np.isfinite(image_std) | (image_std <= MIN_SCALE)
-    if invalid_std.any():
-        names = [MODEL_IMAGE_KEYS[index] for index in np.flatnonzero(invalid_std)]
-        raise ValueError(f"Training raster standard deviation is zero or non-finite for: {', '.join(names)}")
+    image_std = _safe_scale(image_std)
     feature_std = _safe_scale(features.std(axis=0))
     return NormalizationStats(
-        version=STATS_VERSION,
         image_transform=IMAGE_TRANSFORM,
         image_keys=MODEL_IMAGE_KEYS,
         image_scale=tuple(float(value) for value in image_scale),
@@ -322,8 +231,6 @@ def save_stats(stats: NormalizationStats, path: str | Path) -> None:
 def load_stats(path: str | Path) -> NormalizationStats:
     with Path(path).open() as source:
         values = json.load(source)
-    if not isinstance(values, dict):
-        raise ValueError("Normalization statistics must be a JSON object")
     return NormalizationStats.from_dict(values)
 
 
@@ -343,11 +250,6 @@ class NOxDataset(Dataset):
         self.load_images = load_images
         self.frame = _read_split_frame(split, Path(dataframe_dir))
         self.stats = stats if isinstance(stats, NormalizationStats) else NormalizationStats.from_dict(stats)
-        if self.stats.feature_names != MODEL_FEATURE_NAMES:
-            raise ValueError("Normalization feature order does not match the configured model features")
-        threshold = float(self.frame[DEADBAND_THRESHOLD_COL].iloc[0])
-        if threshold != self.stats.deadband_threshold:
-            raise ValueError("Dataset deadband threshold does not match the training statistics")
 
         raw_features = _feature_matrix(self.frame)
         feature_mean = np.asarray(self.stats.feature_mean, dtype=np.float64)

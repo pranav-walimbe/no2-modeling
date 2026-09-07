@@ -194,8 +194,7 @@ source .venv/bin/activate
    indices 0, 1, and 2 automatically select `train`, `val`, and `test`, so each
    task can invoke `python -u -m preprocessing.generate_dataset`. Outside an
    array, use `--split` for one split or omit it to process all splits. Pass
-   `--regenerate-cache` after a cache-incompatible code or configuration change
-   to rebuild the scan entries required by the selected split.
+   `--refresh-cache` after changing image-processing code or settings.
 
 5. Train and evaluate the model:
 

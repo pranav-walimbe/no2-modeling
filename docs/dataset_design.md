@@ -195,7 +195,7 @@ final size cannot be reached reliably.
 
 ## Evaluation checklist
 
-For every generated version, record:
+For every generated dataset, record:
 
 - candidate, processing-success, coverage-eligible, and final counts;
 - AOIs and geographic clusters per split;

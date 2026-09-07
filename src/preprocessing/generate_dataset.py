@@ -39,9 +39,8 @@ from preprocessing.generate_dataset_utils import (
     make_scan_task,
     process_record,
     process_scan_batch,
-    scan_cache_is_valid,
+    scan_cache_exists,
     select_final_records,
-    validate_coverage_config,
     write_csv_atomic,
     write_json_atomic,
 )
@@ -107,11 +106,9 @@ def _bounded_parallel_map(
 
 
 def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
-    # Validate inputs before starting expensive worker processes
+    # Load inputs before starting expensive worker processes
     splits: dict[str, pl.DataFrame] = {}
     for split, path in split_paths.items():
-        if not Path(path).is_file():
-            raise FileNotFoundError(f"Missing {split} records: {path}")
         splits[split] = (
             pl.scan_csv(path, try_parse_dates=True).with_row_index(SOURCE_RECORD_INDEX_COL).collect(engine="streaming")
         )
@@ -168,13 +165,13 @@ def _scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
 def _run_scan_regridding(
     scans: dict[str, ScanTask],
     workers: int,
-    regenerate_cache: bool,
+    refresh_cache: bool,
 ) -> tuple[dict[str, str], dict[str, str]]:
     # Reuse complete persistent entries and batch only cache misses
     cache_paths = {
         key: task.cache_path
         for key, task in scans.items()
-        if not regenerate_cache and scan_cache_is_valid(task.cache_path)
+        if not refresh_cache and scan_cache_exists(task.cache_path)
     }
     failures: dict[str, str] = {}
     missing = [task for key, task in scans.items() if key not in cache_paths]
@@ -294,10 +291,7 @@ def _write_outputs(
             f"{eligible.height:,} passed raster QC; {output_frame.height:,} selected"
         )
         thresholds = candidates[DEADBAND_THRESHOLD_COL].unique()
-        if len(thresholds) != 1:
-            raise ValueError(f"{split} candidates must contain one frozen deadband threshold")
         classification_report = {
-            "version": 1,
             "split": split,
             "raw_delta_nox_threshold": float(thresholds.item()),
             "raster_qc": classification_summary(candidates, eligible),
@@ -372,9 +366,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=NUM_CORES)
     parser.add_argument("--split", choices=("all", *SPLIT_PATHS), default=_default_split())
     parser.add_argument(
-        "--regenerate-cache",
+        "--refresh-cache",
+        dest="refresh_cache",
         action="store_true",
-        help="rebuild required persistent scan-cache entries even when valid files exist",
+        help="rebuild the selected split's cached image rasters",
     )
     return parser.parse_args()
 
@@ -384,10 +379,7 @@ def _default_split() -> str:
     task_id = os.getenv("SLURM_ARRAY_TASK_ID")
     if task_id is None:
         return "all"
-    try:
-        return ARRAY_SPLITS[int(task_id)]
-    except (IndexError, ValueError) as error:
-        raise ValueError("SLURM_ARRAY_TASK_ID must be 0, 1, or 2 for dataset generation") from error
+    return ARRAY_SPLITS[int(task_id)]
 
 
 def _selected_split_paths(split: str) -> dict[str, str]:
@@ -397,8 +389,6 @@ def _selected_split_paths(split: str) -> dict[str, str]:
 
 def _worker_count(requested_workers: int) -> int:
     # NUM_CORES reflects SLURM_CPUS_PER_TASK inside a Savio allocation
-    if requested_workers < 1:
-        raise ValueError("workers must be at least one")
     workers = min(requested_workers, NUM_CORES)
     if workers < requested_workers:
         print(f"Capping workers at the allocated core count: {workers}")
@@ -409,7 +399,6 @@ def main() -> None:
     """Generate paired raster NPZ files and metadata CSVs for all splits."""
     args = parse_args()
     workers = _worker_count(args.workers)
-    validate_coverage_config()
 
     Path(DATASET_DIR).mkdir(parents=True, exist_ok=True)
     Path(DATASET_DF).mkdir(parents=True, exist_ok=True)
@@ -420,7 +409,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix=".dataset-run-", dir=DATASET_DIR) as temporary_dir:
         records, scans, failures = _prepare_records(splits, scan_cache_dir, Path(temporary_dir))
         print(f"Planned {len(records):,} records using {len(scans):,} unique AOI scans")
-        cache_paths, scan_failures = _run_scan_regridding(scans, workers, args.regenerate_cache)
+        cache_paths, scan_failures = _run_scan_regridding(scans, workers, args.refresh_cache)
         hrrr_indices = _hrrr_grid_indices(records)
         tasks, records_by_id = _record_tasks(records, cache_paths, scan_failures, hrrr_indices, failures)
         output_rows = _run_record_processing(tasks, records_by_id, failures, workers)
