@@ -37,8 +37,8 @@ Validation, test, and inference reuse those statistics.
 | None | coal and gas unit counts, temperature | Counts retain their discrete spacing, and temperature has a moderate range. |
 | Sine and cosine | UTC hour, day of year | Circular encoding keeps adjacent boundary values close, such as hours 23 and 0. |
 
-Both numeric NO2 rasters use `asinh` before standardization. Wind rasters are
-standardized without a nonlinear transform.
+NO2 rasters use robust linear scaling. Wind rasters use ordinary
+standardization. All image statistics come from training pixels only.
 
 Coordinates, AOI IDs, current emissions, plume score, and raster-quality scores
 are excluded. This prevents geographic memorization, direct target leakage,
@@ -50,60 +50,41 @@ already gives the network spatial coverage information.
 
 The model receives five channels:
 
-1. paired-valid current NO2 transformed with a robust signed asinh;
-2. paired-valid delta NO2 transformed with a separate robust signed asinh;
+1. paired-valid current NO2;
+2. paired-valid delta NO2;
 3. geographic eastward wind aligned from the native HRRR grid;
 4. geographic northward wind aligned from the native HRRR grid; and
 5. a binary mask whose value is one where both scans supplied accepted NO2.
 
-Each numeric channel uses its own training-pixel mean and standard deviation.
-The NO2 channels also use separate robust scales. All numeric channels clip to
-plus or minus 8 standard deviations; the mask stays binary and unstandardized.
+For each NO2 channel:
+
+- center at the median of valid training pixels;
+- scale by `IQR / 1.349`; and
+- clip to `[-8, 8]`.
+
+Wind channels use their training-pixel mean and population standard deviation,
+then apply the same clipping range. Validation, test, and inference reuse all
+frozen training statistics. The mask stays binary and unstandardized.
 
 The transform is
 
 ```text
-transformed[channel] = asinh(raster[channel] / image_scale[channel])
 normalized[channel] =
-    (transformed[channel] - train_mean[channel]) / train_std[channel]
+    (raster[channel] - train_center[channel]) / train_scale[channel]
 ```
 
-Each `image_scale` is the median of that channel's per-record median absolute
-finite value. This record-balanced definition prevents high-coverage rasters
-from dominating either scale. Asinh preserves sign, is approximately linear
-for weak values, and becomes logarithmic in both tails.
+Only finite pixels under the stored NO2 validity mask fit NO2 statistics.
+Missing NO2 becomes normalized zero, while the mask distinguishes missing
+support from a measured value at the training median.
 
-After standardization, missing values in the NO2 channels are filled with
-zero. Zero is the transformed training mean, not a claim that physical NO2 was
-zero, and the mask channel makes the distinction explicit. This
-follows the general missing-image principle that the validity mask is
-information rather than an implementation detail; specialized mask-updating
-partial convolutions remain an experiment rather than part of this baseline.
-See the original [partial-convolution paper](https://arxiv.org/abs/1804.07723).
+The implementation uses temporary node-local arrays for exact quartiles rather
+than building an in-memory pixel archive. `normalization_stats.json` stores the
+frozen center, scale, and valid-pixel count for each channel. `run_config.json`
+records the fraction of valid pixels clipped for every channel and split.
 
-Normalization uses two sequential training-bundle passes. The first derives
-both robust scales; the second accumulates transformed finite-pixel means and
-variance with a numerically stable combined-Welford update. Only one compressed
-NPZ is open at a time, and the implementation never concatenates the roughly
-28 million training pixels or builds another dense image archive. The JSON
-statistics file stores each channel's transform, scale, mean, and standard
-deviation and is used unchanged for validation, test, and later inference.
-
-Asinh plus global standardization was selected over these options:
-
-- Per-image normalization was rejected because absolute enhancement magnitude
-  is part of the emissions signal.
-- Treating NaN as an ordinary zero without a mask was rejected because scan
-  coverage would be indistinguishable from measured zero change.
-- Raw z-scoring is cheaper by one scan but lets extreme retrieval differences
-  exert more influence on its mean, variance, and gradients.
-- Signed `log1p` also compresses both tails but has a less direct smooth signed
-  formulation than asinh around zero.
-- Percentile min-max scaling depends strongly on chosen endpoints and can hide
-  distribution shift by saturating all values outside the training range.
-
-The 8-sigma bound is intentionally conservative. Tune it only on training and
-validation data and record the retained-pixel distribution before changing it.
+Robust linear scaling limits outlier influence without compressing the whole
+NO2 distribution. Per-image normalization remains unsuitable because absolute
+enhancement magnitude is part of the emissions signal.
 
 ## Network
 
@@ -194,8 +175,8 @@ The same trainer exposes these controlled ablations through `--inputs tabular`,
 Each UTC-stamped directory under `RUNS_DIR` contains:
 
 - `normalization_stats.json` with train-only preprocessing and the deadband;
-- `run_config.json` with features, seed, optimization settings, and parameter
-  count;
+- `run_config.json` with features, settings, clipped-pixel fractions, and
+  parameter count;
 - `checkpoints/best_model.pt` selected by validation loss;
 - `results.json` with metrics and pre-balancing prevalence;
 - one prediction CSV per split;

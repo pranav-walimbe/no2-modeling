@@ -19,17 +19,22 @@ from config import (
     DEADBAND_THRESHOLD_COL,
     LABEL_COL,
     MODEL_CYCLIC_FEATURES,
-    MODEL_IMAGE_CLIP_Z,
+    MODEL_IMAGE_CLIP_ABS,
     MODEL_IMAGE_KEYS,
-    MODEL_IMAGE_TRANSFORMS,
     MODEL_LOG1P_FEATURES,
     MODEL_RAW_FEATURES,
+    MODEL_ROBUST_IMAGE_KEYS,
     MODEL_VALID_MASK_KEY,
 )
 
 RASTER_PATH_COL = "delta_no2_path"
 LABEL_MODE_COL = "label_mode"
 MIN_SCALE = 1e-12
+ROBUST_STD_NORMALIZER = 1.349
+ROBUST_IMAGE_CHANNELS = tuple(MODEL_IMAGE_KEYS.index(name) for name in MODEL_ROBUST_IMAGE_KEYS)
+STANDARD_IMAGE_CHANNELS = tuple(
+    channel for channel in range(len(MODEL_IMAGE_KEYS)) if channel not in ROBUST_IMAGE_CHANNELS
+)
 
 
 def _model_feature_names() -> tuple[str, ...]:
@@ -47,12 +52,10 @@ MODEL_FEATURE_NAMES = _model_feature_names()
 class NormalizationStats:
     """JSON-safe train-split preprocessing state used by every data split."""
 
-    image_transforms: tuple[str, ...]
     image_keys: tuple[str, ...]
+    image_center: tuple[float, ...]
     image_scale: tuple[float, ...]
-    image_mean: tuple[float, ...]
-    image_std: tuple[float, ...]
-    image_finite_pixels: tuple[int, ...]
+    image_valid_pixels: tuple[int, ...]
     feature_names: tuple[str, ...]
     feature_mean: tuple[float, ...]
     feature_std: tuple[float, ...]
@@ -78,12 +81,10 @@ class NormalizationStats:
             Parsed normalization state.
         """
         return cls(
-            image_transforms=tuple(str(name) for name in values["image_transforms"]),
             image_keys=tuple(str(name) for name in values["image_keys"]),
+            image_center=tuple(float(value) for value in values["image_center"]),
             image_scale=tuple(float(value) for value in values["image_scale"]),
-            image_mean=tuple(float(value) for value in values["image_mean"]),
-            image_std=tuple(float(value) for value in values["image_std"]),
-            image_finite_pixels=tuple(int(value) for value in values["image_finite_pixels"]),
+            image_valid_pixels=tuple(int(value) for value in values["image_valid_pixels"]),
             feature_names=tuple(str(name) for name in values["feature_names"]),
             feature_mean=tuple(float(value) for value in values["feature_mean"]),
             feature_std=tuple(float(value) for value in values["feature_std"]),
@@ -142,9 +143,101 @@ def _safe_scale(values: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(values) & (values > MIN_SCALE), values, 1.0)
 
 
-def _image_transform(values: np.ndarray, transform: str, scale: float) -> np.ndarray:
-    # Apply the configured transform for one image channel
-    return np.arcsinh(values / scale) if transform == "asinh" else values
+def _channel_valid_mask(rasters: np.ndarray, mask: np.ndarray, channel: int) -> np.ndarray:
+    # Identify valid pixels for one numeric image channel
+    finite = np.isfinite(rasters[channel])
+    if channel in ROBUST_IMAGE_CHANNELS:
+        finite &= mask.astype(bool)
+    return finite
+
+
+def _valid_channel_values(rasters: np.ndarray, mask: np.ndarray, channel: int) -> np.ndarray:
+    # Select valid values for one numeric image channel
+    return rasters[channel, _channel_valid_mask(rasters, mask, channel)]
+
+
+def _update_moments(
+    values: np.ndarray,
+    count: int,
+    mean: float,
+    sum_squared_deviation: float,
+) -> tuple[float, float]:
+    # Combine one pixel batch with running population moments accumulated over count pixels
+    batch_count = int(values.size)
+    if batch_count == 0:
+        return mean, sum_squared_deviation
+    batch_mean = float(values.mean())
+    batch_squared_deviation = float(np.square(values - batch_mean).sum())
+    combined_count = count + batch_count
+    delta = batch_mean - mean
+    combined_mean = mean + delta * batch_count / combined_count
+    combined_deviation = (
+        sum_squared_deviation + batch_squared_deviation + delta * delta * count * batch_count / combined_count
+    )
+    return combined_mean, combined_deviation
+
+
+def _fit_image_stats(raster_paths: np.ndarray, root: Path, progress_interval: int) -> tuple[np.ndarray, ...]:
+    # Count valid pixels everywhere and accumulate moments for the standardized channels
+    channel_count = len(MODEL_IMAGE_KEYS)
+    count = np.zeros(channel_count, dtype=np.int64)
+    mean = np.zeros(channel_count, dtype=np.float64)
+    sum_squared_deviation = np.zeros(channel_count, dtype=np.float64)
+    for index, serialized_path in enumerate(raster_paths, start=1):
+        rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
+        for channel in range(channel_count):
+            values = _valid_channel_values(rasters, mask, channel)
+            if channel in STANDARD_IMAGE_CHANNELS:
+                mean[channel], sum_squared_deviation[channel] = _update_moments(
+                    values.astype(np.float64, copy=False),
+                    int(count[channel]),
+                    float(mean[channel]),
+                    float(sum_squared_deviation[channel]),
+                )
+            count[channel] += values.size
+        if progress_interval > 0 and (index % progress_interval == 0 or index == len(raster_paths)):
+            print(f"Image-statistics scan: {index:,}/{len(raster_paths):,} rasters")
+
+    center = mean.copy()
+    scale = np.ones(channel_count, dtype=np.float64)
+    for channel in STANDARD_IMAGE_CHANNELS:
+        if count[channel] > 0:
+            scale[channel] = np.sqrt(sum_squared_deviation[channel] / count[channel])
+    for channel, (channel_center, channel_scale) in _fit_robust_image_stats(raster_paths, root, count).items():
+        center[channel] = channel_center
+        scale[channel] = channel_scale
+    return center, _safe_scale(scale), count
+
+
+def _fit_robust_image_stats(raster_paths: np.ndarray, root: Path, count: np.ndarray) -> dict[int, tuple[float, float]]:
+    # Pool valid NO2 pixels to derive a median and robust standard deviation per channel
+    channels = tuple(channel for channel in ROBUST_IMAGE_CHANNELS if count[channel] > 0)
+    if not channels:
+        return {}
+    with tempfile.TemporaryDirectory(prefix=".no2-quantiles-") as temporary_dir:
+        pooled = {
+            channel: np.memmap(
+                Path(temporary_dir) / f"channel-{channel}.bin",
+                dtype=np.float32,
+                mode="w+",
+                shape=(int(count[channel]),),
+            )
+            for channel in channels
+        }
+        offsets = dict.fromkeys(channels, 0)
+        for serialized_path in raster_paths:
+            rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
+            for channel, destination in pooled.items():
+                values = _valid_channel_values(rasters, mask, channel)
+                stop = offsets[channel] + values.size
+                destination[offsets[channel] : stop] = values
+                offsets[channel] = stop
+        robust = {}
+        for channel, values in pooled.items():
+            lower, median, upper = np.percentile(values, (25, 50, 75), overwrite_input=True)
+            robust[channel] = (float(median), float(upper - lower) / ROBUST_STD_NORMALIZER)
+        del pooled
+    return robust
 
 
 def compute_stats(
@@ -156,8 +249,9 @@ def compute_stats(
 ) -> NormalizationStats:
     """Compute memory-bounded normalization statistics from one split.
 
-    NO2 asinh scales use record-balanced median absolute values. A second
-    streaming pass computes per-channel means and variances.
+    Current-NO2 and delta-NO2 use pooled valid-pixel medians and robust standard
+    deviations. Wind channels use pooled finite-pixel means and standard
+    deviations.
 
     Args:
         split: Dataset split used to estimate statistics.
@@ -174,59 +268,56 @@ def compute_stats(
     thresholds = pd.to_numeric(frame[DEADBAND_THRESHOLD_COL], errors="coerce").unique()
 
     raster_paths = frame[RASTER_PATH_COL].to_numpy(dtype=str)
-    channel_count = len(MODEL_IMAGE_KEYS)
-    median_absolute_values = np.empty((len(raster_paths), channel_count), dtype=np.float64)
-    for index, serialized_path in enumerate(raster_paths, start=1):
-        rasters, _ = _load_raster_bundle(_raster_path(serialized_path, root))
-        for channel in range(channel_count):
-            values = rasters[channel, np.isfinite(rasters[channel])].astype(np.float64, copy=False)
-            median_absolute_values[index - 1, channel] = (
-                np.median(np.abs(values)) if MODEL_IMAGE_TRANSFORMS[channel] == "asinh" else 1.0
-            )
-        if progress_interval > 0 and (index % progress_interval == 0 or index == len(frame)):
-            print(f"Robust-scale scan: {index:,}/{len(frame):,} rasters")
-
-    image_scale = np.median(median_absolute_values, axis=0)
-    image_scale = _safe_scale(image_scale)
-
-    count = np.zeros(channel_count, dtype=np.int64)
-    mean = np.zeros(channel_count, dtype=np.float64)
-    sum_squared_deviation = np.zeros(channel_count, dtype=np.float64)
-    for index, serialized_path in enumerate(raster_paths, start=1):
-        rasters, _ = _load_raster_bundle(_raster_path(serialized_path, root))
-        for channel in range(channel_count):
-            finite = np.isfinite(rasters[channel])
-            values = rasters[channel, finite].astype(np.float64, copy=False)
-            values = _image_transform(values, MODEL_IMAGE_TRANSFORMS[channel], float(image_scale[channel]))
-            batch_count = int(values.size)
-            batch_mean = float(values.mean())
-            batch_squared_deviation = float(np.square(values - batch_mean).sum())
-            combined_count = count[channel] + batch_count
-            delta = batch_mean - mean[channel]
-            mean[channel] += delta * batch_count / combined_count
-            sum_squared_deviation[channel] += (
-                batch_squared_deviation + delta * delta * count[channel] * batch_count / combined_count
-            )
-            count[channel] = combined_count
-        if progress_interval > 0 and (index % progress_interval == 0 or index == len(frame)):
-            print(f"Normalization scan: {index:,}/{len(frame):,} rasters")
-
-    image_std = np.sqrt(sum_squared_deviation / count)
-    image_std = _safe_scale(image_std)
+    image_center, image_scale, image_valid_pixels = _fit_image_stats(raster_paths, root, progress_interval)
     feature_std = _safe_scale(features.std(axis=0))
     return NormalizationStats(
-        image_transforms=MODEL_IMAGE_TRANSFORMS,
         image_keys=MODEL_IMAGE_KEYS,
+        image_center=tuple(float(value) for value in image_center),
         image_scale=tuple(float(value) for value in image_scale),
-        image_mean=tuple(float(value) for value in mean),
-        image_std=tuple(float(value) for value in image_std),
-        image_finite_pixels=tuple(int(value) for value in count),
+        image_valid_pixels=tuple(int(value) for value in image_valid_pixels),
         feature_names=MODEL_FEATURE_NAMES,
         feature_mean=tuple(float(value) for value in features.mean(axis=0)),
         feature_std=tuple(float(value) for value in feature_std),
         deadband_threshold=float(thresholds[0]),
         training_records=len(frame),
     )
+
+
+def clipped_pixel_fractions(
+    split: str,
+    stats: NormalizationStats,
+    *,
+    dataset_dir: str | Path = DATASET_DIR,
+    dataframe_dir: str | Path = DATASET_DF,
+) -> dict[str, float]:
+    """Calculate the clipped share of valid pixels for one split.
+
+    Args:
+        split: Dataset split to inspect.
+        stats: Frozen training normalization statistics.
+        dataset_dir: Root containing raster bundles.
+        dataframe_dir: Directory containing split CSV files.
+
+    Returns:
+        Clipped valid-pixel fraction keyed by numeric channel.
+    """
+    root = Path(dataset_dir)
+    frame = _read_split_frame(split, Path(dataframe_dir))
+    clipped = np.zeros(len(MODEL_IMAGE_KEYS), dtype=np.int64)
+    valid = np.zeros(len(MODEL_IMAGE_KEYS), dtype=np.int64)
+    center = np.asarray(stats.image_center)
+    scale = np.asarray(stats.image_scale)
+    for serialized_path in frame[RASTER_PATH_COL].to_numpy(dtype=str):
+        rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
+        for channel in range(len(MODEL_IMAGE_KEYS)):
+            values = _valid_channel_values(rasters, mask, channel)
+            normalized = (values - center[channel]) / scale[channel]
+            clipped[channel] += np.count_nonzero(np.abs(normalized) > MODEL_IMAGE_CLIP_ABS)
+            valid[channel] += values.size
+    return {
+        name: float(channel_clipped / channel_valid) if channel_valid else 0.0
+        for name, channel_clipped, channel_valid in zip(MODEL_IMAGE_KEYS, clipped, valid, strict=True)
+    }
 
 
 def save_stats(stats: NormalizationStats, path: str | Path) -> None:
@@ -304,16 +395,12 @@ class NOxDataset(Dataset):
             rasters, mask = _load_raster_bundle(_raster_path(self.raster_paths[index], self.dataset_dir))
             normalized = np.zeros_like(rasters, dtype=np.float32)
             for channel in range(len(MODEL_IMAGE_KEYS)):
-                channel_finite = np.isfinite(rasters[channel])
-                transformed = _image_transform(
-                    rasters[channel, channel_finite],
-                    self.stats.image_transforms[channel],
-                    self.stats.image_scale[channel],
-                )
-                normalized[channel, channel_finite] = (
-                    transformed - self.stats.image_mean[channel]
-                ) / self.stats.image_std[channel]
-            np.clip(normalized, -MODEL_IMAGE_CLIP_Z, MODEL_IMAGE_CLIP_Z, out=normalized)
+                channel_valid = _channel_valid_mask(rasters, mask, channel)
+                channel_values = rasters[channel, channel_valid]
+                normalized[channel, channel_valid] = (
+                    channel_values - self.stats.image_center[channel]
+                ) / self.stats.image_scale[channel]
+            np.clip(normalized, -MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS, out=normalized)
             image = torch.from_numpy(np.concatenate((normalized, mask[None, ...]), axis=0))
         else:
             image = torch.empty(0, dtype=torch.float32)

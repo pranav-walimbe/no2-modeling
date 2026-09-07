@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from config import (
     DATASET_DF,
     LABEL_COL,
-    MODEL_IMAGE_CLIP_Z,
+    MODEL_IMAGE_CLIP_ABS,
     NUM_CORES,
     RUNS_DIR,
     STRAT_BASE_DIR,
@@ -24,6 +24,7 @@ from modeling.dataset import (
     LABEL_MODE_COL,
     MODEL_FEATURE_NAMES,
     NOxDataset,
+    clipped_pixel_fractions,
     compute_stats,
     load_stats,
     save_stats,
@@ -52,6 +53,11 @@ DEFAULT_EARLY_STOP_PATIENCE = 25
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse model-training command-line options.
+
+    Returns:
+        Parsed command-line arguments.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
@@ -73,6 +79,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _device(requested: str) -> torch.device:
+    # Resolve the requested training device
     if requested == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if requested == "cuda" and not torch.cuda.is_available():
@@ -81,6 +88,7 @@ def _device(requested: str) -> torch.device:
 
 
 def _seed_everything(seed: int) -> None:
+    # Seed CPU and CUDA random number generators
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -89,6 +97,7 @@ def _seed_everything(seed: int) -> None:
 
 
 def _move_batch(batch: tuple[torch.Tensor, ...], device: torch.device) -> tuple[torch.Tensor, ...]:
+    # Move model inputs and targets onto the training device
     image, tabular, target, index = batch
     non_blocking = device.type == "cuda"
     return (
@@ -108,6 +117,20 @@ def train_epoch(
     device: torch.device,
     gradient_clip_norm: float,
 ) -> float:
+    """Train the model for one epoch.
+
+    Args:
+        model: Model to optimize.
+        loader: Training batches.
+        optimizer: Parameter optimizer.
+        criterion: Training loss.
+        scaler: Mixed-precision gradient scaler.
+        device: Training device.
+        gradient_clip_norm: Maximum gradient norm.
+
+    Returns:
+        Mean training loss per record.
+    """
     model.train()
     total_loss = 0.0
     amp_enabled = device.type == "cuda"
@@ -127,6 +150,17 @@ def train_epoch(
 
 
 def val_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device) -> float:
+    """Calculate validation loss for one epoch.
+
+    Args:
+        model: Model to evaluate.
+        loader: Validation batches.
+        criterion: Validation loss.
+        device: Evaluation device.
+
+    Returns:
+        Mean validation loss per record.
+    """
     model.eval()
     total_loss = 0.0
     amp_enabled = device.type == "cuda"
@@ -140,6 +174,16 @@ def val_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, device
 
 
 def run_inference(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
+    """Generate logits for one dataset split.
+
+    Args:
+        model: Trained model.
+        loader: Evaluation batches.
+        device: Inference device.
+
+    Returns:
+        Logits and corresponding dataset indices.
+    """
     model.eval()
     predictions: list[np.ndarray] = []
     indices: list[np.ndarray] = []
@@ -155,6 +199,7 @@ def run_inference(model: nn.Module, loader: DataLoader, device: torch.device) ->
 
 
 def _loader(dataset: NOxDataset, *, shuffle: bool, args: argparse.Namespace, device: torch.device) -> DataLoader:
+    # Configure one deterministic data loader
     options: dict[str, object] = {
         "batch_size": args.batch_size,
         "shuffle": shuffle,
@@ -201,6 +246,7 @@ def _load_classification_summaries(
 
 
 def main() -> None:
+    """Train and evaluate one binary-classification run."""
     args = parse_args()
     _seed_everything(args.seed)
     device = _device(args.device)
@@ -213,9 +259,9 @@ def main() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
 
     save_stats(stats, run_dir / "normalization_stats.json")
-    datasets = {
-        split: NOxDataset(split, stats, load_images=args.inputs != "tabular") for split in ("train", "val", "test")
-    }
+    load_images = args.inputs != "tabular"
+    datasets = {split: NOxDataset(split, stats, load_images=load_images) for split in ("train", "val", "test")}
+    clipped_fractions = {split: clipped_pixel_fractions(split, stats) for split in datasets} if load_images else {}
     target_label_mode = str(datasets["train"].frame[LABEL_MODE_COL].iloc[0])
     train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
     eval_loaders = {
@@ -261,10 +307,11 @@ def main() -> None:
         "scheduler_patience": args.scheduler_patience,
         "scheduler_factor": args.scheduler_factor,
         "early_stop_patience": args.early_stop_patience,
-        "image_transforms": list(stats.image_transforms),
         "image_keys": list(stats.image_keys),
+        "image_center": list(stats.image_center),
         "image_scale": list(stats.image_scale),
-        "image_clip_z": MODEL_IMAGE_CLIP_Z,
+        "image_clip_range": [-MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS],
+        "clipped_valid_pixel_fraction": clipped_fractions,
         "raw_delta_nox_deadband_threshold": stats.deadband_threshold,
         "target_label_mode": target_label_mode,
         "tabular_features": list(MODEL_FEATURE_NAMES),

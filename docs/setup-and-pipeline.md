@@ -204,8 +204,9 @@ source .venv/bin/activate
    ```
 
    The trainer lazily reads current NO2, delta NO2, wind, and the paired-valid
-   mask from each selected NPZ and computes memory-bounded robust
-   normalization statistics from the training split only. It predicts whether
+   mask from each selected NPZ and computes memory-bounded robust NO2
+   normalization statistics from the training split only. It records clipped
+   valid-pixel fractions by channel and split, then predicts whether
    raw delta-NOx is negative or positive outside the frozen deadband and reports
    classification metrics. See `docs/modeling.md` for the full contract.
 
