@@ -205,10 +205,9 @@ source .venv/bin/activate
 
    The trainer lazily reads current NO2, delta NO2, and the paired-valid mask
    from each selected NPZ and computes memory-bounded robust
-   normalization statistics from the training split only. It predicts the
-   signed `delta_nox_norm` target and reports both normalized and physical
-   NOx-mass-change metrics. See `docs/modeling.md` for the feature, leakage,
-   architecture, normalization, and evaluation decisions.
+   normalization statistics from the training split only. It predicts whether
+   raw delta-NOx is negative or positive outside the frozen deadband and reports
+   classification metrics. See `docs/modeling.md` for the full contract.
 
 Each stage depends on the outputs of the preceding stage. Dataset generation
 resumes from valid scan-cache entries. Other scripts resume only where their

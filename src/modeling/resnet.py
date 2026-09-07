@@ -1,4 +1,4 @@
-"""Compact residual network for signed emissions-change regression."""
+"""Compact residual network for emissions-change classification."""
 
 import torch
 from torch import nn

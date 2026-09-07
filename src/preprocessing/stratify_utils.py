@@ -14,6 +14,8 @@ from collection.emissions_schema import (
 )
 from config import (
     CITIES_URL,
+    DEADBAND_THRESHOLD_COL,
+    DEADBAND_TRAIN_FRACTION,
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
     DELTA_SCALE_LEVEL_FRACTION,
@@ -92,6 +94,98 @@ def filter_quantitative_outliers(
     for name, split in splits.items():
         print(f"[{name}] quantitative outliers retained {filtered[name].height:,}/{split.height:,} records")
     return filtered
+
+
+def apply_binary_target(
+    splits: dict[str, pl.DataFrame],
+    deadband_fraction: float = DEADBAND_TRAIN_FRACTION,
+) -> tuple[dict[str, pl.DataFrame], float]:
+    """Apply one train-derived symmetric deadband and sign label to every split.
+
+    Args:
+        splits: Geographic data partitions carrying raw delta-NOx values.
+        deadband_fraction: Training fraction targeted for removal around zero.
+
+    Returns:
+        Filtered labeled splits and the frozen raw-magnitude cutoff.
+    """
+    if not 0 < deadband_fraction < 1:
+        raise ValueError("Deadband fraction must be between zero and one")
+    if "train" not in splits:
+        raise ValueError("Binary target construction requires a training split")
+
+    training_values = splits["train"].filter(pl.col(DELTA_NOX_MASS_COL).is_finite())
+    if training_values.is_empty():
+        raise ValueError("Training split has no finite raw delta-NOx values")
+    threshold = training_values.select(
+        pl.col(DELTA_NOX_MASS_COL)
+        .abs()
+        .quantile(deadband_fraction, interpolation="linear")
+    ).item()
+    if threshold is None or not np.isfinite(threshold) or threshold < 0:
+        raise ValueError("Training deadband threshold must be finite and nonnegative")
+
+    labeled: dict[str, pl.DataFrame] = {}
+    for name, split in splits.items():
+        finite = split.filter(pl.col(DELTA_NOX_MASS_COL).is_finite())
+        labeled[name] = finite.filter(pl.col(DELTA_NOX_MASS_COL).abs() > threshold).with_columns(
+            (pl.col(DELTA_NOX_MASS_COL) > 0).cast(pl.UInt8).alias(LABEL_COL),
+            pl.lit(float(threshold)).alias(DEADBAND_THRESHOLD_COL),
+        )
+        negative = labeled[name].filter(pl.col(LABEL_COL) == 0).height
+        positive = labeled[name].filter(pl.col(LABEL_COL) == 1).height
+        print(
+            f"[{name}] deadband retained {labeled[name].height:,}/{finite.height:,} records; "
+            f"class 0: {negative:,}; class 1: {positive:,}"
+        )
+    print(f"Training-derived raw delta-NOx deadband: [-{threshold:.6g}, {threshold:.6g}]")
+    return labeled, float(threshold)
+
+
+def classification_summary(source: pl.DataFrame, retained: pl.DataFrame) -> dict[str, object]:
+    """Summarize binary-label retention overall and by AOI.
+
+    Args:
+        source: Records before the reported filtering or balancing stage.
+        retained: Retained records carrying binary labels.
+
+    Returns:
+        JSON-safe overall and per-AOI counts.
+    """
+    def counts(frame: pl.DataFrame) -> dict[str, int | float | None]:
+        # Count each class without assuming both are present
+        negative = frame.filter(pl.col(LABEL_COL) == 0).height
+        positive = frame.filter(pl.col(LABEL_COL) == 1).height
+        total = negative + positive
+        return {
+            "retained_records": total,
+            "negative_records": negative,
+            "positive_records": positive,
+            "positive_fraction": positive / total if total else None,
+        }
+
+    source_by_aoi = dict(source.group_by(AOI_ID_COL).len().iter_rows())
+    retained_by_aoi = {int(group[AOI_ID_COL][0]): group for group in retained.partition_by(AOI_ID_COL)}
+    by_aoi = []
+    for aoi_id, source_records in sorted(source_by_aoi.items()):
+        aoi_counts = counts(retained_by_aoi.get(int(aoi_id), retained.head(0)))
+        by_aoi.append(
+            {
+                AOI_ID_COL: int(aoi_id),
+                "source_records": int(source_records),
+                "retained_fraction": aoi_counts["retained_records"] / source_records,
+                **aoi_counts,
+            }
+        )
+    overall = counts(retained)
+    return {
+        "overall": {
+            "source_records": source.height,
+            "retained_fraction": overall["retained_records"] / source.height if source.height else None,
+            **overall,
+        },
+        "by_aoi": by_aoi,
+    }
 
 
 def load_major_cities(url: str = CITIES_URL) -> pl.DataFrame:
@@ -304,14 +398,14 @@ def add_previous_quarter_same_hour_averages(hourly: pl.LazyFrame) -> pl.LazyFram
 
 
 def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
-    """Add hourly NOx changes normalized by the prior completed quarter.
+    """Add hourly NOx changes and a prior-completed-quarter scale.
 
     Args:
         hourly: AOI-hour rows containing a UTC timestamp, date, hour, and
             aggregate NOx mass.
 
     Returns:
-        Rows with raw NOx changes, lagged scales, and transformed labels.
+        Rows with raw NOx changes and lagged scales.
     """
     with_deltas = (
         hourly.with_columns(pl.col(EMISSIONS_HOUR_UTC_COL).alias("_hour_start"))
@@ -360,8 +454,8 @@ def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
         with_deltas.join(quarter_stats, on=[AOI_ID_COL, "_year", "_quarter"], how="left")
         .with_columns(
             pl.when((pl.col("_delta_history_count") >= MIN_DELTA_HISTORY) & (pl.col(DELTA_NOX_SCALE_COL) > 0))
-            .then((pl.col(DELTA_NOX_MASS_COL) / pl.col(DELTA_NOX_SCALE_COL)).arcsinh())
-            .alias(LABEL_COL)
+            .then(pl.col(DELTA_NOX_SCALE_COL))
+            .alias(DELTA_NOX_SCALE_COL)
         )
         .drop(
             "_hour_start",
@@ -381,14 +475,14 @@ def apply_target_label_mode(
     frame: pl.DataFrame,
     mode: str = TARGET_LABEL_MODE,
 ) -> pl.DataFrame:
-    """Select hard-hour or scan-overlap-weighted NOx-change labels.
+    """Select hard-hour or scan-overlap-weighted raw NOx changes.
 
     Args:
         frame: AOI-hour rows after TEMPO observation pairing.
         mode: Configured target construction method.
 
     Returns:
-        Rows with the selected raw and normalized target and its mode.
+        Rows with the selected raw target and its mode.
     """
     if mode not in SUPPORTED_LABEL_MODES:
         raise ValueError(f"Unsupported target label mode: {mode}")
@@ -457,7 +551,6 @@ def apply_target_label_mode(
         indexed.join(contributions, on="_label_row", how="left")
         .with_columns(
             pl.col("_weighted_delta_nox_mass").alias(DELTA_NOX_MASS_COL),
-            (pl.col("_weighted_delta_nox_mass") / pl.col(DELTA_NOX_SCALE_COL)).arcsinh().alias(LABEL_COL),
             pl.lit(mode).alias(LABEL_MODE_COL),
         )
         .drop("_label_row", "_weighted_delta_nox_mass")

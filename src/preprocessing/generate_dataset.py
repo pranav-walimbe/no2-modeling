@@ -17,6 +17,7 @@ from config import (
     DATASET_DIR,
     DATASET_RASTER_DIR,
     DATASET_SCAN_CACHE_DIR,
+    DEADBAND_THRESHOLD_COL,
     HRRR_DIR,
     NUM_CORES,
     TEMPO_DIR,
@@ -42,7 +43,9 @@ from preprocessing.generate_dataset_utils import (
     select_final_records,
     validate_coverage_config,
     write_csv_atomic,
+    write_json_atomic,
 )
+from preprocessing.stratify_utils import classification_summary
 
 SPLIT_PATHS = {
     "train": TRAIN_RECORDS_CSV,
@@ -284,16 +287,30 @@ def _write_outputs(
             source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left")
             .sort(SOURCE_RECORD_INDEX_COL)
         )
-        eligible_count = eligible_generated_records(candidates).height
+        eligible = eligible_generated_records(candidates)
         output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
         print(
             f"[{split}] {candidates.height:,} regridded; "
-            f"{eligible_count:,} passed raster QC; {output_frame.height:,} selected"
+            f"{eligible.height:,} passed raster QC; {output_frame.height:,} selected"
         )
+        thresholds = candidates[DEADBAND_THRESHOLD_COL].unique()
+        if len(thresholds) != 1:
+            raise ValueError(f"{split} candidates must contain one frozen deadband threshold")
+        classification_report = {
+            "version": 1,
+            "split": split,
+            "raw_delta_nox_threshold": float(thresholds.item()),
+            "raster_qc": classification_summary(candidates, eligible),
+            "final_balance": classification_summary(eligible, output_frame),
+        }
         output_frame = _install_selected_rasters(split, output_frame)
         write_csv_atomic(
             output_frame.drop(SOURCE_RECORD_INDEX_COL, CANDIDATE_RASTER_PATH_COL),
             Path(DATASET_DF) / f"{split}_df.csv",
+        )
+        write_json_atomic(
+            classification_report,
+            Path(DATASET_DF) / f"{split}_classification_summary.json",
         )
         write_csv_atomic(
             pl.DataFrame(failure_rows, schema={"record_index": pl.Int64, "error": pl.String}),

@@ -21,6 +21,7 @@ from config import (
     CENTRAL_COVERAGE_WINDOW_SIZE,
     IMG_RANGE,
     IMG_SIZE,
+    LABEL_COL,
     MIN_CENTRAL_FINITE_FRACTION,
     MIN_PAIRED_FINITE_FRACTION,
     MIN_PIXEL_CLOUD,
@@ -135,7 +136,7 @@ def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
-    """Select a quality-ranked AOI-balanced subset.
+    """Select an exactly balanced quality-ranked AOI subset.
 
     Args:
         frame: Generated candidate records eligible for final selection.
@@ -144,22 +145,32 @@ def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
     Returns:
         Selected records without temporary ranking columns.
     """
-    if size < 1:
-        raise ValueError("Final dataset size must be positive")
-    required = {AOI_ID_COL, "date", "hour"}
+    if size < 2 or size % 2:
+        raise ValueError("Final dataset size must be a positive even integer")
+    required = {AOI_ID_COL, "date", "hour", LABEL_COL}
     missing = required.difference(frame.columns)
     if missing:
         raise ValueError(f"Generated records are missing selection columns: {', '.join(sorted(missing))}")
 
     eligible = eligible_generated_records(frame)
-    if eligible.height < size:
-        raise ValueError(
-            f"Only {eligible.height:,} records pass raster-quality gates; "
-            f"cannot produce the requested {size:,} records"
-        )
+    class_size = size // 2
+    selected_classes = []
+    for label in (0, 1):
+        class_records = eligible.filter(pl.col(LABEL_COL) == label)
+        if class_records.height < class_size:
+            raise ValueError(
+                f"Only {class_records.height:,} class {label} records pass raster-quality gates; "
+                f"cannot produce the requested {class_size:,}"
+            )
+        selected_classes.append(_rank_final_records(class_records).head(class_size))
+    return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
+
+
+def _rank_final_records(eligible: pl.DataFrame) -> pl.DataFrame:
+    # Interleave temporal strata within each AOI before global AOI rounds
 
     strata = [AOI_ID_COL, "_selection_year", "_selection_quarter", "_selection_hour_bin"]
-    ranked = (
+    return (
         eligible.with_columns(
             pl.col("date").dt.year().alias("_selection_year"),
             pl.col("date").dt.quarter().alias("_selection_quarter"),
@@ -179,9 +190,7 @@ def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
             ["_aoi_round", RASTER_QUALITY_SCORE_COL, AOI_ID_COL, "date", "hour"],
             descending=[False, True, False, False, False],
         )
-        .head(size)
     )
-    return ranked.drop(*SELECTION_HELPER_COLUMNS)
 
 
 @dataclass(frozen=True)
@@ -524,6 +533,33 @@ def process_record(task: RecordTask) -> RecordResult:
         return RecordResult(task.split, task.record_index, features, None)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         return RecordResult(task.split, task.record_index, {}, f"Record processing failed: {error}")
+
+
+def write_json_atomic(values: dict[str, object], destination: Path) -> None:
+    """Write a JSON object through an atomic replacement.
+
+    Args:
+        values: JSON-safe object to persist.
+        destination: Final JSON path.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(values, temporary, indent=2)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
 
 
 def write_csv_atomic(frame: pl.DataFrame, destination: Path) -> None:

@@ -17,6 +17,8 @@ from torch.utils.data import Dataset
 from config import (
     DATASET_DF,
     DATASET_DIR,
+    DEADBAND_THRESHOLD_COL,
+    DELTA_NOX_MASS_COL,
     IMG_SIZE,
     LABEL_COL,
     MODEL_CYCLIC_FEATURES,
@@ -30,7 +32,7 @@ from config import (
 RASTER_PATH_COL = "delta_no2_path"
 LABEL_MODE_COL = "label_mode"
 IMAGE_TRANSFORM = "asinh"
-STATS_VERSION = 3
+STATS_VERSION = 4
 MIN_SCALE = 1e-12
 
 
@@ -58,8 +60,7 @@ class NormalizationStats:
     feature_names: tuple[str, ...]
     feature_mean: tuple[float, ...]
     feature_std: tuple[float, ...]
-    target_mean: float
-    target_std: float
+    deadband_threshold: float
     training_records: int
 
     def to_dict(self) -> dict[str, object]:
@@ -80,8 +81,7 @@ class NormalizationStats:
             feature_names=tuple(str(name) for name in values["feature_names"]),
             feature_mean=tuple(float(value) for value in values["feature_mean"]),
             feature_std=tuple(float(value) for value in values["feature_std"]),
-            target_mean=float(values["target_mean"]),
-            target_std=float(values["target_std"]),
+            deadband_threshold=float(values["deadband_threshold"]),
             training_records=int(values["training_records"]),
         )
         if stats.image_transform != IMAGE_TRANSFORM:
@@ -98,6 +98,8 @@ class NormalizationStats:
             raise ValueError("Image transform scales must be finite and positive")
         if not all(math.isfinite(value) and value > MIN_SCALE for value in stats.image_std):
             raise ValueError("Image standard deviations must be finite and positive")
+        if not math.isfinite(stats.deadband_threshold) or stats.deadband_threshold < 0:
+            raise ValueError("Deadband threshold must be finite and nonnegative")
         return stats
 
 
@@ -106,7 +108,16 @@ def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
     if not path.is_file():
         raise FileNotFoundError(f"Missing {split} dataframe: {path}")
     frame = pd.read_csv(path)
-    required = {RASTER_PATH_COL, LABEL_COL, LABEL_MODE_COL, "date", "hour", *MODEL_RAW_FEATURES}
+    required = {
+        RASTER_PATH_COL,
+        LABEL_COL,
+        LABEL_MODE_COL,
+        DEADBAND_THRESHOLD_COL,
+        DELTA_NOX_MASS_COL,
+        "date",
+        "hour",
+        *MODEL_RAW_FEATURES,
+    }
     missing = required.difference(frame.columns)
     if missing:
         raise ValueError(f"{split} dataframe is missing model columns: {', '.join(sorted(missing))}")
@@ -114,6 +125,20 @@ def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
         raise ValueError(f"{split} dataframe is empty")
     if frame[LABEL_MODE_COL].nunique() != 1:
         raise ValueError(f"{split} dataframe must contain exactly one target label mode")
+    labels = pd.to_numeric(frame[LABEL_COL], errors="coerce").to_numpy(dtype=np.float64)
+    if not np.isin(labels, (0, 1)).all():
+        raise ValueError(f"{LABEL_COL} must contain only zero and one in {split}")
+    label_counts = np.bincount(labels.astype(np.uint8), minlength=2)
+    if label_counts[0] != label_counts[1]:
+        raise ValueError(f"{split} dataframe must contain equal binary-label counts")
+    thresholds = pd.to_numeric(frame[DEADBAND_THRESHOLD_COL], errors="coerce").to_numpy(dtype=np.float64)
+    if not np.isfinite(thresholds).all() or np.any(thresholds < 0) or not np.all(thresholds == thresholds[0]):
+        raise ValueError(f"{split} must contain one finite nonnegative deadband threshold")
+    raw_delta = pd.to_numeric(frame[DELTA_NOX_MASS_COL], errors="coerce").to_numpy(dtype=np.float64)
+    if not np.isfinite(raw_delta).all() or np.any(np.abs(raw_delta) <= thresholds[0]):
+        raise ValueError(f"{split} contains raw delta-NOx values inside the deadband")
+    if not np.array_equal(labels.astype(np.uint8), (raw_delta > 0).astype(np.uint8)):
+        raise ValueError(f"{split} labels do not match raw delta-NOx signs")
     return frame
 
 
@@ -207,9 +232,7 @@ def compute_stats(
     root = Path(dataset_dir)
     frame = _read_split_frame(split, Path(dataframe_dir))
     features = _feature_matrix(frame)
-    labels = pd.to_numeric(frame[LABEL_COL], errors="coerce").to_numpy(dtype=np.float64)
-    if not np.isfinite(labels).all():
-        raise ValueError(f"{LABEL_COL} contains non-finite values in {split}")
+    thresholds = pd.to_numeric(frame[DEADBAND_THRESHOLD_COL], errors="coerce").unique()
 
     raster_paths = frame[RASTER_PATH_COL].to_numpy(dtype=str)
     channel_count = len(MODEL_IMAGE_KEYS)
@@ -257,7 +280,6 @@ def compute_stats(
         names = [MODEL_IMAGE_KEYS[index] for index in np.flatnonzero(invalid_std)]
         raise ValueError(f"Training raster standard deviation is zero or non-finite for: {', '.join(names)}")
     feature_std = _safe_scale(features.std(axis=0))
-    target_std = float(_safe_scale(np.asarray([labels.std()]))[0])
     return NormalizationStats(
         version=STATS_VERSION,
         image_transform=IMAGE_TRANSFORM,
@@ -269,8 +291,7 @@ def compute_stats(
         feature_names=MODEL_FEATURE_NAMES,
         feature_mean=tuple(float(value) for value in features.mean(axis=0)),
         feature_std=tuple(float(value) for value in feature_std),
-        target_mean=float(labels.mean()),
-        target_std=target_std,
+        deadband_threshold=float(thresholds[0]),
         training_records=len(frame),
     )
 
@@ -306,11 +327,6 @@ def load_stats(path: str | Path) -> NormalizationStats:
     return NormalizationStats.from_dict(values)
 
 
-def denormalize_target(values: np.ndarray, stats: NormalizationStats) -> np.ndarray:
-    """Return predictions in delta_nox_norm units."""
-    return np.asarray(values) * stats.target_std + stats.target_mean
-
-
 class NOxDataset(Dataset):
     """Lazy per-record TEMPO raster and tabular dataset."""
 
@@ -329,13 +345,16 @@ class NOxDataset(Dataset):
         self.stats = stats if isinstance(stats, NormalizationStats) else NormalizationStats.from_dict(stats)
         if self.stats.feature_names != MODEL_FEATURE_NAMES:
             raise ValueError("Normalization feature order does not match the configured model features")
+        threshold = float(self.frame[DEADBAND_THRESHOLD_COL].iloc[0])
+        if threshold != self.stats.deadband_threshold:
+            raise ValueError("Dataset deadband threshold does not match the training statistics")
 
         raw_features = _feature_matrix(self.frame)
         feature_mean = np.asarray(self.stats.feature_mean, dtype=np.float64)
         feature_std = np.asarray(self.stats.feature_std, dtype=np.float64)
         self.features = ((raw_features - feature_mean) / feature_std).astype(np.float32)
         labels = pd.to_numeric(self.frame[LABEL_COL], errors="raise").to_numpy(dtype=np.float64)
-        self.labels = ((labels - self.stats.target_mean) / self.stats.target_std).astype(np.float32)
+        self.labels = labels.astype(np.float32)
         self.raster_paths = self.frame[RASTER_PATH_COL].to_numpy(dtype=str)
 
     def __len__(self) -> int:
