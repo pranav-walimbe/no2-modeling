@@ -34,6 +34,7 @@ Each sample has three aligned 48 by 48 raster channels and scalar context. The
 scalar inputs are:
 
 - coal and natural-gas unit counts;
+- total generator nameplate capacity;
 - previous-quarter average heat input and power generation;
 - the historical NOx-change scale used by the target definition;
 - coincident HRRR 2 m temperature, 10 m U/V wind, and boundary-layer height;
@@ -47,7 +48,7 @@ Validation, test, and inference reuse those statistics.
 
 | Transform before standardization | Features | Reason |
 |---|---|---|
-| `log1p` | heat input, power generation, NOx-change scale, boundary-layer height | These nonnegative features have long right tails; compression limits the influence of extreme values and preserves zero. |
+| `log1p` | nameplate capacity, heat input, power generation, NOx-change scale, boundary-layer height | These nonnegative features have long right tails; compression limits the influence of extreme values and preserves zero. |
 | None | coal and gas unit counts, temperature, U/V wind | Counts retain their discrete spacing, temperature has a moderate range, and wind components can be negative. |
 | Sine and cosine | UTC hour, day of year | Circular encoding keeps adjacent boundary values close, such as hours 23 and 0. |
 
