@@ -42,13 +42,13 @@ forming a delta.
 ## Dataset-generation output
 
 `preprocessing.generate_dataset` deduplicates AOI-scan work and writes the
-five-raster bundles above to a persistent cache under `DATASET_DIR`.
-The cache key identifies the AOI and source granules. Pass `--refresh-cache`
-after changing image-processing code or settings. Scans with the same granule
+five-raster bundles above to the persistent TEMPO cache under `DATASET_DIR`.
+The cache key identifies the AOI and source granules. Pass `--refresh-tempo`
+after changing TEMPO processing. Scans with the same granule
 set run as one batch, which lets a worker open each large NetCDF granule once
 for several AOIs. Aligned wind has a separate persistent AOI-hour cache. HRRR
-files are grouped so each full grid is read once for several AOIs. The same
-`--refresh-cache` flag refreshes both caches.
+files are grouped so each full grid is read once for several AOIs. Pass
+`--refresh-wind` after changing wind alignment.
 
 Each successful model record persists one compressed NPZ containing five
 aligned `float32` arrays:

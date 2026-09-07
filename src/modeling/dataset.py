@@ -33,6 +33,7 @@ MIN_SCALE = 1e-12
 
 
 def _model_feature_names() -> tuple[str, ...]:
+    # Expand raw and cyclic inputs into their model column names
     names = [f"log1p_{name}" if name in MODEL_LOG1P_FEATURES else name for name in MODEL_RAW_FEATURES]
     for name in MODEL_CYCLIC_FEATURES:
         names.extend((f"{name}_sin", f"{name}_cos"))
@@ -59,10 +60,23 @@ class NormalizationStats:
     training_records: int
 
     def to_dict(self) -> dict[str, object]:
+        """Return the normalization state as JSON-safe values.
+
+        Returns:
+            Serialized normalization fields.
+        """
         return asdict(self)
 
     @classmethod
     def from_dict(cls, values: dict[str, object]) -> "NormalizationStats":
+        """Build normalization state from JSON-safe values.
+
+        Args:
+            values: Serialized normalization fields.
+
+        Returns:
+            Parsed normalization state.
+        """
         return cls(
             image_transforms=tuple(str(name) for name in values["image_transforms"]),
             image_keys=tuple(str(name) for name in values["image_keys"]),
@@ -85,7 +99,7 @@ def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
 
 
 def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
-    """Create leakage-safe numeric features in a stable, documented order."""
+    # Create leakage-safe numeric features in their documented order
     columns: list[np.ndarray] = []
     for name in MODEL_RAW_FEATURES:
         values = pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=np.float64)
@@ -107,12 +121,13 @@ def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
 
 
 def _raster_path(serialized_path: object, dataset_dir: Path) -> Path:
+    # Resolve a stored raster path against the dataset root
     path = Path(str(serialized_path))
     return path if path.is_absolute() else dataset_dir / path
 
 
 def _load_raster_bundle(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load paired numeric rasters and their stored support mask."""
+    # Load numeric rasters and their stored support mask
     with np.load(path, allow_pickle=False) as bundle:
         rasters = np.stack(
             [np.asarray(bundle[name], dtype=np.float32) for name in MODEL_IMAGE_KEYS],
@@ -123,6 +138,7 @@ def _load_raster_bundle(path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _safe_scale(values: np.ndarray) -> np.ndarray:
+    # Replace unusable normalization scales with one
     return np.where(np.isfinite(values) & (values > MIN_SCALE), values, 1.0)
 
 
@@ -142,6 +158,15 @@ def compute_stats(
 
     NO2 asinh scales use record-balanced median absolute values. A second
     streaming pass computes per-channel means and variances.
+
+    Args:
+        split: Dataset split used to estimate statistics.
+        dataset_dir: Root containing raster bundles.
+        dataframe_dir: Directory containing split CSV files.
+        progress_interval: Records between progress messages.
+
+    Returns:
+        Frozen image and tabular normalization statistics.
     """
     root = Path(dataset_dir)
     frame = _read_split_frame(split, Path(dataframe_dir))
@@ -205,7 +230,12 @@ def compute_stats(
 
 
 def save_stats(stats: NormalizationStats, path: str | Path) -> None:
-    """Atomically persist preprocessing state beside a model checkpoint."""
+    """Atomically persist preprocessing state beside a model checkpoint.
+
+    Args:
+        stats: Normalization state to save.
+        path: Destination JSON path.
+    """
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -228,6 +258,14 @@ def save_stats(stats: NormalizationStats, path: str | Path) -> None:
 
 
 def load_stats(path: str | Path) -> NormalizationStats:
+    """Load normalization state from JSON.
+
+    Args:
+        path: Source JSON path.
+
+    Returns:
+        Parsed normalization state.
+    """
     with Path(path).open() as source:
         values = json.load(source)
     return NormalizationStats.from_dict(values)

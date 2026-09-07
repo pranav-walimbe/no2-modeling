@@ -194,7 +194,8 @@ source .venv/bin/activate
    indices 0, 1, and 2 automatically select `train`, `val`, and `test`, so each
    task can invoke `python -u -m preprocessing.generate_dataset`. Outside an
    array, use `--split` for one split or omit it to process all splits. Pass
-   `--refresh-cache` after changing image-processing code or settings.
+   `--refresh-tempo` or `--refresh-wind` after changing the corresponding
+   image-processing code or settings.
 
 5. Train and evaluate the model:
 
@@ -202,16 +203,16 @@ source .venv/bin/activate
    python -u -m modeling.train
    ```
 
-   The trainer lazily reads current NO2, delta NO2, and the paired-valid mask
-   from each selected NPZ and computes memory-bounded robust
+   The trainer lazily reads current NO2, delta NO2, wind, and the paired-valid
+   mask from each selected NPZ and computes memory-bounded robust
    normalization statistics from the training split only. It predicts whether
    raw delta-NOx is negative or positive outside the frozen deadband and reports
    classification metrics. See `docs/modeling.md` for the full contract.
 
 Each stage depends on the outputs of the preceding stage. Dataset generation
-resumes from valid scan-cache entries. Other scripts resume only where their
-implementation supports it; check existing output files before rerunning a
-large collection or generation job.
+resumes from valid TEMPO-cache and wind-cache entries. Other scripts resume
+only where their implementation supports it; check existing output files
+before rerunning a large collection or generation job.
 
 ## Savio jobs
 

@@ -16,7 +16,7 @@ from config import (
     DATASET_DF,
     DATASET_DIR,
     DATASET_RASTER_DIR,
-    DATASET_SCAN_CACHE_DIR,
+    DATASET_TEMPO_CACHE_DIR,
     DATASET_WIND_CACHE_DIR,
     DEADBAND_THRESHOLD_COL,
     HRRR_DIR,
@@ -70,7 +70,7 @@ OutputT = TypeVar("OutputT")
 
 @dataclass(frozen=True)
 class PreparedRecord:
-    """One source row resolved to its cached scan and output paths."""
+    """One source row resolved to its cache and output paths."""
 
     split: str
     record_index: int
@@ -118,7 +118,7 @@ def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
 
 def _prepare_records(
     splits: dict[str, pl.DataFrame],
-    scan_cache_dir: Path,
+    tempo_cache_dir: Path,
     wind_cache_dir: Path,
     run_dir: Path,
 ) -> tuple[list[PreparedRecord], dict[str, ScanTask], dict[str, WindTask], dict[str, list[dict[str, object]]]]:
@@ -133,8 +133,8 @@ def _prepare_records(
         for row in frame.iter_rows(named=True):
             record_index = int(row[SOURCE_RECORD_INDEX_COL])
             try:
-                current = make_scan_task(row, "tempo", Path(TEMPO_DIR), scan_cache_dir)
-                previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), scan_cache_dir)
+                current = make_scan_task(row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
+                previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 wind = make_wind_task(row, Path(HRRR_DIR), wind_cache_dir)
                 delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
@@ -163,20 +163,20 @@ def _scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
     return [ScanBatchTask(paths, tuple(group)) for paths, group in grouped.items()]
 
 
-def _run_scan_regridding(
+def _run_tempo_regridding(
     scans: dict[str, ScanTask],
     workers: int,
-    refresh_cache: bool,
+    refresh_tempo: bool,
 ) -> tuple[dict[str, str], dict[str, str]]:
     # Reuse existing entries and batch only cache misses
-    cache_paths = {
-        key: task.cache_path for key, task in scans.items() if not refresh_cache and cache_exists(task.cache_path)
+    tempo_cache_paths = {
+        key: task.cache_path for key, task in scans.items() if not refresh_tempo and cache_exists(task.cache_path)
     }
     failures: dict[str, str] = {}
-    missing = [task for key, task in scans.items() if key not in cache_paths]
-    print(f"Scan cache: {len(cache_paths):,} hits; {len(missing):,} scans to generate")
+    missing = [task for key, task in scans.items() if key not in tempo_cache_paths]
+    print(f"TEMPO cache: {len(tempo_cache_paths):,} hits; {len(missing):,} scans to generate")
     if not missing:
-        return cache_paths, failures
+        return tempo_cache_paths, failures
     batches = _scan_batches(missing)
     granule_reads = sum(len(batch.granule_paths) for batch in batches)
     print(f"Grouped cache misses into {len(batches):,} batches requiring {granule_reads:,} granule reads")
@@ -185,12 +185,12 @@ def _run_scan_regridding(
         for result in batch_results:
             completed += 1
             if result.error is None:
-                cache_paths[result.cache_key] = result.cache_path
+                tempo_cache_paths[result.cache_key] = result.cache_path
             else:
                 failures[result.cache_key] = result.error
         if completed % PROGRESS_INTERVAL < len(batch_results) or completed == len(missing):
             print(f"Regridded {completed:,}/{len(missing):,} cache-missing AOI scans")
-    return cache_paths, failures
+    return tempo_cache_paths, failures
 
 
 def _wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
@@ -204,15 +204,17 @@ def _wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
 def _run_wind_alignment(
     winds: dict[str, WindTask],
     workers: int,
-    refresh_cache: bool,
+    refresh_wind: bool,
 ) -> tuple[dict[str, str], dict[str, str]]:
     # Reuse cached AOI-hour wind rasters unless refresh is explicit
     cache_paths = {
-        key: task.cache_path for key, task in winds.items() if not refresh_cache and cache_exists(task.cache_path)
+        key: task.cache_path for key, task in winds.items() if not refresh_wind and cache_exists(task.cache_path)
     }
     failures: dict[str, str] = {}
     missing = [task for key, task in winds.items() if key not in cache_paths]
     print(f"Wind cache: {len(cache_paths):,} hits; {len(missing):,} AOI-hours to align")
+    if not missing:
+        return cache_paths, failures
     completed = 0
     for batch_results in _bounded_parallel_map(process_wind_batch, _wind_batches(missing), workers):
         for result in batch_results:
@@ -228,8 +230,8 @@ def _run_wind_alignment(
 
 def _record_tasks(
     records: list[PreparedRecord],
-    cache_paths: dict[str, str],
-    scan_failures: dict[str, str],
+    tempo_cache_paths: dict[str, str],
+    tempo_failures: dict[str, str],
     wind_cache_paths: dict[str, str],
     wind_failures: dict[str, str],
     failures: dict[str, list[dict[str, object]]],
@@ -238,9 +240,11 @@ def _record_tasks(
     tasks: list[RecordTask] = []
     records_by_id: dict[tuple[str, int], PreparedRecord] = {}
     for record in records:
-        missing_keys = [key for key in (record.current_scan_key, record.previous_scan_key) if key not in cache_paths]
+        missing_keys = [
+            key for key in (record.current_scan_key, record.previous_scan_key) if key not in tempo_cache_paths
+        ]
         if missing_keys:
-            reasons = [scan_failures.get(key, "scan cache unavailable") for key in missing_keys]
+            reasons = [tempo_failures.get(key, "TEMPO cache unavailable") for key in missing_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
         if record.wind_cache_key not in wind_cache_paths:
@@ -253,8 +257,8 @@ def _record_tasks(
             RecordTask(
                 split=record.split,
                 record_index=record.record_index,
-                current_cache_path=cache_paths[record.current_scan_key],
-                previous_cache_path=cache_paths[record.previous_scan_key],
+                current_cache_path=tempo_cache_paths[record.current_scan_key],
+                previous_cache_path=tempo_cache_paths[record.previous_scan_key],
                 wind_cache_path=wind_cache_paths[record.wind_cache_key],
                 output_path=record.delta_no2_path,
             )
@@ -347,7 +351,7 @@ def _count_failure_outcomes(failure_rows: list[dict[str, object]]) -> tuple[int,
 
 
 def _install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:
-    """Atomically replace one split's raster directory with selected files."""
+    # Atomically replace one split's raster directory with selected files
     raster_root = Path(DATASET_RASTER_DIR)
     raster_root.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{split}-staging-", dir=raster_root))
@@ -383,14 +387,23 @@ def _install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse dataset-generation command-line options."""
+    """Parse dataset-generation command-line options.
+
+    Returns:
+        Parsed command-line arguments.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=NUM_CORES)
     parser.add_argument("--split", choices=("all", *SPLIT_PATHS), default=_default_split())
     parser.add_argument(
-        "--refresh-cache",
+        "--refresh-tempo",
         action="store_true",
-        help="rebuild the selected split's cached image rasters",
+        help="rebuild cached TEMPO rasters for the selected split",
+    )
+    parser.add_argument(
+        "--refresh-wind",
+        action="store_true",
+        help="rebuild cached wind rasters for the selected split",
     )
     return parser.parse_args()
 
@@ -424,25 +437,25 @@ def main() -> None:
     Path(DATASET_DIR).mkdir(parents=True, exist_ok=True)
     Path(DATASET_DF).mkdir(parents=True, exist_ok=True)
     Path(DATASET_RASTER_DIR).mkdir(parents=True, exist_ok=True)
-    scan_cache_dir = Path(DATASET_SCAN_CACHE_DIR)
-    scan_cache_dir.mkdir(parents=True, exist_ok=True)
+    tempo_cache_dir = Path(DATASET_TEMPO_CACHE_DIR)
+    tempo_cache_dir.mkdir(parents=True, exist_ok=True)
     wind_cache_dir = Path(DATASET_WIND_CACHE_DIR)
     wind_cache_dir.mkdir(parents=True, exist_ok=True)
     splits = _load_splits(_selected_split_paths(args.split))
     with tempfile.TemporaryDirectory(prefix=".dataset-run-", dir=DATASET_DIR) as temporary_dir:
         records, scans, winds, failures = _prepare_records(
             splits,
-            scan_cache_dir,
+            tempo_cache_dir,
             wind_cache_dir,
             Path(temporary_dir),
         )
         print(f"Planned {len(records):,} records using {len(scans):,} TEMPO scans and {len(winds):,} wind rasters")
-        cache_paths, scan_failures = _run_scan_regridding(scans, workers, args.refresh_cache)
-        wind_cache_paths, wind_failures = _run_wind_alignment(winds, workers, args.refresh_cache)
+        tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, workers, args.refresh_tempo)
+        wind_cache_paths, wind_failures = _run_wind_alignment(winds, workers, args.refresh_wind)
         tasks, records_by_id = _record_tasks(
             records,
-            cache_paths,
-            scan_failures,
+            tempo_cache_paths,
+            tempo_failures,
             wind_cache_paths,
             wind_failures,
             failures,
