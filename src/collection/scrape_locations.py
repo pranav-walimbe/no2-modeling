@@ -1,8 +1,9 @@
-"""Add current facility attributes to hourly emissions with Polars."""
+"""Add prediction-date facility attributes to hourly emissions with Polars."""
 
 import os
+import re
 import time
-from datetime import date, datetime
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,12 +14,13 @@ from timezonefinder import TimezoneFinder
 
 from collection.emissions_schema import (
     EMISSIONS_HOUR_UTC_COL,
+    FACILITY_NAMEPLATE_CAPACITY_MW_COL,
     LOCAL_STANDARD_DATE_COL,
     LOCAL_STANDARD_HOUR_COL,
     TIME_ZONE_COL,
     UTC_STANDARD_OFFSET_HOURS_COL,
 )
-from config import EMISSIONS_RECORDS_PARQUET, EMISSIONS_START_DATE, FULL_DATA_PARQUET
+from config import EMISSIONS_RECORDS_PARQUET, FULL_DATA_PARQUET
 from prerequisites import require_campd_credentials
 
 API_URL = "https://api.epa.gov/easey/facilities-mgmt/facilities/attributes"
@@ -30,6 +32,20 @@ MAX_RETRY_DELAY_SECONDS = 300
 RATE_LIMIT_WAIT_SECONDS = 3_600
 ROW_GROUP_SIZE = 250_000
 STANDARD_OFFSET_REFERENCE = datetime(2025, 1, 1, 12)
+FACILITY_ATTRIBUTE_YEAR_COL = "facilityAttributeYear"
+UNIT_ATTRIBUTE_YEAR_COL = "unitAttributeYear"
+PREDICTION_YEAR_COL = "_predictionYear"
+GENERATOR_CAPACITY_PATTERN = re.compile(
+    r"\s*(?P<generator>[^(),]+?)\s*\(\s*(?P<capacity>(?:\d+(?:\.\d*)?|\.\d+))\s*\)\s*"
+)
+CAPACITY_ATTRIBUTE_SCHEMA = {
+    "facilityId": pl.Int64,
+    FACILITY_ATTRIBUTE_YEAR_COL: pl.Int64,
+    FACILITY_NAMEPLATE_CAPACITY_MW_COL: pl.Float64,
+}
+
+FacilityYear = tuple[int, int]
+GeneratorValues = dict[FacilityYear, dict[str, set[float]]]
 
 FACILITY_ATTRIBUTE_COLUMNS = {
     "year": "facilityAttributeYear",
@@ -147,59 +163,138 @@ def get_facility_attributes(
     latest_year: int,
     earliest_year: int,
 ) -> list[dict[str, object]]:
-    """Return unit records from each facility's newest available year.
+    """Return matching unit records for every requested attribute year.
 
     Args:
         facility_ids: EPA facility identifiers required by the emissions data.
-        latest_year: First facility-attribute year to query.
+        latest_year: Newest facility-attribute year to query.
         earliest_year: Oldest facility-attribute year to query.
 
     Returns:
-        Facility and unit records from the newest available year per facility.
+        Facility and unit records from all requested years.
     """
-    remaining_facility_ids = set(facility_ids)
+    if earliest_year > latest_year:
+        raise ValueError("earliest_year must not exceed latest_year")
+    required_facility_ids = set(facility_ids)
+    matched_facility_ids: set[int] = set()
     selected_records: list[dict[str, object]] = []
 
     for year in range(latest_year, earliest_year - 1, -1):
         year_records = _fetch_attribute_year(year)
         matched_records: list[dict[str, object]] = []
-        matched_facility_ids: set[int] = set()
+        matched_this_year: set[int] = set()
         for record in year_records:
             try:
                 facility_id = int(record["facilityId"])
             except (KeyError, TypeError, ValueError):
                 continue
-            if facility_id in remaining_facility_ids:
+            if facility_id in required_facility_ids:
                 matched_records.append(record)
-                matched_facility_ids.add(facility_id)
+                matched_this_year.add(facility_id)
 
         selected_records.extend(matched_records)
-        remaining_facility_ids.difference_update(matched_facility_ids)
-        print(
-            f"Matched {len(matched_facility_ids):,} facilities for {year}; "
-            f"{len(remaining_facility_ids):,} still need attributes"
-        )
-        if not remaining_facility_ids:
-            return selected_records
+        matched_facility_ids.update(matched_this_year)
+        print(f"Matched {len(matched_this_year):,}/{len(required_facility_ids):,} required facilities for {year}")
 
-    missing = ", ".join(str(facility_id) for facility_id in sorted(remaining_facility_ids))
+    missing_facility_ids = required_facility_ids.difference(matched_facility_ids)
+    if not missing_facility_ids:
+        return selected_records
+    missing = ", ".join(str(facility_id) for facility_id in sorted(missing_facility_ids))
     raise RuntimeError(f"CAMPD returned no facility attributes for required facilities: {missing}")
 
 
+def _parse_generator_capacities(value: object) -> tuple[tuple[str, float], ...]:
+    # Parse the CAMPD comma-separated generator and capacity field
+    if value is None:
+        return ()
+    if not isinstance(value, str):
+        raise ValueError(f"Generator nameplate-capacity value must be text, found {type(value).__name__}")
+    if not value.strip():
+        return ()
+    entries: list[tuple[str, float]] = []
+    for part in value.split(","):
+        match = GENERATOR_CAPACITY_PATTERN.fullmatch(part)
+        if match is None:
+            raise ValueError(f"Invalid generator nameplate-capacity entry: {part.strip()!r}")
+        generator_id = match.group("generator").strip().upper()
+        capacity_mw = float(match.group("capacity"))
+        if not generator_id or capacity_mw <= 0:
+            raise ValueError(f"Invalid generator nameplate-capacity entry: {part.strip()!r}")
+        entries.append((generator_id, capacity_mw))
+    return tuple(entries)
+
+
+def _collect_capacity_values(attributes: pl.DataFrame) -> tuple[GeneratorValues, set[FacilityYear]]:
+    # Parse every capacity field into facility-year generator groups
+    generator_values: GeneratorValues = {}
+    facility_years: set[FacilityYear] = set()
+    for facility_id, year, serialized in attributes.select(
+        "facilityId", "year", "associatedGeneratorsAndNameplateCapacity"
+    ).iter_rows():
+        if facility_id is None or year is None:
+            raise ValueError("CAMPD capacity attributes require facility and year identifiers")
+        facility_key = (int(facility_id), int(year))
+        facility_years.add(facility_key)
+        try:
+            entries = _parse_generator_capacities(serialized)
+        except ValueError:
+            continue
+        facility_generators = generator_values.setdefault(facility_key, {})
+        for generator_id, capacity_mw in entries:
+            facility_generators.setdefault(generator_id, set()).add(capacity_mw)
+    return generator_values, facility_years
+
+
+def _summarize_capacity(
+    facility_key: FacilityYear,
+    generator_values: GeneratorValues,
+) -> dict[str, int | float]:
+    # Exclude generators that have conflicting capacity values
+    facility_generators = generator_values.get(facility_key, {})
+    conflict_generators = {
+        generator_id for generator_id, capacities in facility_generators.items() if len(capacities) > 1
+    }
+    resolved_capacity_mw = sum(
+        next(iter(capacities))
+        for generator_id, capacities in facility_generators.items()
+        if generator_id not in conflict_generators
+    )
+    return {
+        "facilityId": facility_key[0],
+        FACILITY_ATTRIBUTE_YEAR_COL: facility_key[1],
+        FACILITY_NAMEPLATE_CAPACITY_MW_COL: float(resolved_capacity_mw),
+    }
+
+
+def _build_capacity_attributes(attributes: pl.DataFrame) -> pl.DataFrame:
+    # Resolve generators once per facility and attribute year
+    generator_values, facility_years = _collect_capacity_values(attributes)
+    rows: list[dict[str, int | float]] = []
+    for facility_key in sorted(facility_years):
+        rows.append(_summarize_capacity(facility_key, generator_values))
+    return pl.DataFrame(rows, schema=CAPACITY_ATTRIBUTE_SCHEMA)
+
+
 def _build_attribute_frames(records: list[dict[str, object]]) -> tuple[pl.DataFrame, pl.DataFrame]:
-    # Separate facility-level fields from unit-level fields before the hourly join
+    # Separate time-varying facility and unit fields before the hourly join
     attributes = pl.DataFrame(records, schema=ATTRIBUTE_SCHEMA, strict=False).with_columns(
         pl.col("unitId").str.strip_chars()
     )
-    facility_attributes = attributes.select(
-        "facilityId",
-        *(pl.col(source).alias(target) for source, target in FACILITY_ATTRIBUTE_COLUMNS.items()),
-    ).unique(subset="facilityId", keep="first", maintain_order=True)
+    capacity_attributes = _build_capacity_attributes(attributes)
+    facility_attributes = (
+        attributes.select(
+            "facilityId",
+            *(pl.col(source).alias(target) for source, target in FACILITY_ATTRIBUTE_COLUMNS.items()),
+        )
+        .unique(subset=["facilityId", FACILITY_ATTRIBUTE_YEAR_COL], keep="first", maintain_order=True)
+        .join(capacity_attributes, on=["facilityId", FACILITY_ATTRIBUTE_YEAR_COL], how="left")
+    )
     unit_attributes = attributes.select(
         "facilityId",
+        pl.col("year").alias(UNIT_ATTRIBUTE_YEAR_COL),
         pl.col("unitId").alias("unitIdKey"),
         *(pl.col(source).alias(target) for source, target in UNIT_ATTRIBUTE_COLUMNS.items()),
-    ).unique(subset=["facilityId", "unitIdKey"], keep="first", maintain_order=True)
+    ).unique(subset=["facilityId", UNIT_ATTRIBUTE_YEAR_COL, "unitIdKey"], keep="first", maintain_order=True)
     return facility_attributes, unit_attributes
 
 
@@ -266,8 +361,8 @@ def write_augmented_parquet(
     Args:
         input_path: Raw hourly emissions Parquet file.
         output_path: Final compressed Parquet file.
-        facility_attributes: One row of facility attributes per facility.
-        unit_attributes: One row of unit attributes per facility and unit.
+        facility_attributes: Annual facility attributes and capacity summaries.
+        unit_attributes: Annual unit attributes per facility and unit.
 
     Returns:
         Number of enriched rows written.
@@ -284,16 +379,34 @@ def write_augmented_parquet(
 
     unit_id = pl.col("unitId").cast(pl.String, strict=False).str.strip_chars()
     source_row_count = source.select(pl.len()).collect().item()
-    located_facilities = _add_facility_time_zones(facility_attributes)
+    located_facilities = _add_facility_time_zones(facility_attributes).sort("facilityId", FACILITY_ATTRIBUTE_YEAR_COL)
+    sorted_unit_attributes = unit_attributes.sort("facilityId", "unitIdKey", UNIT_ATTRIBUTE_YEAR_COL)
     augmented = (
         source.with_columns(
             pl.col("facilityId").cast(pl.Int64, strict=False),
             unit_id.alias("unitId"),
             unit_id.alias("unitIdKey"),
+            pl.col("date").cast(pl.Date, strict=False).dt.year().alias(PREDICTION_YEAR_COL),
         )
-        .join(located_facilities.lazy(), on="facilityId", how="left")
-        .join(unit_attributes.lazy(), on=["facilityId", "unitIdKey"], how="left")
-        .drop("unitIdKey")
+        .sort("facilityId", PREDICTION_YEAR_COL)
+        .join_asof(
+            located_facilities.lazy(),
+            left_on=PREDICTION_YEAR_COL,
+            right_on=FACILITY_ATTRIBUTE_YEAR_COL,
+            by="facilityId",
+            strategy="backward",
+            check_sortedness=False,
+        )
+        .sort("facilityId", "unitIdKey", PREDICTION_YEAR_COL)
+        .join_asof(
+            sorted_unit_attributes.lazy(),
+            left_on=PREDICTION_YEAR_COL,
+            right_on=UNIT_ATTRIBUTE_YEAR_COL,
+            by=["facilityId", "unitIdKey"],
+            strategy="backward",
+            check_sortedness=False,
+        )
+        .drop("unitIdKey", PREDICTION_YEAR_COL)
         .drop_nulls(["lat", "lon", "epaRegion"])
         .pipe(_convert_local_standard_hours_to_utc)
     )
@@ -306,12 +419,12 @@ def write_augmented_parquet(
             row_group_size=ROW_GROUP_SIZE,
         )
         row_count = pl.scan_parquet(temporary_path).select(pl.len()).collect().item()
-        if row_count == 0:
-            raise RuntimeError("No emissions rows had complete facility location attributes")
         if row_count < source_row_count:
             raise RuntimeError(
                 f"Location enrichment dropped {source_row_count - row_count:,} of {source_row_count:,} emissions rows"
             )
+        if row_count == 0:
+            raise RuntimeError("No emissions rows were available for location enrichment")
         if row_count > source_row_count:
             raise RuntimeError(f"Location enrichment added {row_count - source_row_count:,} duplicate emissions rows")
         os.replace(temporary_path, output_path)
@@ -322,12 +435,13 @@ def write_augmented_parquet(
 
 
 def main() -> None:
-    """Write hourly emissions enriched with current facility attributes."""
+    """Write hourly emissions enriched with prediction-date attributes."""
     require_campd_credentials()
 
     input_path = Path(EMISSIONS_RECORDS_PARQUET)
+    source = pl.scan_parquet(input_path)
     facility_ids = (
-        pl.scan_parquet(input_path)
+        source
         .select(pl.col("facilityId").cast(pl.Int64, strict=False))
         .drop_nulls()
         .unique()
@@ -335,11 +449,17 @@ def main() -> None:
         .collect()["facilityId"]
         .to_list()
     )
+    source_years = source.select(
+        pl.col("date").cast(pl.Date, strict=False).dt.year().min().alias("earliest"),
+        pl.col("date").cast(pl.Date, strict=False).dt.year().max().alias("latest"),
+    ).collect().row(0, named=True)
+    if source_years["earliest"] is None or source_years["latest"] is None:
+        raise ValueError("Raw hourly emissions contain no valid prediction dates")
 
     attribute_records = get_facility_attributes(
         facility_ids=facility_ids,
-        latest_year=date.today().year,
-        earliest_year=EMISSIONS_START_DATE.year,
+        latest_year=int(source_years["latest"]),
+        earliest_year=int(source_years["earliest"]),
     )
 
     facility_attributes, unit_attributes = _build_attribute_frames(attribute_records)

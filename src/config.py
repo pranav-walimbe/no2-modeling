@@ -5,6 +5,8 @@ from datetime import date, datetime, timezone
 
 from dotenv import load_dotenv
 
+from collection.emissions_schema import TOTAL_NAMEPLATE_CAPACITY_MW_COL
+
 # ============================================================================
 # API
 # ============================================================================
@@ -126,6 +128,7 @@ LABEL_WEIGHT_CAP = 5.0  # maximum inverse-frequency multiplier in the training l
 MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
     "num_coal_units",
     "num_ng_units",
+    TOTAL_NAMEPLATE_CAPACITY_MW_COL,
     "avg_heat_input",
     "avg_pwr_gen",
     DELTA_NOX_SCALE_COL,
@@ -135,6 +138,7 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
     "boundary_layer_height_m",
 )
 MODEL_LOG1P_FEATURES = (  # stabilize strongly right-skewed, nonnegative quantities before z-scoring
+    TOTAL_NAMEPLATE_CAPACITY_MW_COL,
     "avg_heat_input",
     DELTA_NOX_SCALE_COL,
 )

@@ -5,7 +5,11 @@ import os
 import numpy as np
 import polars as pl
 
-from collection.emissions_schema import EMISSIONS_HOUR_UTC_COL
+from collection.emissions_schema import (
+    EMISSIONS_HOUR_UTC_COL,
+    FACILITY_NAMEPLATE_CAPACITY_MW_COL,
+    TOTAL_NAMEPLATE_CAPACITY_MW_COL,
+)
 from config import (
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
@@ -66,6 +70,7 @@ OUTPUT_COLUMNS = [
     MAJOR_CITY_DIST_COL,
     "num_coal_units",
     "num_ng_units",
+    TOTAL_NAMEPLATE_CAPACITY_MW_COL,
     "date",
     "hour",
     EMISSIONS_HOUR_UTC_COL,
@@ -99,6 +104,7 @@ REQUIRED_COLUMNS = [
     "noxMassMeasureFlg",
     "primaryFuelInfo",
     "attributePrimaryFuelInfo",
+    FACILITY_NAMEPLATE_CAPACITY_MW_COL,
 ]
 
 
