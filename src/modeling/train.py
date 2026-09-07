@@ -1,4 +1,4 @@
-"""Train a mask-aware model for normalized hourly NOx-mass changes."""
+"""Train a mask-aware binary classifier for hourly NOx-mass changes."""
 
 import argparse
 import json
@@ -12,26 +12,30 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from config import LABEL_COL, LABEL_WEIGHT_BIN_COUNT, LABEL_WEIGHT_CAP, MODEL_IMAGE_CLIP_Z, NUM_CORES, RUNS_DIR
+from config import (
+    DATASET_DF,
+    LABEL_COL,
+    MODEL_IMAGE_CLIP_Z,
+    NUM_CORES,
+    RUNS_DIR,
+    STRAT_BASE_DIR,
+)
 from modeling.dataset import (
     LABEL_MODE_COL,
     MODEL_FEATURE_NAMES,
-    NormalizationStats,
     NOxDataset,
     compute_stats,
-    denormalize_target,
     load_stats,
     save_stats,
 )
 from modeling.eval_utils import (
-    NORMALIZED_PRED_COL,
-    NORMALIZED_TRUE_COL,
-    HistogramWeightedHuberLoss,
-    add_mass_change_predictions,
-    build_histogram_weight_config,
+    LOGIT_COL,
+    POSITIVE_PROBABILITY_COL,
+    PREDICTED_CLASS_COL,
+    TRUE_CLASS_COL,
     save_results,
 )
-from modeling.plot_utils import plot_loss_curve, plot_pred_vs_true, plot_residuals, plot_spatial_error
+from modeling.plot_utils import plot_class_probabilities, plot_loss_curve, plot_spatial_accuracy
 from modeling.resnet import DEFAULT_DROPOUT, DEFAULT_HEAD_DIM, NOxModel
 
 DEFAULT_BATCH_SIZE = 128
@@ -41,7 +45,6 @@ DEFAULT_PREFETCH_FACTOR = 2
 DEFAULT_SEED = 42
 DEFAULT_LEARNING_RATE = 3e-4
 DEFAULT_WEIGHT_DECAY = 1e-4
-DEFAULT_HUBER_DELTA = 1.0
 DEFAULT_GRADIENT_CLIP_NORM = 5.0
 DEFAULT_SCHEDULER_PATIENCE = 10
 DEFAULT_SCHEDULER_FACTOR = 0.50
@@ -59,9 +62,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
-    parser.add_argument("--huber-delta", type=float, default=DEFAULT_HUBER_DELTA)
-    parser.add_argument("--label-bins", type=int, default=LABEL_WEIGHT_BIN_COUNT)
-    parser.add_argument("--max-label-weight", type=float, default=LABEL_WEIGHT_CAP)
     parser.add_argument("--gradient-clip-norm", type=float, default=DEFAULT_GRADIENT_CLIP_NORM)
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
     parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
@@ -78,32 +78,6 @@ def _device(requested: str) -> torch.device:
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     return torch.device(requested)
-
-
-def _validate_args(args: argparse.Namespace) -> None:
-    positive_integer_names = ("batch_size", "epochs", "prefetch_factor", "head_dim", "label_bins")
-    if any(getattr(args, name) < 1 for name in positive_integer_names):
-        raise ValueError(f"These arguments must be positive: {', '.join(positive_integer_names)}")
-    if args.seed < 0 or args.scheduler_patience < 0:
-        raise ValueError("seed and scheduler patience cannot be negative")
-    if args.workers < 0:
-        raise ValueError("workers cannot be negative")
-    if args.workers > NUM_CORES:
-        raise ValueError(f"workers cannot exceed the allocated CPU count ({NUM_CORES})")
-    if args.learning_rate <= 0 or args.huber_delta <= 0 or args.gradient_clip_norm <= 0:
-        raise ValueError("learning rate, Huber delta, and gradient clip norm must be positive")
-    if args.label_bins % 2:
-        raise ValueError("label bins must be even to keep negative and positive labels separate")
-    if args.max_label_weight <= 0:
-        raise ValueError("maximum label weight must be positive")
-    if args.weight_decay < 0:
-        raise ValueError("weight decay cannot be negative")
-    if not 0 <= args.dropout < 1:
-        raise ValueError("dropout must be in [0, 1)")
-    if not 0 < args.scheduler_factor < 1:
-        raise ValueError("scheduler factor must be in (0, 1)")
-    if args.early_stop_patience <= args.scheduler_patience:
-        raise ValueError("early-stop patience must exceed scheduler patience")
 
 
 def _seed_everything(seed: int) -> None:
@@ -196,24 +170,44 @@ def _loader(dataset: NOxDataset, *, shuffle: bool, args: argparse.Namespace, dev
 
 def _prediction_frame(
     dataset: NOxDataset,
-    predictions: np.ndarray,
+    logits: np.ndarray,
     indices: np.ndarray,
-    stats: NormalizationStats,
 ) -> pd.DataFrame:
+    # Attach probabilities and thresholded classes in source-record order
     frame = dataset.frame.iloc[indices].copy().reset_index(drop=True)
-    frame[NORMALIZED_TRUE_COL] = frame["delta_nox_norm"].to_numpy(dtype=np.float64)
-    frame[NORMALIZED_PRED_COL] = denormalize_target(predictions, stats)
-    return add_mass_change_predictions(frame)
+    probability = 1.0 / (1.0 + np.exp(-np.clip(logits, -80, 80)))
+    frame[TRUE_CLASS_COL] = frame[LABEL_COL].to_numpy(dtype=np.uint8)
+    frame[LOGIT_COL] = logits
+    frame[POSITIVE_PROBABILITY_COL] = probability
+    frame[PREDICTED_CLASS_COL] = (probability >= 0.5).astype(np.uint8)
+    return frame
+
+
+def _load_classification_summaries(
+    dataframe_dir: str | Path = DATASET_DF,
+) -> dict[str, object]:
+    # Preserve natural prevalence beside metrics from balanced splits
+    stratification_path = Path(STRAT_BASE_DIR) / "classification_summary.json"
+    with stratification_path.open() as source:
+        stratification = json.load(source)
+
+    generated = {}
+    for split in ("train", "val", "test"):
+        path = Path(dataframe_dir) / f"{split}_classification_summary.json"
+        with path.open() as source:
+            summary = json.load(source)
+        generated[split] = summary
+    return {"stratification": stratification, "generated_splits": generated}
 
 
 def main() -> None:
     args = parse_args()
-    _validate_args(args)
     _seed_everything(args.seed)
     device = _device(args.device)
 
     stats = load_stats(args.stats) if args.stats else compute_stats("train")
-    run_name = datetime.now(timezone.utc).strftime("delta_nox_%Y%m%d_%H%M%S")
+    classification_summaries = _load_classification_summaries()
+    run_name = datetime.now(timezone.utc).strftime("delta_nox_classification_%Y%m%d_%H%M%S")
     run_dir = Path(RUNS_DIR) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
@@ -222,10 +216,7 @@ def main() -> None:
     datasets = {
         split: NOxDataset(split, stats, load_images=args.inputs != "tabular") for split in ("train", "val", "test")
     }
-    label_modes = {str(dataset.frame[LABEL_MODE_COL].iloc[0]) for dataset in datasets.values()}
-    if len(label_modes) != 1:
-        raise ValueError("Train, validation, and test must use the same target label mode")
-    target_label_mode = label_modes.pop()
+    target_label_mode = str(datasets["train"].frame[LABEL_MODE_COL].iloc[0])
     train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
     eval_loaders = {
         split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in datasets.items()
@@ -239,18 +230,8 @@ def main() -> None:
         dropout=args.dropout,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    loss_weight_config = build_histogram_weight_config(
-        datasets["train"].frame[LABEL_COL].to_numpy(dtype=np.float64),
-        bin_count=args.label_bins,
-        weight_cap=args.max_label_weight,
-    )
-    train_criterion = HistogramWeightedHuberLoss(
-        loss_weight_config,
-        delta=args.huber_delta,
-        target_mean=stats.target_mean,
-        target_std=stats.target_std,
-    ).to(device)
-    eval_criterion = nn.HuberLoss(delta=args.huber_delta)
+    train_criterion = nn.BCEWithLogitsLoss()
+    eval_criterion = nn.BCEWithLogitsLoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -276,8 +257,6 @@ def main() -> None:
         "dropout": args.dropout,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
-        "huber_delta": args.huber_delta,
-        "label_weighting": loss_weight_config.to_dict(),
         "gradient_clip_norm": args.gradient_clip_norm,
         "scheduler_patience": args.scheduler_patience,
         "scheduler_factor": args.scheduler_factor,
@@ -286,14 +265,13 @@ def main() -> None:
         "image_keys": list(stats.image_keys),
         "image_scale": list(stats.image_scale),
         "image_clip_z": MODEL_IMAGE_CLIP_Z,
+        "raw_delta_nox_deadband_threshold": stats.deadband_threshold,
         "target_label_mode": target_label_mode,
         "tabular_features": list(MODEL_FEATURE_NAMES),
         "model_parameters": model.num_params(),
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
-    with (run_dir / "loss_weights.json").open("w") as destination:
-        json.dump(loss_weight_config.to_dict(), destination, indent=2)
     print(f"Training {model.num_params():,} parameters on {device}; outputs: {run_dir}")
 
     for epoch in range(1, args.epochs + 1):
@@ -338,13 +316,12 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     split_frames = {}
     for split, loader in eval_loaders.items():
-        predictions, indices = run_inference(model, loader, device)
-        split_frames[split] = _prediction_frame(datasets[split], predictions, indices, stats)
+        logits, indices = run_inference(model, loader, device)
+        split_frames[split] = _prediction_frame(datasets[split], logits, indices)
 
-    plot_pred_vs_true(split_frames, run_dir)
-    plot_residuals(split_frames, run_dir)
-    plot_spatial_error(split_frames, run_dir)
-    save_results(split_frames, run_dir, train_target_mean=stats.target_mean)
+    plot_class_probabilities(split_frames, run_dir)
+    plot_spatial_accuracy(split_frames, run_dir)
+    save_results(split_frames, classification_summaries, run_dir)
 
 
 if __name__ == "__main__":

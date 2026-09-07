@@ -1,6 +1,7 @@
 """Partition AOI-hour emission records into train, validation, and test splits."""
 
 import os
+from pathlib import Path
 
 import polars as pl
 
@@ -10,6 +11,8 @@ from collection.emissions_schema import (
     TOTAL_NAMEPLATE_CAPACITY_MW_COL,
 )
 from config import (
+    DEADBAND_THRESHOLD_COL,
+    DEADBAND_TRAIN_FRACTION,
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
     FULL_DATA_PARQUET,
@@ -25,6 +28,7 @@ from config import (
     VAL_RECORDS_CSV,
     VAL_RECORDS_SIZE,
 )
+from preprocessing.generate_dataset_utils import write_json_atomic
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
     LABEL_MODE_COL,
@@ -35,10 +39,12 @@ from preprocessing.stratify_utils import (
     add_hrrr_files,
     add_major_city_distance,
     aggregate_aoi_hours,
+    apply_binary_target,
     apply_target_label_mode,
     build_aoi_membership,
     build_aoi_spatial_frame,
     build_aois,
+    classification_summary,
     cluster_aois,
     filter_quantitative_outliers,
     filter_usable_nox_measurements,
@@ -86,6 +92,7 @@ OUTPUT_COLUMNS = [
     NOX_MASS_COL,
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
+    DEADBAND_THRESHOLD_COL,
     LABEL_COL,
     LABEL_MODE_COL,
 ]
@@ -109,13 +116,7 @@ REQUIRED_COLUMNS = [
 
 def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
     # Assign each geographic cluster to exactly one split
-    if frame["cluster"].null_count() > 0:
-        raise ValueError("Cannot split records with missing cluster assignments")
-
     clusters = frame.select("cluster").unique().sort("cluster").sample(fraction=1.0, shuffle=True, seed=SPLIT_SEED)
-    if clusters.height < 3:
-        raise ValueError("At least three geographic clusters are required to create train, validation, and test splits")
-
     train_count = min(clusters.height - 2, max(1, int(clusters.height * TRAIN_FRACTION)))
     val_count = min(clusters.height - train_count - 1, max(1, int(clusters.height * VAL_FRACTION)))
     cluster_splits = {
@@ -132,42 +133,42 @@ def _limit_splits(
     splits: dict[str, pl.DataFrame],
     limits: dict[str, int] = SPLIT_RECORD_LIMITS,
 ) -> dict[str, pl.DataFrame]:
-    # Select coal-output records first and rank the remainder by lagged power
+    # Balance labels while retaining lagged power priority within each class
     limited: dict[str, pl.DataFrame] = {}
-    required = {AOI_ID_COL, "date", "hour", PREVIOUS_QUARTER_COAL_POWER_COL, PREVIOUS_QUARTER_POWER_COL}
     for name, split in splits.items():
         limit = limits[name]
-        if limit < 1:
-            raise ValueError(f"{name} split limit must be positive")
-        if split.height <= limit:
-            limited[name] = split
-            continue
-        missing = required.difference(split.columns)
-        if missing:
-            raise ValueError(f"Cannot prioritize {name} split without columns: {', '.join(sorted(missing))}")
         indexed = split.with_row_index("_priority_row").with_columns(
             split.select(AOI_ID_COL, "date", "hour").hash_rows(seed=SPLIT_SEED).alias("_priority_hash")
         )
-        coal_pool = indexed.filter(
-            pl.col(PREVIOUS_QUARTER_COAL_POWER_COL).is_finite()
-            & (pl.col(PREVIOUS_QUARTER_COAL_POWER_COL) > 0)
-        )
-        selected_coal = _rank_priority_pool(coal_pool, PREVIOUS_QUARTER_COAL_POWER_COL).head(limit)
-        remaining_count = limit - selected_coal.height
-        if remaining_count:
-            general_pool = indexed.join(selected_coal.select("_priority_row"), on="_priority_row", how="anti")
-            selected_general = _rank_priority_pool(general_pool, PREVIOUS_QUARTER_POWER_COL).head(remaining_count)
-            selected = pl.concat((selected_coal, selected_general), how="vertical")
-        else:
-            selected = selected_coal
-        if selected.height < limit:
-            raise ValueError(f"Only {selected.height:,} records are available for the requested {name} limit {limit:,}")
+        class_limit = limit // 2
+        selected_classes = []
+        for label in (0, 1):
+            class_pool = indexed.filter(pl.col(LABEL_COL) == label)
+            if class_pool.height < class_limit:
+                raise ValueError(
+                    f"{name} class {label} has {class_pool.height:,} records; "
+                    f"cannot select the requested {class_limit:,}"
+                )
+            selected_classes.append(_select_priority_records(class_pool, class_limit))
+        selected = pl.concat(selected_classes, how="vertical")
         limited[name] = selected.sort("_priority_row").drop("_priority_row", "_priority_hash", "_priority_round")
-        print(
-            f"[{name}] selected {selected_coal.height:,} coal-priority and "
-            f"{remaining_count:,} general records from {split.height:,} candidates"
-        )
+        print(f"[{name}] selected {class_limit:,} records per class from {split.height:,} candidates")
     return limited
+
+
+def _select_priority_records(frame: pl.DataFrame, limit: int) -> pl.DataFrame:
+    # Exhaust positive coal-output candidates before using the general pool
+    coal_pool = frame.filter(
+        pl.col(PREVIOUS_QUARTER_COAL_POWER_COL).is_finite()
+        & (pl.col(PREVIOUS_QUARTER_COAL_POWER_COL) > 0)
+    )
+    selected_coal = _rank_priority_pool(coal_pool, PREVIOUS_QUARTER_COAL_POWER_COL).head(limit)
+    remaining_count = limit - selected_coal.height
+    if not remaining_count:
+        return selected_coal
+    general_pool = frame.join(selected_coal.select("_priority_row"), on="_priority_row", how="anti")
+    selected_general = _rank_priority_pool(general_pool, PREVIOUS_QUARTER_POWER_COL).head(remaining_count)
+    return pl.concat((selected_coal, selected_general), how="vertical")
 
 
 def _rank_priority_pool(frame: pl.DataFrame, priority_column: str) -> pl.DataFrame:
@@ -190,13 +191,6 @@ def _rank_priority_pool(frame: pl.DataFrame, priority_column: str) -> pl.DataFra
 def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
     source = pl.scan_parquet(FULL_DATA_PARQUET)
-    missing_columns = set(REQUIRED_COLUMNS).difference(source.collect_schema().names())
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
-        raise ValueError(
-            f"Full emissions data is missing required AOI columns: {missing}. "
-            "Rerun collection.scrape_emissions and collection.scrape_locations."
-        )
     records = (
         source.select(REQUIRED_COLUMNS)
         .with_columns(pl.col("date").cast(pl.Date, strict=False))
@@ -210,7 +204,10 @@ def main() -> None:
     spatial_aois = build_aoi_spatial_frame(aois)
     membership = build_aoi_membership(aois, facilities, spatial_aois)
     frame = aggregate_aoi_hours(records, aois, membership).filter(
-        pl.col("avg_heat_input").is_not_null() & pl.col("avg_pwr_gen").is_not_null() & pl.col(LABEL_COL).is_not_null()
+        pl.col("avg_heat_input").is_not_null()
+        & pl.col("avg_pwr_gen").is_not_null()
+        & pl.col(DELTA_NOX_MASS_COL).is_not_null()
+        & pl.col(DELTA_NOX_SCALE_COL).is_not_null()
     )
     frame = frame.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
     frame = apply_target_label_mode(add_tempo_observations(frame, observations))
@@ -226,10 +223,27 @@ def main() -> None:
         & pl.col(MAJOR_CITY_DIST_COL).is_finite()
     )
     frame = serialize_tempo_path_lists(frame)
-    splits = _limit_splits(filter_quantitative_outliers(_split_by_cluster(frame)))
+    filtered_splits = filter_quantitative_outliers(_split_by_cluster(frame))
+    labeled_splits, threshold = apply_binary_target(filtered_splits)
+    splits = _limit_splits(labeled_splits)
     del frame
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
+    summary = {
+        "deadband": {
+            "training_fraction": DEADBAND_TRAIN_FRACTION,
+            "raw_delta_nox_threshold": threshold,
+            "retained_rule": "abs(delta_nox_mass) > threshold",
+        },
+        "splits": {
+            name: {
+                "deadband": classification_summary(filtered_splits[name], labeled_splits[name]),
+                "candidate_balance": classification_summary(labeled_splits[name], splits[name]),
+            }
+            for name in splits
+        },
+    }
+    write_json_atomic(summary, Path(STRAT_BASE_DIR) / "classification_summary.json")
     # Project and write one split at a time so the copies never coexist
     for name, destination in (("train", TRAIN_RECORDS_CSV), ("val", VAL_RECORDS_CSV), ("test", TEST_RECORDS_CSV)):
         splits.pop(name).select(OUTPUT_COLUMNS).write_csv(destination)

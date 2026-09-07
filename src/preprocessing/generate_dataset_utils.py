@@ -19,20 +19,15 @@ from eccodes import (
 
 from config import (
     CENTRAL_COVERAGE_WINDOW_SIZE,
-    IMG_RANGE,
     IMG_SIZE,
+    LABEL_COL,
     MIN_CENTRAL_FINITE_FRACTION,
     MIN_PAIRED_FINITE_FRACTION,
-    MIN_PIXEL_CLOUD,
     MODEL_IMAGE_KEYS,
     MODEL_VALID_MASK_KEY,
     RASTER_UNCERTAINTY_WEIGHT,
-    TEMPO_CELL_OVERLAP_FLOOR_KM2,
-    TEMPO_EFFECTIVE_SAMPLE_FLOOR,
-    TEMPO_GOOD_QUALITY_FLAG,
 )
 from preprocessing.regrid import (
-    SAVED_RASTER_NAMES,
     AoiGrid,
     build_granule_spatial_index,
     concatenate_pixels,
@@ -56,7 +51,6 @@ SELECTION_HELPER_COLUMNS = (
     "_stratum_rank",
     "_aoi_round",
 )
-HRRR_GRID_SPACING_M = 3_000.0
 HRRR_FIELDS = {
     "2t": "temperature_2m_k",
     "10u": "wind_u_10m_mps",
@@ -74,18 +68,6 @@ TABULAR_FEATURE_NAMES = (
 )
 
 
-def validate_coverage_config() -> None:
-    """Validate raster-coverage thresholds before expensive generation starts."""
-    if not 0 <= MIN_PAIRED_FINITE_FRACTION <= 1:
-        raise ValueError("MIN_PAIRED_FINITE_FRACTION must be in [0, 1]")
-    if not 0 <= MIN_CENTRAL_FINITE_FRACTION <= 1:
-        raise ValueError("MIN_CENTRAL_FINITE_FRACTION must be in [0, 1]")
-    if not 0 <= RASTER_UNCERTAINTY_WEIGHT <= 1:
-        raise ValueError("RASTER_UNCERTAINTY_WEIGHT must be in [0, 1]")
-    if not 1 <= CENTRAL_COVERAGE_WINDOW_SIZE <= IMG_SIZE or (IMG_SIZE - CENTRAL_COVERAGE_WINDOW_SIZE) % 2:
-        raise ValueError("CENTRAL_COVERAGE_WINDOW_SIZE must be centred within the configured raster")
-
-
 def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
     """Filter records by raster quality and add a bounded score.
 
@@ -95,16 +77,6 @@ def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
     Returns:
         Eligible records carrying a bounded raster-quality score.
     """
-    validate_coverage_config()
-    required = {
-        PAIRED_FINITE_FRACTION_COL,
-        CENTRAL_FINITE_FRACTION_COL,
-        MEAN_RETRIEVAL_UNCERTAINTY_COL,
-    }
-    missing = required.difference(frame.columns)
-    if missing:
-        raise ValueError(f"Generated records are missing quality columns: {', '.join(sorted(missing))}")
-
     paired = pl.col(PAIRED_FINITE_FRACTION_COL)
     central = pl.col(CENTRAL_FINITE_FRACTION_COL)
     keep = (
@@ -135,7 +107,7 @@ def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
-    """Select a quality-ranked AOI-balanced subset.
+    """Select an exactly balanced quality-ranked AOI subset.
 
     Args:
         frame: Generated candidate records eligible for final selection.
@@ -144,22 +116,25 @@ def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
     Returns:
         Selected records without temporary ranking columns.
     """
-    if size < 1:
-        raise ValueError("Final dataset size must be positive")
-    required = {AOI_ID_COL, "date", "hour"}
-    missing = required.difference(frame.columns)
-    if missing:
-        raise ValueError(f"Generated records are missing selection columns: {', '.join(sorted(missing))}")
-
     eligible = eligible_generated_records(frame)
-    if eligible.height < size:
-        raise ValueError(
-            f"Only {eligible.height:,} records pass raster-quality gates; "
-            f"cannot produce the requested {size:,} records"
-        )
+    class_size = size // 2
+    selected_classes = []
+    for label in (0, 1):
+        class_records = eligible.filter(pl.col(LABEL_COL) == label)
+        if class_records.height < class_size:
+            raise ValueError(
+                f"Only {class_records.height:,} class {label} records pass raster-quality gates; "
+                f"cannot produce the requested {class_size:,}"
+            )
+        selected_classes.append(_rank_final_records(class_records).head(class_size))
+    return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
+
+
+def _rank_final_records(eligible: pl.DataFrame) -> pl.DataFrame:
+    # Interleave temporal strata within each AOI before global AOI rounds
 
     strata = [AOI_ID_COL, "_selection_year", "_selection_quarter", "_selection_hour_bin"]
-    ranked = (
+    return (
         eligible.with_columns(
             pl.col("date").dt.year().alias("_selection_year"),
             pl.col("date").dt.quarter().alias("_selection_quarter"),
@@ -179,9 +154,7 @@ def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
             ["_aoi_round", RASTER_QUALITY_SCORE_COL, AOI_ID_COL, "date", "hour"],
             descending=[False, True, False, False, False],
         )
-        .head(size)
     )
-    return ranked.drop(*SELECTION_HELPER_COLUMNS)
 
 
 @dataclass(frozen=True)
@@ -246,16 +219,7 @@ def parse_tempo_paths(serialized_paths: object, tempo_root: Path) -> tuple[str, 
     Returns:
         Non-empty tuple of absolute granule paths.
     """
-    if not isinstance(serialized_paths, str):
-        raise TypeError("TEMPO path list must be a JSON string")
-    try:
-        relative_paths = json.loads(serialized_paths)
-    except json.JSONDecodeError as error:
-        raise ValueError("TEMPO path list is not valid JSON") from error
-    if not isinstance(relative_paths, list) or not relative_paths:
-        raise ValueError("TEMPO path list must contain at least one granule")
-    if any(not isinstance(path, str) or not path for path in relative_paths):
-        raise ValueError("TEMPO path list contains an invalid granule path")
+    relative_paths = json.loads(str(serialized_paths))
     return tuple(str(tempo_root / path) for path in relative_paths)
 
 
@@ -275,16 +239,11 @@ def make_scan_task(row: dict[str, object], path_column: str, tempo_root: Path, c
     lon = float(row["lon"])
     lat = float(row["lat"])
     granule_paths = parse_tempo_paths(row[path_column], tempo_root)
-    cache_contract = {
+    scan_identity = {
         "aoi": [aoi_id, lon, lat],
         "granules": granule_paths,
-        "grid": [IMG_SIZE, IMG_RANGE],
-        "pixel_cloud_max": MIN_PIXEL_CLOUD,
-        "good_quality_flag": TEMPO_GOOD_QUALITY_FLAG,
-        "cell_overlap_floor_km2": TEMPO_CELL_OVERLAP_FLOOR_KM2,
-        "effective_sample_floor": TEMPO_EFFECTIVE_SAMPLE_FLOOR,
     }
-    identity = json.dumps(cache_contract, sort_keys=True, separators=(",", ":"))
+    identity = json.dumps(scan_identity, sort_keys=True, separators=(",", ":"))
     cache_key = hashlib.sha256(identity.encode()).hexdigest()
     return ScanTask(
         cache_key=cache_key,
@@ -296,23 +255,16 @@ def make_scan_task(row: dict[str, object], path_column: str, tempo_root: Path, c
     )
 
 
-def scan_cache_is_valid(path: str | Path) -> bool:
-    """Return whether a cached scan has the complete raster contract.
+def scan_cache_exists(path: str | Path) -> bool:
+    """Return whether a cached scan exists.
 
     Args:
         path: Candidate persistent scan bundle.
 
     Returns:
-        True when all expected arrays have the configured shape and dtype.
+        True when the cache path exists.
     """
-    try:
-        with np.load(path, allow_pickle=False) as bundle:
-            return set(bundle.files) == set(SAVED_RASTER_NAMES) and all(
-                bundle[name].shape == (IMG_SIZE, IMG_SIZE) and bundle[name].dtype == np.float32
-                for name in SAVED_RASTER_NAMES
-            )
-    except (OSError, ValueError):
-        return False
+    return Path(path).is_file()
 
 
 def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
@@ -375,10 +327,6 @@ def build_hrrr_grid_indices(
         if message is None:
             raise ValueError(f"HRRR file contains no GRIB messages: {reference_path}")
         try:
-            spacing_x = float(codes_get(message, "DxInMetres"))
-            spacing_y = float(codes_get(message, "DyInMetres"))
-            if not np.isclose(spacing_x, HRRR_GRID_SPACING_M) or not np.isclose(spacing_y, HRRR_GRID_SPACING_M):
-                raise ValueError(f"Expected a 3 km HRRR grid, found {spacing_x:g} by {spacing_y:g} m")
             return {
                 aoi_id: int(codes_grib_find_nearest(message, lat, lon, is_lsm=False, npoints=1)[0]["index"])
                 for aoi_id, (lat, lon) in locations.items()
@@ -439,8 +387,6 @@ def derive_raster_features(
     with np.load(current_path, allow_pickle=False) as current, np.load(previous_path, allow_pickle=False) as previous:
         current_no2 = current["no2"]
         previous_no2 = previous["no2"]
-        if current_no2.shape != (IMG_SIZE, IMG_SIZE) or previous_no2.shape != current_no2.shape:
-            raise ValueError("Paired TEMPO rasters do not share the configured grid shape")
         valid = np.isfinite(current_no2) & np.isfinite(previous_no2)
         if not valid.any():
             raise ValueError(NO_PAIRED_FINITE_NO2_ERROR)
@@ -471,13 +417,6 @@ def derive_raster_features(
                 current["retrieval_uncertainty"], previous["retrieval_uncertainty"], valid
             ),
         }
-    required_finite = [
-        value
-        for name, value in features.items()
-        if name != MEAN_RETRIEVAL_UNCERTAINTY_COL
-    ]
-    if not all(np.isfinite(value) for value in required_finite):
-        raise ValueError("Derived TEMPO features contain non-finite values")
     rasters = {
         CURRENT_RASTER_NAME: paired_current_no2,
         DELTA_RASTER_NAME: delta_no2,
@@ -524,6 +463,33 @@ def process_record(task: RecordTask) -> RecordResult:
         return RecordResult(task.split, task.record_index, features, None)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         return RecordResult(task.split, task.record_index, {}, f"Record processing failed: {error}")
+
+
+def write_json_atomic(values: dict[str, object], destination: Path) -> None:
+    """Write a JSON object through an atomic replacement.
+
+    Args:
+        values: JSON-safe object to persist.
+        destination: Final JSON path.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(values, temporary, indent=2)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
 
 
 def write_csv_atomic(frame: pl.DataFrame, destination: Path) -> None:

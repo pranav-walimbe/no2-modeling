@@ -194,8 +194,7 @@ source .venv/bin/activate
    indices 0, 1, and 2 automatically select `train`, `val`, and `test`, so each
    task can invoke `python -u -m preprocessing.generate_dataset`. Outside an
    array, use `--split` for one split or omit it to process all splits. Pass
-   `--regenerate-cache` after a cache-incompatible code or configuration change
-   to rebuild the scan entries required by the selected split.
+   `--refresh-cache` after changing image-processing code or settings.
 
 5. Train and evaluate the model:
 
@@ -205,10 +204,9 @@ source .venv/bin/activate
 
    The trainer lazily reads current NO2, delta NO2, and the paired-valid mask
    from each selected NPZ and computes memory-bounded robust
-   normalization statistics from the training split only. It predicts the
-   signed `delta_nox_norm` target and reports both normalized and physical
-   NOx-mass-change metrics. See `docs/modeling.md` for the feature, leakage,
-   architecture, normalization, and evaluation decisions.
+   normalization statistics from the training split only. It predicts whether
+   raw delta-NOx is negative or positive outside the frozen deadband and reports
+   classification metrics. See `docs/modeling.md` for the full contract.
 
 Each stage depends on the outputs of the preceding stage. Dataset generation
 resumes from valid scan-cache entries. Other scripts resume only where their

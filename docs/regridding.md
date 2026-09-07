@@ -43,12 +43,10 @@ forming a delta.
 
 `preprocessing.generate_dataset` deduplicates AOI-scan work and writes the
 five-raster bundles above to a persistent cache under `DATASET_DIR`.
-The cache key includes the AOI, source granules, grid definition, native-pixel
-filters, and cell-support thresholds. The generator validates each bundle
-before reuse. Pass `--regenerate-cache` to rebuild the entries required by the
-selected split after an incompatible change. Scans with the same granule set
-run as one batch, which lets a worker open each large NetCDF granule once for
-several AOIs. Each successful model record persists one compressed NPZ
+The cache key identifies the AOI and source granules. Pass `--refresh-cache`
+after changing image-processing code or settings. Scans with the same granule
+set run as one batch, which lets a worker open each large NetCDF granule once
+for several AOIs. Each successful model record persists one compressed NPZ
 containing three aligned `float32` arrays:
 
 - `current_no2`, current-scan NO2 restricted to paired-valid support;

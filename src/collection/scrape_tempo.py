@@ -21,8 +21,6 @@ from config import (
 from prerequisites import require_earthdata_credentials
 
 DOWNLOAD_BATCH_SIZE = 100  # bounds downloader memory and retry scope
-_SUPPORTED_LEVELS = {"L2", "L3"}
-_SUPPORTED_VERSIONS = {"V03", "V04"}
 _GRANULE_PATTERN = re.compile(r"^TEMPO_NO2_(L2|L3)_(V\d{2})_(\d{8})T(\d{6})Z_S(\d{3})(?:G(\d{2}))?\.nc$")
 
 
@@ -88,18 +86,6 @@ def _monthly_granule_directory(base_dir: str | Path, granule: _TempoGranuleName)
     return Path(base_dir, f"{granule.observed_at.year:04d}", f"{granule.observed_at.month:02d}")
 
 
-def _validate_config() -> None:
-    # Reject inconsistent selections before authentication or network access
-    if TEMPO_LEVEL not in _SUPPORTED_LEVELS:
-        raise ValueError(f"Unsupported TEMPO_LEVEL {TEMPO_LEVEL!r}; choose L2 or L3")
-    if TEMPO_VERSION not in _SUPPORTED_VERSIONS:
-        raise ValueError(f"Unsupported TEMPO_VERSION {TEMPO_VERSION!r}; choose V03 or V04")
-    if TEMPO_PRODUCT != f"TEMPO_NO2_{TEMPO_LEVEL}":
-        raise ValueError("TEMPO_PRODUCT must match TEMPO_LEVEL")
-    if DOWNLOAD_BATCH_SIZE < 1:
-        raise ValueError("DOWNLOAD_BATCH_SIZE must be positive")
-
-
 def _download_window(start: datetime, end: datetime) -> tuple[int, int, int]:
     # Search one month then flush each directory in bounded batches
     results = earthaccess.search_data(
@@ -146,12 +132,8 @@ def _download_window(start: datetime, end: datetime) -> tuple[int, int, int]:
 
 def main() -> None:
     """Download missing TEMPO files using monthly searches and bounded batches."""
-    _validate_config()
     start = _parse_utc(TEMPO_START_DATE)
     end = _parse_utc(TEMPO_END_DATE)
-    if end < start:
-        raise ValueError("TEMPO_END_DATE must not precede TEMPO_START_DATE")
-
     require_earthdata_credentials()
     earthaccess.login(strategy="environment")
     total_found = 0

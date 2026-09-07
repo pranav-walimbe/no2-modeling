@@ -68,16 +68,16 @@ the emitted modeling `date` and `hour` therefore share one UTC clock. The
 enriched emissions archive retains the source local-standard fields and each
 facility's resolved timezone and standard offset for auditability.
 
-The current target is
+The binary target uses raw `delta_nox_mass`:
 
-```text
-delta_nox_norm = asinh(delta_nox_mass / delta_nox_scale)
-```
+- Fit one cutoff to the training split's 20th percentile of absolute change.
+- Remove records with absolute change at or below that cutoff in every split.
+- Assign class 0 to negative changes and class 1 to positive changes.
+- Select equal class counts in every candidate and final split.
+- Store the cutoff with each record.
 
-where `delta_nox_scale` is based on the AOI's previous completed quarter. The
-transform preserves sign, compresses extreme changes, and makes changes at
-different-sized plants more comparable. Exact zero-change records are valid
-and remain in the population.
+Stratification and final generation write JSON summaries with overall and
+per-AOI retention, natural pre-balancing prevalence, and selected class counts.
 
 Each sample stores current regridded NO2, current minus previous NO2, and a
 paired-valid mask on the same fixed grid. Both numeric rasters are finite only
@@ -160,8 +160,8 @@ Before raster generation, apply these rules to every split:
 - Select records from AOIs with positive coal-unit output first, ranked by coal
   output.
 - Fill any remaining slots from the general pool, ranked by total AOI power.
-- Round-robin across AOIs within each pool.
-- Do not use current-quarter output or target values.
+- Apply the priority and AOI round-robin independently within each label.
+- Do not use current-quarter output or target magnitude for ordering.
 
 ## Final raster selection
 
@@ -176,8 +176,8 @@ Quality-gated candidates are selected deterministically:
 5. Use coverage-plus-uncertainty quality to break competition within each round
    and stop at the exact configured split size.
 
-Selection does not balance target labels. Report unweighted validation and test
-metrics. Handle rare training targets with training-only weights or sampling.
+Final selection takes equal counts from both labels after raster-quality gates.
+Use the saved pre-balancing prevalence when interpreting balanced metrics.
 
 ## Performance and persistence
 
@@ -195,7 +195,7 @@ final size cannot be reached reliably.
 
 ## Evaluation checklist
 
-For every generated version, record:
+For every generated dataset, record:
 
 - candidate, processing-success, coverage-eligible, and final counts;
 - AOIs and geographic clusters per split;

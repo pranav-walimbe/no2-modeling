@@ -1,4 +1,4 @@
-"""Compact residual network for signed emissions-change regression."""
+"""Compact residual network for emissions-change classification."""
 
 import torch
 from torch import nn
@@ -53,14 +53,6 @@ class NOxModel(nn.Module):
         dropout: float = DEFAULT_DROPOUT,
     ) -> None:
         super().__init__()
-        if n_tabular_features < 1:
-            raise ValueError("n_tabular_features must be positive")
-        if not use_image and not use_tabular:
-            raise ValueError("At least one model input branch must be enabled")
-        if head_dim < 1:
-            raise ValueError("head_dim must be positive")
-        if not 0 <= dropout < 1:
-            raise ValueError("dropout must be in [0, 1)")
         self.use_image = use_image
         self.use_tabular = use_tabular
 

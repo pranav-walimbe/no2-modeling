@@ -143,9 +143,6 @@ def _fetch_attribute_page(
             )
             time.sleep(delay)
 
-    raise AssertionError("Retry loop exited unexpectedly")
-
-
 def _fetch_attribute_year(year: int) -> list[dict[str, object]]:
     # Collect every nationwide page for one year
     records: list[dict[str, object]] = []
@@ -173,8 +170,6 @@ def get_facility_attributes(
     Returns:
         Facility and unit records from all requested years.
     """
-    if earliest_year > latest_year:
-        raise ValueError("earliest_year must not exceed latest_year")
     required_facility_ids = set(facility_ids)
     matched_facility_ids: set[int] = set()
     selected_records: list[dict[str, object]] = []
@@ -205,21 +200,19 @@ def get_facility_attributes(
 
 def _parse_generator_capacities(value: object) -> tuple[tuple[str, float], ...]:
     # Parse the CAMPD comma-separated generator and capacity field
-    if value is None:
-        return ()
     if not isinstance(value, str):
-        raise ValueError(f"Generator nameplate-capacity value must be text, found {type(value).__name__}")
+        return ()
     if not value.strip():
         return ()
     entries: list[tuple[str, float]] = []
     for part in value.split(","):
         match = GENERATOR_CAPACITY_PATTERN.fullmatch(part)
         if match is None:
-            raise ValueError(f"Invalid generator nameplate-capacity entry: {part.strip()!r}")
+            continue
         generator_id = match.group("generator").strip().upper()
         capacity_mw = float(match.group("capacity"))
         if not generator_id or capacity_mw <= 0:
-            raise ValueError(f"Invalid generator nameplate-capacity entry: {part.strip()!r}")
+            continue
         entries.append((generator_id, capacity_mw))
     return tuple(entries)
 
@@ -232,13 +225,10 @@ def _collect_capacity_values(attributes: pl.DataFrame) -> tuple[GeneratorValues,
         "facilityId", "year", "associatedGeneratorsAndNameplateCapacity"
     ).iter_rows():
         if facility_id is None or year is None:
-            raise ValueError("CAMPD capacity attributes require facility and year identifiers")
+            continue
         facility_key = (int(facility_id), int(year))
         facility_years.add(facility_key)
-        try:
-            entries = _parse_generator_capacities(serialized)
-        except ValueError:
-            continue
+        entries = _parse_generator_capacities(serialized)
         facility_generators = generator_values.setdefault(facility_key, {})
         for generator_id, capacity_mw in entries:
             facility_generators.setdefault(generator_id, set()).add(capacity_mw)
@@ -411,11 +401,6 @@ def write_augmented_parquet(
     temporary_path.unlink(missing_ok=True)
 
     source = pl.scan_parquet(input_path)
-    missing_columns = {"facilityId", "unitId"}.difference(source.collect_schema().names())
-    if missing_columns:
-        missing = ", ".join(sorted(missing_columns))
-        raise ValueError(f"Raw hourly emissions Parquet is missing required columns: {missing}")
-
     unit_id = pl.col("unitId").cast(pl.String, strict=False).str.strip_chars()
     source_row_count = source.select(pl.len()).collect().item()
     prediction_years = (
@@ -493,9 +478,6 @@ def main() -> None:
         pl.col("date").cast(pl.Date, strict=False).dt.year().min().alias("earliest"),
         pl.col("date").cast(pl.Date, strict=False).dt.year().max().alias("latest"),
     ).collect().row(0, named=True)
-    if source_years["earliest"] is None or source_years["latest"] is None:
-        raise ValueError("Raw hourly emissions contain no valid prediction dates")
-
     attribute_records = get_facility_attributes(
         facility_ids=facility_ids,
         latest_year=int(source_years["latest"]),

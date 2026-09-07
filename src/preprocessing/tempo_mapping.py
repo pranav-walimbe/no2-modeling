@@ -214,8 +214,6 @@ def build_granule_index(
             continue
         tasks.extend((str(path), str(path.relative_to(tempo_root)), year, month) for path in sorted(paths))
 
-    if workers < 1:
-        raise ValueError("workers must be at least 1")
     print(f"Granule index: reading {len(tasks)} granules")
     if not tasks:
         parsed = []
@@ -556,10 +554,6 @@ def build_aoi_mapping(
         stride: Cross-track geolocation sampling stride.
         scan_dates: Optional scan-start dates owned by this invocation.
     """
-    if workers < 1:
-        raise ValueError("workers must be at least 1")
-    if stride < 1:
-        raise ValueError("stride must be at least 1")
     mapping_root = Path(mapping_dir)
 
     selected_granules = _select_granules_for_scan_dates(granules, scan_dates)
@@ -624,10 +618,6 @@ def read_aoi_mapping(
 
 def load_tempo_mapping() -> pl.DataFrame:
     """Load the prebuilt TEMPO AOI-observation mapping."""
-    if not list(Path(TEMPO_GRANULE_MAPPING).rglob("granules.parquet")):
-        raise FileNotFoundError("TEMPO granule index is missing; run the TEMPO mapping jobs first")
-    if not list(Path(TEMPO_AOI_MAPPING).rglob("date=*.parquet")):
-        raise FileNotFoundError("TEMPO AOI mapping is missing; run the TEMPO mapping jobs first")
     return read_aoi_mapping(TEMPO_AOI_MAPPING, columns=PAIRING_COLUMNS)
 
 
@@ -720,9 +710,6 @@ def serialize_tempo_path_lists(frame: pl.DataFrame) -> pl.DataFrame:
 def _load_aois(aoi_ids: set[int] | None = None) -> pl.DataFrame:
     # Rebuild the same AOI definitions used by stratify_plants
     source = pl.scan_parquet(FULL_DATA_PARQUET)
-    missing = set(AOI_COLUMNS).difference(source.collect_schema().names())
-    if missing:
-        raise ValueError(f"Full emissions data is missing AOI columns: {', '.join(sorted(missing))}")
     if aoi_ids is not None:
         source = source.filter(pl.col("facilityId").is_in(aoi_ids))
     facilities = source.select(AOI_COLUMNS).drop_nulls().unique(subset="facilityId").collect()
@@ -749,10 +736,6 @@ def partition_mapping_months(
     Returns:
         Months owned exclusively by the requested task.
     """
-    if task_count < 1:
-        raise ValueError("task_count must be at least 1")
-    if not 0 <= task_id < task_count:
-        raise ValueError("task_id must be in [0, task_count)")
     return months[task_id::task_count]
 
 
@@ -774,8 +757,6 @@ def _build_index(overwrite: bool, workers: int) -> None:
 def _build_observations(task_id: int, task_count: int, overwrite: bool, workers: int) -> None:
     # Infer unfinished work from absent month directories
     granules = read_granule_index()
-    if granules.is_empty():
-        raise FileNotFoundError("TEMPO granule index is missing; run the index job first")
     months = list(_available_mapping_months(granules))
     assigned_months = partition_mapping_months(months, task_id, task_count)
     mapping_root = Path(TEMPO_AOI_MAPPING)

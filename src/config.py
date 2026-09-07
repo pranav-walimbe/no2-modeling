@@ -87,7 +87,9 @@ RASTER_UNCERTAINTY_WEIGHT = 0.25  # share of final raster ranking assigned to lo
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
-LABEL_COL = "delta_nox_norm"
+LABEL_COL = "delta_nox_class"
+DEADBAND_THRESHOLD_COL = "delta_nox_deadband_threshold"
+DEADBAND_TRAIN_FRACTION = 0.20  # discard the lowest training absolute raw changes
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_DELTA_HISTORY = 168
 DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added to its scale
@@ -118,8 +120,6 @@ MODEL_IMAGE_KEYS = ("current_no2", "delta_no2")  # numeric arrays normalized ind
 MODEL_VALID_MASK_KEY = "valid_mask"  # paired finite-NO2 support stored with each sample
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS) + 1  # numeric channels plus the paired-valid mask
 MODEL_IMAGE_CLIP_Z = 8.0  # bound rare raster extremes after train-only standardization
-LABEL_WEIGHT_BIN_COUNT = 20  # signed bins give about 600 training records per bin before imbalance
-LABEL_WEIGHT_CAP = 5.0  # maximum inverse-frequency multiplier in the training loss
 MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
     "num_coal_units",
     "num_ng_units",

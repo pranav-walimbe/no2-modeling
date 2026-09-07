@@ -1,32 +1,17 @@
 # Modeling
 
-This document defines the first production modeling baseline for inferring an
-hourly change in power-plant NOx emissions from paired TEMPO observations. It
-replaces the legacy raw-NOx model and its dense two-image array contract.
+This document defines the binary baseline for classifying hourly power-plant
+NOx changes from paired TEMPO observations.
 
 ## Prediction target
 
-The network predicts the dataset's signed, robust target
-
-```text
-delta_nox_norm = asinh(delta_nox_mass / delta_nox_scale)
-```
-
-where `delta_nox_scale` is estimated only from the AOI's previous completed
-quarter. The inverse used for physical-unit evaluation is
-
-```text
-predicted_delta_nox_mass = delta_nox_scale * sinh(predicted_delta_nox_norm)
-```
-
-The asinh transform is approximately linear near zero, preserves the direction
-of a change, and compresses large positive and negative changes. The training
-target is additionally standardized with the training-split mean and standard
-deviation for optimization. Predictions are returned to `delta_nox_norm`
-before metrics or plots are produced.
-
-This is a change model, not an absolute-emissions model. Current `nox_mass`,
-`delta_nox_mass`, and `delta_nox_norm` must never be input features.
+- Fit a symmetric cutoff at the training 20th percentile of
+  `abs(delta_nox_mass)`.
+- Freeze the cutoff for validation, test, and inference.
+- Remove records inside the closed deadband.
+- Label negative changes as 0 and positive changes as 1.
+- Balance each split to equal label counts after raster QC.
+- Preserve raw `delta_nox_mass` for reporting, never as an input.
 
 ## Inputs and leakage policy
 
@@ -36,7 +21,7 @@ scalar inputs are:
 - coal and natural-gas unit counts;
 - total generator nameplate capacity;
 - previous-quarter average heat input and power generation;
-- the historical NOx-change scale used by the target definition;
+- the historical NOx-change variability from the prior completed quarter;
 - coincident HRRR 2 m temperature, 10 m U/V wind, and boundary-layer height;
 - sine/cosine encodings of UTC hour and day of year.
 
@@ -52,8 +37,7 @@ Validation, test, and inference reuse those statistics.
 | None | coal and gas unit counts, temperature, U/V wind | Counts retain their discrete spacing, temperature has a moderate range, and wind components can be negative. |
 | Sine and cosine | UTC hour, day of year | Circular encoding keeps adjacent boundary values close, such as hours 23 and 0. |
 
-The signed target and both numeric NO2 rasters use `asinh`. The transform stays
-close to linear near zero and compresses positive and negative tails.
+Both numeric NO2 rasters use `asinh` before standardization.
 
 Coordinates, AOI IDs, current emissions, plume score, and raster-quality scores
 are excluded. This prevents geographic memorization, direct target leakage,
@@ -124,7 +108,7 @@ The default network is a compact residual CNN plus an MLP scalar branch.
 Residual stages reduce 48 by 48 images to a 6 by 6 feature map. A 3 by 3
 adaptive average pool retains coarse plume location, while a global maximum
 pool preserves localized enhancements that an average can dilute. Their fused
-embedding is joined with the scalar embedding for one regression output.
+embedding is joined with the scalar embedding for one classification logit.
 
 GroupNorm replaces BatchNorm throughout the image encoder. GroupNorm does not
 depend on batch-level statistics and is stable if memory pressure forces small
@@ -140,12 +124,13 @@ future experiment only with those transformations implemented together.
 
 ## Optimization and I/O
 
-Training uses AdamW, weighted Huber loss in standardized-target units, gradient
-clipping, validation-loss scheduling, and early stopping. Twenty train-derived
-signed histogram bins keep negative and positive labels separate. Each bin gets
-an inverse-frequency weight capped at 5. Validation and test loss remain
-unweighted. Every run saves the bin edges, counts, and weights in
-`loss_weights.json`.
+Training uses:
+
+- AdamW;
+- unweighted binary cross-entropy with logits;
+- gradient clipping and mixed precision on CUDA;
+- validation-loss scheduling; and
+- early stopping.
 
 `config.py` owns only the shared modeling data contract: paths, raster key and
 channels, image clipping, and input-feature definitions. Training defaults live
@@ -169,19 +154,14 @@ hurt shared-filesystem performance and multiply parent-process memory.
 
 ## Evaluation philosophy
 
-The primary validation and test metrics are MAE, RMSE, bias, R-squared, and
-Pearson correlation. They are reported in both normalized-target units and
-physical NOx-mass-change units. MAPE is excluded because the target is signed
-and can legitimately equal or cross zero.
+Report accuracy, balanced accuracy, precision, recall, specificity, F1, ROC
+AUC, and the full confusion matrix. Also record:
 
-The run also records:
-
-- zero-change and training-mean baselines;
-- equal-count test slices by absolute target magnitude;
-- per-AOI physical MAE and bias;
-- row-level predictions for later coverage, season, fuel, and geography slices;
-- normalized and physical prediction plots, signed residuals, and held-out AOI
-  spatial error.
+- class counts and natural pre-balancing prevalence;
+- equal-count test slices by absolute raw delta-NOx magnitude;
+- per-AOI metrics;
+- row-level logits, probabilities, and predictions; and
+- probability distributions and held-out AOI accuracy maps.
 
 Model selection uses validation loss only. Test outputs describe the final
 chosen system and must not drive normalization, architecture, thresholds, or
@@ -193,7 +173,7 @@ AOIs.
 
 Before treating the CNN as scientifically useful, compare it with:
 
-1. zero-change and training-mean constants already emitted by the trainer;
+1. constant and natural-prevalence classifiers;
 2. a tabular-only MLP with the same scalar features;
 3. an image-only model;
 4. the full image-plus-tabular model;
@@ -210,12 +190,13 @@ The same trainer exposes these controlled ablations through `--inputs tabular`,
 
 Each UTC-stamped directory under `RUNS_DIR` contains:
 
-- `normalization_stats.json` with the exact train-only preprocessing state;
+- `normalization_stats.json` with train-only preprocessing and the deadband;
 - `run_config.json` with features, seed, optimization settings, and parameter
   count;
 - `checkpoints/best_model.pt` selected by validation loss;
-- aggregate `results.json` and one prediction CSV per split;
-- loss, prediction, residual, and spatial-error plots.
+- `results.json` with metrics and pre-balancing prevalence;
+- one prediction CSV per split;
+- loss, probability-distribution, and spatial-accuracy plots.
 
 Run training on a compute node with
 
