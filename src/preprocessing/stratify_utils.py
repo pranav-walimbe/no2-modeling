@@ -31,6 +31,8 @@ from config import (
 AOI_ID_COL = "aoi_id"
 MAJOR_CITY_DIST_COL = "major_city_dist"
 LABEL_MODE_COL = "label_mode"
+PREVIOUS_QUARTER_COAL_POWER_COL = "_previous_quarter_coal_power"
+PREVIOUS_QUARTER_POWER_COL = "_previous_quarter_power"
 SUPPORTED_LABEL_MODES = frozenset({"hard_hour", "overlap_weighted"})
 METERS_PER_KM = 1000.0
 MAD_NORMAL_SCALE = 1.4826  # puts MAD on a standard-deviation scale under normality
@@ -218,6 +220,48 @@ def _fuel_flags() -> tuple[pl.Expr, pl.Expr]:
     # Prefer hourly fuel metadata and fall back to facility attributes
     fuel = pl.coalesce("primaryFuelInfo", "attributePrimaryFuelInfo").fill_null("").str.to_lowercase()
     return fuel.str.contains("coal"), fuel.str.contains("natural gas")
+
+
+def _previous_quarter_power_priorities(
+    records: pl.LazyFrame,
+    membership: pl.DataFrame,
+) -> pl.LazyFrame:
+    # Shift unit-level quarterly output summaries into the prediction quarter
+    coal, _ = _fuel_flags()
+    unit_quarter = (
+        records.with_columns(
+            pl.col("date").dt.year().alias("_priority_year"),
+            pl.col("date").dt.quarter().alias("_priority_quarter"),
+            coal.alias("_priority_is_coal"),
+        )
+        .filter(pl.col("grossLoad").is_finite())
+        .group_by("facilityId", "unitId", "_priority_year", "_priority_quarter")
+        .agg(
+            pl.col("grossLoad").mean().alias("_unit_average_power"),
+            pl.col("_priority_is_coal").any(),
+        )
+    )
+    return (
+        unit_quarter.join(membership.lazy(), on="facilityId", how="inner")
+        .group_by(AOI_ID_COL, "_priority_year", "_priority_quarter")
+        .agg(
+            pl.col("_unit_average_power").sum().alias(PREVIOUS_QUARTER_POWER_COL),
+            pl.col("_unit_average_power")
+            .filter(pl.col("_priority_is_coal"))
+            .sum()
+            .alias(PREVIOUS_QUARTER_COAL_POWER_COL),
+        )
+        .with_columns(
+            pl.when(pl.col("_priority_quarter") == 4)
+            .then(pl.col("_priority_year") + 1)
+            .otherwise(pl.col("_priority_year"))
+            .alias("_priority_year"),
+            pl.when(pl.col("_priority_quarter") == 4)
+            .then(1)
+            .otherwise(pl.col("_priority_quarter") + 1)
+            .alias("_priority_quarter"),
+        )
+    )
 
 
 def filter_usable_nox_measurements(
@@ -428,6 +472,7 @@ def aggregate_aoi_hours(
     """Aggregate unit observations and prediction-date attributes to AOI hours."""
     records_lazy = records.lazy() if isinstance(records, pl.DataFrame) else records
     coal, natural_gas = _fuel_flags()
+    power_priorities = _previous_quarter_power_priorities(records_lazy, membership)
     unit_counts = (
         records_lazy.with_columns(coal.alias("is_coal"), natural_gas.alias("is_ng"))
         .group_by("facilityId", "unitId")
@@ -467,6 +512,12 @@ def aggregate_aoi_hours(
     )
     return (
         add_delta_nox_targets(add_previous_quarter_same_hour_averages(hourly))
+        .with_columns(
+            pl.col("date").dt.year().alias("_priority_year"),
+            pl.col("date").dt.quarter().alias("_priority_quarter"),
+        )
+        .join(power_priorities, on=[AOI_ID_COL, "_priority_year", "_priority_quarter"], how="left")
+        .drop("_priority_year", "_priority_quarter")
         .join(facility_capacity, on=[AOI_ID_COL, EMISSIONS_HOUR_UTC_COL], how="left")
         .join(unit_counts, on=AOI_ID_COL, how="left")
         .join(aois.select(AOI_ID_COL, "lat", "lon", "x_m", "y_m").lazy(), on=AOI_ID_COL, how="left")
