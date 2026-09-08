@@ -200,11 +200,12 @@ non-overlapping plant regions rather than memorization of known AOIs.
 Before treating the CNN as scientifically useful, compare it with:
 
 1. constant and natural-prevalence classifiers;
-2. a tabular-only MLP with the same scalar features;
-3. an image-only model;
-4. the full image-plus-tabular model;
-5. a delta-plus-mask versus current-plus-delta-plus-mask ablation;
-6. a mask ablation over the same eligible records.
+2. an XGBoost tabular baseline trained after every deep-learning run;
+3. a tabular-only MLP with the same scalar features;
+4. an image-only model;
+5. the full image-plus-tabular model;
+6. a delta-plus-mask versus current-plus-delta-plus-mask ablation;
+7. a mask ablation over the same eligible records.
 
 Report every comparison on the same frozen validation and test records. The full
 model earns its place only when image information improves held-out-AOI error
@@ -221,8 +222,13 @@ Each UTC-stamped directory under `RUNS_DIR` holds:
 - `run_config.json` with features, settings, clipped-pixel fractions, and
   parameter count;
 - `checkpoints/best_model.pt` selected by validation loss;
-- `results.json` with metrics and pre-balancing prevalence;
-- one prediction CSV per split;
+- `results.json` with deep-learning and XGBoost metrics, direct metric
+  differences, and pre-balancing prevalence. Existing top-level metric fields
+  continue to describe the deep-learning model;
+- one deep-learning prediction CSV per split plus matching
+  `xgboost_*_predictions.csv` files;
+- `checkpoints/xgboost_model.json` selected by validation log loss;
+- `model_comparison.png` with side-by-side split metrics;
 - loss, probability-distribution, and spatial-accuracy plots.
 
 Run training on a compute node:

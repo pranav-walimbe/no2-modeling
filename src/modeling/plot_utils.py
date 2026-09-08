@@ -6,9 +6,21 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from modeling.eval_utils import POSITIVE_PROBABILITY_COL, TRUE_CLASS_COL, plant_metrics
+from modeling.eval_utils import (
+    POSITIVE_PROBABILITY_COL,
+    TRUE_CLASS_COL,
+    classification_metrics,
+    plant_metrics,
+)
 
 SPLIT_ORDER = ("train", "val", "test")
+MODEL_DISPLAY_NAMES = {"deep_learning": "Deep learning", "xgboost": "XGBoost"}
+COMPARISON_METRIC_NAMES = {
+    "accuracy": "Accuracy",
+    "balanced_accuracy": "Balanced accuracy",
+    "f1": "F1",
+    "roc_auc": "ROC AUC",
+}
 
 
 def _save(figure: plt.Figure, run_dir: str | Path, plot_name: str) -> None:
@@ -85,3 +97,39 @@ def plot_spatial_accuracy(split_frames: dict[str, pd.DataFrame], run_dir: str | 
         axis.set(xlabel="Longitude", ylabel="Latitude", title=f"{split} AOIs")
     figure.tight_layout()
     _save(figure, run_dir, "spatial_accuracy")
+
+
+def plot_model_comparison(model_frames: dict[str, dict[str, pd.DataFrame]], run_dir: str | Path) -> None:
+    """Compare deep-learning and XGBoost metrics on every frozen split.
+
+    Args:
+        model_frames: Row-level predictions by model and data split.
+        run_dir: Model-run output directory.
+    """
+    rows = []
+    for model_name, split_frames in model_frames.items():
+        for split, frame in split_frames.items():
+            metrics = classification_metrics(
+                frame[TRUE_CLASS_COL].to_numpy(),
+                frame[POSITIVE_PROBABILITY_COL].to_numpy(),
+            )
+            for metric, display_name in COMPARISON_METRIC_NAMES.items():
+                rows.append(
+                    {
+                        "model": MODEL_DISPLAY_NAMES.get(model_name, model_name),
+                        "split": split,
+                        "metric": display_name,
+                        "score": metrics[metric],
+                    }
+                )
+
+    sns.set_theme(style="whitegrid", font_scale=1.0)
+    figure, axes = plt.subplots(1, 3, figsize=(17, 5), sharey=True)
+    comparison = pd.DataFrame(rows)
+    for axis, split in zip(axes, SPLIT_ORDER, strict=True):
+        subset = comparison.loc[comparison["split"] == split]
+        sns.barplot(data=subset, x="metric", y="score", hue="model", ax=axis)
+        axis.set(xlabel="Metric", ylabel="Score", title=split, ylim=(0, 1))
+        axis.tick_params(axis="x", rotation=20)
+    figure.tight_layout()
+    _save(figure, run_dir, "model_comparison")

@@ -11,6 +11,15 @@ TRUE_CLASS_COL = "y_true"
 PREDICTED_CLASS_COL = "y_pred"
 POSITIVE_PROBABILITY_COL = "probability_positive"
 LOGIT_COL = "logit"
+MODEL_COMPARISON_METRICS = (
+    "accuracy",
+    "balanced_accuracy",
+    "precision",
+    "recall",
+    "specificity",
+    "f1",
+    "roc_auc",
+)
 
 
 def classification_metrics(
@@ -78,18 +87,8 @@ def plant_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def save_results(
-    split_frames: dict[str, pd.DataFrame],
-    classification_summaries: dict[str, object],
-    run_dir: str | Path,
-) -> None:
-    """Save classification metrics and row-level predictions.
-
-    Args:
-        split_frames: Row-level predictions for each data split.
-        classification_summaries: Pre-balancing retention and prevalence data.
-        run_dir: Model-run output directory.
-    """
+def _model_results(split_frames: dict[str, pd.DataFrame]) -> dict[str, object]:
+    # Summarize full splits and fixed equal-count test magnitude slices
     results: dict[str, object] = {
         "splits": {
             name: classification_metrics(
@@ -99,7 +98,6 @@ def save_results(
             for name, frame in split_frames.items()
         }
     }
-    results["dataset_classification_summaries"] = classification_summaries
     test = split_frames["test"]
     magnitude = np.abs(test["delta_nox_mass"].to_numpy(dtype=np.float64))
     ordered_indices = np.argsort(magnitude, kind="stable")
@@ -114,9 +112,59 @@ def save_results(
         )
         for name, subset in slices.items()
     }
+    return results
+
+
+def _model_comparison(model_results: dict[str, dict[str, object]]) -> dict[str, object]:
+    # Place both scores and their deep-learning difference beside each other
+    deep_learning = model_results["deep_learning"]["splits"]
+    xgboost = model_results["xgboost"]["splits"]
+    def metric_values(split: str, metric: str) -> dict[str, float | None]:
+        deep_value = deep_learning[split][metric]
+        xgboost_value = xgboost[split][metric]
+        difference = None if deep_value is None or xgboost_value is None else deep_value - xgboost_value
+        return {
+            "deep_learning": deep_value,
+            "xgboost": xgboost_value,
+            "deep_learning_minus_xgboost": difference,
+        }
+
+    return {
+        split: {metric: metric_values(split, metric) for metric in MODEL_COMPARISON_METRICS}
+        for split in deep_learning
+    }
+
+
+def save_results(
+    model_frames: dict[str, dict[str, pd.DataFrame]],
+    classification_summaries: dict[str, object],
+    run_dir: str | Path,
+) -> None:
+    """Save classification metrics and row-level predictions.
+
+    Args:
+        model_frames: Row-level predictions by model and data split.
+        classification_summaries: Pre-balancing retention and prevalence data.
+        run_dir: Model-run output directory.
+    """
+    model_results = {name: _model_results(split_frames) for name, split_frames in model_frames.items()}
+    deep_learning_results = model_results["deep_learning"]
+    results: dict[str, object] = {
+        "splits": deep_learning_results["splits"],
+        "test_absolute_delta_tertiles": deep_learning_results["test_absolute_delta_tertiles"],
+        "models": model_results,
+    }
+    results["comparison"] = _model_comparison(model_results)
+    results["dataset_classification_summaries"] = classification_summaries
 
     output_dir = Path(run_dir)
     with (output_dir / "results.json").open("w") as destination:
         json.dump(results, destination, indent=2)
-    for split, frame in split_frames.items():
-        frame.to_csv(output_dir / f"{split}_predictions.csv", index=False)
+    for model_name, split_frames in model_frames.items():
+        for split, frame in split_frames.items():
+            filename = (
+                f"{split}_predictions.csv"
+                if model_name == "deep_learning"
+                else f"{model_name}_{split}_predictions.csv"
+            )
+            frame.to_csv(output_dir / filename, index=False)
