@@ -35,8 +35,14 @@ from modeling.eval_utils import (
     TRUE_CLASS_COL,
     save_results,
 )
-from modeling.plot_utils import plot_class_probabilities, plot_loss_curve, plot_spatial_accuracy
+from modeling.plot_utils import (
+    plot_class_probabilities,
+    plot_loss_curve,
+    plot_model_comparison,
+    plot_spatial_accuracy,
+)
 from modeling.resnet import DEFAULT_DROPOUT, DEFAULT_HEAD_DIM, NOxModel
+from modeling.xgboost import train_xgboost_baseline
 
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 300
@@ -366,7 +372,23 @@ def main() -> None:
 
     plot_class_probabilities(split_frames, run_dir)
     plot_spatial_accuracy(split_frames, run_dir)
-    save_results(split_frames, classification_summaries, run_dir)
+    print("Training XGBoost tabular baseline")
+    xgboost_run = train_xgboost_baseline(
+        datasets,
+        checkpoint_dir / "xgboost_model.json",
+        seed=args.seed,
+        workers=args.workers,
+    )
+    run_config["xgboost"] = {
+        **xgboost_run.config.to_dict(),
+        "best_iteration": xgboost_run.best_iteration,
+        "best_validation_logloss": xgboost_run.best_validation_logloss,
+    }
+    with (run_dir / "run_config.json").open("w") as destination:
+        json.dump(run_config, destination, indent=2)
+    model_frames = {"deep_learning": split_frames, "xgboost": xgboost_run.split_frames}
+    plot_model_comparison(model_frames, run_dir)
+    save_results(model_frames, classification_summaries, run_dir)
 
 
 if __name__ == "__main__":
