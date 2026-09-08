@@ -1,7 +1,7 @@
 # Modeling
 
-This document defines the binary baseline for classifying hourly power-plant
-NOx changes from paired TEMPO observations.
+The binary baseline classifies hourly power-plant NOx changes from paired TEMPO
+observations.
 
 ## Prediction target
 
@@ -14,8 +14,9 @@ NOx changes from paired TEMPO observations.
 
 ## Inputs and leakage policy
 
-Each sample has five aligned 48 by 48 raster channels and scalar context. The
-scalar inputs are:
+Each sample carries five aligned 48 by 48 raster channels and scalar context.
+
+Scalar inputs:
 
 - coal and natural-gas unit counts;
 - total generator nameplate capacity;
@@ -24,86 +25,99 @@ scalar inputs are:
 - coincident HRRR 2 m temperature and boundary-layer height;
 - sine/cosine encodings of UTC hour and day of year.
 
+Excluded inputs and the reason for each:
+
+| Excluded | Reason |
+|---|---|
+| Coordinates, AOI IDs | Prevent geographic memorization |
+| Current emissions | Direct target leakage |
+| Plume score, raster-quality scores | Diagnostics extracted from the response image |
+
+Coverage stays available for sliced evaluation. The image mask already tells the
+network where the scans have support.
+
 ### Feature transformations
 
-The pipeline transforms each scalar according to its distribution, then
-standardizes every scalar with the training-split mean and standard deviation.
-Validation, test, and inference reuse those statistics.
+Each scalar gets a transform matched to its distribution, then standardization
+with the training-split mean and standard deviation. Validation, test, and
+inference reuse those statistics.
 
-| Transform before standardization | Features | Reason |
+| Transform | Features | Reason |
 |---|---|---|
-| `log1p` | nameplate capacity, heat input, power generation, NOx-change scale, boundary-layer height | These nonnegative features have long right tails; compression limits the influence of extreme values and preserves zero. |
-| None | coal and gas unit counts, temperature | Counts retain their discrete spacing, and temperature has a moderate range. |
-| Sine and cosine | UTC hour, day of year | Circular encoding keeps adjacent boundary values close, such as hours 23 and 0. |
-
-NO2 rasters use robust linear scaling. Wind rasters use ordinary
-standardization. All image statistics come from training pixels only.
-
-Coordinates, AOI IDs, current emissions, plume score, and raster-quality scores
-are excluded. This prevents geographic memorization, direct target leakage,
-and conditioning predictions on a diagnostic extracted from the response
-image. Coverage remains available for sliced evaluation; the image mask
-already gives the network spatial coverage information.
+| `log1p` | nameplate capacity, heat input, power generation, NOx-change scale, boundary-layer height | Nonnegative with long right tails; compression limits extreme values and preserves zero |
+| None | coal and gas unit counts, temperature | Counts keep their discrete spacing, and temperature spans a moderate range |
+| Sine and cosine | UTC hour, day of year | Circular encoding keeps hour 23 adjacent to hour 0 |
 
 ## Image representation and normalization
 
-The model receives five channels:
+Five channels reach the model:
 
 1. paired-valid current NO2;
 2. paired-valid delta NO2;
 3. geographic eastward wind aligned from the native HRRR grid;
-4. geographic northward wind aligned from the native HRRR grid; and
-5. a binary mask whose value is one where both scans supplied accepted NO2.
+4. geographic northward wind aligned from the native HRRR grid;
+5. a binary mask set to one where both scans supplied accepted NO2.
 
-For each NO2 channel:
+Every statistic comes from training pixels alone:
 
-- center at the median of valid training pixels;
-- scale by `IQR / 1.349`; and
-- clip to `[-8, 8]`.
-
-Wind channels use their training-pixel mean and population standard deviation,
-then apply the same clipping range. Validation, test, and inference reuse all
-frozen training statistics. The mask stays binary and unstandardized.
-
-The transform is
+| Channels | Center | Scale |
+|---|---|---|
+| current NO2, delta NO2 | median of valid pixels | `IQR / 1.349` |
+| wind u, wind v | mean of finite pixels | population standard deviation |
 
 ```text
 normalized[channel] =
     (raster[channel] - train_center[channel]) / train_scale[channel]
 ```
 
-Only finite pixels under the stored NO2 validity mask fit NO2 statistics.
-Missing NO2 becomes normalized zero, while the mask distinguishes missing
-support from a measured value at the training median.
+- Clip all four numeric channels to `[-8, 8]`.
+- Keep the mask binary and unstandardized.
+- Fit NO2 statistics on finite pixels under the stored validity mask.
+- Reuse the frozen training statistics for validation, test, and inference.
 
-The implementation uses temporary node-local arrays for exact quartiles rather
-than building an in-memory pixel archive. `normalization_stats.json` stores the
-frozen center, scale, and valid-pixel count for each channel. `run_config.json`
-records the fraction of valid pixels clipped for every channel and split.
+Missing NO2 becomes normalized zero. The mask separates missing support from a
+measured value sitting at the training median.
 
-Robust linear scaling limits outlier influence without compressing the whole
-NO2 distribution. Per-image normalization remains unsuitable because absolute
-enhancement magnitude is part of the emissions signal.
+Two design notes:
+
+- Robust linear scaling limits outlier influence without compressing the whole
+  NO2 distribution.
+- Per-image normalization stays unsuitable because absolute enhancement
+  magnitude carries part of the emissions signal.
+
+Where the numbers live:
+
+- `normalization_stats.json` holds the center, scale, and valid-pixel count per
+  channel.
+- `run_config.json` holds the clipped valid-pixel fraction per channel and split.
+
+Exact quartiles come from temporary node-local arrays, so the fit never builds
+an in-memory pixel archive.
 
 ## Network
 
-The default network is a compact residual CNN plus an MLP scalar branch.
-Residual stages reduce 48 by 48 images to a 6 by 6 feature map. A 3 by 3
-adaptive average pool retains coarse plume location, while a global maximum
-pool preserves localized enhancements that an average can dilute. Their fused
-embedding is joined with the scalar embedding for one classification logit.
+A compact residual CNN plus an MLP scalar branch:
 
-GroupNorm replaces BatchNorm throughout the image encoder. GroupNorm does not
-depend on batch-level statistics and is stable if memory pressure forces small
-batches; this is the central result of the original
-[Group Normalization paper](https://arxiv.org/abs/1803.08494). LayerNorm is used
-in the MLP projections. The older DenseNet alternative was removed because it
-duplicated an obsolete input signature and was not selected by training.
+- Residual stages reduce 48 by 48 images to a 6 by 6 feature map.
+- A 3 by 3 adaptive average pool retains coarse plume location.
+- A global maximum pool preserves localized enhancements that an average
+  dilutes.
+- The fused image embedding joins the scalar embedding for one classification
+  logit.
 
-We do not rotate or flip rasters in the baseline. HRRR grid-relative wind is
-rotated to geographic east and north during alignment. Any later spatial
-augmentation must transform the wind vector values along with the raster
-coordinates and mask.
+Normalization choices:
+
+- GroupNorm throughout the image encoder, since it avoids batch-level
+  statistics and holds up when memory pressure forces small batches. See the
+  [Group Normalization paper](https://arxiv.org/abs/1803.08494).
+- LayerNorm in the MLP projections.
+
+The DenseNet alternative is gone. It duplicated an obsolete input signature and
+training never selected it.
+
+The baseline applies no rotation or flip. Alignment rotates HRRR grid-relative
+wind to geographic east and north, so any later spatial augmentation must
+transform the wind vector values along with the raster coordinates and mask.
 
 ## Optimization and I/O
 
@@ -112,45 +126,58 @@ Training uses:
 - AdamW;
 - unweighted binary cross-entropy with logits;
 - gradient clipping and mixed precision on CUDA;
-- validation-loss scheduling; and
+- validation-loss scheduling;
 - early stopping.
 
-`config.py` owns only the shared modeling data contract: paths, raster key and
-channels, image clipping, and input-feature definitions. Training defaults live
-in `modeling/train.py`, while architecture defaults live in `modeling/resnet.py`;
-both are exposed through training CLI flags. This keeps preprocessing and
-collection code independent of a particular training run while ensuring each
-run records its resolved settings.
+Where settings live:
 
-CUDA runs use automatic mixed precision for convolutions and linear layers,
-with gradient scaling. PyTorch documents AMP as selecting lower precision for
-eligible high-throughput operations while retaining float32 where its range is
-needed; see the [PyTorch AMP documentation](https://docs.pytorch.org/docs/2.3/amp.html).
+| File | Owns |
+|---|---|
+| `config.py` | Shared data contract: paths, raster keys and channels, image clipping, input-feature definitions |
+| `modeling/train.py` | Training defaults |
+| `modeling/resnet.py` | Architecture defaults |
 
-The map-style dataset lazily decompresses the selected per-record NPZ files.
-DataLoader workers overlap that I/O with GPU computation, remain persistent
-between epochs, and prefetch a bounded two batches per worker. Pinned memory is
-enabled only for CUDA. These controls and their memory implications are
-described in the [PyTorch DataLoader documentation](https://docs.pytorch.org/docs/2.3/data.html).
-The configured worker count is capped by the allocated CPUs; increasing it can
-hurt shared-filesystem performance and multiply parent-process memory.
+Training CLI flags expose the last two, which keeps preprocessing and collection
+code independent of any single run while each run still records its resolved
+settings.
+
+CUDA runs use automatic mixed precision for convolutions and linear layers, with
+gradient scaling. AMP selects lower precision for eligible high-throughput
+operations and keeps float32 where the range matters; see the
+[PyTorch AMP documentation](https://docs.pytorch.org/docs/2.3/amp.html).
+
+Data loading:
+
+- The map-style dataset decompresses the selected per-record NPZ files on
+  demand.
+- DataLoader workers overlap that I/O with GPU computation, persist between
+  epochs, and prefetch two batches each.
+- Pinned memory stays on for CUDA alone.
+- The allocated CPUs cap the worker count. Raising it can hurt
+  shared-filesystem performance and multiply parent-process memory.
+
+The [PyTorch DataLoader documentation](https://docs.pytorch.org/docs/2.3/data.html)
+covers these controls and their memory implications.
 
 ## Evaluation philosophy
 
-Report accuracy, balanced accuracy, precision, recall, specificity, F1, ROC
-AUC, and the full confusion matrix. Also record:
+Report accuracy, balanced accuracy, precision, recall, specificity, F1, ROC AUC,
+and the full confusion matrix. Also record:
 
 - class counts and natural pre-balancing prevalence;
 - equal-count test slices by absolute raw delta-NOx magnitude;
 - per-AOI metrics;
-- row-level logits, probabilities, and predictions; and
+- row-level logits, probabilities, and predictions;
 - probability distributions and held-out AOI accuracy maps.
 
-Model selection uses validation loss only. Test outputs describe the final
-chosen system and must not drive normalization, architecture, thresholds, or
-hyperparameters. Because the split is geographic, validation and test measure
-transfer to non-overlapping plant regions rather than memorization of known
-AOIs.
+Rules:
+
+- Select models on validation loss alone.
+- Keep test outputs out of decisions about normalization, architecture,
+  thresholds, and hyperparameters.
+
+The split is geographic, so validation and test measure transfer to
+non-overlapping plant regions rather than memorization of known AOIs.
 
 ## Required comparisons
 
@@ -160,20 +187,21 @@ Before treating the CNN as scientifically useful, compare it with:
 2. a tabular-only MLP with the same scalar features;
 3. an image-only model;
 4. the full image-plus-tabular model;
-5. a delta-plus-mask versus current-plus-delta-plus-mask ablation; and
-6. a mask ablation, while keeping the same eligible records.
+5. a delta-plus-mask versus current-plus-delta-plus-mask ablation;
+6. a mask ablation over the same eligible records.
 
-Report all comparisons on the same frozen validation and test records. The
-full model is justified only if image information improves held-out-AOI error
-and the improvement is not confined to unusually clear or high-plume scenes.
-The same trainer exposes these controlled ablations through `--inputs tabular`,
-`--inputs image`, and the default `--inputs full`.
+Report every comparison on the same frozen validation and test records. The full
+model earns its place only when image information improves held-out-AOI error
+and the gain extends past unusually clear or high-plume scenes. The trainer
+exposes these ablations through `--inputs tabular`, `--inputs image`, and the
+default `--inputs full`.
 
 ## Run artifacts
 
-Each UTC-stamped directory under `RUNS_DIR` contains:
+Each UTC-stamped directory under `RUNS_DIR` holds:
 
-- `normalization_stats.json` with train-only preprocessing and the deadband cutoff;
+- `normalization_stats.json` with train-only preprocessing and the deadband
+  cutoff;
 - `run_config.json` with features, settings, clipped-pixel fractions, and
   parameter count;
 - `checkpoints/best_model.pt` selected by validation loss;
@@ -181,13 +209,15 @@ Each UTC-stamped directory under `RUNS_DIR` contains:
 - one prediction CSV per split;
 - loss, probability-distribution, and spatial-accuracy plots.
 
-Run training on a compute node with
+Run training on a compute node:
 
 ```bash
 python -u -m modeling.train
 ```
 
-Use `--workers`, `--batch-size`, and `--epochs` for allocation-specific
-overrides, and `--inputs` for the controlled branch ablations. `--stats` may
-reuse a compatible statistics JSON, but only when the training dataset and
-configured feature order are unchanged.
+Flags:
+
+- `--workers`, `--batch-size`, `--epochs` for allocation-specific overrides;
+- `--inputs` for the controlled branch ablations;
+- `--stats` to reuse a compatible statistics JSON, valid only when the training
+  dataset and configured feature order are unchanged.
