@@ -149,3 +149,5 @@ MODEL_CYCLIC_FEATURES = ("hour", "day_of_year")  # each expands to sine and cosi
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))  # number of cores for parallelized jobs
 COUNTRIES_URL = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"  # country polygons for US map background
 CITIES_URL = "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_populated_places_simple.zip"  # populated places shapefile for proximity filtering
+REFERENCE_CACHE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/reference"  # downloaded reference geometry cache
+CITIES_CACHE = os.path.join(REFERENCE_CACHE_DIR, "ne_10m_populated_places_simple.zip")  # local copy read without GDAL networking

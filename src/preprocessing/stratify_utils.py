@@ -1,5 +1,10 @@
 """Utilities for building and splitting AOI-hour records."""
 
+import shutil
+import tempfile
+import urllib.request
+from pathlib import Path
+
 import geopandas as gpd
 import numpy as np
 import polars as pl
@@ -13,6 +18,7 @@ from collection.emissions_schema import (
     TOTAL_NAMEPLATE_CAPACITY_MW_COL,
 )
 from config import (
+    CITIES_CACHE,
     CITIES_URL,
     DEADBAND_THRESHOLD_COL,
     DEADBAND_TRAIN_FRACTION,
@@ -170,16 +176,33 @@ def classification_summary(source: pl.DataFrame, retained: pl.DataFrame) -> dict
     }
 
 
-def load_major_cities(url: str = CITIES_URL) -> pl.DataFrame:
+def _cache_populated_places(url: str, path: Path) -> None:
+    # Fetch the archive outside GDAL because its embedded curl conflicts with the eccodes copy
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".partial", delete=False) as staged_file:
+        staged = Path(staged_file.name)
+        with urllib.request.urlopen(url) as response:
+            shutil.copyfileobj(response, staged_file)
+    try:
+        staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def load_major_cities(url: str = CITIES_URL, cache_path: str | Path = CITIES_CACHE) -> pl.DataFrame:
     """Load centroids of populated places meeting the major-city population threshold.
 
     Args:
         url: Source of the populated-places shapefile.
+        cache_path: Local archive downloaded once and reused by later runs.
 
     Returns:
         One row per major city carrying WGS84 ``lon`` and ``lat``.
     """
-    cities = gpd.read_file(url).to_crs("EPSG:4326")
+    path = Path(cache_path)
+    if not path.exists():
+        _cache_populated_places(url, path)
+    cities = gpd.read_file(path).to_crs("EPSG:4326")
     cities = cities[cities["pop_max"] >= MIN_CITY_POPULATION]
     return pl.DataFrame(
         {
