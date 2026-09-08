@@ -21,7 +21,6 @@ from config import (
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_ABS,
     MODEL_IMAGE_KEYS,
-    MODEL_LOG1P_FEATURES,
     MODEL_RAW_FEATURES,
     MODEL_ROBUST_IMAGE_KEYS,
     MODEL_VALID_MASK_KEY,
@@ -39,7 +38,7 @@ STANDARD_IMAGE_CHANNELS = tuple(
 
 def _model_feature_names() -> tuple[str, ...]:
     # Expand raw and cyclic inputs into their model column names
-    names = [f"log1p_{name}" if name in MODEL_LOG1P_FEATURES else name for name in MODEL_RAW_FEATURES]
+    names = list(MODEL_RAW_FEATURES)
     for name in MODEL_CYCLIC_FEATURES:
         names.extend((f"{name}_sin", f"{name}_cos"))
     return tuple(names)
@@ -103,10 +102,7 @@ def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
     # Create leakage-safe numeric features in their documented order
     columns: list[np.ndarray] = []
     for name in MODEL_RAW_FEATURES:
-        values = pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=np.float64)
-        if name in MODEL_LOG1P_FEATURES:
-            values = np.log1p(values)
-        columns.append(values)
+        columns.append(pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=np.float64))
 
     for cyclic_feature in MODEL_CYCLIC_FEATURES:
         if cyclic_feature == "hour":
