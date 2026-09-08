@@ -234,6 +234,8 @@ python -u -m modeling.train
 Flags:
 
 - `--workers`, `--batch-size`, `--epochs` for allocation-specific overrides;
-- `--inputs` for the controlled branch ablations;
-- `--stats` to reuse a compatible statistics JSON, valid only when the training
-  dataset and configured feature order are unchanged.
+- `--inputs` for the controlled branch ablations.
+
+Every run recomputes normalization statistics from the training split and writes
+them to its own run directory. No flag reuses a saved file, so a stale statistics
+JSON can never normalize a run against the wrong feature order.

@@ -100,9 +100,9 @@ def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
 
 def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
     # Create leakage-safe numeric features in their documented order
-    columns: list[np.ndarray] = []
-    for name in MODEL_RAW_FEATURES:
-        columns.append(pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=np.float64))
+    columns: list[np.ndarray] = [
+        pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=np.float64) for name in MODEL_RAW_FEATURES
+    ]
 
     for cyclic_feature in MODEL_CYCLIC_FEATURES:
         if cyclic_feature == "hour":
@@ -340,20 +340,6 @@ def save_stats(stats: NormalizationStats, path: str | Path) -> None:
     finally:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink(missing_ok=True)
-
-
-def load_stats(path: str | Path) -> NormalizationStats:
-    """Load normalization state from JSON.
-
-    Args:
-        path: Source JSON path.
-
-    Returns:
-        Parsed normalization state.
-    """
-    with Path(path).open() as source:
-        values = json.load(source)
-    return NormalizationStats.from_dict(values)
 
 
 class NOxDataset(Dataset):
