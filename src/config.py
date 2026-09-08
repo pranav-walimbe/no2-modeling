@@ -131,14 +131,8 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
     TOTAL_NAMEPLATE_CAPACITY_MW_COL,
     "avg_heat_input",
     "avg_pwr_gen",
-    DELTA_NOX_SCALE_COL,
     "temperature_2m_k",
     "boundary_layer_height_m",
-)
-MODEL_LOG1P_FEATURES = (  # stabilize strongly right-skewed, nonnegative quantities before z-scoring
-    TOTAL_NAMEPLATE_CAPACITY_MW_COL,
-    "avg_heat_input",
-    DELTA_NOX_SCALE_COL,
 )
 MODEL_CYCLIC_FEATURES = ("hour", "day_of_year")  # each expands to sine and cosine
 

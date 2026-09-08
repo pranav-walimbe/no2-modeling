@@ -21,7 +21,6 @@ Scalar inputs:
 - coal and natural-gas unit counts;
 - total generator nameplate capacity;
 - previous-quarter average heat input and power generation;
-- the historical NOx-change variability from the prior completed quarter;
 - coincident HRRR 2 m temperature and boundary-layer height;
 - sine/cosine encodings of UTC hour and day of year.
 
@@ -32,21 +31,38 @@ Excluded inputs and the reason for each:
 | Coordinates, AOI IDs | Prevent geographic memorization |
 | Current emissions | Direct target leakage |
 | Plume score, raster-quality scores | Diagnostics extracted from the response image |
+| Prior-quarter NOx-change scale | Encodes how far a plant usually swings, which tracks crossing a fixed magnitude cutoff |
 
 Coverage stays available for sliced evaluation. The image mask already tells the
 network where the scans have support.
 
 ### Feature transformations
 
-Each scalar gets a transform matched to its distribution, then standardization
-with the training-split mean and standard deviation. Validation, test, and
-inference reuse those statistics.
+Every scalar enters raw, then gets standardized with the training-split mean and
+standard deviation. Validation, test, and inference reuse those statistics.
 
-| Transform | Features | Reason |
-|---|---|---|
-| `log1p` | nameplate capacity, heat input, power generation, NOx-change scale, boundary-layer height | Nonnegative with long right tails; compression limits extreme values and preserves zero |
-| None | coal and gas unit counts, temperature | Counts keep their discrete spacing, and temperature spans a moderate range |
-| Sine and cosine | UTC hour, day of year | Circular encoding keeps hour 23 adjacent to hour 0 |
+| Transform | Features |
+|---|---|
+| None | all scalar inputs |
+| Sine and cosine | UTC hour, day of year |
+
+Sine and cosine keep hour 23 adjacent to hour 0.
+
+No feature carries a `log1p` transform. Measurements on the first generated
+training split rejected it, split by feature:
+
+| Feature | Raw skew | `log1p` skew | Tail share raw | Tail share `log1p` |
+|---|---|---|---|---|
+| `avg_heat_input` | 0.378 | -0.673 | 0.032 | 0.041 |
+| `total_nameplate_capacity_mw` | 0.789 | -0.643 | 0.038 | 0.044 |
+| `avg_pwr_gen` | 0.062 | -1.009 | 0.027 | 0.046 |
+| `boundary_layer_height_m` | 1.401 | -0.875 | 0.058 | 0.051 |
+
+Tail share is the fraction of total absolute deviation from the median held by
+the top 1 percent of records. Only `boundary_layer_height_m` improves on both
+measures, and a logistic probe on the tabular features moved validation AUC by
+less than 0.005 across every combination tested. Nothing justified the added
+distortion, so the transform is gone.
 
 ## Image representation and normalization
 
@@ -218,6 +234,8 @@ python -u -m modeling.train
 Flags:
 
 - `--workers`, `--batch-size`, `--epochs` for allocation-specific overrides;
-- `--inputs` for the controlled branch ablations;
-- `--stats` to reuse a compatible statistics JSON, valid only when the training
-  dataset and configured feature order are unchanged.
+- `--inputs` for the controlled branch ablations.
+
+Every run recomputes normalization statistics from the training split and writes
+them to its own run directory. No flag reuses a saved file, so a stale statistics
+JSON can never normalize a run against the wrong feature order.

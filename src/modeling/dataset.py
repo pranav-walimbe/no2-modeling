@@ -21,7 +21,6 @@ from config import (
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_ABS,
     MODEL_IMAGE_KEYS,
-    MODEL_LOG1P_FEATURES,
     MODEL_RAW_FEATURES,
     MODEL_ROBUST_IMAGE_KEYS,
     MODEL_VALID_MASK_KEY,
@@ -39,7 +38,7 @@ STANDARD_IMAGE_CHANNELS = tuple(
 
 def _model_feature_names() -> tuple[str, ...]:
     # Expand raw and cyclic inputs into their model column names
-    names = [f"log1p_{name}" if name in MODEL_LOG1P_FEATURES else name for name in MODEL_RAW_FEATURES]
+    names = list(MODEL_RAW_FEATURES)
     for name in MODEL_CYCLIC_FEATURES:
         names.extend((f"{name}_sin", f"{name}_cos"))
     return tuple(names)
@@ -101,12 +100,9 @@ def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
 
 def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
     # Create leakage-safe numeric features in their documented order
-    columns: list[np.ndarray] = []
-    for name in MODEL_RAW_FEATURES:
-        values = pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=np.float64)
-        if name in MODEL_LOG1P_FEATURES:
-            values = np.log1p(values)
-        columns.append(values)
+    columns: list[np.ndarray] = [
+        pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=np.float64) for name in MODEL_RAW_FEATURES
+    ]
 
     for cyclic_feature in MODEL_CYCLIC_FEATURES:
         if cyclic_feature == "hour":
@@ -344,20 +340,6 @@ def save_stats(stats: NormalizationStats, path: str | Path) -> None:
     finally:
         if temporary_path is not None and temporary_path.exists():
             temporary_path.unlink(missing_ok=True)
-
-
-def load_stats(path: str | Path) -> NormalizationStats:
-    """Load normalization state from JSON.
-
-    Args:
-        path: Source JSON path.
-
-    Returns:
-        Parsed normalization state.
-    """
-    with Path(path).open() as source:
-        values = json.load(source)
-    return NormalizationStats.from_dict(values)
 
 
 class NOxDataset(Dataset):

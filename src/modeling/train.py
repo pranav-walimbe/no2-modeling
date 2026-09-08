@@ -26,7 +26,6 @@ from modeling.dataset import (
     NOxDataset,
     clipped_pixel_fractions,
     compute_stats,
-    load_stats,
     save_stats,
 )
 from modeling.eval_utils import (
@@ -72,7 +71,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
     parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
-    parser.add_argument("--stats", type=Path, help="Reuse normalization_stats.json from a compatible training split")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--inputs", choices=("full", "image", "tabular"), default="full")
     return parser.parse_args()
@@ -251,7 +249,7 @@ def main() -> None:
     _seed_everything(args.seed)
     device = _device(args.device)
 
-    stats = load_stats(args.stats) if args.stats else compute_stats("train")
+    stats = compute_stats("train")
     classification_summaries = _load_classification_summaries()
     run_name = datetime.now(timezone.utc).strftime("delta_nox_classification_%Y%m%d_%H%M%S")
     run_dir = Path(RUNS_DIR) / run_name
