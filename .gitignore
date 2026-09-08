@@ -206,7 +206,10 @@ cython_debug/
 # Local agent handoff state
 AGENTS.md
 CLAUDE.md
-/.agents/
+/.agents/*
+!/.agents/skills/
+/.agents/skills/*
+!/.agents/skills/savio-slurm/
 /.claude/
 
 # Local analysis and batch scripts
