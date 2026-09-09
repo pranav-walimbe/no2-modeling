@@ -168,9 +168,12 @@ Read balanced metrics against the saved pre-balancing prevalence.
 - Metadata operations use Polars and project only the required columns.
 - Generation bounds the number of pending worker futures and caches each unique
   AOI scan for one run.
-- Candidate delta rasters live in the run's temporary directory.
-- Only final selected rasters move into the persistent split directory.
+- Candidate delta rasters live in atomic resumable shards until finalization.
+- Only final selected rasters are linked or copied into the persistent split
+  directory.
 - Replacing a split directory clears stale, unreferenced files from earlier runs.
+- Successful finalization removes the shard workspace. Failed runs preserve
+  completed shards for retry.
 
 For large archives, run stratification and raster generation through Slurm.
 Never regrid the entire metadata population just to rank it. Raise the candidate
