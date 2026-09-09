@@ -511,7 +511,6 @@ def parse_args() -> argparse.Namespace:
         Parsed command-line arguments.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workers", type=int, default=NUM_CORES)
     parser.add_argument("--split", choices=("all", *SPLIT_PATHS), default=_default_split())
     parser.add_argument(
         "--refresh-tempo",
@@ -539,18 +538,9 @@ def _selected_split_paths(split: str) -> dict[str, str]:
     return SPLIT_PATHS if split == "all" else {split: SPLIT_PATHS[split]}
 
 
-def _worker_count(requested_workers: int) -> int:
-    # NUM_CORES reflects SLURM_CPUS_PER_TASK inside a Savio allocation
-    workers = min(requested_workers, NUM_CORES)
-    if workers < requested_workers:
-        print(f"Capping workers at the allocated core count: {workers}")
-    return workers
-
-
 def main() -> None:
     """Generate paired raster NPZ files and metadata CSVs for all splits."""
     args = parse_args()
-    workers = _worker_count(args.workers)
 
     Path(DATASET_DIR).mkdir(parents=True, exist_ok=True)
     Path(DATASET_DF).mkdir(parents=True, exist_ok=True)
@@ -568,8 +558,8 @@ def main() -> None:
             Path(temporary_dir),
         )
         print(f"Planned {len(records):,} records using {len(scans):,} TEMPO scans and {len(winds):,} wind rasters")
-        tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, workers, args.refresh_tempo)
-        wind_cache_paths, wind_failures = _run_wind_alignment(winds, workers, args.refresh_wind)
+        tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, NUM_CORES, args.refresh_tempo)
+        wind_cache_paths, wind_failures = _run_wind_alignment(winds, NUM_CORES, args.refresh_wind)
         tasks, records_by_id = _record_tasks(
             records,
             tempo_cache_paths,
@@ -578,7 +568,7 @@ def main() -> None:
             wind_failures,
             failures,
         )
-        output_rows = _run_record_processing(tasks, records_by_id, failures, workers)
+        output_rows = _run_record_processing(tasks, records_by_id, failures, NUM_CORES)
         _write_outputs(output_rows, failures, splits)
 
 

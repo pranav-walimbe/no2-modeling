@@ -189,8 +189,8 @@ python -u -m preprocessing.generate_dataset
   by paired coverage alone;
 - selects the exact configured size through AOI-balanced, temporally diverse
   quality ranking;
-- defaults to `SLURM_CPUS_PER_TASK` workers through `NUM_CORES` and refuses to
-  exceed that allocation.
+- uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
+  allocation.
 
 Every successful split-CSV row carries its relative `delta_no2_path`, plume
 score, paired cloud, quality and retrieval-uncertainty means, and
