@@ -180,13 +180,13 @@ python -u -m preprocessing.generate_dataset
 
 `preprocessing.generate_dataset`:
 
-- regrids the current and previous TEMPO scans onto the same AOI grid and
-  requires finite NO2 in both;
+- resolves current, previous, and prior-14-day same-time TEMPO scans through one
+  deduplicated persistent image-cache plan;
 - writes one compressed five-channel NPZ per retained record;
 - stores each unique AOI scan and aligned AOI-hour wind raster in persistent
   caches, grouping work so workers reuse each NetCDF or GRIB read;
-- requires at least 50 percent paired-finite coverage over both the full raster
-  and the central 8 by 8 cells;
+- requires at least 50 percent paired-finite coverage and ranks raster quality
+  by paired coverage alone;
 - selects the exact configured size through AOI-balanced, temporally diverse
   quality ranking;
 - defaults to `SLURM_CPUS_PER_TASK` workers through `NUM_CORES` and refuses to
@@ -199,7 +199,7 @@ centre-interpolated HRRR temperature and boundary-layer height.
 Running the splits:
 
 - Train, validation, and test hold disjoint geographic clusters, so a three-task
-  Slurm array runs them at once.
+  Slurm array can use up to three nodes at once.
 - Array indices 0, 1, and 2 select `train`, `val`, and `test`, so each task can
   invoke `python -u -m preprocessing.generate_dataset` unchanged.
 - Outside an array, pass `--split` for one split or omit it for all.
@@ -212,12 +212,12 @@ Running the splits:
 python -u -m modeling.train
 ```
 
-The trainer reads current NO2, delta NO2, wind, and the paired-valid mask from
-each selected NPZ on demand, fits memory-bounded robust NO2 normalization
-statistics on the training split alone, and records clipped valid-pixel
-fractions by channel and split. It then predicts whether raw delta-NOx falls
-below or above zero outside the fixed deadband and reports classification
-metrics. See `docs/modeling.md` for the full contract.
+The trainer reads current NO2, hourly delta NO2, EMA delta NO2, and wind from
+each selected NPZ on demand. It fits memory-bounded robust NO2 normalization
+statistics on the training split alone and records clipped valid-pixel fractions
+by channel and split. It then predicts whether raw delta-NOx falls below or
+above zero outside the fixed deadband and reports classification metrics. See
+`docs/modeling.md` for the full contract.
 
 ### Resuming
 

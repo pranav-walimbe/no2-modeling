@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TypeVar
 
@@ -19,8 +20,13 @@ from config import (
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WIND_CACHE_DIR,
     DELTA_THRESHOLD,
+    EMA_HISTORY_DAYS,
+    EMA_MIN_SCANS,
+    EMA_SAME_TIME_TOLERANCE_MINUTES,
     HRRR_DIR,
+    LABEL_COL,
     NUM_CORES,
+    TEMPO_AOI_MAPPING,
     TEMPO_DIR,
     TEST_RECORDS_CSV,
     TEST_SIZE,
@@ -48,7 +54,7 @@ from preprocessing.generate_dataset_utils import (
     write_csv_atomic,
     write_json_atomic,
 )
-from preprocessing.stratify_utils import classification_summary
+from preprocessing.stratify_utils import AOI_ID_COL, classification_summary
 
 SPLIT_PATHS = {
     "train": TRAIN_RECORDS_CSV,
@@ -76,6 +82,8 @@ class PreparedRecord:
     record_index: int
     current_scan_key: str
     previous_scan_key: str
+    historical_scan_keys: tuple[str, ...]
+    historical_age_days: tuple[float, ...]
     wind_cache_key: str
     delta_no2_path: str
 
@@ -116,6 +124,48 @@ def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
     return splits
 
 
+ObservationIndex = dict[int, dict[date, list[dict[str, object]]]]
+
+
+def _load_observations(aoi_ids: list[int]) -> ObservationIndex:
+    # Index the shared TEMPO observations once by AOI and calendar day
+    paths = sorted(Path(TEMPO_AOI_MAPPING).rglob("date=*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"No AOI observation shards found under {TEMPO_AOI_MAPPING}")
+    observations = (
+        pl.scan_parquet(paths)
+        .select("aoi_id", "scan_date", "tempo_time", "granule_paths", "sampled_pixel_count")
+        .filter(pl.col("aoi_id").is_in(aoi_ids))
+        .collect()
+    )
+    index: ObservationIndex = {}
+    for observation in observations.iter_rows(named=True):
+        aoi_id = int(observation["aoi_id"])
+        scan_date = observation["scan_date"]
+        index.setdefault(aoi_id, {}).setdefault(scan_date, []).append(observation)
+    return index
+
+
+def _same_time_history(
+    observations_by_day: dict[date, list[dict[str, object]]], target_time: datetime
+) -> list[dict[str, object]]:
+    # Keep the closest scan per prior day inside the same-time tolerance
+    target_seconds = target_time.hour * 3600 + target_time.minute * 60 + target_time.second
+    selected = []
+    for age_days in range(1, EMA_HISTORY_DAYS + 1):
+        scan_date = target_time.date() - timedelta(days=age_days)
+        candidates = []
+        for observation in observations_by_day.get(scan_date, []):
+            observation_time = observation["tempo_time"]
+            observation_seconds = observation_time.hour * 3600 + observation_time.minute * 60 + observation_time.second
+            difference = abs((observation_seconds - target_seconds + 43_200) % 86_400 - 43_200)
+            if difference <= EMA_SAME_TIME_TOLERANCE_MINUTES * 60:
+                candidates.append((difference, -int(observation["sampled_pixel_count"]), observation))
+        if candidates:
+            selected.append(min(candidates, key=lambda priority: priority[:2])[2])
+    return sorted(selected, key=lambda row: row["tempo_time"])
+
+
 def _prepare_records(
     splits: dict[str, pl.DataFrame],
     tempo_cache_dir: Path,
@@ -127,6 +177,8 @@ def _prepare_records(
     scans: dict[str, ScanTask] = {}
     winds: dict[str, WindTask] = {}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in splits}
+    aoi_ids = sorted({int(aoi_id) for frame in splits.values() for aoi_id in frame["aoi_id"].unique()})
+    observations_by_aoi = _load_observations(aoi_ids)
     for split, frame in splits.items():
         output_dir = run_dir / "record-rasters" / split
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +188,22 @@ def _prepare_records(
                 current = make_scan_task(row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 wind = make_wind_task(row, Path(HRRR_DIR), wind_cache_dir)
+                history = _same_time_history(observations_by_aoi[int(row["aoi_id"])], row["tempo_time"])
+                if len(history) < EMA_MIN_SCANS:
+                    raise ValueError(f"Only {len(history)} same-time historical scans are available")
+                historical_scans = []
+                historical_age_days = []
+                for observation in history:
+                    history_row = {
+                        "aoi_id": row["aoi_id"],
+                        "lon": row["lon"],
+                        "lat": row["lat"],
+                        "tempo": observation["granule_paths"],
+                    }
+                    historical_scan = make_scan_task(history_row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
+                    historical_scans.append(historical_scan)
+                    age = (row["tempo_time"] - observation["tempo_time"]).total_seconds() / 86_400
+                    historical_age_days.append(float(age))
                 delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
                     PreparedRecord(
@@ -143,12 +211,16 @@ def _prepare_records(
                         record_index=record_index,
                         current_scan_key=current.cache_key,
                         previous_scan_key=previous.cache_key,
+                        historical_scan_keys=tuple(scan.cache_key for scan in historical_scans),
+                        historical_age_days=tuple(historical_age_days),
                         wind_cache_key=wind.cache_key,
                         delta_no2_path=str(delta_no2_path),
                     )
                 )
                 scans.setdefault(current.cache_key, current)
                 scans.setdefault(previous.cache_key, previous)
+                for historical_scan in historical_scans:
+                    scans.setdefault(historical_scan.cache_key, historical_scan)
                 winds.setdefault(wind.cache_key, wind)
             except (KeyError, TypeError, ValueError) as error:
                 failures[split].append({"record_index": record_index, "error": str(error)})
@@ -247,6 +319,23 @@ def _record_tasks(
             reasons = [tempo_failures.get(key, "TEMPO cache unavailable") for key in missing_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
+        available_history = [
+            (tempo_cache_paths[key], age)
+            for key, age in zip(record.historical_scan_keys, record.historical_age_days, strict=True)
+            if key in tempo_cache_paths
+        ]
+        if len(available_history) < EMA_MIN_SCANS:
+            missing_count = len(record.historical_scan_keys) - len(available_history)
+            failures[record.split].append(
+                {
+                    "record_index": record.record_index,
+                    "error": (
+                        f"Only {len(available_history)} historical scans remain after "
+                        f"{missing_count} TEMPO cache failures"
+                    ),
+                }
+            )
+            continue
         if record.wind_cache_key not in wind_cache_paths:
             reason = wind_failures.get(record.wind_cache_key, "wind cache unavailable")
             failures[record.split].append({"record_index": record.record_index, "error": reason})
@@ -259,6 +348,8 @@ def _record_tasks(
                 record_index=record.record_index,
                 current_cache_path=tempo_cache_paths[record.current_scan_key],
                 previous_cache_path=tempo_cache_paths[record.previous_scan_key],
+                historical_cache_paths=tuple(path for path, _ in available_history),
+                historical_age_days=tuple(age for _, age in available_history),
                 wind_cache_path=wind_cache_paths[record.wind_cache_key],
                 output_path=record.delta_no2_path,
             )
@@ -316,11 +407,21 @@ def _write_outputs(
             f"[{split}] {candidates.height:,} regridded; "
             f"{eligible.height:,} passed raster QC; {output_frame.height:,} selected"
         )
+        eligible_coverage = _coverage_selection_summary(eligible)
+        selected_coverage = _coverage_selection_summary(output_frame)
+        print(
+            f"[{split}] full paired coverage: {selected_coverage['full_coverage_records']:,}/"
+            f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"
+        )
         classification_report = {
             "split": split,
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
             "raster_qc": classification_summary(candidates, eligible),
             "final_balance": classification_summary(eligible, output_frame),
+            "coverage_selection": {
+                "eligible": eligible_coverage,
+                "selected": selected_coverage,
+            },
         }
         output_frame = _install_selected_rasters(split, output_frame)
         write_csv_atomic(
@@ -341,6 +442,24 @@ def _write_outputs(
             f"{no_paired_coverage:,} rejected with no paired finite NO2; "
             f"{processing_failures:,} processing failures"
         )
+
+
+def _coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
+    # Report full coverage and AOI representation overall and by class
+    def summarize(group: pl.DataFrame) -> dict[str, int | float]:
+        records = group.height
+        full_coverage = group.filter(pl.col("paired_finite_fraction") >= 1.0).height
+        return {
+            "records": records,
+            "full_coverage_records": full_coverage,
+            "full_coverage_fraction": full_coverage / records if records else 0.0,
+            "aoi_count": group[AOI_ID_COL].n_unique() if records else 0,
+        }
+
+    return {
+        **summarize(frame),
+        "by_class": {str(label): summarize(frame.filter(pl.col(LABEL_COL) == label)) for label in (0, 1)},
+    }
 
 
 def _count_failure_outcomes(failure_rows: list[dict[str, object]]) -> tuple[int, int]:

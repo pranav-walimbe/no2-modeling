@@ -20,13 +20,13 @@ from scipy.ndimage import map_coordinates
 
 from config import (
     CENTRAL_COVERAGE_WINDOW_SIZE,
+    EMA_HALF_LIFE_DAYS,
+    EMA_MIN_PIXEL_OBSERVATIONS,
+    EMA_MIN_SCANS,
     IMG_SIZE,
     LABEL_COL,
-    MIN_CENTRAL_FINITE_FRACTION,
     MIN_PAIRED_FINITE_FRACTION,
     MODEL_IMAGE_KEYS,
-    MODEL_VALID_MASK_KEY,
-    RASTER_UNCERTAINTY_WEIGHT,
 )
 from preprocessing.regrid import (
     AoiGrid,
@@ -38,8 +38,7 @@ from preprocessing.regrid import (
 )
 from preprocessing.stratify_utils import AOI_ID_COL
 
-CURRENT_RASTER_NAME, DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
-VALID_MASK_NAME = MODEL_VALID_MASK_KEY
+CURRENT_RASTER_NAME, DELTA_RASTER_NAME, EMA_DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
 NO_PAIRED_FINITE_NO2_ERROR = "Paired TEMPO scans have no cells with finite NO2 in both rasters"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
 CENTRAL_FINITE_FRACTION_COL = "central_finite_fraction"
@@ -77,29 +76,8 @@ def eligible_generated_records(frame: pl.DataFrame) -> pl.DataFrame:
         Eligible records carrying a bounded raster-quality score.
     """
     paired = pl.col(PAIRED_FINITE_FRACTION_COL)
-    central = pl.col(CENTRAL_FINITE_FRACTION_COL)
-    keep = (
-        paired.is_finite()
-        & central.is_finite()
-        & (paired >= MIN_PAIRED_FINITE_FRACTION)
-        & (central >= MIN_CENTRAL_FINITE_FRACTION)
-    )
-    if RASTER_UNCERTAINTY_WEIGHT > 0:
-        keep &= pl.col(MEAN_RETRIEVAL_UNCERTAINTY_COL).is_finite()
-    eligible = frame.filter(keep)
-    coverage_quality = 2 * paired * central / (paired + central)
-    if RASTER_UNCERTAINTY_WEIGHT == 0:
-        uncertainty_quality = pl.lit(0.0)
-    elif eligible.height == 1:
-        uncertainty_quality = pl.lit(1.0)
-    else:
-        uncertainty_quality = 1 - (
-            (pl.col(MEAN_RETRIEVAL_UNCERTAINTY_COL).rank(method="average") - 1) / (eligible.height - 1)
-        )
-    return eligible.with_columns(
-        ((1 - RASTER_UNCERTAINTY_WEIGHT) * coverage_quality + RASTER_UNCERTAINTY_WEIGHT * uncertainty_quality).alias(
-            RASTER_QUALITY_SCORE_COL
-        )
+    return frame.filter(paired.is_finite() & (paired >= MIN_PAIRED_FINITE_FRACTION)).with_columns(
+        paired.alias(RASTER_QUALITY_SCORE_COL)
     )
 
 
@@ -191,6 +169,8 @@ class RecordTask:
     record_index: int
     current_cache_path: str
     previous_cache_path: str
+    historical_cache_paths: tuple[str, ...]
+    historical_age_days: tuple[float, ...]
     wind_cache_path: str
     output_path: str
 
@@ -251,13 +231,13 @@ def parse_tempo_paths(serialized_paths: object, tempo_root: Path) -> tuple[str, 
     """Parse a stratified CSV's JSON granule list into absolute paths.
 
     Args:
-        serialized_paths: JSON string emitted by the stratification stage.
+        serialized_paths: JSON string from stratification or an indexed path list.
         tempo_root: Root of the configured TEMPO Level 2 archive.
 
     Returns:
         Non-empty tuple of absolute granule paths.
     """
-    relative_paths = json.loads(str(serialized_paths))
+    relative_paths = json.loads(serialized_paths) if isinstance(serialized_paths, str) else serialized_paths
     return tuple(str(tempo_root / path) for path in relative_paths)
 
 
@@ -519,23 +499,52 @@ def _paired_mean(current: np.ndarray, previous: np.ndarray, valid: np.ndarray) -
     return float(np.mean(finite)) if finite.size else float("nan")
 
 
+def _historical_ema(
+    historical_paths: tuple[str, ...],
+    age_days: tuple[float, ...],
+) -> np.ndarray:
+    # Build one causal EMA from persistent regridded scan-cache entries
+    if len(historical_paths) != len(age_days):
+        raise ValueError("Historical cache paths and ages must have equal length")
+    if len(historical_paths) < EMA_MIN_SCANS:
+        raise ValueError(f"Only {len(historical_paths)} historical scans are available")
+    historical = []
+    for path in historical_paths:
+        with np.load(path, allow_pickle=False) as cache:
+            historical.append(np.asarray(cache["no2"], dtype=np.float64))
+    stack = np.stack(historical)
+    weights = np.exp2(-np.asarray(age_days, dtype=np.float64) / EMA_HALF_LIFE_DAYS)[:, None, None]
+    finite = np.isfinite(stack)
+    support = finite.sum(axis=0)
+    weighted_sum = np.nansum(stack * weights, axis=0)
+    weight_sum = np.sum(finite * weights, axis=0)
+    ema = np.full(stack.shape[1:], np.nan, dtype=np.float64)
+    usable = support >= EMA_MIN_PIXEL_OBSERVATIONS
+    ema[usable] = weighted_sum[usable] / weight_sum[usable]
+    return ema
+
+
 def derive_raster_features(
     current_path: str,
     previous_path: str,
+    historical_paths: tuple[str, ...],
+    historical_age_days: tuple[float, ...],
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Derive paired model rasters and scan-quality scalar features.
 
     Args:
         current_path: Cached five-raster bundle for the current scan.
         previous_path: Cached five-raster bundle for the prior scan.
+        historical_paths: Cached same-time scans from the preceding two weeks.
+        historical_age_days: Exact age of each historical scan before current.
 
     Returns:
         Model raster arrays and their plume, cloud, quality, and uncertainty
         summaries.
     """
     with np.load(current_path, allow_pickle=False) as current, np.load(previous_path, allow_pickle=False) as previous:
-        current_no2 = current["no2"]
-        previous_no2 = previous["no2"]
+        current_no2 = np.asarray(current["no2"], dtype=np.float64)
+        previous_no2 = np.asarray(previous["no2"], dtype=np.float64)
         valid = np.isfinite(current_no2) & np.isfinite(previous_no2)
         if not valid.any():
             raise ValueError(NO_PAIRED_FINITE_NO2_ERROR)
@@ -549,6 +558,10 @@ def derive_raster_features(
         delta_no2 = np.full(current_no2.shape, np.nan, dtype=np.float32)
         delta_values = current_no2[valid].astype(np.float64) - previous_no2[valid].astype(np.float64)
         delta_no2[valid] = delta_values.astype(np.float32)
+        historical_ema = _historical_ema(historical_paths, historical_age_days)
+        ema_valid = np.isfinite(current_no2) & np.isfinite(historical_ema)
+        ema_delta_no2 = np.full(current_no2.shape, np.nan, dtype=np.float32)
+        ema_delta_no2[ema_valid] = (current_no2[ema_valid] - historical_ema[ema_valid]).astype(np.float32)
         p10, p50, p99 = np.percentile(delta_values, [10, 50, 99])
         denominator = p50 - p10
         epsilon = np.finfo(np.float64).eps * max(abs(p10), abs(p50), 1.0)
@@ -569,7 +582,7 @@ def derive_raster_features(
     rasters = {
         CURRENT_RASTER_NAME: paired_current_no2,
         DELTA_RASTER_NAME: delta_no2,
-        VALID_MASK_NAME: valid.astype(np.float32),
+        EMA_DELTA_RASTER_NAME: ema_delta_no2,
     }
     return rasters, features
 
@@ -606,7 +619,12 @@ def process_record(task: RecordTask) -> RecordResult:
         Derived scalar features or contextual failure text.
     """
     try:
-        rasters, features = derive_raster_features(task.current_cache_path, task.previous_cache_path)
+        rasters, features = derive_raster_features(
+            task.current_cache_path,
+            task.previous_cache_path,
+            task.historical_cache_paths,
+            task.historical_age_days,
+        )
         wind_rasters, weather_features = extract_wind_cache(task.wind_cache_path)
         rasters.update(wind_rasters)
         features.update(weather_features)

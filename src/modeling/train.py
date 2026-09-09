@@ -1,4 +1,4 @@
-"""Train a mask-aware binary classifier for hourly NOx-mass changes."""
+"""Train a raster-and-tabular classifier for hourly NOx-mass changes."""
 
 import argparse
 import json

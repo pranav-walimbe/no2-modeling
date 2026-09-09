@@ -87,13 +87,16 @@ IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_PAIRED_FINITE_FRACTION = 0.50  # least share of cells finite in both scans
 CENTRAL_COVERAGE_WINDOW_SIZE = 8  # centred 12 km window; even because the 48-cell grid centre is an intersection
-MIN_CENTRAL_FINITE_FRACTION = 0.50  # least paired-finite share in the central window
-RASTER_UNCERTAINTY_WEIGHT = 0.25  # share of final raster ranking assigned to low retrieval uncertainty
+EMA_HISTORY_DAYS = 14  # causal same-time background window before each current scan
+EMA_HALF_LIFE_DAYS = 5.0  # temporal decay applied inside the same-time background
+EMA_SAME_TIME_TOLERANCE_MINUTES = 30  # largest daily scan-time mismatch
+EMA_MIN_SCANS = 7  # least number of historical daily scans required per record
+EMA_MIN_PIXEL_OBSERVATIONS = 5  # least historical support required per EMA pixel
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
 LABEL_COL = "delta_nox_class"
-DELTA_THRESHOLD = 50.0  # least raw delta-NOx magnitude kept as a labeled class
+DELTA_THRESHOLD = 100.0  # least raw delta-NOx magnitude kept as a labeled class
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_DELTA_HISTORY = 168
 DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added to its scale
@@ -120,10 +123,9 @@ TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 # Modeling data contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "wind_u_10m_mps", "wind_v_10m_mps")
-MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2")
-MODEL_VALID_MASK_KEY = "valid_mask"  # paired finite-NO2 support stored with each sample
-MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS) + 1  # numeric channels plus the paired-valid mask
+MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2", "wind_u_10m_mps", "wind_v_10m_mps")
+MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2")
+MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
 MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
     "num_coal_units",

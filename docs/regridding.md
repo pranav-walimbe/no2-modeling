@@ -60,9 +60,15 @@ Each successful model record persists one compressed NPZ holding five aligned
 
 - `current_no2`, current-scan NO2 restricted to paired-valid support;
 - `delta_no2`, current minus previous NO2 on the same support;
+- `ema_delta_no2`, current minus a causal same-time 14-day NO2 EMA;
 - `wind_u_10m_mps`, geographic eastward wind;
-- `wind_v_10m_mps`, geographic northward wind;
-- `valid_mask`, one on paired-valid support and zero elsewhere.
+- `wind_v_10m_mps`, geographic northward wind.
+
+The EMA uses one closest scan per preceding calendar day within 30 minutes of
+the current scan time, a 5-day half-life, at least seven daily scans per record,
+and at least five observations per output pixel. Historical scans use the same
+persistent TEMPO image cache and are normalized only after the EMA delta is
+formed.
 
 Every row in the companion split CSV carries its NPZ path in `delta_no2_path`
 plus these derived features:
@@ -70,8 +76,7 @@ plus these derived features:
 - `plume_score`, from finite delta pixels as `(p99 - p50) / (p50 - p10)`;
 - `paired_finite_fraction`, the share of the 48 by 48 grid finite in both scans;
 - `central_finite_fraction`, the paired-finite share of the central 8 by 8 cells;
-- `raster_quality_score`, the configured blend of paired coverage quality and
-  inverse retrieval-uncertainty rank, for records selected into the final split;
+- `raster_quality_score`, equal to paired coverage for final record ranking;
 - `mean_weighted_cloud_fraction` and `mean_good_quality_fraction`, each averaged
   over both scans at paired-valid delta cells;
 - `mean_retrieval_uncertainty`, averaged over both scans at paired-valid cells;
@@ -100,11 +105,11 @@ pairs. Production uses:
 - an accepted-overlap floor of 0.25 km2;
 - no additional effective-sample floor.
 
-Dataset generation then adds record-level rules: both paired coverage fractions
-at 0.50 or above, finite mean retrieval uncertainty whenever uncertainty ranking
-is enabled, and a final quality score blending coverage with inverse uncertainty
-rank. None of these change per-scan tessellation or its 0.25 km2 cell-support
-floor. Plume, cloud, and quality summaries stay diagnostics and rank nothing.
+Dataset generation then requires paired coverage of at least 0.50 and ranks
+eligible records by paired coverage alone. Central coverage and retrieval
+uncertainty remain diagnostics. None of these change per-scan tessellation or
+its 0.25 km2 cell-support floor. Plume, cloud, and quality summaries also remain
+diagnostics and rank nothing.
 
 What the measurements showed:
 
