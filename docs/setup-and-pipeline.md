@@ -156,7 +156,7 @@ Time handling:
 scripts/slurm/submit_tempo_mapping.sh --overwrite
 # Wait for the observation job array to finish successfully.
 python -u -m preprocessing.stratify_plants
-python -u -m preprocessing.generate_dataset
+python -u -m preprocessing.generate_dataset --shard-size 20000
 ```
 
 `preprocessing.tempo_mapping`:
@@ -198,15 +198,22 @@ centre-interpolated HRRR temperature and boundary-layer height.
 
 Running the splits:
 
-- Train, validation, and test hold disjoint geographic clusters, so a three-task
-  Slurm array can use up to three nodes at once.
-- Array indices 0, 1, and 2 select `train`, `val`, and `test`, so each task can
-  invoke `python -u -m preprocessing.generate_dataset` unchanged.
-- Outside an array, pass `--split` for one split or omit it for all.
-- Run `--refresh-cache` from a single non-array process to empty both cache
-  directories before rebuilding entries for the selected split. Use
-  `--refresh-tempo` or `--refresh-wind` to empty and rebuild only one cache.
-  Refresh flags fail inside a Slurm array to prevent shared-cache deletion races.
+- Run `python -u -m preprocessing.generate_dataset --shard-size N` on a login
+  node. The CLI assigns at most `N` consecutive source records to each array
+  task across train, validation, and test, then submits a dependent finalizer.
+- Each worker publishes a completed shard atomically. A rerun validates and
+  skips completed shards while regenerating missing or inconsistent shards.
+- The finalizer runs only after the array becomes terminal. It requires every
+  expected shard, applies exact class balance and global AOI round-robin
+  selection, publishes the existing flattened output layout, and removes the
+  shard workspace after success.
+- Pass `--refresh-shards` to discard resumable shard output before launching a
+  new run. Persistent TEMPO and wind caches and the published dataset remain
+  intact.
+- `--refresh-cache`, `--refresh-tempo`, and `--refresh-wind` clear the selected
+  shared caches once before fan-out and also discard shards that depend on them.
+- Direct `python -u -m preprocessing.generate_dataset` remains available for a
+  monolithic local run. Pass `--split` to limit that run to one split.
 
 ### 5. Train and evaluate
 
@@ -224,9 +231,11 @@ above zero outside the fixed deadband and reports classification metrics. See
 ### Resuming
 
 Each stage depends on the preceding stage's outputs. Dataset generation resumes
-from valid TEMPO-cache and wind-cache entries. Other scripts resume only where
-their implementation supports it, so check existing output files before
-rerunning a large collection or generation job.
+from completed record shards and valid TEMPO-cache and wind-cache entries. Use
+`--refresh-shards` after an implementation change that invalidates partial
+record outputs or after replacing a source split CSV. Other scripts resume only
+where their implementation supports it, so check existing output files before
+rerunning a large job.
 
 ## Savio jobs
 
