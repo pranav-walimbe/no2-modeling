@@ -3,7 +3,9 @@
 import hashlib
 import json
 import os
+import shutil
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,6 +57,246 @@ TABULAR_FEATURE_NAMES = (
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
     *HRRR_FIELDS.values(),
 )
+SOURCE_RECORD_INDEX_COL = "_source_record_index"
+CANDIDATE_RASTER_PATH_COL = "_candidate_raster_path"
+CANDIDATE_FEATURE_SCHEMA = {
+    SOURCE_RECORD_INDEX_COL: pl.UInt32,
+    CANDIDATE_RASTER_PATH_COL: pl.String,
+    **{name: pl.Float64 for name in TABULAR_FEATURE_NAMES},
+}
+PROCESSING_FAILURE_SCHEMA = {"record_index": pl.Int64, "error": pl.String}
+SHARD_CANDIDATES_FILE = "candidates.csv"
+SHARD_FAILURES_FILE = "failures.csv"
+SHARD_COMPLETION_FILE = "complete.json"
+
+
+@dataclass(frozen=True)
+class ShardTask:
+    """One deterministic source-record range assigned to an array task."""
+
+    task_id: int
+    split: str
+    shard_index: int
+    start: int
+    stop: int
+
+    @property
+    def size(self) -> int:
+        """Return the number of source records assigned to this shard."""
+        return self.stop - self.start
+
+
+def build_shard_plan(split_paths: dict[str, str], shard_size: int) -> list[ShardTask]:
+    """Map split CSV rows onto consecutive Slurm array task IDs.
+
+    Args:
+        split_paths: Ordered split names and source CSV paths.
+        shard_size: Maximum source records assigned to one task.
+
+    Returns:
+        Deterministic shard tasks spanning every source record.
+    """
+    if shard_size <= 0:
+        raise ValueError("Shard size must be greater than zero")
+    tasks: list[ShardTask] = []
+    for split, path in split_paths.items():
+        row_count = int(pl.scan_csv(path).select(pl.len()).collect(engine="streaming").item())
+        for shard_index, start in enumerate(range(0, row_count, shard_size)):
+            tasks.append(
+                ShardTask(
+                    task_id=len(tasks),
+                    split=split,
+                    shard_index=shard_index,
+                    start=start,
+                    stop=min(start + shard_size, row_count),
+                )
+            )
+    return tasks
+
+
+@dataclass(frozen=True)
+class DatasetShardStore:
+    """Manage resumable dataset shards under one validated workspace."""
+
+    root: Path
+
+    def load(self, task: ShardTask, resolve_paths: bool = False) -> tuple[pl.DataFrame, pl.DataFrame]:
+        """Load and validate one completed shard.
+
+        Args:
+            task: Expected shard identity and source-record range.
+            resolve_paths: Replace stored relative raster paths with absolute paths.
+
+        Returns:
+            Candidate features and processing failures.
+        """
+        shard_dir = self.root / task.split / f"{task.shard_index:06d}"
+        with (shard_dir / SHARD_COMPLETION_FILE).open() as source:
+            completion = json.load(source)
+        candidates = pl.read_csv(
+            shard_dir / SHARD_CANDIDATES_FILE,
+            schema_overrides=CANDIDATE_FEATURE_SCHEMA,
+        )
+        failures = pl.read_csv(
+            shard_dir / SHARD_FAILURES_FILE,
+            schema_overrides=PROCESSING_FAILURE_SCHEMA,
+        )
+        expected_completion = self._completion_values(task, candidates.height, failures.height)
+        if completion != expected_completion:
+            raise ValueError(f"Shard {task.task_id} has an inconsistent completion marker")
+        if candidates.schema != CANDIDATE_FEATURE_SCHEMA:
+            raise ValueError(f"Shard {task.task_id} has an unexpected candidate schema")
+        expected_indices = list(range(task.start, task.stop))
+        candidate_indices = [int(value) for value in candidates[SOURCE_RECORD_INDEX_COL].to_list()]
+        failure_indices = [int(value) for value in failures["record_index"].to_list()]
+        if sorted(candidate_indices + failure_indices) != expected_indices:
+            raise ValueError(f"Shard {task.task_id} does not contain one outcome per source record")
+
+        absolute_paths = []
+        for record_index, serialized_path in zip(
+            candidate_indices,
+            candidates[CANDIDATE_RASTER_PATH_COL].to_list(),
+            strict=True,
+        ):
+            relative_path = Path(str(serialized_path))
+            expected_path = Path("record-rasters") / task.split / f"{record_index:06d}.npz"
+            if relative_path != expected_path:
+                raise ValueError(f"Shard {task.task_id} has an unexpected raster path for record {record_index}")
+            absolute_path = shard_dir / relative_path
+            if not absolute_path.is_file():
+                raise ValueError(f"Shard {task.task_id} is missing raster {relative_path}")
+            absolute_paths.append(str(absolute_path))
+        if resolve_paths:
+            candidates = candidates.with_columns(pl.Series(CANDIDATE_RASTER_PATH_COL, absolute_paths, dtype=pl.String))
+        return candidates, failures
+
+    def is_complete(self, task: ShardTask) -> bool:
+        """Return whether one shard has a valid terminal outcome for each source record.
+
+        Args:
+            task: Expected shard identity and source-record range.
+
+        Returns:
+            True when the shard can be reused or finalized.
+        """
+        try:
+            self.load(task)
+        except (json.JSONDecodeError, OSError, TypeError, ValueError, pl.exceptions.PolarsError):
+            return False
+        return True
+
+    def create_staging(self, task: ShardTask) -> Path:
+        """Clear incomplete attempts and create a private staging directory.
+
+        Args:
+            task: Shard that the caller will generate.
+
+        Returns:
+            Empty directory on the shard filesystem.
+        """
+        split_root = self._prepare_split_root(task.split)
+        self._remove_directory(split_root / f"{task.shard_index:06d}", split_root)
+        temporary_prefix = f".{task.shard_index:06d}-"
+        for path in split_root.iterdir():
+            if path.name.startswith(temporary_prefix):
+                self._remove_directory(path, split_root)
+        return Path(tempfile.mkdtemp(prefix=temporary_prefix, dir=split_root))
+
+    def complete(
+        self,
+        task: ShardTask,
+        staging: Path,
+        output_rows: list[dict[str, object]],
+        failure_rows: list[dict[str, object]],
+    ) -> None:
+        """Write terminal shard artifacts and publish the directory atomically.
+
+        Args:
+            task: Shard identity and expected source-record range.
+            staging: Directory containing generated candidate rasters.
+            output_rows: Successful record features and raster paths.
+            failure_rows: Failed source-record indices and messages.
+        """
+        candidates = pl.DataFrame(output_rows, schema=CANDIDATE_FEATURE_SCHEMA).sort(SOURCE_RECORD_INDEX_COL)
+        relative_paths = [
+            str(Path(candidate_path).relative_to(staging))
+            for candidate_path in candidates[CANDIDATE_RASTER_PATH_COL].to_list()
+        ]
+        candidates = candidates.with_columns(pl.Series(CANDIDATE_RASTER_PATH_COL, relative_paths, dtype=pl.String))
+        failures = pl.DataFrame(
+            sorted(failure_rows, key=lambda row: int(row["record_index"])),
+            schema=PROCESSING_FAILURE_SCHEMA,
+        )
+        outcome_indices = [int(value) for value in candidates[SOURCE_RECORD_INDEX_COL].to_list()]
+        outcome_indices.extend(int(value) for value in failures["record_index"].to_list())
+        if sorted(outcome_indices) != list(range(task.start, task.stop)):
+            raise ValueError(f"Shard {task.task_id} did not produce one outcome per source record")
+
+        write_csv_atomic(candidates, staging / SHARD_CANDIDATES_FILE)
+        write_csv_atomic(failures, staging / SHARD_FAILURES_FILE)
+        write_json_atomic(
+            self._completion_values(task, candidates.height, failures.height),
+            staging / SHARD_COMPLETION_FILE,
+        )
+        os.replace(staging, self.root / task.split / f"{task.shard_index:06d}")
+
+    def clear_splits(self, splits: Iterable[str]) -> None:
+        """Delete shard workspaces for the supplied split names.
+
+        Args:
+            splits: Iterable of split names under this store.
+        """
+        shard_root = self._prepare_root()
+        for split in splits:
+            split_path = shard_root / str(split)
+            if split_path.exists():
+                self._remove_directory(split_path, shard_root)
+        if not any(shard_root.iterdir()):
+            shard_root.rmdir()
+
+    def _prepare_root(self) -> Path:
+        # Validate the shard root before changing descendants
+        dataset_root = self.root.parent.resolve()
+        if self.root.name != "shards" or self.root.is_symlink():
+            raise ValueError(f"Refusing to use shard workspace outside {dataset_root}: {self.root}")
+        if self.root.exists() and not self.root.is_dir():
+            raise ValueError(f"Shard workspace is not a directory: {self.root}")
+        self.root.mkdir(parents=True, exist_ok=True)
+        return self.root
+
+    def _prepare_split_root(self, split: str) -> Path:
+        # Validate one split directory before changing shard contents
+        shard_root = self._prepare_root()
+        split_root = shard_root / split
+        if split_root.parent.resolve() != shard_root.resolve() or split_root.is_symlink():
+            raise ValueError(f"Refusing to use split shard workspace outside {shard_root}: {split_root}")
+        if split_root.exists() and not split_root.is_dir():
+            raise ValueError(f"Split shard workspace is not a directory: {split_root}")
+        split_root.mkdir(parents=True, exist_ok=True)
+        return split_root
+
+    @staticmethod
+    def _remove_directory(path: Path, parent: Path) -> None:
+        # Restrict recursive deletion to the expected parent directory
+        if path.parent.resolve() != parent.resolve():
+            raise ValueError(f"Refusing to clear shard path outside {parent}: {path}")
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise ValueError(f"Shard path is not a directory: {path}")
+        if path.exists():
+            shutil.rmtree(path)
+
+    @staticmethod
+    def _completion_values(task: ShardTask, successful_count: int, failure_count: int) -> dict[str, object]:
+        # Describe the shard boundary and its terminal outcomes
+        return {
+            "split": task.split,
+            "shard_index": task.shard_index,
+            "start": task.start,
+            "stop": task.stop,
+            "source_count": task.size,
+            "successful_count": successful_count,
+            "failure_count": failure_count,
+        }
 
 
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:

@@ -1,7 +1,6 @@
 """Generate paired TEMPO rasters and tabular features for every data split."""
 
 import argparse
-import json
 import os
 import shutil
 import subprocess
@@ -37,12 +36,18 @@ from config import (
     VAL_SIZE,
 )
 from preprocessing.generate_dataset_utils import (
-    TABULAR_FEATURE_NAMES,
+    CANDIDATE_FEATURE_SCHEMA,
+    CANDIDATE_RASTER_PATH_COL,
+    PROCESSING_FAILURE_SCHEMA,
+    SOURCE_RECORD_INDEX_COL,
+    DatasetShardStore,
     RecordTask,
     ScanBatchTask,
     ScanTask,
+    ShardTask,
     WindBatchTask,
     WindTask,
+    build_shard_plan,
     cache_exists,
     make_scan_task,
     make_wind_task,
@@ -63,18 +68,12 @@ SPLIT_PATHS = {
 ARRAY_SPLITS = tuple(SPLIT_PATHS)
 MAX_PENDING_FACTOR = 2
 PROGRESS_INTERVAL = 1_000
-SHARD_DIR_NAME = "shards"
-SHARD_CANDIDATES_FILE = "candidates.csv"
-SHARD_FAILURES_FILE = "failures.csv"
-SHARD_COMPLETION_FILE = "complete.json"
 LEGACY_DATASET_JOB_NAME = "generate-dataset"
 SHARD_WORKER_JOB_NAME = "generate-dataset-shard"
 SHARD_FINALIZER_JOB_NAME = "generate-dataset-finalize"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DATASET_BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_dataset.sh"
-SOURCE_RECORD_INDEX_COL = "_source_record_index"
 DELTA_NO2_PATH_COL = "delta_no2_path"
-CANDIDATE_RASTER_PATH_COL = "_candidate_raster_path"
 FINAL_SPLIT_SIZES = {"train": TRAIN_SIZE, "val": VAL_SIZE, "test": TEST_SIZE}
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")
@@ -94,51 +93,12 @@ class PreparedRecord:
     delta_no2_path: str
 
 
-@dataclass(frozen=True)
-class ShardTask:
-    """One deterministic source-record range assigned to an array task."""
-
-    task_id: int
-    split: str
-    shard_index: int
-    start: int
-    stop: int
-
-    @property
-    def size(self) -> int:
-        """Return the number of source records assigned to this shard."""
-        return self.stop - self.start
-
-
 def _positive_int(value: str) -> int:
     # Parse a strictly positive command-line integer
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return parsed
-
-
-def _source_row_count(path: str) -> int:
-    # Count records without materializing the source split
-    return int(pl.scan_csv(path).select(pl.len()).collect(engine="streaming").item())
-
-
-def _shard_plan(split_paths: dict[str, str], shard_size: int) -> list[ShardTask]:
-    # Assign consecutive array IDs across deterministic split ranges
-    tasks: list[ShardTask] = []
-    for split, path in split_paths.items():
-        row_count = _source_row_count(path)
-        for shard_index, start in enumerate(range(0, row_count, shard_size)):
-            tasks.append(
-                ShardTask(
-                    task_id=len(tasks),
-                    split=split,
-                    shard_index=shard_index,
-                    start=start,
-                    stop=min(start + shard_size, row_count),
-                )
-            )
-    return tasks
 
 
 def _slurm_array_spec(task_ids: list[int]) -> str:
@@ -157,54 +117,6 @@ def _slurm_array_spec(task_ids: list[int]) -> str:
         previous = task_id
     ranges.append(str(range_start) if range_start == previous else f"{range_start}-{previous}")
     return ",".join(ranges)
-
-
-def _shard_root() -> Path:
-    # Keep resumable work under the configured dataset root
-    return Path(DATASET_DIR) / SHARD_DIR_NAME
-
-
-def _prepare_shard_root() -> Path:
-    # Validate the shard root before creating or removing descendants
-    dataset_root = Path(DATASET_DIR).resolve()
-    shard_root = _shard_root()
-    if shard_root.parent.resolve() != dataset_root or shard_root.is_symlink():
-        raise ValueError(f"Refusing to use shard workspace outside {dataset_root}: {shard_root}")
-    if shard_root.exists() and not shard_root.is_dir():
-        raise ValueError(f"Shard workspace is not a directory: {shard_root}")
-    shard_root.mkdir(parents=True, exist_ok=True)
-    return shard_root
-
-
-def _prepare_split_shard_root(split: str) -> Path:
-    # Validate one split directory before using its shard contents
-    shard_root = _prepare_shard_root()
-    split_root = shard_root / split
-    if split_root.parent.resolve() != shard_root.resolve() or split_root.is_symlink():
-        raise ValueError(f"Refusing to use split shard workspace outside {shard_root}: {split_root}")
-    if split_root.exists() and not split_root.is_dir():
-        raise ValueError(f"Split shard workspace is not a directory: {split_root}")
-    split_root.mkdir(parents=True, exist_ok=True)
-    return split_root
-
-
-def _shard_path(task: ShardTask) -> Path:
-    # Name shards by stable split-local indices
-    return _shard_root() / task.split / f"{task.shard_index:06d}"
-
-
-def _feature_schema() -> dict[str, pl.DataType]:
-    # Define the intermediate feature contract once
-    return {
-        SOURCE_RECORD_INDEX_COL: pl.UInt32,
-        CANDIDATE_RASTER_PATH_COL: pl.String,
-        **{name: pl.Float64 for name in TABULAR_FEATURE_NAMES},
-    }
-
-
-def _failure_schema() -> dict[str, pl.DataType]:
-    # Define the intermediate failure contract once
-    return {"record_index": pl.Int64, "error": pl.String}
 
 
 def _bounded_parallel_map(
@@ -526,7 +438,7 @@ def _write_outputs(
     for split, source_frame in source_splits.items():
         rows = output_rows[split]
         failure_rows = sorted(failures[split], key=lambda row: int(row["record_index"]))
-        features = pl.DataFrame(rows, schema=_feature_schema())
+        features = pl.DataFrame(rows, schema=CANDIDATE_FEATURE_SCHEMA)
         candidates = source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left").sort(
             SOURCE_RECORD_INDEX_COL
         )
@@ -540,7 +452,7 @@ def _write_outputs(
         prepared_outputs[split] = (
             output_frame,
             classification_report,
-            pl.DataFrame(failure_rows, schema=_failure_schema()),
+            pl.DataFrame(failure_rows, schema=PROCESSING_FAILURE_SCHEMA),
         )
 
     for split, (output_frame, classification_report, failure_frame) in prepared_outputs.items():
@@ -600,137 +512,12 @@ def _install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:
     return frame.with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
 
 
-def _completion_values(task: ShardTask, successful_count: int, failure_count: int) -> dict[str, object]:
-    # Describe the deterministic shard boundary and its terminal outcomes
-    return {
-        "split": task.split,
-        "shard_index": task.shard_index,
-        "start": task.start,
-        "stop": task.stop,
-        "source_count": task.size,
-        "successful_count": successful_count,
-        "failure_count": failure_count,
-    }
-
-
-def _load_completed_shard(task: ShardTask, resolve_paths: bool = False) -> tuple[pl.DataFrame, pl.DataFrame]:
-    # Validate the completion marker and every source-record outcome
-    shard_dir = _shard_path(task)
-    with (shard_dir / SHARD_COMPLETION_FILE).open() as source:
-        completion = json.load(source)
-    candidates = pl.read_csv(
-        shard_dir / SHARD_CANDIDATES_FILE,
-        schema_overrides=_feature_schema(),
-    )
-    failures = pl.read_csv(
-        shard_dir / SHARD_FAILURES_FILE,
-        schema_overrides={"record_index": pl.Int64, "error": pl.String},
-    )
-    expected_completion = _completion_values(task, candidates.height, failures.height)
-    if completion != expected_completion:
-        raise ValueError(f"Shard {task.task_id} has an inconsistent completion marker")
-    if candidates.schema != _feature_schema():
-        raise ValueError(f"Shard {task.task_id} has an unexpected candidate schema")
-    expected_indices = list(range(task.start, task.stop))
-    candidate_indices = [int(value) for value in candidates[SOURCE_RECORD_INDEX_COL].to_list()]
-    failure_indices = [int(value) for value in failures["record_index"].to_list()]
-    if sorted(candidate_indices + failure_indices) != expected_indices:
-        raise ValueError(f"Shard {task.task_id} does not contain one outcome per source record")
-
-    absolute_paths = []
-    for record_index, serialized_path in zip(
-        candidate_indices,
-        candidates[CANDIDATE_RASTER_PATH_COL].to_list(),
-        strict=True,
-    ):
-        relative_path = Path(str(serialized_path))
-        expected_path = Path("record-rasters") / task.split / f"{record_index:06d}.npz"
-        if relative_path != expected_path:
-            raise ValueError(f"Shard {task.task_id} has an unexpected raster path for record {record_index}")
-        absolute_path = shard_dir / relative_path
-        if not absolute_path.is_file():
-            raise ValueError(f"Shard {task.task_id} is missing raster {relative_path}")
-        absolute_paths.append(str(absolute_path))
-    if resolve_paths:
-        candidates = candidates.with_columns(pl.Series(CANDIDATE_RASTER_PATH_COL, absolute_paths, dtype=pl.String))
-    return candidates, failures
-
-
-def _is_shard_complete(task: ShardTask) -> bool:
-    # Treat any missing or inconsistent artifact as incomplete
-    try:
-        _load_completed_shard(task)
-    except (json.JSONDecodeError, OSError, TypeError, ValueError, pl.exceptions.PolarsError):
-        return False
-    return True
-
-
-def _remove_shard_directory(path: Path, split_root: Path) -> None:
-    # Restrict recursive deletion to one split's shard directory
-    if path.parent.resolve() != split_root.resolve():
-        raise ValueError(f"Refusing to clear shard path outside {split_root}: {path}")
-    if path.is_symlink() or (path.exists() and not path.is_dir()):
-        raise ValueError(f"Shard path is not a directory: {path}")
-    if path.exists():
-        shutil.rmtree(path)
-
-
-def _clear_task_workspace(task: ShardTask) -> None:
-    # Remove one invalid shard and temporary directories from interrupted attempts
-    split_root = _prepare_split_shard_root(task.split)
-    _remove_shard_directory(_shard_path(task), split_root)
-    temporary_prefix = f".{task.shard_index:06d}-"
-    for path in split_root.iterdir():
-        if path.name.startswith(temporary_prefix):
-            _remove_shard_directory(path, split_root)
-
-
-def _clear_shard_splits(split_paths: dict[str, str]) -> None:
-    # Remove only selected split directories under the configured shard root
-    shard_root = _prepare_shard_root()
-    for split in split_paths:
-        split_path = shard_root / split
-        if split_path.exists():
-            _remove_shard_directory(split_path, shard_root)
-    if shard_root.exists() and not any(shard_root.iterdir()):
-        shard_root.rmdir()
-
-
-def _write_shard_outputs(
-    task: ShardTask,
-    staging: Path,
-    output_rows: dict[str, list[dict[str, object]]],
-    failures: dict[str, list[dict[str, object]]],
-) -> None:
-    # Persist relative raster paths before publishing the completed shard
-    candidates = pl.DataFrame(output_rows[task.split], schema=_feature_schema()).sort(SOURCE_RECORD_INDEX_COL)
-    relative_paths = []
-    for candidate_path in candidates[CANDIDATE_RASTER_PATH_COL].to_list():
-        relative_paths.append(str(Path(candidate_path).relative_to(staging)))
-    candidates = candidates.with_columns(pl.Series(CANDIDATE_RASTER_PATH_COL, relative_paths, dtype=pl.String))
-    failure_rows = sorted(failures[task.split], key=lambda row: int(row["record_index"]))
-    failure_frame = pl.DataFrame(failure_rows, schema=_failure_schema())
-    outcome_indices = [int(value) for value in candidates[SOURCE_RECORD_INDEX_COL].to_list()]
-    outcome_indices.extend(int(value) for value in failure_frame["record_index"].to_list())
-    if sorted(outcome_indices) != list(range(task.start, task.stop)):
-        raise ValueError(f"Shard {task.task_id} did not produce one outcome per source record")
-
-    write_csv_atomic(candidates, staging / SHARD_CANDIDATES_FILE)
-    write_csv_atomic(failure_frame, staging / SHARD_FAILURES_FILE)
-    write_json_atomic(
-        _completion_values(task, candidates.height, failure_frame.height),
-        staging / SHARD_COMPLETION_FILE,
-    )
-
-
-def _run_shard(task: ShardTask) -> None:
+def _run_shard(task: ShardTask, store: DatasetShardStore) -> None:
     # Generate one resumable source-record range
-    if _is_shard_complete(task):
+    if store.is_complete(task):
         print(f"Shard {task.task_id} is already complete")
         return
-    _clear_task_workspace(task)
-    split_root = _prepare_split_shard_root(task.split)
-    staging = Path(tempfile.mkdtemp(prefix=f".{task.shard_index:06d}-", dir=split_root))
+    staging = store.create_staging(task)
     tempo_cache_dir = Path(DATASET_TEMPO_CACHE_DIR)
     wind_cache_dir = Path(DATASET_WIND_CACHE_DIR)
     tempo_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -758,29 +545,32 @@ def _run_shard(task: ShardTask) -> None:
             failures,
         )
         output_rows = _run_record_processing(record_tasks, records_by_id, failures, NUM_CORES)
-        _write_shard_outputs(task, staging, output_rows, failures)
-        os.replace(staging, _shard_path(task))
+        store.complete(task, staging, output_rows[task.split], failures[task.split])
     finally:
         if staging.exists():
             shutil.rmtree(staging)
     print(f"Completed shard {task.task_id}: {task.split} records {task.start:,}:{task.stop:,}")
 
 
-def _finalize_shards(tasks: list[ShardTask], split_paths: dict[str, str]) -> None:
+def _finalize_shards(
+    tasks: list[ShardTask],
+    split_paths: dict[str, str],
+    store: DatasetShardStore,
+) -> None:
     # Combine validated shard outputs before applying global split selection
     output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in split_paths}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in split_paths}
     for task in tasks:
         try:
-            candidates, failure_frame = _load_completed_shard(task, resolve_paths=True)
-        except (json.JSONDecodeError, OSError, TypeError, ValueError, pl.exceptions.PolarsError) as error:
+            candidates, failure_frame = store.load(task, resolve_paths=True)
+        except (OSError, TypeError, ValueError, pl.exceptions.PolarsError) as error:
             raise ValueError(f"Cannot finalize incomplete shard {task.task_id}: {error}") from error
         output_rows[task.split].extend(candidates.to_dicts())
         failures[task.split].extend(failure_frame.to_dicts())
 
     source_splits = _load_splits(split_paths)
     _write_outputs(output_rows, failures, source_splits)
-    _clear_shard_splits(split_paths)
+    store.clear_splits(split_paths)
     print(f"Finalized {len(tasks):,} shards and removed their staging workspace")
 
 
@@ -830,11 +620,6 @@ def _default_split() -> str:
     return ARRAY_SPLITS[int(task_id)]
 
 
-def _selected_split_paths(split: str) -> dict[str, str]:
-    # Preserve the optional single-split local workflow
-    return SPLIT_PATHS if split == "all" else {split: SPLIT_PATHS[split]}
-
-
 def _reset_cache_directory(cache_dir: Path) -> None:
     # Restrict recursive deletion to a configured direct child of DATASET_DIR
     dataset_root = Path(DATASET_DIR).resolve()
@@ -875,11 +660,11 @@ def _initialize_output_directories() -> tuple[Path, Path]:
     return tempo_cache_dir, wind_cache_dir
 
 
-def _run_monolithic(args: argparse.Namespace) -> None:
+def _run_monolithic(args: argparse.Namespace, split_paths: dict[str, str]) -> None:
     # Preserve direct single-process generation outside the shard launcher
     tempo_cache_dir, wind_cache_dir = _initialize_output_directories()
     _reset_requested_caches(args, tempo_cache_dir, wind_cache_dir)
-    splits = _load_splits(_selected_split_paths(args.split))
+    splits = _load_splits(split_paths)
     refresh_tempo = args.refresh_cache or args.refresh_tempo
     refresh_wind = args.refresh_cache or args.refresh_wind
     with tempfile.TemporaryDirectory(prefix=".dataset-run-", dir=DATASET_DIR) as temporary_dir:
@@ -902,13 +687,6 @@ def _run_monolithic(args: argparse.Namespace) -> None:
         )
         output_rows = _run_record_processing(tasks, records_by_id, failures, NUM_CORES)
         _write_outputs(output_rows, failures, splits)
-
-
-def _required_shard_size(args: argparse.Namespace) -> int:
-    # Require explicit sizing for every internal sharded stage
-    if args.shard_size is None:
-        raise ValueError("Sharded dataset generation requires --shard-size")
-    return int(args.shard_size)
 
 
 def _active_dataset_job_ids() -> list[str]:
@@ -944,15 +722,7 @@ def _submit_job(arguments: list[str]) -> str:
     return job_id
 
 
-def _shard_cli_arguments(args: argparse.Namespace, shard_size: int) -> list[str]:
-    # Forward only immutable plan inputs to workers and the finalizer
-    arguments = ["--shard-size", str(shard_size)]
-    if args.split != "all":
-        arguments.extend(("--split", args.split))
-    return arguments
-
-
-def _launch_sharded_run(args: argparse.Namespace) -> None:
+def _launch_sharded_run(args: argparse.Namespace, split_paths: dict[str, str], shard_size: int) -> None:
     # Prepare resumable state before submitting array workers and a finalizer
     if os.getenv("SLURM_JOB_ID") is not None:
         raise ValueError("Launch sharded dataset generation from a login node")
@@ -964,16 +734,17 @@ def _launch_sharded_run(args: argparse.Namespace) -> None:
         joined_ids = ", ".join(active_job_ids)
         raise RuntimeError(f"Dataset-generation jobs are already active: {joined_ids}")
 
-    shard_size = _required_shard_size(args)
-    split_paths = _selected_split_paths(args.split)
     tempo_cache_dir, wind_cache_dir = _initialize_output_directories()
     _reset_requested_caches(args, tempo_cache_dir, wind_cache_dir)
+    store = DatasetShardStore(Path(DATASET_DIR) / "shards")
     if args.refresh_shards or args.refresh_cache or args.refresh_tempo or args.refresh_wind:
-        _clear_shard_splits(split_paths)
-    tasks = _shard_plan(split_paths, shard_size)
-    pending_task_ids = [task.task_id for task in tasks if not _is_shard_complete(task)]
+        store.clear_splits(split_paths)
+    tasks = build_shard_plan(split_paths, shard_size)
+    pending_task_ids = [task.task_id for task in tasks if not store.is_complete(task)]
     array_spec = _slurm_array_spec(pending_task_ids)
-    shard_arguments = _shard_cli_arguments(args, shard_size)
+    shard_arguments = ["--shard-size", str(shard_size)]
+    if args.split != "all":
+        shard_arguments.extend(("--split", args.split))
     worker_job_id: str | None = None
     if pending_task_ids:
         worker_job_id = _submit_job(
@@ -1003,41 +774,38 @@ def _launch_sharded_run(args: argparse.Namespace) -> None:
     print(f"Dataset finalizer: {finalizer_job_id}")
 
 
-def _run_array_shard(args: argparse.Namespace) -> None:
+def _run_array_shard(split_paths: dict[str, str], shard_size: int) -> None:
     # Resolve this array index through the deterministic source-row plan
     task_id_text = os.getenv("SLURM_ARRAY_TASK_ID")
     if task_id_text is None:
         raise ValueError("Shard workers require SLURM_ARRAY_TASK_ID")
-    tasks = _shard_plan(_selected_split_paths(args.split), _required_shard_size(args))
+    tasks = build_shard_plan(split_paths, shard_size)
     task_id = int(task_id_text)
     if task_id < 0 or task_id >= len(tasks):
         raise ValueError(f"Array task {task_id} is outside the {len(tasks):,}-shard plan")
-    _run_shard(tasks[task_id])
-
-
-def _run_shard_finalizer(args: argparse.Namespace) -> None:
-    # Validate and combine the complete deterministic shard plan
-    split_paths = _selected_split_paths(args.split)
-    tasks = _shard_plan(split_paths, _required_shard_size(args))
-    _initialize_output_directories()
-    _finalize_shards(tasks, split_paths)
+    _run_shard(tasks[task_id], DatasetShardStore(Path(DATASET_DIR) / "shards"))
 
 
 def main() -> None:
     """Generate paired raster NPZ files and metadata CSVs for all splits."""
     args = parse_args()
     stage = os.getenv("DATASET_GENERATION_STAGE", "generate")
+    split_paths = SPLIT_PATHS if args.split == "all" else {args.split: SPLIT_PATHS[args.split]}
+    if stage in {"worker", "finalize"} and args.shard_size is None:
+        raise ValueError("Sharded dataset generation requires --shard-size")
     if stage == "worker":
-        _run_array_shard(args)
+        _run_array_shard(split_paths, int(args.shard_size))
     elif stage == "finalize":
-        _run_shard_finalizer(args)
+        _initialize_output_directories()
+        tasks = build_shard_plan(split_paths, int(args.shard_size))
+        _finalize_shards(tasks, split_paths, DatasetShardStore(Path(DATASET_DIR) / "shards"))
     elif stage == "generate":
         if args.shard_size is not None:
-            _launch_sharded_run(args)
+            _launch_sharded_run(args, split_paths, args.shard_size)
         elif args.refresh_shards:
             raise ValueError("--refresh-shards requires --shard-size")
         else:
-            _run_monolithic(args)
+            _run_monolithic(args, split_paths)
     else:
         raise ValueError(f"Unsupported internal dataset-generation stage: {stage}")
 
