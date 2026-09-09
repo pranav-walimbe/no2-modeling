@@ -53,6 +53,13 @@ Caching behavior:
 | TEMPO scans | AOI and source granules | Scans sharing a granule set run together, so a worker opens each large NetCDF granule once for several AOIs | `--refresh-tempo` |
 | Aligned wind | AOI and hour | HRRR files are grouped so each full grid is read once for several AOIs | `--refresh-wind` |
 
+`--refresh-cache` fully deletes both configured cache directories before
+rebuilding entries referenced by the selected split. `--refresh-tempo` and
+`--refresh-wind` fully delete only their respective cache. Refresh must run as a
+single non-array process because all split jobs share these directories. The
+TEMPO rebuild includes current, previous-hour, and EMA-history scans. Individual
+cache files are still written atomically.
+
 Pass the matching flag after changing TEMPO processing or wind alignment.
 
 Each successful model record persists one compressed NPZ holding five aligned
@@ -64,7 +71,7 @@ Each successful model record persists one compressed NPZ holding five aligned
 - `wind_u_10m_mps`, geographic eastward wind;
 - `wind_v_10m_mps`, geographic northward wind.
 
-The EMA uses one closest scan per preceding calendar day within 30 minutes of
+The EMA uses one closest scan per preceding calendar day within 60 minutes of
 the current scan time, a 5-day half-life, at least seven daily scans per record,
 and at least five observations per output pixel. Historical scans use the same
 persistent TEMPO image cache and are normalized only after the EMA delta is

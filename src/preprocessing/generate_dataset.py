@@ -513,14 +513,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--split", choices=("all", *SPLIT_PATHS), default=_default_split())
     parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="empty both image caches before rebuilding entries for the selected split",
+    )
+    parser.add_argument(
         "--refresh-tempo",
         action="store_true",
-        help="rebuild cached TEMPO rasters for the selected split",
+        help="empty the TEMPO image cache before rebuilding entries for the selected split",
     )
     parser.add_argument(
         "--refresh-wind",
         action="store_true",
-        help="rebuild cached wind rasters for the selected split",
+        help="empty the wind image cache before rebuilding entries for the selected split",
     )
     return parser.parse_args()
 
@@ -538,6 +543,34 @@ def _selected_split_paths(split: str) -> dict[str, str]:
     return SPLIT_PATHS if split == "all" else {split: SPLIT_PATHS[split]}
 
 
+def _reset_cache_directory(cache_dir: Path) -> None:
+    # Restrict recursive deletion to a configured direct child of DATASET_DIR
+    dataset_root = Path(DATASET_DIR).resolve()
+    resolved_cache = cache_dir.resolve()
+    if resolved_cache.parent != dataset_root:
+        raise ValueError(f"Refusing to clear cache outside {dataset_root}: {resolved_cache}")
+    if resolved_cache.exists() and not resolved_cache.is_dir():
+        raise ValueError(f"Cache path is not a directory: {resolved_cache}")
+    if resolved_cache.exists():
+        print(f"Clearing persistent image cache: {resolved_cache}")
+        shutil.rmtree(resolved_cache)
+    resolved_cache.mkdir(parents=True)
+
+
+def _reset_requested_caches(args: argparse.Namespace, tempo_cache_dir: Path, wind_cache_dir: Path) -> None:
+    # Clear shared caches only from a single non-array process
+    refresh_tempo = args.refresh_cache or args.refresh_tempo
+    refresh_wind = args.refresh_cache or args.refresh_wind
+    if not refresh_tempo and not refresh_wind:
+        return
+    if os.getenv("SLURM_ARRAY_TASK_ID") is not None:
+        raise ValueError("Cache refresh cannot run inside a Slurm array because its tasks share cache directories")
+    if refresh_tempo:
+        _reset_cache_directory(tempo_cache_dir)
+    if refresh_wind:
+        _reset_cache_directory(wind_cache_dir)
+
+
 def main() -> None:
     """Generate paired raster NPZ files and metadata CSVs for all splits."""
     args = parse_args()
@@ -546,10 +579,13 @@ def main() -> None:
     Path(DATASET_DF).mkdir(parents=True, exist_ok=True)
     Path(DATASET_RASTER_DIR).mkdir(parents=True, exist_ok=True)
     tempo_cache_dir = Path(DATASET_TEMPO_CACHE_DIR)
-    tempo_cache_dir.mkdir(parents=True, exist_ok=True)
     wind_cache_dir = Path(DATASET_WIND_CACHE_DIR)
+    _reset_requested_caches(args, tempo_cache_dir, wind_cache_dir)
+    tempo_cache_dir.mkdir(parents=True, exist_ok=True)
     wind_cache_dir.mkdir(parents=True, exist_ok=True)
     splits = _load_splits(_selected_split_paths(args.split))
+    refresh_tempo = args.refresh_cache or args.refresh_tempo
+    refresh_wind = args.refresh_cache or args.refresh_wind
     with tempfile.TemporaryDirectory(prefix=".dataset-run-", dir=DATASET_DIR) as temporary_dir:
         records, scans, winds, failures = _prepare_records(
             splits,
@@ -558,8 +594,8 @@ def main() -> None:
             Path(temporary_dir),
         )
         print(f"Planned {len(records):,} records using {len(scans):,} TEMPO scans and {len(winds):,} wind rasters")
-        tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, NUM_CORES, args.refresh_tempo)
-        wind_cache_paths, wind_failures = _run_wind_alignment(winds, NUM_CORES, args.refresh_wind)
+        tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, NUM_CORES, refresh_tempo)
+        wind_cache_paths, wind_failures = _run_wind_alignment(winds, NUM_CORES, refresh_wind)
         tasks, records_by_id = _record_tasks(
             records,
             tempo_cache_paths,

@@ -75,7 +75,7 @@ Five channels reach the model:
 5. geographic northward wind aligned from the native HRRR grid.
 
 The causal EMA uses the closest preceding scan from each of 14 calendar days
-within 30 minutes of the current scan time. Daily values receive a 5-day
+within 60 minutes of the current scan time. Daily values receive a 5-day
 half-life, each record requires at least seven scans, and each EMA pixel requires
 at least five observations.
 

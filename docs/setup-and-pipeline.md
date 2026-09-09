@@ -203,8 +203,10 @@ Running the splits:
 - Array indices 0, 1, and 2 select `train`, `val`, and `test`, so each task can
   invoke `python -u -m preprocessing.generate_dataset` unchanged.
 - Outside an array, pass `--split` for one split or omit it for all.
-- Pass `--refresh-tempo` or `--refresh-wind` after changing the corresponding
-  image-processing code or settings.
+- Run `--refresh-cache` from a single non-array process to empty both cache
+  directories before rebuilding entries for the selected split. Use
+  `--refresh-tempo` or `--refresh-wind` to empty and rebuild only one cache.
+  Refresh flags fail inside a Slurm array to prevent shared-cache deletion races.
 
 ### 5. Train and evaluate
 
