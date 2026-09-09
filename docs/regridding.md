@@ -37,9 +37,9 @@ Each AOI scan is saved as one compressed `.npz` holding five aligned 48 by 48
 | `sum_weight` | Total area in km2 where accepted native footprints overlap the cell | `0.0` when no accepted footprint overlaps; zero marks a real absence of support, not a missing value |
 
 The ancillary rasters stay populated where `no2` is `NaN`, which preserves
-information about cloudy or low-overlap cells. Downstream code treats finite
-`no2` values as the validity mask and requires both scans to be finite before
-forming a delta.
+information about cloudy or low-overlap cells. Downstream code requires at
+least 99% finite NO2 in each scan and fills the remaining gaps before forming a
+delta.
 
 ## Dataset-generation output
 
@@ -57,7 +57,7 @@ Caching behavior:
 rebuilding entries referenced by the selected split. `--refresh-tempo` and
 `--refresh-wind` fully delete only their respective cache. Refresh must run as a
 single non-array process because all split jobs share these directories. The
-TEMPO rebuild includes current, previous-hour, and EMA-history scans. Individual
+TEMPO rebuild includes current, previous-hour, and EMA scans. Individual
 cache files are still written atomically.
 
 Pass the matching flag after changing TEMPO processing or wind alignment.
@@ -65,28 +65,27 @@ Pass the matching flag after changing TEMPO processing or wind alignment.
 Each successful model record persists one compressed NPZ holding five aligned
 `float32` arrays:
 
-- `current_no2`, current-scan NO2 restricted to paired-valid support;
-- `delta_no2`, current minus previous NO2 on the same support;
+- `current_no2`, current-scan NO2 after filling at most 1% missing cells;
+- `delta_no2`, current minus previous filled NO2;
 - `ema_delta_no2`, current minus a causal same-time 14-day NO2 EMA;
 - `wind_u_10m_mps`, geographic eastward wind;
 - `wind_v_10m_mps`, geographic northward wind.
 
 The EMA uses one closest scan per preceding calendar day within 60 minutes of
-the current scan time, a 5-day half-life, at least seven daily scans per record,
-and at least five observations per output pixel. Historical scans use the same
-persistent TEMPO image cache and are normalized only after the EMA delta is
-formed.
+the current scan time and a 5-day half-life. Every contributing scan must have
+at least 99% finite NO2 before nearest-valid filling, and each record requires at
+least seven such scans. EMA scans use the same persistent TEMPO image cache as
+the current and previous scans. Normalization occurs only after forming the EMA
+delta.
 
 Every row in the companion split CSV carries its NPZ path in `delta_no2_path`
 plus these derived features:
 
 - `plume_score`, from finite delta pixels as `(p99 - p50) / (p50 - p10)`;
-- `paired_finite_fraction`, the share of the 48 by 48 grid finite in both scans;
-- `central_finite_fraction`, the paired-finite share of the central 8 by 8 cells;
-- `raster_quality_score`, equal to paired coverage for final record ranking;
 - `mean_weighted_cloud_fraction` and `mean_good_quality_fraction`, each averaged
-  over both scans at paired-valid delta cells;
-- `mean_retrieval_uncertainty`, averaged over both scans at paired-valid cells;
+  over both scans at their original paired-valid cells;
+- `mean_retrieval_uncertainty`, averaged over both scans at their original
+  paired-valid cells;
 - `temperature_2m_k` and `boundary_layer_height_m`, bilinearly interpolated at
   the AOI centroid.
 
@@ -112,11 +111,12 @@ pairs. Production uses:
 - an accepted-overlap floor of 0.25 km2;
 - no additional effective-sample floor.
 
-Dataset generation then requires paired coverage of at least 0.50 and ranks
-eligible records by paired coverage alone. Central coverage and retrieval
-uncertainty remain diagnostics. None of these change per-scan tessellation or
-its 0.25 km2 cell-support floor. Plume, cloud, and quality summaries also remain
-diagnostics and rank nothing.
+Dataset generation requires at least 99% finite NO2 independently in every
+current, previous, and contributing EMA scan. It fills the remaining cells from
+the nearest finite grid cell, then selects records through temporal and AOI
+round-robin without coverage ranking. These rules do not change per-scan
+tessellation or its 0.25 km2 cell-support floor. Plume, cloud, uncertainty, and
+quality summaries remain diagnostics and rank nothing.
 
 What the measurements showed:
 

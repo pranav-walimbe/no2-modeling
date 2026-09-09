@@ -1,9 +1,9 @@
 # Dataset design
 
 Turning the full AOI-hour population into a fixed-size modeling dataset rests on
-one principle: keep scientific eligibility, raster quality, and diversity
-sampling separate. A record must clear the first two. Quality alone must never
-decide which population the third step represents.
+one principle: keep scientific eligibility and diversity sampling separate. A
+raster either clears the fixed eligibility rules or does not. Raster coverage
+does not prioritize records after that gate.
 
 ## Output-size contract
 
@@ -20,8 +20,8 @@ TEST_SIZE = 4_000
 - An undersized split never passes silently.
 
 Stratification writes three times each requested size: 36,000 train, 12,000
-validation, 12,000 test candidates. The overdraw leaves room for paired-coverage,
-historical-EMA availability, and operational failures without regridding the
+validation, 12,000 test candidates. The overdraw leaves room for per-scan
+coverage, EMA availability, and operational failures without regridding the
 much larger eligible metadata population. Each generation run reports the new
 retention rate so this multiplier can be recalibrated from current evidence.
 
@@ -54,7 +54,7 @@ Outlier bounds:
   heat input, prior-quarter power generation, and the robust NOx-change scale.
 - Freeze and reuse those bounds for validation and test.
 - Leave coordinates, time fields, unit counts, city distance, target values, and
-  coverage percentages untrimmed.
+  temporal-overlap percentages untrimmed.
 - Expect the independent filters to remove more than two percent of rows
   overall.
 
@@ -85,8 +85,8 @@ Each sample stores five arrays on one fixed grid:
 
 | Array | Notes |
 |---|---|
-| current regridded NO2 | finite only where both scans have accepted support |
-| current minus previous NO2 | same paired-valid support |
+| current regridded NO2 | at least 99% observed before remaining gaps are filled |
+| current minus previous NO2 | difference of two eligible, filled rasters |
 | current minus 14-day same-time EMA NO2 | causal background anomaly with a 5-day half-life |
 | eastward wind, northward wind | bilinearly aligned from the native HRRR grid and finite across the image |
 
@@ -112,7 +112,7 @@ Nameplate capacity:
 
 Keep `hard_hour` as the default until both modes compete on frozen splits.
 
-## Raster-quality gates
+## Raster eligibility and filling
 
 The native regridder accepts an NO2 contributor only when:
 
@@ -121,16 +121,11 @@ The native regridder accepts an NO2 contributor only when:
 - value and geometry are valid;
 - at least 0.25 km2 of accepted support reaches an output cell.
 
-After pairing scans, a candidate must have `paired_finite_fraction >= 0.50`
-across all 48 by 48 cells. Eligible records use paired coverage directly as
-their raster-quality score. Central coverage and retrieval uncertainty remain
-available for diagnostics but do not filter or rank records. Generation
-summaries report retained records, full-coverage rates, and AOI representation
-overall and by class before and after final selection.
-
-`coverage_percent` and `paired_finite_fraction` measure different things. The
-first measures temporal overlap with a CAMPD clock hour. The second measures
-spatial support shared by two rasterized scans.
+Every current, previous, and prospective EMA scan must have finite NO2 in at
+least 99% of its 48 by 48 cells. Accepted rasters fill the remaining gaps from
+the nearest finite grid cell. Low-coverage EMA scans are skipped, and a record
+must retain at least seven EMA scans. Coverage fractions are not persisted,
+ranked, or supplied to the model.
 
 ## Quantities that do not select records
 
@@ -154,19 +149,19 @@ Before raster generation, apply these rules to every split:
 
 ## Final raster selection
 
-Quality-gated candidates are selected deterministically:
+Successfully generated candidates are selected deterministically:
 
 1. Form strata by AOI, year, quarter, and four-hour UTC bin.
-2. Rank records within each stratum by raster quality.
+2. Order records within each stratum by date and hour.
 3. Interleave strata within each AOI, deferring repeated records from one narrow
    time period.
 4. Round-robin globally across AOIs so every available AOI receives one record
    before any receives a second.
-5. Break competition within each round on coverage-plus-uncertainty quality, and
-   stop at the exact configured split size.
+5. Break ties deterministically by AOI, date, and hour, then stop at the exact
+   configured split size.
 
-Final selection takes equal counts from both labels after the raster-quality
-gates. Read balanced metrics against the saved pre-balancing prevalence.
+Final selection takes equal counts from both labels after raster generation.
+Read balanced metrics against the saved pre-balancing prevalence.
 
 ## Performance and persistence
 
@@ -186,11 +181,11 @@ of reach.
 
 For every generated dataset, record:
 
-- candidate, processing-success, coverage-eligible, and final counts;
+- candidate, processing-success, and final counts;
 - AOIs and geographic clusters per split;
 - records per AOI, year, quarter, and observation hour;
-- distributions of label, fuel mix, plant size, paired coverage, and weather;
-- metrics overall and by AOI, label magnitude, coverage, season, and fuel;
+- distributions of label, fuel mix, plant size, and weather;
+- metrics overall and by AOI, label magnitude, season, and fuel;
 - a trivial tabular-only baseline against image-plus-tabular models.
 
 Freeze the test set once these checks pass, then choose filter thresholds and

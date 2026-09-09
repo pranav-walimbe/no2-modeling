@@ -185,10 +185,10 @@ python -u -m preprocessing.generate_dataset
 - writes one compressed five-channel NPZ per retained record;
 - stores each unique AOI scan and aligned AOI-hour wind raster in persistent
   caches, grouping work so workers reuse each NetCDF or GRIB read;
-- requires at least 50 percent paired-finite coverage and ranks raster quality
-  by paired coverage alone;
-- selects the exact configured size through AOI-balanced, temporally diverse
-  quality ranking;
+- requires at least 99 percent finite NO2 in each current, previous, and EMA
+  scan, then fills the remaining gaps from the nearest finite cell;
+- selects the exact configured size through deterministic AOI and temporal
+  round-robin;
 - uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
   allocation.
 

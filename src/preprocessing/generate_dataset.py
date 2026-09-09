@@ -24,7 +24,6 @@ from config import (
     EMA_MIN_SCANS,
     EMA_SAME_TIME_TOLERANCE_MINUTES,
     HRRR_DIR,
-    LABEL_COL,
     NUM_CORES,
     TEMPO_AOI_MAPPING,
     TEMPO_DIR,
@@ -36,7 +35,6 @@ from config import (
     VAL_SIZE,
 )
 from preprocessing.generate_dataset_utils import (
-    NO_PAIRED_FINITE_NO2_ERROR,
     TABULAR_FEATURE_NAMES,
     RecordTask,
     ScanBatchTask,
@@ -44,7 +42,6 @@ from preprocessing.generate_dataset_utils import (
     WindBatchTask,
     WindTask,
     cache_exists,
-    eligible_generated_records,
     make_scan_task,
     make_wind_task,
     process_record,
@@ -54,7 +51,7 @@ from preprocessing.generate_dataset_utils import (
     write_csv_atomic,
     write_json_atomic,
 )
-from preprocessing.stratify_utils import AOI_ID_COL, classification_summary
+from preprocessing.stratify_utils import classification_summary
 
 SPLIT_PATHS = {
     "train": TRAIN_RECORDS_CSV,
@@ -68,8 +65,6 @@ SOURCE_RECORD_INDEX_COL = "_source_record_index"
 DELTA_NO2_PATH_COL = "delta_no2_path"
 CANDIDATE_RASTER_PATH_COL = "_candidate_raster_path"
 FINAL_SPLIT_SIZES = {"train": TRAIN_SIZE, "val": VAL_SIZE, "test": TEST_SIZE}
-NO_PAIRED_FINITE_NO2_FAILURE = f"Record processing failed: {NO_PAIRED_FINITE_NO2_ERROR}"
-
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")
 
@@ -82,8 +77,8 @@ class PreparedRecord:
     record_index: int
     current_scan_key: str
     previous_scan_key: str
-    historical_scan_keys: tuple[str, ...]
-    historical_age_days: tuple[float, ...]
+    ema_scan_keys: tuple[str, ...]
+    ema_scan_age_days: tuple[float, ...]
     wind_cache_key: str
     delta_no2_path: str
 
@@ -146,7 +141,7 @@ def _load_observations(aoi_ids: list[int]) -> ObservationIndex:
     return index
 
 
-def _same_time_history(
+def _same_time_ema_observations(
     observations_by_day: dict[date, list[dict[str, object]]], target_time: datetime
 ) -> list[dict[str, object]]:
     # Keep the closest scan per prior day inside the same-time tolerance
@@ -188,22 +183,24 @@ def _prepare_records(
                 current = make_scan_task(row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 wind = make_wind_task(row, Path(HRRR_DIR), wind_cache_dir)
-                history = _same_time_history(observations_by_aoi[int(row["aoi_id"])], row["tempo_time"])
-                if len(history) < EMA_MIN_SCANS:
-                    raise ValueError(f"Only {len(history)} same-time historical scans are available")
-                historical_scans = []
-                historical_age_days = []
-                for observation in history:
-                    history_row = {
+                ema_observations = _same_time_ema_observations(
+                    observations_by_aoi[int(row["aoi_id"])], row["tempo_time"]
+                )
+                if len(ema_observations) < EMA_MIN_SCANS:
+                    raise ValueError(f"Only {len(ema_observations)} same-time EMA scans are available")
+                ema_scans = []
+                ema_scan_age_days = []
+                for observation in ema_observations:
+                    ema_row = {
                         "aoi_id": row["aoi_id"],
                         "lon": row["lon"],
                         "lat": row["lat"],
                         "tempo": observation["granule_paths"],
                     }
-                    historical_scan = make_scan_task(history_row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
-                    historical_scans.append(historical_scan)
+                    ema_scan = make_scan_task(ema_row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
+                    ema_scans.append(ema_scan)
                     age = (row["tempo_time"] - observation["tempo_time"]).total_seconds() / 86_400
-                    historical_age_days.append(float(age))
+                    ema_scan_age_days.append(float(age))
                 delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
                     PreparedRecord(
@@ -211,16 +208,16 @@ def _prepare_records(
                         record_index=record_index,
                         current_scan_key=current.cache_key,
                         previous_scan_key=previous.cache_key,
-                        historical_scan_keys=tuple(scan.cache_key for scan in historical_scans),
-                        historical_age_days=tuple(historical_age_days),
+                        ema_scan_keys=tuple(scan.cache_key for scan in ema_scans),
+                        ema_scan_age_days=tuple(ema_scan_age_days),
                         wind_cache_key=wind.cache_key,
                         delta_no2_path=str(delta_no2_path),
                     )
                 )
                 scans.setdefault(current.cache_key, current)
                 scans.setdefault(previous.cache_key, previous)
-                for historical_scan in historical_scans:
-                    scans.setdefault(historical_scan.cache_key, historical_scan)
+                for ema_scan in ema_scans:
+                    scans.setdefault(ema_scan.cache_key, ema_scan)
                 winds.setdefault(wind.cache_key, wind)
             except (KeyError, TypeError, ValueError) as error:
                 failures[split].append({"record_index": record_index, "error": str(error)})
@@ -319,19 +316,18 @@ def _record_tasks(
             reasons = [tempo_failures.get(key, "TEMPO cache unavailable") for key in missing_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
-        available_history = [
+        available_ema_scans = [
             (tempo_cache_paths[key], age)
-            for key, age in zip(record.historical_scan_keys, record.historical_age_days, strict=True)
+            for key, age in zip(record.ema_scan_keys, record.ema_scan_age_days, strict=True)
             if key in tempo_cache_paths
         ]
-        if len(available_history) < EMA_MIN_SCANS:
-            missing_count = len(record.historical_scan_keys) - len(available_history)
+        if len(available_ema_scans) < EMA_MIN_SCANS:
+            missing_count = len(record.ema_scan_keys) - len(available_ema_scans)
             failures[record.split].append(
                 {
                     "record_index": record.record_index,
                     "error": (
-                        f"Only {len(available_history)} historical scans remain after "
-                        f"{missing_count} TEMPO cache failures"
+                        f"Only {len(available_ema_scans)} EMA scans remain after {missing_count} TEMPO cache failures"
                     ),
                 }
             )
@@ -348,8 +344,8 @@ def _record_tasks(
                 record_index=record.record_index,
                 current_cache_path=tempo_cache_paths[record.current_scan_key],
                 previous_cache_path=tempo_cache_paths[record.previous_scan_key],
-                historical_cache_paths=tuple(path for path, _ in available_history),
-                historical_age_days=tuple(age for _, age in available_history),
+                ema_scan_paths=tuple(path for path, _ in available_ema_scans),
+                ema_scan_age_days=tuple(age for _, age in available_ema_scans),
                 wind_cache_path=wind_cache_paths[record.wind_cache_key],
                 output_path=record.delta_no2_path,
             )
@@ -401,27 +397,12 @@ def _write_outputs(
         candidates = source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left").sort(
             SOURCE_RECORD_INDEX_COL
         )
-        eligible = eligible_generated_records(candidates)
         output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
-        print(
-            f"[{split}] {candidates.height:,} regridded; "
-            f"{eligible.height:,} passed raster QC; {output_frame.height:,} selected"
-        )
-        eligible_coverage = _coverage_selection_summary(eligible)
-        selected_coverage = _coverage_selection_summary(output_frame)
-        print(
-            f"[{split}] full paired coverage: {selected_coverage['full_coverage_records']:,}/"
-            f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"
-        )
+        print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
         classification_report = {
             "split": split,
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
-            "raster_qc": classification_summary(candidates, eligible),
-            "final_balance": classification_summary(eligible, output_frame),
-            "coverage_selection": {
-                "eligible": eligible_coverage,
-                "selected": selected_coverage,
-            },
+            "final_balance": classification_summary(candidates, output_frame),
         }
         output_frame = _install_selected_rasters(split, output_frame)
         write_csv_atomic(
@@ -436,36 +417,7 @@ def _write_outputs(
             pl.DataFrame(failure_rows, schema={"record_index": pl.Int64, "error": pl.String}),
             Path(DATASET_DF) / f"{split}_failures.csv",
         )
-        no_paired_coverage, processing_failures = _count_failure_outcomes(failure_rows)
-        print(
-            f"[{split}] wrote {output_frame.height:,} records; "
-            f"{no_paired_coverage:,} rejected with no paired finite NO2; "
-            f"{processing_failures:,} processing failures"
-        )
-
-
-def _coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
-    # Report full coverage and AOI representation overall and by class
-    def summarize(group: pl.DataFrame) -> dict[str, int | float]:
-        records = group.height
-        full_coverage = group.filter(pl.col("paired_finite_fraction") >= 1.0).height
-        return {
-            "records": records,
-            "full_coverage_records": full_coverage,
-            "full_coverage_fraction": full_coverage / records if records else 0.0,
-            "aoi_count": group[AOI_ID_COL].n_unique() if records else 0,
-        }
-
-    return {
-        **summarize(frame),
-        "by_class": {str(label): summarize(frame.filter(pl.col(LABEL_COL) == label)) for label in (0, 1)},
-    }
-
-
-def _count_failure_outcomes(failure_rows: list[dict[str, object]]) -> tuple[int, int]:
-    # Separate expected coverage rejection from operational failures
-    no_paired_coverage = sum(row.get("error") == NO_PAIRED_FINITE_NO2_FAILURE for row in failure_rows)
-    return no_paired_coverage, len(failure_rows) - no_paired_coverage
+        print(f"[{split}] wrote {output_frame.height:,} records; {len(failure_rows):,} processing failures")
 
 
 def _install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:

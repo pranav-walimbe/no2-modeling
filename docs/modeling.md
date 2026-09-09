@@ -68,16 +68,16 @@ distortion, so the transform is gone.
 
 Five channels reach the model:
 
-1. paired-valid current NO2;
-2. paired-valid current-minus-previous NO2;
+1. current NO2 after the per-scan coverage gate and nearest-valid filling;
+2. current-minus-previous filled NO2;
 3. current-minus-14-day same-time EMA NO2;
 4. geographic eastward wind aligned from the native HRRR grid;
 5. geographic northward wind aligned from the native HRRR grid.
 
 The causal EMA uses the closest preceding scan from each of 14 calendar days
 within 60 minutes of the current scan time. Daily values receive a 5-day
-half-life, each record requires at least seven scans, and each EMA pixel requires
-at least five observations.
+half-life. Every scan requires 99% finite coverage before its remaining gaps are
+filled, and each record requires at least seven eligible EMA scans.
 
 Every statistic comes from training pixels alone:
 
@@ -95,7 +95,7 @@ normalized[channel] =
 - Fit every channel on its finite training pixels.
 - Reuse the frozen training statistics for validation, test, and inference.
 
-Missing raster values become normalized zero. No validity-mask channel is
+The three NO2 channels are finite after filling. No validity-mask channel is
 provided to the network.
 
 Two design notes:

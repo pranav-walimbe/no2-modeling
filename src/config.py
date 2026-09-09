@@ -44,7 +44,7 @@ TEMPO_START_DATE = "2023-08-02 00:00:00"  # beginning of the TEMPO science recor
 TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
 
 TEMPO_GOOD_QUALITY_FLAG = 0  # V04 main_data_quality_flag value accepted into the NO2 mean
-TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.25  # removes edge slivers with about 1 percentage point paired-coverage loss
+TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.25  # removes edge slivers with about 1 percentage point finite-support loss
 TEMPO_EFFECTIVE_SAMPLE_FLOOR = 0.0  # ESS 1.25 cut paired-cell coverage from 58 percent to 21 percent
 
 # ============================================================================
@@ -85,13 +85,11 @@ DATASET_TEMPO_CACHE_DIR = os.path.join(DATASET_DIR, "tempo-cache")  # persistent
 DATASET_WIND_CACHE_DIR = os.path.join(DATASET_DIR, "wind-cache")  # persistent aligned AOI-hour wind rasters
 IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
-MIN_PAIRED_FINITE_FRACTION = 0.50  # least share of cells finite in both scans
-CENTRAL_COVERAGE_WINDOW_SIZE = 8  # centred 12 km window; even because the 48-cell grid centre is an intersection
+MIN_NO2_FINITE_FRACTION = 0.99  # least finite share required before filling a TEMPO raster
 EMA_HISTORY_DAYS = 14  # causal same-time background window before each current scan
 EMA_HALF_LIFE_DAYS = 5.0  # temporal decay applied inside the same-time background
 EMA_SAME_TIME_TOLERANCE_MINUTES = 60  # largest daily scan-time mismatch
-EMA_MIN_SCANS = 7  # least number of historical daily scans required per record
-EMA_MIN_PIXEL_OBSERVATIONS = 5  # least historical support required per EMA pixel
+EMA_MIN_SCANS = 7  # least number of eligible daily EMA scans required per record
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
