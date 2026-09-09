@@ -122,10 +122,16 @@ The native regridder accepts an NO2 contributor only when:
 - at least 0.25 km2 of accepted support reaches an output cell.
 
 Every current, previous, and prospective EMA scan must have finite NO2 in at
-least 99% of its 48 by 48 cells. Accepted rasters fill the remaining gaps from
+least 95% of its 48 by 48 cells. Accepted rasters fill the remaining gaps from
 the nearest finite grid cell. Low-coverage EMA scans are skipped, and a record
-must retain at least seven EMA scans. Coverage fractions are not persisted,
-ranked, or supplied to the model.
+must retain at least seven EMA scans.
+
+After pairing current and previous scans, generated records use
+`paired_finite_fraction` as the only final-selection ranking signal. There is
+no separate paired-coverage gate. Central coverage and retrieval uncertainty do
+not filter or rank records. Generation summaries report retained counts,
+full-coverage rates, and represented AOIs overall and by class. Paired coverage
+remains a dataset diagnostic and is not supplied to the model.
 
 ## Quantities that do not select records
 
@@ -152,13 +158,11 @@ Before raster generation, apply these rules to every split:
 Successfully generated candidates are selected deterministically:
 
 1. Form strata by AOI, year, quarter, and four-hour UTC bin.
-2. Order records within each stratum by date and hour.
-3. Interleave strata within each AOI, deferring repeated records from one narrow
-   time period.
-4. Round-robin globally across AOIs so every available AOI receives one record
-   before any receives a second.
-5. Break ties deterministically by AOI, date, and hour, then stop at the exact
-   configured split size.
+2. Rank records within each stratum by paired raster coverage.
+3. Interleave temporal strata within each AOI.
+4. Round-robin globally across AOIs.
+5. Break competition within each AOI round by paired coverage and stop at the
+   exact configured split size for each class.
 
 Final selection takes equal counts from both labels after raster generation.
 Read balanced metrics against the saved pre-balancing prevalence.

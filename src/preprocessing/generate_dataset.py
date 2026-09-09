@@ -25,6 +25,7 @@ from config import (
     EMA_MIN_SCANS,
     EMA_SAME_TIME_TOLERANCE_MINUTES,
     HRRR_DIR,
+    LABEL_COL,
     NUM_CORES,
     TEMPO_AOI_MAPPING,
     TEMPO_DIR,
@@ -38,6 +39,7 @@ from config import (
 from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
     CANDIDATE_RASTER_PATH_COL,
+    PAIRED_FINITE_FRACTION_COL,
     PROCESSING_FAILURE_SCHEMA,
     SOURCE_RECORD_INDEX_COL,
     DatasetShardStore,
@@ -58,7 +60,7 @@ from preprocessing.generate_dataset_utils import (
     write_csv_atomic,
     write_json_atomic,
 )
-from preprocessing.stratify_utils import classification_summary
+from preprocessing.stratify_utils import AOI_ID_COL, classification_summary
 
 SPLIT_PATHS = {
     "train": TRAIN_RECORDS_CSV,
@@ -443,11 +445,20 @@ def _write_outputs(
             SOURCE_RECORD_INDEX_COL
         )
         output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
+        selected_coverage = _coverage_selection_summary(output_frame)
         print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
+        print(
+            f"[{split}] full paired coverage: {selected_coverage['full_coverage_records']:,}/"
+            f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"
+        )
         classification_report = {
             "split": split,
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
             "final_balance": classification_summary(candidates, output_frame),
+            "coverage_selection": {
+                "generated": _coverage_selection_summary(candidates),
+                "selected": selected_coverage,
+            },
         }
         prepared_outputs[split] = (
             output_frame,
@@ -470,6 +481,29 @@ def _write_outputs(
             Path(DATASET_DF) / f"{split}_failures.csv",
         )
         print(f"[{split}] wrote {output_frame.height:,} records; {failure_frame.height:,} processing failures")
+
+
+def _coverage_group_summary(frame: pl.DataFrame) -> dict[str, int | float]:
+    # Summarize retained count and paired coverage for one record group
+    records = frame.height
+    full_coverage = frame.filter(pl.col(PAIRED_FINITE_FRACTION_COL) >= 1.0).height
+    return {
+        "records": records,
+        "full_coverage_records": full_coverage,
+        "full_coverage_fraction": full_coverage / records if records else 0.0,
+        "aoi_count": frame[AOI_ID_COL].n_unique() if records else 0,
+    }
+
+
+def _coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
+    # Report coverage and AOI representation overall and by class
+    return {
+        **_coverage_group_summary(frame),
+        "by_class": {
+            str(label): _coverage_group_summary(frame.filter(pl.col(LABEL_COL) == label))
+            for label in (0, 1)
+        },
+    }
 
 
 def _install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:

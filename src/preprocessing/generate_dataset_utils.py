@@ -38,6 +38,7 @@ from preprocessing.regrid import (
 from preprocessing.stratify_utils import AOI_ID_COL
 
 CURRENT_RASTER_NAME, DELTA_RASTER_NAME, EMA_DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
+PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
@@ -52,6 +53,7 @@ HRRR_FIELDS = {
 }
 TABULAR_FEATURE_NAMES = (
     "plume_score",
+    PAIRED_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
@@ -300,15 +302,20 @@ class DatasetShardStore:
 
 
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
-    """Select an exactly balanced round-robin AOI subset.
+    """Select an exactly balanced coverage-ranked AOI subset.
 
     Args:
-        frame: Successfully generated candidate records.
+        frame: Successfully generated candidate records with finite paired coverage.
         size: Exact number of records to select.
 
     Returns:
         Selected records without temporary ranking columns.
     """
+    if PAIRED_FINITE_FRACTION_COL not in frame.columns:
+        raise ValueError(f"Generated records are missing {PAIRED_FINITE_FRACTION_COL}")
+    if not frame[PAIRED_FINITE_FRACTION_COL].is_finite().all():
+        raise ValueError("Generated records contain non-finite paired raster coverage")
+
     class_size = size // 2
     selected_classes = []
     for label in (0, 1):
@@ -318,12 +325,12 @@ def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
                 f"Only {class_records.height:,} class {label} records were generated; "
                 f"cannot produce the requested {class_size:,}"
             )
-        selected_classes.append(_round_robin_records(class_records).head(class_size))
+        selected_classes.append(_rank_final_records(class_records).head(class_size))
     return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
 
 
-def _round_robin_records(frame: pl.DataFrame) -> pl.DataFrame:
-    # Interleave temporal strata within each AOI before global AOI rounds
+def _rank_final_records(frame: pl.DataFrame) -> pl.DataFrame:
+    # Rank by coverage while retaining temporal and AOI round-robin ordering
 
     strata = [AOI_ID_COL, "_selection_year", "_selection_quarter", "_selection_hour_bin"]
     return (
@@ -332,11 +339,20 @@ def _round_robin_records(frame: pl.DataFrame) -> pl.DataFrame:
             pl.col("date").dt.quarter().alias("_selection_quarter"),
             (pl.col("hour") // 4).alias("_selection_hour_bin"),
         )
-        .sort([*strata, "date", "hour"])
+        .sort(
+            [*strata, PAIRED_FINITE_FRACTION_COL, "date", "hour"],
+            descending=[False, False, False, False, True, False, False],
+        )
         .with_columns(pl.col(AOI_ID_COL).cum_count().over(strata).alias("_stratum_rank"))
-        .sort([AOI_ID_COL, "_stratum_rank", "date", "hour"])
+        .sort(
+            [AOI_ID_COL, "_stratum_rank", PAIRED_FINITE_FRACTION_COL, "date", "hour"],
+            descending=[False, False, True, False, False],
+        )
         .with_columns(pl.col(AOI_ID_COL).cum_count().over(AOI_ID_COL).alias("_aoi_round"))
-        .sort(["_aoi_round", AOI_ID_COL, "date", "hour"])
+        .sort(
+            ["_aoi_round", PAIRED_FINITE_FRACTION_COL, AOI_ID_COL, "date", "hour"],
+            descending=[False, True, False, False, False],
+        )
     )
 
 
@@ -780,6 +796,7 @@ def derive_raster_features(
         epsilon = np.finfo(np.float64).eps * max(abs(p10), abs(p50), 1.0)
         features = {
             "plume_score": float((p99 - p50) / max(denominator, epsilon)),
+            PAIRED_FINITE_FRACTION_COL: float(np.mean(paired_valid)),
             "mean_weighted_cloud_fraction": _paired_mean(
                 current["weighted_cloud_fraction"], previous["weighted_cloud_fraction"], paired_valid
             ),
