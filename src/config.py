@@ -44,7 +44,7 @@ TEMPO_START_DATE = "2023-08-02 00:00:00"  # beginning of the TEMPO science recor
 TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
 
 TEMPO_GOOD_QUALITY_FLAG = 0  # V04 main_data_quality_flag value accepted into the NO2 mean
-TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.25  # removes edge slivers with about 1 percentage point paired-coverage loss
+TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.25  # removes edge slivers with about 1 percentage point finite-support loss
 TEMPO_EFFECTIVE_SAMPLE_FLOOR = 0.0  # ESS 1.25 cut paired-cell coverage from 58 percent to 21 percent
 
 # ============================================================================
@@ -85,15 +85,16 @@ DATASET_TEMPO_CACHE_DIR = os.path.join(DATASET_DIR, "tempo-cache")  # persistent
 DATASET_WIND_CACHE_DIR = os.path.join(DATASET_DIR, "wind-cache")  # persistent aligned AOI-hour wind rasters
 IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
-MIN_PAIRED_FINITE_FRACTION = 0.50  # least share of cells finite in both scans
-CENTRAL_COVERAGE_WINDOW_SIZE = 8  # centred 12 km window; even because the 48-cell grid centre is an intersection
-MIN_CENTRAL_FINITE_FRACTION = 0.50  # least paired-finite share in the central window
-RASTER_UNCERTAINTY_WEIGHT = 0.25  # share of final raster ranking assigned to low retrieval uncertainty
+MIN_NO2_FINITE_FRACTION = 0.97  # least finite share required before filling a TEMPO raster
+EMA_HISTORY_DAYS = 14  # causal same-time background window before each current scan
+EMA_HALF_LIFE_DAYS = 5.0  # temporal decay applied inside the same-time background
+EMA_SAME_TIME_TOLERANCE_MINUTES = 60  # largest daily scan-time mismatch
+EMA_MIN_SCANS = 7  # least number of eligible daily EMA scans required per record
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
 LABEL_COL = "delta_nox_class"
-DELTA_THRESHOLD = 50.0  # least raw delta-NOx magnitude kept as a labeled class
+DELTA_THRESHOLD = 100.0  # least raw delta-NOx magnitude kept as a labeled class
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_DELTA_HISTORY = 168
 DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added to its scale
@@ -111,7 +112,7 @@ OUTLIER_FILTER_COLUMNS = (  # excludes coordinates, counts, time, and already bo
 TRAIN_SIZE = 12_000
 VAL_SIZE = 4_000
 TEST_SIZE = 4_000
-STRATIFY_CANDIDATE_MULTIPLIER = 3  # overdraw for paired TEMPO coverage rejection
+STRATIFY_CANDIDATE_MULTIPLIER = 5  # overdraw for raster eligibility attrition
 TRAIN_RECORDS_SIZE = TRAIN_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 VAL_RECORDS_SIZE = VAL_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
@@ -120,10 +121,9 @@ TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 # Modeling data contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "wind_u_10m_mps", "wind_v_10m_mps")
-MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2")
-MODEL_VALID_MASK_KEY = "valid_mask"  # paired finite-NO2 support stored with each sample
-MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS) + 1  # numeric channels plus the paired-valid mask
+MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2", "wind_u_10m_mps", "wind_v_10m_mps")
+MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2")
+MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
 MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
     "num_coal_units",

@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TypeVar
 
@@ -19,8 +20,12 @@ from config import (
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WIND_CACHE_DIR,
     DELTA_THRESHOLD,
+    EMA_HISTORY_DAYS,
+    EMA_MIN_SCANS,
+    EMA_SAME_TIME_TOLERANCE_MINUTES,
     HRRR_DIR,
     NUM_CORES,
+    TEMPO_AOI_MAPPING,
     TEMPO_DIR,
     TEST_RECORDS_CSV,
     TEST_SIZE,
@@ -30,7 +35,6 @@ from config import (
     VAL_SIZE,
 )
 from preprocessing.generate_dataset_utils import (
-    NO_PAIRED_FINITE_NO2_ERROR,
     TABULAR_FEATURE_NAMES,
     RecordTask,
     ScanBatchTask,
@@ -38,7 +42,6 @@ from preprocessing.generate_dataset_utils import (
     WindBatchTask,
     WindTask,
     cache_exists,
-    eligible_generated_records,
     make_scan_task,
     make_wind_task,
     process_record,
@@ -62,8 +65,6 @@ SOURCE_RECORD_INDEX_COL = "_source_record_index"
 DELTA_NO2_PATH_COL = "delta_no2_path"
 CANDIDATE_RASTER_PATH_COL = "_candidate_raster_path"
 FINAL_SPLIT_SIZES = {"train": TRAIN_SIZE, "val": VAL_SIZE, "test": TEST_SIZE}
-NO_PAIRED_FINITE_NO2_FAILURE = f"Record processing failed: {NO_PAIRED_FINITE_NO2_ERROR}"
-
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")
 
@@ -76,6 +77,8 @@ class PreparedRecord:
     record_index: int
     current_scan_key: str
     previous_scan_key: str
+    ema_scan_keys: tuple[str, ...]
+    ema_scan_age_days: tuple[float, ...]
     wind_cache_key: str
     delta_no2_path: str
 
@@ -116,6 +119,48 @@ def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
     return splits
 
 
+ObservationIndex = dict[int, dict[date, list[dict[str, object]]]]
+
+
+def _load_observations(aoi_ids: list[int]) -> ObservationIndex:
+    # Index the shared TEMPO observations once by AOI and calendar day
+    paths = sorted(Path(TEMPO_AOI_MAPPING).rglob("date=*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"No AOI observation shards found under {TEMPO_AOI_MAPPING}")
+    observations = (
+        pl.scan_parquet(paths)
+        .select("aoi_id", "scan_date", "tempo_time", "granule_paths", "sampled_pixel_count")
+        .filter(pl.col("aoi_id").is_in(aoi_ids))
+        .collect()
+    )
+    index: ObservationIndex = {}
+    for observation in observations.iter_rows(named=True):
+        aoi_id = int(observation["aoi_id"])
+        scan_date = observation["scan_date"]
+        index.setdefault(aoi_id, {}).setdefault(scan_date, []).append(observation)
+    return index
+
+
+def _same_time_ema_observations(
+    observations_by_day: dict[date, list[dict[str, object]]], target_time: datetime
+) -> list[dict[str, object]]:
+    # Keep the closest scan per prior day inside the same-time tolerance
+    target_seconds = target_time.hour * 3600 + target_time.minute * 60 + target_time.second
+    selected = []
+    for age_days in range(1, EMA_HISTORY_DAYS + 1):
+        scan_date = target_time.date() - timedelta(days=age_days)
+        candidates = []
+        for observation in observations_by_day.get(scan_date, []):
+            observation_time = observation["tempo_time"]
+            observation_seconds = observation_time.hour * 3600 + observation_time.minute * 60 + observation_time.second
+            difference = abs((observation_seconds - target_seconds + 43_200) % 86_400 - 43_200)
+            if difference <= EMA_SAME_TIME_TOLERANCE_MINUTES * 60:
+                candidates.append((difference, -int(observation["sampled_pixel_count"]), observation))
+        if candidates:
+            selected.append(min(candidates, key=lambda priority: priority[:2])[2])
+    return sorted(selected, key=lambda row: row["tempo_time"])
+
+
 def _prepare_records(
     splits: dict[str, pl.DataFrame],
     tempo_cache_dir: Path,
@@ -127,6 +172,8 @@ def _prepare_records(
     scans: dict[str, ScanTask] = {}
     winds: dict[str, WindTask] = {}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in splits}
+    aoi_ids = sorted({int(aoi_id) for frame in splits.values() for aoi_id in frame["aoi_id"].unique()})
+    observations_by_aoi = _load_observations(aoi_ids)
     for split, frame in splits.items():
         output_dir = run_dir / "record-rasters" / split
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +183,24 @@ def _prepare_records(
                 current = make_scan_task(row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 wind = make_wind_task(row, Path(HRRR_DIR), wind_cache_dir)
+                ema_observations = _same_time_ema_observations(
+                    observations_by_aoi[int(row["aoi_id"])], row["tempo_time"]
+                )
+                if len(ema_observations) < EMA_MIN_SCANS:
+                    raise ValueError(f"Only {len(ema_observations)} same-time EMA scans are available")
+                ema_scans = []
+                ema_scan_age_days = []
+                for observation in ema_observations:
+                    ema_row = {
+                        "aoi_id": row["aoi_id"],
+                        "lon": row["lon"],
+                        "lat": row["lat"],
+                        "tempo": observation["granule_paths"],
+                    }
+                    ema_scan = make_scan_task(ema_row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
+                    ema_scans.append(ema_scan)
+                    age = (row["tempo_time"] - observation["tempo_time"]).total_seconds() / 86_400
+                    ema_scan_age_days.append(float(age))
                 delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
                     PreparedRecord(
@@ -143,12 +208,16 @@ def _prepare_records(
                         record_index=record_index,
                         current_scan_key=current.cache_key,
                         previous_scan_key=previous.cache_key,
+                        ema_scan_keys=tuple(scan.cache_key for scan in ema_scans),
+                        ema_scan_age_days=tuple(ema_scan_age_days),
                         wind_cache_key=wind.cache_key,
                         delta_no2_path=str(delta_no2_path),
                     )
                 )
                 scans.setdefault(current.cache_key, current)
                 scans.setdefault(previous.cache_key, previous)
+                for ema_scan in ema_scans:
+                    scans.setdefault(ema_scan.cache_key, ema_scan)
                 winds.setdefault(wind.cache_key, wind)
             except (KeyError, TypeError, ValueError) as error:
                 failures[split].append({"record_index": record_index, "error": str(error)})
@@ -247,6 +316,22 @@ def _record_tasks(
             reasons = [tempo_failures.get(key, "TEMPO cache unavailable") for key in missing_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
+        available_ema_scans = [
+            (tempo_cache_paths[key], age)
+            for key, age in zip(record.ema_scan_keys, record.ema_scan_age_days, strict=True)
+            if key in tempo_cache_paths
+        ]
+        if len(available_ema_scans) < EMA_MIN_SCANS:
+            missing_count = len(record.ema_scan_keys) - len(available_ema_scans)
+            failures[record.split].append(
+                {
+                    "record_index": record.record_index,
+                    "error": (
+                        f"Only {len(available_ema_scans)} EMA scans remain after {missing_count} TEMPO cache failures"
+                    ),
+                }
+            )
+            continue
         if record.wind_cache_key not in wind_cache_paths:
             reason = wind_failures.get(record.wind_cache_key, "wind cache unavailable")
             failures[record.split].append({"record_index": record.record_index, "error": reason})
@@ -259,6 +344,8 @@ def _record_tasks(
                 record_index=record.record_index,
                 current_cache_path=tempo_cache_paths[record.current_scan_key],
                 previous_cache_path=tempo_cache_paths[record.previous_scan_key],
+                ema_scan_paths=tuple(path for path, _ in available_ema_scans),
+                ema_scan_age_days=tuple(age for _, age in available_ema_scans),
                 wind_cache_path=wind_cache_paths[record.wind_cache_key],
                 output_path=record.delta_no2_path,
             )
@@ -310,17 +397,12 @@ def _write_outputs(
         candidates = source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left").sort(
             SOURCE_RECORD_INDEX_COL
         )
-        eligible = eligible_generated_records(candidates)
         output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
-        print(
-            f"[{split}] {candidates.height:,} regridded; "
-            f"{eligible.height:,} passed raster QC; {output_frame.height:,} selected"
-        )
+        print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
         classification_report = {
             "split": split,
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
-            "raster_qc": classification_summary(candidates, eligible),
-            "final_balance": classification_summary(eligible, output_frame),
+            "final_balance": classification_summary(candidates, output_frame),
         }
         output_frame = _install_selected_rasters(split, output_frame)
         write_csv_atomic(
@@ -335,18 +417,7 @@ def _write_outputs(
             pl.DataFrame(failure_rows, schema={"record_index": pl.Int64, "error": pl.String}),
             Path(DATASET_DF) / f"{split}_failures.csv",
         )
-        no_paired_coverage, processing_failures = _count_failure_outcomes(failure_rows)
-        print(
-            f"[{split}] wrote {output_frame.height:,} records; "
-            f"{no_paired_coverage:,} rejected with no paired finite NO2; "
-            f"{processing_failures:,} processing failures"
-        )
-
-
-def _count_failure_outcomes(failure_rows: list[dict[str, object]]) -> tuple[int, int]:
-    # Separate expected coverage rejection from operational failures
-    no_paired_coverage = sum(row.get("error") == NO_PAIRED_FINITE_NO2_FAILURE for row in failure_rows)
-    return no_paired_coverage, len(failure_rows) - no_paired_coverage
+        print(f"[{split}] wrote {output_frame.height:,} records; {len(failure_rows):,} processing failures")
 
 
 def _install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:
@@ -392,17 +463,21 @@ def parse_args() -> argparse.Namespace:
         Parsed command-line arguments.
     """
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workers", type=int, default=NUM_CORES)
     parser.add_argument("--split", choices=("all", *SPLIT_PATHS), default=_default_split())
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="empty both image caches before rebuilding entries for the selected split",
+    )
     parser.add_argument(
         "--refresh-tempo",
         action="store_true",
-        help="rebuild cached TEMPO rasters for the selected split",
+        help="empty the TEMPO image cache before rebuilding entries for the selected split",
     )
     parser.add_argument(
         "--refresh-wind",
         action="store_true",
-        help="rebuild cached wind rasters for the selected split",
+        help="empty the wind image cache before rebuilding entries for the selected split",
     )
     return parser.parse_args()
 
@@ -420,27 +495,49 @@ def _selected_split_paths(split: str) -> dict[str, str]:
     return SPLIT_PATHS if split == "all" else {split: SPLIT_PATHS[split]}
 
 
-def _worker_count(requested_workers: int) -> int:
-    # NUM_CORES reflects SLURM_CPUS_PER_TASK inside a Savio allocation
-    workers = min(requested_workers, NUM_CORES)
-    if workers < requested_workers:
-        print(f"Capping workers at the allocated core count: {workers}")
-    return workers
+def _reset_cache_directory(cache_dir: Path) -> None:
+    # Restrict recursive deletion to a configured direct child of DATASET_DIR
+    dataset_root = Path(DATASET_DIR).resolve()
+    resolved_cache = cache_dir.resolve()
+    if resolved_cache.parent != dataset_root:
+        raise ValueError(f"Refusing to clear cache outside {dataset_root}: {resolved_cache}")
+    if resolved_cache.exists() and not resolved_cache.is_dir():
+        raise ValueError(f"Cache path is not a directory: {resolved_cache}")
+    if resolved_cache.exists():
+        print(f"Clearing persistent image cache: {resolved_cache}")
+        shutil.rmtree(resolved_cache)
+    resolved_cache.mkdir(parents=True)
+
+
+def _reset_requested_caches(args: argparse.Namespace, tempo_cache_dir: Path, wind_cache_dir: Path) -> None:
+    # Clear shared caches only from a single non-array process
+    refresh_tempo = args.refresh_cache or args.refresh_tempo
+    refresh_wind = args.refresh_cache or args.refresh_wind
+    if not refresh_tempo and not refresh_wind:
+        return
+    if os.getenv("SLURM_ARRAY_TASK_ID") is not None:
+        raise ValueError("Cache refresh cannot run inside a Slurm array because its tasks share cache directories")
+    if refresh_tempo:
+        _reset_cache_directory(tempo_cache_dir)
+    if refresh_wind:
+        _reset_cache_directory(wind_cache_dir)
 
 
 def main() -> None:
     """Generate paired raster NPZ files and metadata CSVs for all splits."""
     args = parse_args()
-    workers = _worker_count(args.workers)
 
     Path(DATASET_DIR).mkdir(parents=True, exist_ok=True)
     Path(DATASET_DF).mkdir(parents=True, exist_ok=True)
     Path(DATASET_RASTER_DIR).mkdir(parents=True, exist_ok=True)
     tempo_cache_dir = Path(DATASET_TEMPO_CACHE_DIR)
-    tempo_cache_dir.mkdir(parents=True, exist_ok=True)
     wind_cache_dir = Path(DATASET_WIND_CACHE_DIR)
+    _reset_requested_caches(args, tempo_cache_dir, wind_cache_dir)
+    tempo_cache_dir.mkdir(parents=True, exist_ok=True)
     wind_cache_dir.mkdir(parents=True, exist_ok=True)
     splits = _load_splits(_selected_split_paths(args.split))
+    refresh_tempo = args.refresh_cache or args.refresh_tempo
+    refresh_wind = args.refresh_cache or args.refresh_wind
     with tempfile.TemporaryDirectory(prefix=".dataset-run-", dir=DATASET_DIR) as temporary_dir:
         records, scans, winds, failures = _prepare_records(
             splits,
@@ -449,8 +546,8 @@ def main() -> None:
             Path(temporary_dir),
         )
         print(f"Planned {len(records):,} records using {len(scans):,} TEMPO scans and {len(winds):,} wind rasters")
-        tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, workers, args.refresh_tempo)
-        wind_cache_paths, wind_failures = _run_wind_alignment(winds, workers, args.refresh_wind)
+        tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, NUM_CORES, refresh_tempo)
+        wind_cache_paths, wind_failures = _run_wind_alignment(winds, NUM_CORES, refresh_wind)
         tasks, records_by_id = _record_tasks(
             records,
             tempo_cache_paths,
@@ -459,7 +556,7 @@ def main() -> None:
             wind_failures,
             failures,
         )
-        output_rows = _run_record_processing(tasks, records_by_id, failures, workers)
+        output_rows = _run_record_processing(tasks, records_by_id, failures, NUM_CORES)
         _write_outputs(output_rows, failures, splits)
 
 

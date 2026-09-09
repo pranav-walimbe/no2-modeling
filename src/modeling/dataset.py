@@ -23,7 +23,6 @@ from config import (
     MODEL_IMAGE_KEYS,
     MODEL_RAW_FEATURES,
     MODEL_ROBUST_IMAGE_KEYS,
-    MODEL_VALID_MASK_KEY,
 )
 
 RASTER_PATH_COL = "delta_no2_path"
@@ -123,15 +122,14 @@ def _raster_path(serialized_path: object, dataset_dir: Path) -> Path:
     return path if path.is_absolute() else dataset_dir / path
 
 
-def _load_raster_bundle(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    # Load numeric rasters and their stored support mask
+def _load_raster_bundle(path: Path) -> np.ndarray:
+    # Load numeric model rasters in their configured order
     with np.load(path, allow_pickle=False) as bundle:
         rasters = np.stack(
             [np.asarray(bundle[name], dtype=np.float32) for name in MODEL_IMAGE_KEYS],
             axis=0,
         )
-        mask = np.asarray(bundle[MODEL_VALID_MASK_KEY], dtype=np.float32)
-    return rasters, mask
+    return rasters
 
 
 def _safe_scale(values: np.ndarray) -> np.ndarray:
@@ -139,17 +137,14 @@ def _safe_scale(values: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(values) & (values > MIN_SCALE), values, 1.0)
 
 
-def _channel_valid_mask(rasters: np.ndarray, mask: np.ndarray, channel: int) -> np.ndarray:
+def _channel_valid_mask(rasters: np.ndarray, channel: int) -> np.ndarray:
     # Identify valid pixels for one numeric image channel
-    finite = np.isfinite(rasters[channel])
-    if channel in ROBUST_IMAGE_CHANNELS:
-        finite &= mask.astype(bool)
-    return finite
+    return np.isfinite(rasters[channel])
 
 
-def _valid_channel_values(rasters: np.ndarray, mask: np.ndarray, channel: int) -> np.ndarray:
+def _valid_channel_values(rasters: np.ndarray, channel: int) -> np.ndarray:
     # Select valid values for one numeric image channel
-    return rasters[channel, _channel_valid_mask(rasters, mask, channel)]
+    return rasters[channel, _channel_valid_mask(rasters, channel)]
 
 
 def _update_moments(
@@ -180,9 +175,9 @@ def _fit_image_stats(raster_paths: np.ndarray, root: Path, progress_interval: in
     mean = np.zeros(channel_count, dtype=np.float64)
     sum_squared_deviation = np.zeros(channel_count, dtype=np.float64)
     for index, serialized_path in enumerate(raster_paths, start=1):
-        rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
+        rasters = _load_raster_bundle(_raster_path(serialized_path, root))
         for channel in range(channel_count):
-            values = _valid_channel_values(rasters, mask, channel)
+            values = _valid_channel_values(rasters, channel)
             if channel in STANDARD_IMAGE_CHANNELS:
                 mean[channel], sum_squared_deviation[channel] = _update_moments(
                     values.astype(np.float64, copy=False),
@@ -222,9 +217,9 @@ def _fit_robust_image_stats(raster_paths: np.ndarray, root: Path, count: np.ndar
         }
         offsets = dict.fromkeys(channels, 0)
         for serialized_path in raster_paths:
-            rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
+            rasters = _load_raster_bundle(_raster_path(serialized_path, root))
             for channel, destination in pooled.items():
-                values = _valid_channel_values(rasters, mask, channel)
+                values = _valid_channel_values(rasters, channel)
                 stop = offsets[channel] + values.size
                 destination[offsets[channel] : stop] = values
                 offsets[channel] = stop
@@ -302,9 +297,9 @@ def clipped_pixel_fractions(
     center = np.asarray(stats.image_center)
     scale = np.asarray(stats.image_scale)
     for serialized_path in frame[RASTER_PATH_COL].to_numpy(dtype=str):
-        rasters, mask = _load_raster_bundle(_raster_path(serialized_path, root))
+        rasters = _load_raster_bundle(_raster_path(serialized_path, root))
         for channel in range(len(MODEL_IMAGE_KEYS)):
-            values = _valid_channel_values(rasters, mask, channel)
+            values = _valid_channel_values(rasters, channel)
             normalized = (values - center[channel]) / scale[channel]
             clipped[channel] += np.count_nonzero(np.abs(normalized) > MODEL_IMAGE_CLIP_ABS)
             valid[channel] += values.size
@@ -372,16 +367,16 @@ class NOxDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         if self.load_images:
-            rasters, mask = _load_raster_bundle(_raster_path(self.raster_paths[index], self.dataset_dir))
+            rasters = _load_raster_bundle(_raster_path(self.raster_paths[index], self.dataset_dir))
             normalized = np.zeros_like(rasters, dtype=np.float32)
             for channel in range(len(MODEL_IMAGE_KEYS)):
-                channel_valid = _channel_valid_mask(rasters, mask, channel)
+                channel_valid = _channel_valid_mask(rasters, channel)
                 channel_values = rasters[channel, channel_valid]
                 normalized[channel, channel_valid] = (
                     channel_values - self.stats.image_center[channel]
                 ) / self.stats.image_scale[channel]
             np.clip(normalized, -MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS, out=normalized)
-            image = torch.from_numpy(np.concatenate((normalized, mask[None, ...]), axis=0))
+            image = torch.from_numpy(normalized)
         else:
             image = torch.empty(0, dtype=torch.float32)
         return (

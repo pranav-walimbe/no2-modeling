@@ -5,7 +5,8 @@ observations.
 
 ## Prediction target
 
-- Apply the fixed symmetric `DELTA_THRESHOLD` cutoff on `abs(delta_nox_mass)`.
+- Apply the fixed symmetric 100 lb `DELTA_THRESHOLD` cutoff on
+  `abs(delta_nox_mass)`.
 - Use the same cutoff for train, validation, test, and inference.
 - Remove records inside the closed deadband.
 - Label negative changes as 0 and positive changes as 1.
@@ -33,8 +34,7 @@ Excluded inputs and the reason for each:
 | Plume score, raster-quality scores | Diagnostics extracted from the response image |
 | Prior-quarter NOx-change scale | Encodes how far a plant usually swings, which tracks crossing a fixed magnitude cutoff |
 
-Coverage stays available for sliced evaluation. The image mask already tells the
-network where the scans have support.
+Coverage stays available for sliced evaluation but is not a model input.
 
 ### Feature transformations
 
@@ -68,17 +68,22 @@ distortion, so the transform is gone.
 
 Five channels reach the model:
 
-1. paired-valid current NO2;
-2. paired-valid delta NO2;
-3. geographic eastward wind aligned from the native HRRR grid;
-4. geographic northward wind aligned from the native HRRR grid;
-5. a binary mask set to one where both scans supplied accepted NO2.
+1. current NO2 after the per-scan coverage gate and nearest-valid filling;
+2. current-minus-previous filled NO2;
+3. current-minus-14-day same-time EMA NO2;
+4. geographic eastward wind aligned from the native HRRR grid;
+5. geographic northward wind aligned from the native HRRR grid.
+
+The causal EMA uses the closest preceding scan from each of 14 calendar days
+within 60 minutes of the current scan time. Daily values receive a 5-day
+half-life. Every scan requires 99% finite coverage before its remaining gaps are
+filled, and each record requires at least seven eligible EMA scans.
 
 Every statistic comes from training pixels alone:
 
 | Channels | Center | Scale |
 |---|---|---|
-| current NO2, delta NO2 | median of valid pixels | `IQR / 1.349` |
+| current NO2, hourly delta NO2, EMA delta NO2 | median of finite pixels | `IQR / 1.349` |
 | wind u, wind v | mean of finite pixels | population standard deviation |
 
 ```text
@@ -86,13 +91,12 @@ normalized[channel] =
     (raster[channel] - train_center[channel]) / train_scale[channel]
 ```
 
-- Clip all four numeric channels to `[-8, 8]`.
-- Keep the mask binary and unstandardized.
-- Fit NO2 statistics on finite pixels under the stored validity mask.
+- Clip all five numeric channels to `[-8, 8]`.
+- Fit every channel on its finite training pixels.
 - Reuse the frozen training statistics for validation, test, and inference.
 
-Missing NO2 becomes normalized zero. The mask separates missing support from a
-measured value sitting at the training median.
+The three NO2 channels are finite after filling. No validity-mask channel is
+provided to the network.
 
 Two design notes:
 
@@ -133,7 +137,7 @@ training never selected it.
 
 The baseline applies no rotation or flip. Alignment rotates HRRR grid-relative
 wind to geographic east and north, so any later spatial augmentation must
-transform the wind vector values along with the raster coordinates and mask.
+transform the wind vector values along with the raster coordinates.
 
 ## Optimization and I/O
 
