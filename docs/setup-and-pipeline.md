@@ -188,7 +188,7 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   caches, grouping work so workers reuse each NetCDF or GRIB read;
 - requires greater than 90 percent current coverage and greater than 75 percent
   paired coverage for both delta rasters, preserving gaps in separate masks;
-- builds a per-pixel 14-day EMA from at least seven historical dates, requiring
+- builds a per-pixel 14-day EMA from the available historical dates, requiring
   five finite dates per cell and using a seven-day half-life;
 - selects the requested size through deterministic AOI and temporal round-robin,
   or the largest exactly balanced subset when either class is short;

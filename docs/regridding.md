@@ -73,9 +73,9 @@ Each successful model record persists one compressed NPZ holding five aligned
   binary support for the three NO2 arrays.
 
 The EMA uses one closest scan per preceding calendar day within 60 minutes of
-the current scan time and a seven-day half-life. Each record needs at least
-seven historical dates. Each cell needs finite support from at least five dates;
-its weights are renormalized over only those dates. EMA scans use the same
+the current scan time and a seven-day half-life. Each cell needs finite support
+from at least five dates, and its weights are renormalized over only those
+dates. EMA scans use the same
 persistent TEMPO image cache as the current and previous scans. Normalization
 occurs only after forming the EMA delta.
 

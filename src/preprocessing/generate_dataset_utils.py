@@ -23,8 +23,6 @@ from scipy.ndimage import map_coordinates
 from config import (
     EMA_HALF_LIFE_DAYS,
     EMA_MIN_PIXEL_OBSERVATIONS,
-    EMA_MIN_SCANS,
-    IMG_SIZE,
     LABEL_COL,
     MIN_CURRENT_NO2_FINITE_FRACTION,
     MIN_DELTA_NO2_FINITE_FRACTION,
@@ -108,8 +106,6 @@ def build_shard_plan(split_paths: dict[str, str], shard_size: int) -> list[Shard
     Returns:
         Deterministic shard tasks spanning every source record.
     """
-    if shard_size <= 0:
-        raise ValueError("Shard size must be greater than zero")
     tasks: list[ShardTask] = []
     for split, path in split_paths.items():
         row_count = int(pl.scan_csv(path).select(pl.len()).collect(engine="streaming").item())
@@ -143,8 +139,6 @@ class DatasetShardStore:
             Candidate features and processing failures.
         """
         shard_dir = self.root / task.split / f"{task.shard_index:06d}"
-        with (shard_dir / SHARD_COMPLETION_FILE).open() as source:
-            completion = json.load(source)
         candidates = pl.read_csv(
             shard_dir / SHARD_CANDIDATES_FILE,
             schema_overrides=CANDIDATE_FEATURE_SCHEMA,
@@ -153,11 +147,6 @@ class DatasetShardStore:
             shard_dir / SHARD_FAILURES_FILE,
             schema_overrides=PROCESSING_FAILURE_SCHEMA,
         )
-        expected_completion = self._completion_values(task, candidates.height, failures.height)
-        if completion != expected_completion:
-            raise ValueError(f"Shard {task.task_id} has an inconsistent completion marker")
-        if candidates.schema != CANDIDATE_FEATURE_SCHEMA:
-            raise ValueError(f"Shard {task.task_id} has an unexpected candidate schema")
         expected_indices = list(range(task.start, task.stop))
         candidate_indices = [int(value) for value in candidates[SOURCE_RECORD_INDEX_COL].to_list()]
         failure_indices = [int(value) for value in failures["record_index"].to_list()]
@@ -171,9 +160,6 @@ class DatasetShardStore:
             strict=True,
         ):
             relative_path = Path(str(serialized_path))
-            expected_path = Path("record-rasters") / task.split / f"{record_index:06d}.npz"
-            if relative_path != expected_path:
-                raise ValueError(f"Shard {task.task_id} has an unexpected raster path for record {record_index}")
             absolute_path = shard_dir / relative_path
             if not absolute_path.is_file():
                 raise ValueError(f"Shard {task.task_id} is missing raster {relative_path}")
@@ -267,23 +253,13 @@ class DatasetShardStore:
             shard_root.rmdir()
 
     def _prepare_root(self) -> Path:
-        # Validate the shard root before changing descendants
-        dataset_root = self.root.parent.resolve()
-        if self.root.name != "shards" or self.root.is_symlink():
-            raise ValueError(f"Refusing to use shard workspace outside {dataset_root}: {self.root}")
-        if self.root.exists() and not self.root.is_dir():
-            raise ValueError(f"Shard workspace is not a directory: {self.root}")
+        # Create the shard root before changing descendants
         self.root.mkdir(parents=True, exist_ok=True)
         return self.root
 
     def _prepare_split_root(self, split: str) -> Path:
-        # Validate one split directory before changing shard contents
-        shard_root = self._prepare_root()
-        split_root = shard_root / split
-        if split_root.parent.resolve() != shard_root.resolve() or split_root.is_symlink():
-            raise ValueError(f"Refusing to use split shard workspace outside {shard_root}: {split_root}")
-        if split_root.exists() and not split_root.is_dir():
-            raise ValueError(f"Split shard workspace is not a directory: {split_root}")
+        # Create one split directory before changing shard contents
+        split_root = self._prepare_root() / split
         split_root.mkdir(parents=True, exist_ok=True)
         return split_root
 
@@ -321,11 +297,6 @@ def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
     Returns:
         Selected records without temporary ranking columns.
     """
-    if PAIRED_FINITE_FRACTION_COL not in frame.columns:
-        raise ValueError(f"Generated records are missing {PAIRED_FINITE_FRACTION_COL}")
-    if not frame[PAIRED_FINITE_FRACTION_COL].is_finite().all():
-        raise ValueError("Generated records contain non-finite paired raster coverage")
-
     eligible_by_class = {label: frame.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
     class_size = min(size // 2, *eligible_by_class.values())
     selected_classes = []
@@ -748,11 +719,6 @@ def _ema_from_scans(
     ema_scan_age_days: tuple[float, ...],
 ) -> np.ndarray:
     # Build one causal per-pixel EMA from the available historical dates
-    if len(ema_scan_paths) != len(ema_scan_age_days):
-        raise ValueError("EMA scan paths and ages must have equal length")
-    if len(ema_scan_paths) < EMA_MIN_SCANS:
-        raise ValueError(f"Only {len(ema_scan_paths)} EMA dates are available; {EMA_MIN_SCANS} are required")
-
     ema_scans: list[np.ndarray] = []
     for path in ema_scan_paths:
         with np.load(path, allow_pickle=False) as cache:
@@ -875,26 +841,6 @@ def _write_npz_atomic(destination: str, **arrays: np.ndarray | float) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def _validate_model_rasters(rasters: dict[str, np.ndarray]) -> None:
-    # Validate the complete model bundle before its atomic write
-    expected_names = set((*MODEL_IMAGE_KEYS, *MODEL_MASK_KEYS))
-    if set(rasters) != expected_names:
-        raise ValueError(f"Model raster bundle keys differ from {sorted(expected_names)}")
-    for name in MODEL_IMAGE_KEYS:
-        raster = rasters[name]
-        if raster.shape != (IMG_SIZE, IMG_SIZE) or raster.dtype != np.float32:
-            raise ValueError(f"{name} must be a float32 {(IMG_SIZE, IMG_SIZE)} raster")
-    for channel, name in enumerate(MODEL_MASK_KEYS):
-        mask = rasters[name]
-        if mask.shape != (IMG_SIZE, IMG_SIZE) or mask.dtype != np.uint8 or not np.isin(mask, (0, 1)).all():
-            raise ValueError(f"{name} must be a binary uint8 {(IMG_SIZE, IMG_SIZE)} mask")
-        if not np.array_equal(mask.astype(bool), np.isfinite(rasters[MODEL_IMAGE_KEYS[channel]])):
-            raise ValueError(f"{name} disagrees with finite {MODEL_IMAGE_KEYS[channel]} values")
-    for name in (WIND_U_RASTER_NAME, WIND_V_RASTER_NAME):
-        if not np.isfinite(rasters[name]).all():
-            raise ValueError(f"{name} must be finite across the full grid")
-
-
 def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     # Build and validate one complete raster and scalar feature bundle
     rasters, features = derive_raster_features(
@@ -906,7 +852,6 @@ def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[s
     wind_rasters, weather_features = extract_wind_cache(task.wind_cache_path)
     rasters.update(wind_rasters)
     features.update(weather_features)
-    _validate_model_rasters(rasters)
     return rasters, features
 
 

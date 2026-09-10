@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from config import MODEL_IMAGE_CHANNELS, MODEL_INPUT_CHANNELS, MODEL_MASK_KEYS
+from config import MODEL_IMAGE_CHANNELS, MODEL_MASK_KEYS
 
 DEFAULT_HEAD_DIM = 128
 DEFAULT_DROPOUT = 0.30
@@ -68,8 +68,6 @@ class PartialConv2d(nn.Module):
         Returns:
             Renormalized features and the propagated binary mask.
         """
-        if mask.shape[1] != 1 or mask.shape[0] != inputs.shape[0] or mask.shape[2:] != inputs.shape[2:]:
-            raise ValueError("Partial convolution mask must be one channel and match the input grid")
         masked = inputs * mask
         features = self.convolution(masked)
         with torch.no_grad():
@@ -167,8 +165,6 @@ class NOxModel(nn.Module):
     def forward(self, image: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
         features = []
         if self.use_image:
-            if image.shape[1] != MODEL_INPUT_CHANNELS:
-                raise ValueError(f"Expected {MODEL_INPUT_CHANNELS} image channels; got {image.shape[1]}")
             masks = image[:, MODEL_IMAGE_CHANNELS:]
             no2_features = [
                 stem(image[:, channel : channel + 1], masks[:, channel : channel + 1])

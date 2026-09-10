@@ -77,8 +77,8 @@ Five numeric channels and three masks reach the model:
 
 The causal EMA uses the closest preceding scan from each of 14 calendar days
 within 60 minutes of the current scan time. Daily values receive a seven-day
-half-life. Each record requires at least seven historical dates and each EMA
-cell requires at least five finite dates.
+half-life. Each EMA cell requires at least five finite dates, and the paired
+current/EMA coverage gate decides whether the record survives.
 
 Every statistic comes from training pixels alone:
 

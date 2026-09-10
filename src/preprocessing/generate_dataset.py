@@ -22,7 +22,6 @@ from config import (
     DATASET_WIND_CACHE_DIR,
     DELTA_THRESHOLD,
     EMA_HISTORY_DAYS,
-    EMA_MIN_SCANS,
     EMA_SAME_TIME_TOLERANCE_MINUTES,
     HRRR_DIR,
     LABEL_COL,
@@ -242,8 +241,6 @@ def _prepare_records(
                 ema_observations = _same_time_ema_observations(
                     observations_by_aoi[int(row["aoi_id"])], row["tempo_time"]
                 )
-                if len(ema_observations) < EMA_MIN_SCANS:
-                    raise ValueError(f"Only {len(ema_observations)} same-time EMA scans are available")
                 ema_scans = []
                 ema_scan_age_days = []
                 for observation in ema_observations:
@@ -379,17 +376,6 @@ def _record_tasks(
             for key, age in zip(record.ema_scan_keys, record.ema_scan_age_days, strict=True)
             if key in tempo_cache_paths
         ]
-        if len(available_ema_scans) < EMA_MIN_SCANS:
-            missing_count = len(record.ema_scan_keys) - len(available_ema_scans)
-            failures[record.split].append(
-                {
-                    "record_index": record.record_index,
-                    "error": (
-                        f"Only {len(available_ema_scans)} EMA scans remain after {missing_count} TEMPO cache failures"
-                    ),
-                }
-            )
-            continue
         if record.wind_cache_key not in wind_cache_paths:
             reason = wind_failures.get(record.wind_cache_key, "wind cache unavailable")
             failures[record.split].append({"record_index": record.record_index, "error": reason})

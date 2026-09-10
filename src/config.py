@@ -91,7 +91,6 @@ MIN_EMA_DELTA_NO2_FINITE_FRACTION = 0.75  # strict paired current/EMA coverage f
 EMA_HISTORY_DAYS = 14  # causal same-time background window before each current scan
 EMA_HALF_LIFE_DAYS = 7.0  # temporal decay applied inside the same-time background
 EMA_SAME_TIME_TOLERANCE_MINUTES = 60  # largest daily scan-time mismatch
-EMA_MIN_SCANS = 7  # least number of eligible daily EMA scans required per record
 EMA_MIN_PIXEL_OBSERVATIONS = 5  # least distinct historical dates required per EMA cell
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"

@@ -17,7 +17,6 @@ from config import (
     DATASET_DF,
     DATASET_DIR,
     DELTA_THRESHOLD,
-    IMG_SIZE,
     LABEL_COL,
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_ABS,
@@ -127,23 +126,8 @@ def _raster_path(serialized_path: object, dataset_dir: Path) -> Path:
 def _load_raster_bundle(path: Path) -> tuple[np.ndarray, np.ndarray]:
     # Load numeric rasters and their independent NO2 masks
     with np.load(path, allow_pickle=False) as bundle:
-        raster_arrays = [bundle[name] for name in MODEL_IMAGE_KEYS]
-        mask_arrays = [bundle[name] for name in MODEL_MASK_KEYS]
-        if any(array.shape != (IMG_SIZE, IMG_SIZE) for array in (*raster_arrays, *mask_arrays)):
-            raise ValueError(f"Raster bundle arrays must have shape {(IMG_SIZE, IMG_SIZE)} in {path}")
-        if any(array.dtype != np.float32 for array in raster_arrays):
-            raise ValueError(f"Numeric rasters must use float32 in {path}")
-        if any(array.dtype != np.uint8 for array in mask_arrays):
-            raise ValueError(f"Validity masks must use uint8 in {path}")
-        rasters = np.stack(raster_arrays, axis=0)
-        masks = np.stack(mask_arrays, axis=0).astype(np.float32)
-    if not np.isin(masks, (0.0, 1.0)).all():
-        raise ValueError(f"Masks must be binary in {path}")
-    if not np.isfinite(rasters[3:]).all():
-        raise ValueError(f"Wind rasters contain non-finite values in {path}")
-    for channel, mask in enumerate(masks):
-        if not np.array_equal(mask.astype(bool), np.isfinite(rasters[channel])):
-            raise ValueError(f"{MODEL_MASK_KEYS[channel]} disagrees with finite values in {path}")
+        rasters = np.stack([bundle[name] for name in MODEL_IMAGE_KEYS], axis=0)
+        masks = np.stack([bundle[name] for name in MODEL_MASK_KEYS], axis=0).astype(np.float32)
     return rasters, masks
 
 

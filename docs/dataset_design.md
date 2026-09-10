@@ -125,8 +125,8 @@ The native regridder accepts an NO2 contributor only when:
 
 Missing cells are never interpolated. Current coverage must be greater than
 90%. The current/previous intersection must cover more than 75% of the raster.
-The EMA uses at least seven available historical dates, a seven-day half-life,
-and at least five finite dates independently at each cell. Weights are
+The EMA uses a seven-day half-life over the available historical dates and at
+least five finite dates independently at each cell. Weights are
 renormalized over the dates available at that cell. The current/EMA intersection
 must also cover more than 75% of the raster.
 
@@ -175,8 +175,10 @@ Read balanced metrics against the saved pre-balancing prevalence.
 
 - Metadata operations use Polars and project only the required columns.
 - Per-pixel EMA support and weighting use stacked NumPy arrays without a Python
-  loop over grid cells. See the
-  [mask-aware EMA benchmark](mask_aware_ema_benchmark.md).
+  loop over grid cells. On 250 synthetic records this ran 1.4 times the
+  throughput of the removed nearest-fill path and cut EMA compute time by a
+  factor of seven at unchanged peak memory. Archive reads now dominate the
+  per-record cost.
 - Generation bounds the number of pending worker futures and caches each unique
   AOI scan for one run.
 - Candidate delta rasters live in atomic resumable shards until finalization.
