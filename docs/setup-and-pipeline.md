@@ -182,13 +182,16 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
 
 - resolves current, previous, and prior-14-day same-time TEMPO scans through one
   deduplicated persistent image-cache plan;
-- writes one compressed five-channel NPZ per retained record;
+- writes five numeric rasters and three independent NO2 masks per retained
+  record;
 - stores each unique AOI scan and aligned AOI-hour wind raster in persistent
   caches, grouping work so workers reuse each NetCDF or GRIB read;
-- requires at least 99 percent finite NO2 in each current, previous, and EMA
-  scan, then fills the remaining gaps from the nearest finite cell;
-- selects the exact configured size through deterministic AOI and temporal
-  round-robin;
+- requires greater than 90 percent current coverage and greater than 75 percent
+  paired coverage for both delta rasters, preserving gaps in separate masks;
+- builds a per-pixel 14-day EMA from at least seven historical dates, requiring
+  five finite dates per cell and using a seven-day half-life;
+- selects the requested size through deterministic AOI and temporal round-robin,
+  or the largest exactly balanced subset when either class is short;
 - uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
   allocation.
 
@@ -214,6 +217,11 @@ Running the splits:
   shared caches once before fan-out and also discard shards that depend on them.
 - Direct `python -u -m preprocessing.generate_dataset` remains available for a
   monolithic local run. Pass `--split` to limit that run to one split.
+- Before regeneration, run
+  `python -u -m preprocessing.generate_dataset --audit-retention` to evaluate
+  all fixed gates from existing caches. The audit refuses refresh flags, writes
+  no candidate rasters, and saves its retention report under `DATASET_DF`.
+  Use `--audit-output PATH` to place the report elsewhere.
 
 ### 5. Train and evaluate
 
@@ -221,12 +229,12 @@ Running the splits:
 python -u -m modeling.train
 ```
 
-The trainer reads current NO2, hourly delta NO2, EMA delta NO2, and wind from
-each selected NPZ on demand. It fits memory-bounded robust NO2 normalization
-statistics on the training split alone and records clipped valid-pixel fractions
-by channel and split. It then predicts whether raw delta-NOx falls below or
-above zero outside the fixed deadband and reports classification metrics. See
-`docs/modeling.md` for the full contract.
+The trainer reads current NO2, hourly delta NO2, EMA delta NO2, wind, and three
+validity masks from each selected NPZ on demand. It fits memory-bounded robust
+NO2 normalization statistics on the training split alone and records clipped
+valid-pixel fractions by channel and split. It then predicts whether raw
+delta-NOx falls below or above zero outside the fixed deadband and reports
+classification metrics. See `docs/modeling.md` for the full contract.
 
 ### Resuming
 

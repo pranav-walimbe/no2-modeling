@@ -18,14 +18,19 @@ from eccodes import (
     codes_release,
 )
 from pyproj import CRS, Proj, Transformer
-from scipy.ndimage import distance_transform_edt, map_coordinates
+from scipy.ndimage import map_coordinates
 
 from config import (
     EMA_HALF_LIFE_DAYS,
+    EMA_MIN_PIXEL_OBSERVATIONS,
     EMA_MIN_SCANS,
+    IMG_SIZE,
     LABEL_COL,
-    MIN_NO2_FINITE_FRACTION,
+    MIN_CURRENT_NO2_FINITE_FRACTION,
+    MIN_DELTA_NO2_FINITE_FRACTION,
+    MIN_EMA_DELTA_NO2_FINITE_FRACTION,
     MODEL_IMAGE_KEYS,
+    MODEL_MASK_KEYS,
 )
 from preprocessing.regrid import (
     AoiGrid,
@@ -38,7 +43,10 @@ from preprocessing.regrid import (
 from preprocessing.stratify_utils import AOI_ID_COL
 
 CURRENT_RASTER_NAME, DELTA_RASTER_NAME, EMA_DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
+CURRENT_MASK_NAME, DELTA_MASK_NAME, EMA_DELTA_MASK_NAME = MODEL_MASK_KEYS
+CURRENT_FINITE_FRACTION_COL = "current_finite_fraction"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
+EMA_PAIRED_FINITE_FRACTION_COL = "ema_paired_finite_fraction"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
@@ -53,7 +61,9 @@ HRRR_FIELDS = {
 }
 TABULAR_FEATURE_NAMES = (
     "plume_score",
+    CURRENT_FINITE_FRACTION_COL,
     PAIRED_FINITE_FRACTION_COL,
+    EMA_PAIRED_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
@@ -302,11 +312,11 @@ class DatasetShardStore:
 
 
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
-    """Select an exactly balanced coverage-ranked AOI subset.
+    """Select the largest requested balanced coverage-ranked AOI subset.
 
     Args:
         frame: Successfully generated candidate records with finite paired coverage.
-        size: Exact number of records to select.
+        size: Maximum number of records to select.
 
     Returns:
         Selected records without temporary ranking columns.
@@ -316,15 +326,11 @@ def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
     if not frame[PAIRED_FINITE_FRACTION_COL].is_finite().all():
         raise ValueError("Generated records contain non-finite paired raster coverage")
 
-    class_size = size // 2
+    eligible_by_class = {label: frame.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
+    class_size = min(size // 2, *eligible_by_class.values())
     selected_classes = []
     for label in (0, 1):
         class_records = frame.filter(pl.col(LABEL_COL) == label)
-        if class_records.height < class_size:
-            raise ValueError(
-                f"Only {class_records.height:,} class {label} records were generated; "
-                f"cannot produce the requested {class_size:,}"
-            )
         selected_classes.append(_rank_final_records(class_records).head(class_size))
     return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
 
@@ -724,45 +730,51 @@ def _paired_mean(current: np.ndarray, previous: np.ndarray, valid: np.ndarray) -
 
 
 class _InsufficientRasterCoverageError(ValueError):
-    """Signal that a TEMPO raster cannot be safely gap-filled."""
+    """Signal that a derived TEMPO raster misses a fixed coverage gate."""
 
 
-def _fill_no2(no2: np.ndarray, scan_name: str) -> np.ndarray:
-    # Fill small coverage gaps from the nearest finite grid cell
-    values = np.asarray(no2, dtype=np.float64)
-    finite = np.isfinite(values)
-    finite_fraction = float(np.mean(finite))
-    if finite_fraction < MIN_NO2_FINITE_FRACTION:
+def _require_coverage(valid: np.ndarray, threshold: float, raster_name: str) -> float:
+    # Return coverage after enforcing one strict raster eligibility gate
+    fraction = float(np.mean(valid))
+    if fraction <= threshold:
         raise _InsufficientRasterCoverageError(
-            f"{scan_name} NO2 coverage is below the required {MIN_NO2_FINITE_FRACTION:.0%}"
+            f"{raster_name} coverage must exceed {threshold:.0%}; got {fraction:.2%}"
         )
-    if finite.all():
-        return values
-    nearest = distance_transform_edt(~finite, return_distances=False, return_indices=True)
-    return values[tuple(nearest)]
+    return fraction
 
 
 def _ema_from_scans(
     ema_scan_paths: tuple[str, ...],
     ema_scan_age_days: tuple[float, ...],
 ) -> np.ndarray:
-    # Build one causal EMA from eligible TEMPO cache entries
+    # Build one causal per-pixel EMA from the available historical dates
     if len(ema_scan_paths) != len(ema_scan_age_days):
         raise ValueError("EMA scan paths and ages must have equal length")
+    if len(ema_scan_paths) < EMA_MIN_SCANS:
+        raise ValueError(f"Only {len(ema_scan_paths)} EMA dates are available; {EMA_MIN_SCANS} are required")
+
     ema_scans: list[np.ndarray] = []
-    usable_age_days: list[float] = []
-    for path, age_days in zip(ema_scan_paths, ema_scan_age_days, strict=True):
+    for path in ema_scan_paths:
         with np.load(path, allow_pickle=False) as cache:
-            try:
-                ema_scans.append(_fill_no2(cache["no2"], "EMA scan"))
-            except _InsufficientRasterCoverageError:
-                continue
-        usable_age_days.append(age_days)
-    if len(ema_scans) < EMA_MIN_SCANS:
-        raise ValueError(f"Only {len(ema_scans)} EMA scans meet the {MIN_NO2_FINITE_FRACTION:.0%} coverage threshold")
-    stack = np.stack(ema_scans)
-    weights = np.exp2(-np.asarray(usable_age_days, dtype=np.float64) / EMA_HALF_LIFE_DAYS)
-    return np.average(stack, axis=0, weights=weights)
+            ema_scans.append(np.asarray(cache["no2"], dtype=np.float64))
+
+    return _masked_ema(np.stack(ema_scans), np.asarray(ema_scan_age_days, dtype=np.float64))
+
+
+def _masked_ema(stack: np.ndarray, age_days: np.ndarray) -> np.ndarray:
+    # Compute support-aware temporal weights across the stacked scan axis
+    finite = np.isfinite(stack)
+    support = np.count_nonzero(finite, axis=0)
+    weights = np.exp2(-age_days / EMA_HALF_LIFE_DAYS)[:, None, None]
+    # Broadcasting per-date weights against the finite mask renormalizes each cell over its own dates
+    valid_weights = finite * weights
+    weight_sum = np.sum(valid_weights, axis=0)
+    weighted_sum = np.sum(np.where(finite, stack, 0.0) * weights, axis=0)
+    ema = np.full(stack.shape[1:], np.nan, dtype=np.float64)
+    valid = support >= EMA_MIN_PIXEL_OBSERVATIONS
+    # The where clause leaves the NaN prefill at cells below the support floor
+    np.divide(weighted_sum, weight_sum, out=ema, where=valid)
+    return ema
 
 
 def derive_raster_features(
@@ -784,19 +796,42 @@ def derive_raster_features(
         summaries.
     """
     with np.load(current_path, allow_pickle=False) as current, np.load(previous_path, allow_pickle=False) as previous:
-        paired_valid = np.isfinite(current["no2"]) & np.isfinite(previous["no2"])
-        current_no2 = _fill_no2(current["no2"], "Current scan")
-        previous_no2 = _fill_no2(previous["no2"], "Previous scan")
-        delta_no2 = current_no2 - previous_no2
-        delta_values = delta_no2.ravel()
+        current_no2 = np.asarray(current["no2"], dtype=np.float64)
+        previous_no2 = np.asarray(previous["no2"], dtype=np.float64)
+        current_valid = np.isfinite(current_no2)
+        previous_valid = np.isfinite(previous_no2)
+        current_fraction = _require_coverage(
+            current_valid,
+            MIN_CURRENT_NO2_FINITE_FRACTION,
+            "Current NO2",
+        )
+
+        paired_valid = current_valid & previous_valid
+        paired_fraction = _require_coverage(
+            paired_valid,
+            MIN_DELTA_NO2_FINITE_FRACTION,
+            "One-hour delta",
+        )
+        delta_no2 = np.full_like(current_no2, np.nan)
+        np.subtract(current_no2, previous_no2, out=delta_no2, where=paired_valid)
+
         ema_no2 = _ema_from_scans(ema_scan_paths, ema_scan_age_days)
-        ema_delta_no2 = current_no2 - ema_no2
-        p10, p50, p99 = np.percentile(delta_values, [10, 50, 99])
+        ema_paired_valid = current_valid & np.isfinite(ema_no2)
+        ema_paired_fraction = _require_coverage(
+            ema_paired_valid,
+            MIN_EMA_DELTA_NO2_FINITE_FRACTION,
+            "EMA delta",
+        )
+        ema_delta_no2 = np.full_like(current_no2, np.nan)
+        np.subtract(current_no2, ema_no2, out=ema_delta_no2, where=ema_paired_valid)
+        p10, p50, p99 = np.percentile(delta_no2[paired_valid], [10, 50, 99])
         denominator = p50 - p10
         epsilon = np.finfo(np.float64).eps * max(abs(p10), abs(p50), 1.0)
         features = {
             "plume_score": float((p99 - p50) / max(denominator, epsilon)),
-            PAIRED_FINITE_FRACTION_COL: float(np.mean(paired_valid)),
+            CURRENT_FINITE_FRACTION_COL: current_fraction,
+            PAIRED_FINITE_FRACTION_COL: paired_fraction,
+            EMA_PAIRED_FINITE_FRACTION_COL: ema_paired_fraction,
             "mean_weighted_cloud_fraction": _paired_mean(
                 current["weighted_cloud_fraction"], previous["weighted_cloud_fraction"], paired_valid
             ),
@@ -811,6 +846,9 @@ def derive_raster_features(
         CURRENT_RASTER_NAME: current_no2.astype(np.float32),
         DELTA_RASTER_NAME: delta_no2.astype(np.float32),
         EMA_DELTA_RASTER_NAME: ema_delta_no2.astype(np.float32),
+        CURRENT_MASK_NAME: current_valid.astype(np.uint8),
+        DELTA_MASK_NAME: paired_valid.astype(np.uint8),
+        EMA_DELTA_MASK_NAME: ema_paired_valid.astype(np.uint8),
     }
     return rasters, features
 
@@ -837,6 +875,41 @@ def _write_npz_atomic(destination: str, **arrays: np.ndarray | float) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
+def _validate_model_rasters(rasters: dict[str, np.ndarray]) -> None:
+    # Validate the complete model bundle before its atomic write
+    expected_names = set((*MODEL_IMAGE_KEYS, *MODEL_MASK_KEYS))
+    if set(rasters) != expected_names:
+        raise ValueError(f"Model raster bundle keys differ from {sorted(expected_names)}")
+    for name in MODEL_IMAGE_KEYS:
+        raster = rasters[name]
+        if raster.shape != (IMG_SIZE, IMG_SIZE) or raster.dtype != np.float32:
+            raise ValueError(f"{name} must be a float32 {(IMG_SIZE, IMG_SIZE)} raster")
+    for channel, name in enumerate(MODEL_MASK_KEYS):
+        mask = rasters[name]
+        if mask.shape != (IMG_SIZE, IMG_SIZE) or mask.dtype != np.uint8 or not np.isin(mask, (0, 1)).all():
+            raise ValueError(f"{name} must be a binary uint8 {(IMG_SIZE, IMG_SIZE)} mask")
+        if not np.array_equal(mask.astype(bool), np.isfinite(rasters[MODEL_IMAGE_KEYS[channel]])):
+            raise ValueError(f"{name} disagrees with finite {MODEL_IMAGE_KEYS[channel]} values")
+    for name in (WIND_U_RASTER_NAME, WIND_V_RASTER_NAME):
+        if not np.isfinite(rasters[name]).all():
+            raise ValueError(f"{name} must be finite across the full grid")
+
+
+def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    # Build and validate one complete raster and scalar feature bundle
+    rasters, features = derive_raster_features(
+        task.current_cache_path,
+        task.previous_cache_path,
+        task.ema_scan_paths,
+        task.ema_scan_age_days,
+    )
+    wind_rasters, weather_features = extract_wind_cache(task.wind_cache_path)
+    rasters.update(wind_rasters)
+    features.update(weather_features)
+    _validate_model_rasters(rasters)
+    return rasters, features
+
+
 def process_record(task: RecordTask) -> RecordResult:
     """Create one persistent model raster bundle and its tabular features.
 
@@ -847,19 +920,27 @@ def process_record(task: RecordTask) -> RecordResult:
         Derived scalar features or contextual failure text.
     """
     try:
-        rasters, features = derive_raster_features(
-            task.current_cache_path,
-            task.previous_cache_path,
-            task.ema_scan_paths,
-            task.ema_scan_age_days,
-        )
-        wind_rasters, weather_features = extract_wind_cache(task.wind_cache_path)
-        rasters.update(wind_rasters)
-        features.update(weather_features)
+        rasters, features = _build_model_bundle(task)
         _write_npz_atomic(task.output_path, **rasters)
         return RecordResult(task.split, task.record_index, features, None)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         return RecordResult(task.split, task.record_index, {}, f"Record processing failed: {error}")
+
+
+def audit_record(task: RecordTask) -> RecordResult:
+    """Evaluate one record entirely from persistent caches without writing a raster.
+
+    Args:
+        task: Cached TEMPO and HRRR locations for one record.
+
+    Returns:
+        Derived scalar features or contextual failure text.
+    """
+    try:
+        _, features = _build_model_bundle(task)
+        return RecordResult(task.split, task.record_index, features, None)
+    except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        return RecordResult(task.split, task.record_index, {}, f"Record audit failed: {error}")
 
 
 def write_json_atomic(values: dict[str, object], destination: Path) -> None:

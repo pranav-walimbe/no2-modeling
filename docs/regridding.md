@@ -37,9 +37,8 @@ Each AOI scan is saved as one compressed `.npz` holding five aligned 48 by 48
 | `sum_weight` | Total area in km2 where accepted native footprints overlap the cell | `0.0` when no accepted footprint overlaps; zero marks a real absence of support, not a missing value |
 
 The ancillary rasters stay populated where `no2` is `NaN`, which preserves
-information about cloudy or low-overlap cells. Downstream code requires at
-least 99% finite NO2 in each scan and fills the remaining gaps before forming a
-delta.
+information about cloudy or low-overlap cells. Downstream code preserves these
+gaps and forms explicit masks instead of interpolating them.
 
 ## Dataset-generation output
 
@@ -63,20 +62,22 @@ cache files are still written atomically.
 Pass the matching flag after changing TEMPO processing or wind alignment.
 
 Each successful model record persists one compressed NPZ holding five aligned
-`float32` arrays:
+`float32` arrays and three `uint8` masks:
 
-- `current_no2`, current-scan NO2 after filling at most 1% missing cells;
-- `delta_no2`, current minus previous filled NO2;
+- `current_no2`, current-scan NO2 on native QA-passing support;
+- `delta_no2`, current minus previous NO2 on their support intersection;
 - `ema_delta_no2`, current minus a causal same-time 14-day NO2 EMA;
 - `wind_u_10m_mps`, geographic eastward wind;
-- `wind_v_10m_mps`, geographic northward wind.
+- `wind_v_10m_mps`, geographic northward wind;
+- `current_no2_mask`, `delta_no2_mask`, and `ema_delta_no2_mask`, independent
+  binary support for the three NO2 arrays.
 
 The EMA uses one closest scan per preceding calendar day within 60 minutes of
-the current scan time and a 5-day half-life. Every contributing scan must have
-at least 99% finite NO2 before nearest-valid filling, and each record requires at
-least seven such scans. EMA scans use the same persistent TEMPO image cache as
-the current and previous scans. Normalization occurs only after forming the EMA
-delta.
+the current scan time and a seven-day half-life. Each record needs at least
+seven historical dates. Each cell needs finite support from at least five dates;
+its weights are renormalized over only those dates. EMA scans use the same
+persistent TEMPO image cache as the current and previous scans. Normalization
+occurs only after forming the EMA delta.
 
 Every row in the companion split CSV carries its NPZ path in `delta_no2_path`
 plus these derived features:
@@ -111,10 +112,10 @@ pairs. Production uses:
 - an accepted-overlap floor of 0.25 km2;
 - no additional effective-sample floor.
 
-Dataset generation requires at least 99% finite NO2 independently in every
-current, previous, and contributing EMA scan. It fills the remaining cells from
-the nearest finite grid cell, then selects records through temporal and AOI
-round-robin without coverage ranking. These rules do not change per-scan
+Dataset generation requires greater than 90% current coverage and greater than
+75% support for both the hourly and EMA deltas. It retains missing cells and
+selects eligible records through temporal and AOI round-robin with hourly paired
+coverage as the sole quality rank. These rules do not change per-scan
 tessellation or its 0.25 km2 cell-support floor. Plume, cloud, uncertainty, and
 quality summaries remain diagnostics and rank nothing.
 

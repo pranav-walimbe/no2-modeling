@@ -66,18 +66,19 @@ distortion, so the transform is gone.
 
 ## Image representation and normalization
 
-Five channels reach the model:
+Five numeric channels and three masks reach the model:
 
-1. current NO2 after the per-scan coverage gate and nearest-valid filling;
-2. current-minus-previous filled NO2;
+1. current NO2 on finite native support;
+2. current-minus-previous NO2 on paired support;
 3. current-minus-14-day same-time EMA NO2;
 4. geographic eastward wind aligned from the native HRRR grid;
-5. geographic northward wind aligned from the native HRRR grid.
+5. geographic northward wind aligned from the native HRRR grid;
+6. independent binary validity masks for the three NO2 channels.
 
 The causal EMA uses the closest preceding scan from each of 14 calendar days
-within 60 minutes of the current scan time. Daily values receive a 5-day
-half-life. Every scan requires 99% finite coverage before its remaining gaps are
-filled, and each record requires at least seven eligible EMA scans.
+within 60 minutes of the current scan time. Daily values receive a seven-day
+half-life. Each record requires at least seven historical dates and each EMA
+cell requires at least five finite dates.
 
 Every statistic comes from training pixels alone:
 
@@ -91,12 +92,14 @@ normalized[channel] =
     (raster[channel] - train_center[channel]) / train_scale[channel]
 ```
 
-- Clip all five numeric channels to `[-8, 8]`.
+- Clip all five numeric channels to `[-8, 8]` and replace invalid normalized
+  values with zero only when loading the model input.
 - Fit every channel on its finite training pixels.
 - Reuse the frozen training statistics for validation, test, and inference.
 
-The three NO2 channels are finite after filling. No validity-mask channel is
-provided to the network.
+The three masks remain binary and unscaled. A separate two-layer partial-
+convolution stem consumes each NO2 value-mask pair. The resulting features join
+the dense wind stem before the shared residual encoder.
 
 Two design notes:
 

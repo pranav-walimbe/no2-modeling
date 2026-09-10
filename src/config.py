@@ -85,11 +85,14 @@ DATASET_TEMPO_CACHE_DIR = os.path.join(DATASET_DIR, "tempo-cache")  # persistent
 DATASET_WIND_CACHE_DIR = os.path.join(DATASET_DIR, "wind-cache")  # persistent aligned AOI-hour wind rasters
 IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
-MIN_NO2_FINITE_FRACTION = 0.95  # least finite share required before filling a TEMPO raster
+MIN_CURRENT_NO2_FINITE_FRACTION = 0.90  # strict record-level current-scan coverage floor
+MIN_DELTA_NO2_FINITE_FRACTION = 0.75  # strict paired current/previous coverage floor
+MIN_EMA_DELTA_NO2_FINITE_FRACTION = 0.75  # strict paired current/EMA coverage floor
 EMA_HISTORY_DAYS = 14  # causal same-time background window before each current scan
-EMA_HALF_LIFE_DAYS = 5.0  # temporal decay applied inside the same-time background
+EMA_HALF_LIFE_DAYS = 7.0  # temporal decay applied inside the same-time background
 EMA_SAME_TIME_TOLERANCE_MINUTES = 60  # largest daily scan-time mismatch
 EMA_MIN_SCANS = 7  # least number of eligible daily EMA scans required per record
+EMA_MIN_PIXEL_OBSERVATIONS = 5  # least distinct historical dates required per EMA cell
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
@@ -109,10 +112,10 @@ OUTLIER_FILTER_COLUMNS = (  # excludes coordinates, counts, time, and already bo
     DELTA_NOX_SCALE_COL,
 )
 
-TRAIN_SIZE = 12_000
+TRAIN_SIZE = 16_000
 VAL_SIZE = 4_000
 TEST_SIZE = 4_000
-STRATIFY_CANDIDATE_MULTIPLIER = 5  # overdraw for raster eligibility attrition
+STRATIFY_CANDIDATE_MULTIPLIER = 3  # overdraw for raster eligibility attrition
 TRAIN_RECORDS_SIZE = TRAIN_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 VAL_RECORDS_SIZE = VAL_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
@@ -122,8 +125,10 @@ TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
 MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2", "wind_u_10m_mps", "wind_v_10m_mps")
+MODEL_MASK_KEYS = ("current_no2_mask", "delta_no2_mask", "ema_delta_no2_mask")
 MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2")
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS)
+MODEL_INPUT_CHANNELS = MODEL_IMAGE_CHANNELS + len(MODEL_MASK_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
 MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
     "num_coal_units",
@@ -143,4 +148,6 @@ NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))  # n
 COUNTRIES_URL = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"  # country polygons for US map background
 CITIES_URL = "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_populated_places_simple.zip"  # populated places shapefile for proximity filtering
 REFERENCE_CACHE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/reference"  # downloaded reference geometry cache
-CITIES_CACHE = os.path.join(REFERENCE_CACHE_DIR, "ne_10m_populated_places_simple.zip")  # local copy read without GDAL networking
+CITIES_CACHE = os.path.join(
+    REFERENCE_CACHE_DIR, "ne_10m_populated_places_simple.zip"
+)  # local copy read without GDAL networking
