@@ -313,11 +313,19 @@ def _fuel_flags() -> tuple[pl.Expr, pl.Expr]:
     return fuel.str.contains("coal"), fuel.str.contains("natural gas")
 
 
-def _previous_quarter_power_priorities(
+def previous_quarter_power_priorities(
     records: pl.LazyFrame,
     membership: pl.DataFrame,
 ) -> pl.LazyFrame:
-    # Shift unit-level quarterly output summaries into the prediction quarter
+    """Build lagged AOI power summaries for record prioritization.
+
+    Args:
+        records: Unit-hour emissions records with fuel and gross-load fields.
+        membership: Facility-to-AOI membership table.
+
+    Returns:
+        Total and coal power summaries shifted into the following quarter.
+    """
     coal, _ = _fuel_flags()
     unit_quarter = (
         records.with_columns(
@@ -548,7 +556,7 @@ def aggregate_aoi_hours(
     """Aggregate unit observations and prediction-date attributes to AOI hours."""
     records_lazy = records.lazy() if isinstance(records, pl.DataFrame) else records
     coal, natural_gas = _fuel_flags()
-    power_priorities = _previous_quarter_power_priorities(records_lazy, membership)
+    power_priorities = previous_quarter_power_priorities(records_lazy, membership)
     unit_counts = (
         records_lazy.with_columns(coal.alias("is_coal"), natural_gas.alias("is_ng"))
         .group_by("facilityId", "unitId")

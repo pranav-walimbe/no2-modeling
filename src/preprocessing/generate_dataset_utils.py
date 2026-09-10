@@ -5,9 +5,12 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
 import polars as pl
@@ -18,14 +21,20 @@ from eccodes import (
     codes_release,
 )
 from pyproj import CRS, Proj, Transformer
-from scipy.ndimage import distance_transform_edt, map_coordinates
+from scipy.ndimage import map_coordinates
 
 from config import (
+    DATASET_RASTER_DIR,
     EMA_HALF_LIFE_DAYS,
-    EMA_MIN_SCANS,
+    EMA_HISTORY_DAYS,
+    EMA_MIN_PIXEL_OBSERVATIONS,
+    EMA_SAME_TIME_TOLERANCE_MINUTES,
     LABEL_COL,
-    MIN_NO2_FINITE_FRACTION,
+    MIN_CURRENT_NO2_FINITE_FRACTION,
+    MIN_DELTA_NO2_FINITE_FRACTION,
+    MIN_EMA_DELTA_NO2_FINITE_FRACTION,
     MODEL_IMAGE_KEYS,
+    MODEL_MASK_KEYS,
 )
 from preprocessing.regrid import (
     AoiGrid,
@@ -38,7 +47,10 @@ from preprocessing.regrid import (
 from preprocessing.stratify_utils import AOI_ID_COL
 
 CURRENT_RASTER_NAME, DELTA_RASTER_NAME, EMA_DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
+CURRENT_MASK_NAME, DELTA_MASK_NAME, EMA_DELTA_MASK_NAME = MODEL_MASK_KEYS
+CURRENT_FINITE_FRACTION_COL = "current_finite_fraction"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
+EMA_PAIRED_FINITE_FRACTION_COL = "ema_paired_finite_fraction"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
@@ -53,7 +65,9 @@ HRRR_FIELDS = {
 }
 TABULAR_FEATURE_NAMES = (
     "plume_score",
+    CURRENT_FINITE_FRACTION_COL,
     PAIRED_FINITE_FRACTION_COL,
+    EMA_PAIRED_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
@@ -61,6 +75,7 @@ TABULAR_FEATURE_NAMES = (
 )
 SOURCE_RECORD_INDEX_COL = "_source_record_index"
 CANDIDATE_RASTER_PATH_COL = "_candidate_raster_path"
+DELTA_NO2_PATH_COL = "delta_no2_path"
 CANDIDATE_FEATURE_SCHEMA = {
     SOURCE_RECORD_INDEX_COL: pl.UInt32,
     CANDIDATE_RASTER_PATH_COL: pl.String,
@@ -70,6 +85,44 @@ PROCESSING_FAILURE_SCHEMA = {"record_index": pl.Int64, "error": pl.String}
 SHARD_CANDIDATES_FILE = "candidates.csv"
 SHARD_FAILURES_FILE = "failures.csv"
 SHARD_COMPLETION_FILE = "complete.json"
+MAX_PENDING_FACTOR = 2
+InputT = TypeVar("InputT")
+OutputT = TypeVar("OutputT")
+
+
+def bounded_parallel_map(
+    function: Callable[[InputT], OutputT],
+    tasks: Iterable[InputT],
+    workers: int,
+) -> Iterator[OutputT]:
+    """Map a worker function over tasks while bounding pending futures.
+
+    Args:
+        function: Worker callable executed in a separate process.
+        tasks: Task stream consumed lazily so large runs stay memory-safe.
+        workers: Number of worker processes.
+
+    Yields:
+        Each worker result as it completes.
+    """
+    task_iterator = iter(tasks)
+    max_pending = max(workers * MAX_PENDING_FACTOR, 1)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        pending: set[Future[OutputT]] = set()
+        for _ in range(max_pending):
+            try:
+                pending.add(executor.submit(function, next(task_iterator)))
+            except StopIteration:
+                break
+
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                yield future.result()
+                try:
+                    pending.add(executor.submit(function, next(task_iterator)))
+                except StopIteration:
+                    pass
 
 
 @dataclass(frozen=True)
@@ -98,8 +151,6 @@ def build_shard_plan(split_paths: dict[str, str], shard_size: int) -> list[Shard
     Returns:
         Deterministic shard tasks spanning every source record.
     """
-    if shard_size <= 0:
-        raise ValueError("Shard size must be greater than zero")
     tasks: list[ShardTask] = []
     for split, path in split_paths.items():
         row_count = int(pl.scan_csv(path).select(pl.len()).collect(engine="streaming").item())
@@ -133,8 +184,6 @@ class DatasetShardStore:
             Candidate features and processing failures.
         """
         shard_dir = self.root / task.split / f"{task.shard_index:06d}"
-        with (shard_dir / SHARD_COMPLETION_FILE).open() as source:
-            completion = json.load(source)
         candidates = pl.read_csv(
             shard_dir / SHARD_CANDIDATES_FILE,
             schema_overrides=CANDIDATE_FEATURE_SCHEMA,
@@ -143,11 +192,6 @@ class DatasetShardStore:
             shard_dir / SHARD_FAILURES_FILE,
             schema_overrides=PROCESSING_FAILURE_SCHEMA,
         )
-        expected_completion = self._completion_values(task, candidates.height, failures.height)
-        if completion != expected_completion:
-            raise ValueError(f"Shard {task.task_id} has an inconsistent completion marker")
-        if candidates.schema != CANDIDATE_FEATURE_SCHEMA:
-            raise ValueError(f"Shard {task.task_id} has an unexpected candidate schema")
         expected_indices = list(range(task.start, task.stop))
         candidate_indices = [int(value) for value in candidates[SOURCE_RECORD_INDEX_COL].to_list()]
         failure_indices = [int(value) for value in failures["record_index"].to_list()]
@@ -161,9 +205,6 @@ class DatasetShardStore:
             strict=True,
         ):
             relative_path = Path(str(serialized_path))
-            expected_path = Path("record-rasters") / task.split / f"{record_index:06d}.npz"
-            if relative_path != expected_path:
-                raise ValueError(f"Shard {task.task_id} has an unexpected raster path for record {record_index}")
             absolute_path = shard_dir / relative_path
             if not absolute_path.is_file():
                 raise ValueError(f"Shard {task.task_id} is missing raster {relative_path}")
@@ -257,23 +298,13 @@ class DatasetShardStore:
             shard_root.rmdir()
 
     def _prepare_root(self) -> Path:
-        # Validate the shard root before changing descendants
-        dataset_root = self.root.parent.resolve()
-        if self.root.name != "shards" or self.root.is_symlink():
-            raise ValueError(f"Refusing to use shard workspace outside {dataset_root}: {self.root}")
-        if self.root.exists() and not self.root.is_dir():
-            raise ValueError(f"Shard workspace is not a directory: {self.root}")
+        # Create the shard root before changing descendants
         self.root.mkdir(parents=True, exist_ok=True)
         return self.root
 
     def _prepare_split_root(self, split: str) -> Path:
-        # Validate one split directory before changing shard contents
-        shard_root = self._prepare_root()
-        split_root = shard_root / split
-        if split_root.parent.resolve() != shard_root.resolve() or split_root.is_symlink():
-            raise ValueError(f"Refusing to use split shard workspace outside {shard_root}: {split_root}")
-        if split_root.exists() and not split_root.is_dir():
-            raise ValueError(f"Split shard workspace is not a directory: {split_root}")
+        # Create one split directory before changing shard contents
+        split_root = self._prepare_root() / split
         split_root.mkdir(parents=True, exist_ok=True)
         return split_root
 
@@ -301,30 +332,100 @@ class DatasetShardStore:
         }
 
 
+def _coverage_group_summary(frame: pl.DataFrame) -> dict[str, int | float]:
+    # Summarize retained count and paired coverage for one record group
+    records = frame.height
+    full_coverage = frame.filter(pl.col(PAIRED_FINITE_FRACTION_COL) >= 1.0).height
+    return {
+        "records": records,
+        "full_coverage_records": full_coverage,
+        "full_coverage_fraction": full_coverage / records if records else 0.0,
+        "aoi_count": frame[AOI_ID_COL].n_unique() if records else 0,
+    }
+
+
+def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
+    """Report paired coverage and AOI representation overall and by class.
+
+    Args:
+        frame: Records carrying paired coverage and class labels.
+
+    Returns:
+        Coverage counts and AOI representation for the frame and each class.
+    """
+    return {
+        **_coverage_group_summary(frame),
+        "by_class": {str(label): _coverage_group_summary(frame.filter(pl.col(LABEL_COL) == label)) for label in (0, 1)},
+    }
+
+
+def install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:
+    """Install selected rasters into one split through an atomic replacement.
+
+    Links or copies each selected raster into a staging directory, swaps it into
+    place, and restores the previous split if any step fails. Shard rasters stay
+    intact so a later run can resume from them.
+
+    Args:
+        split: Split whose raster directory is replaced.
+        frame: Selected records carrying candidate raster paths.
+
+    Returns:
+        The frame with a relative path column for each installed raster.
+    """
+    raster_root = Path(DATASET_RASTER_DIR)
+    raster_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{split}-staging-", dir=raster_root))
+    final_dir = raster_root / split
+    backup = Path(tempfile.mkdtemp(prefix=f".{split}-backup-", dir=raster_root))
+    backup.rmdir()
+    had_previous = final_dir.exists()
+    relative_paths = []
+    try:
+        for output_index, candidate_path in enumerate(frame[CANDIDATE_RASTER_PATH_COL].to_list()):
+            filename = f"{output_index:06d}.npz"
+            destination = staging / filename
+            try:
+                os.link(candidate_path, destination)
+            except OSError:
+                shutil.copy2(candidate_path, destination)
+            relative_paths.append(str(Path("rasters") / split / filename))
+        if had_previous:
+            os.replace(final_dir, backup)
+        os.replace(staging, final_dir)
+    except Exception:
+        if final_dir.exists() and had_previous and backup.exists():
+            shutil.rmtree(final_dir)
+            os.replace(backup, final_dir)
+        elif had_previous and backup.exists():
+            os.replace(backup, final_dir)
+        raise
+    else:
+        if backup.exists():
+            shutil.rmtree(backup)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+        if backup.exists() and not had_previous:
+            shutil.rmtree(backup)
+    return frame.with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
+
+
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
-    """Select an exactly balanced coverage-ranked AOI subset.
+    """Select the largest requested balanced coverage-ranked AOI subset.
 
     Args:
         frame: Successfully generated candidate records with finite paired coverage.
-        size: Exact number of records to select.
+        size: Maximum number of records to select.
 
     Returns:
         Selected records without temporary ranking columns.
     """
-    if PAIRED_FINITE_FRACTION_COL not in frame.columns:
-        raise ValueError(f"Generated records are missing {PAIRED_FINITE_FRACTION_COL}")
-    if not frame[PAIRED_FINITE_FRACTION_COL].is_finite().all():
-        raise ValueError("Generated records contain non-finite paired raster coverage")
-
-    class_size = size // 2
+    eligible_by_class = {label: frame.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
+    class_size = min(size // 2, *eligible_by_class.values())
     selected_classes = []
     for label in (0, 1):
         class_records = frame.filter(pl.col(LABEL_COL) == label)
-        if class_records.height < class_size:
-            raise ValueError(
-                f"Only {class_records.height:,} class {label} records were generated; "
-                f"cannot produce the requested {class_size:,}"
-            )
         selected_classes.append(_rank_final_records(class_records).head(class_size))
     return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
 
@@ -509,6 +610,21 @@ def cache_exists(path: str | Path) -> bool:
     return Path(path).is_file()
 
 
+def scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
+    """Group scan tasks so each worker reads one granule set once.
+
+    Args:
+        scans: Scan tasks awaiting regridding.
+
+    Returns:
+        One batch per distinct granule set.
+    """
+    grouped: dict[tuple[str, ...], list[ScanTask]] = {}
+    for scan in scans:
+        grouped.setdefault(scan.granule_paths, []).append(scan)
+    return [ScanBatchTask(paths, tuple(group)) for paths, group in grouped.items()]
+
+
 def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
     """Regrid several AOIs while loading each shared granule once.
 
@@ -671,6 +787,21 @@ def _centre_hrrr_features(grid: _HrrrGrid, fields: dict[str, np.ndarray], task: 
     }
 
 
+def wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
+    """Group wind tasks so each HRRR field is read once.
+
+    Args:
+        winds: Wind tasks awaiting alignment.
+
+    Returns:
+        One batch per distinct HRRR file.
+    """
+    grouped: dict[str, list[WindTask]] = {}
+    for wind in winds:
+        grouped.setdefault(wind.hrrr_path, []).append(wind)
+    return [WindBatchTask(path, tuple(group)) for path, group in grouped.items()]
+
+
 def process_wind_batch(batch: WindBatchTask) -> list[WindResult]:
     """Align all AOIs sharing one HRRR source file.
 
@@ -724,45 +855,74 @@ def _paired_mean(current: np.ndarray, previous: np.ndarray, valid: np.ndarray) -
 
 
 class _InsufficientRasterCoverageError(ValueError):
-    """Signal that a TEMPO raster cannot be safely gap-filled."""
+    """Signal that a derived TEMPO raster misses a fixed coverage gate."""
 
 
-def _fill_no2(no2: np.ndarray, scan_name: str) -> np.ndarray:
-    # Fill small coverage gaps from the nearest finite grid cell
-    values = np.asarray(no2, dtype=np.float64)
-    finite = np.isfinite(values)
-    finite_fraction = float(np.mean(finite))
-    if finite_fraction < MIN_NO2_FINITE_FRACTION:
+def _require_coverage(valid: np.ndarray, threshold: float, raster_name: str) -> float:
+    # Return coverage after enforcing one strict raster eligibility gate
+    fraction = float(np.mean(valid))
+    if fraction <= threshold:
         raise _InsufficientRasterCoverageError(
-            f"{scan_name} NO2 coverage is below the required {MIN_NO2_FINITE_FRACTION:.0%}"
+            f"{raster_name} coverage must exceed {threshold:.0%}; got {fraction:.2%}"
         )
-    if finite.all():
-        return values
-    nearest = distance_transform_edt(~finite, return_distances=False, return_indices=True)
-    return values[tuple(nearest)]
+    return fraction
+
+
+def same_time_ema_observations(
+    observations_by_day: dict[date, list[dict[str, object]]], target_time: datetime
+) -> list[dict[str, object]]:
+    """Select the closest preceding same-time scan for each historical day.
+
+    Args:
+        observations_by_day: Candidate observations indexed by calendar day.
+        target_time: Scan time the history is matched against.
+
+    Returns:
+        At most one observation per preceding day, ordered by scan time.
+    """
+    target_seconds = target_time.hour * 3600 + target_time.minute * 60 + target_time.second
+    selected = []
+    for age_days in range(1, EMA_HISTORY_DAYS + 1):
+        scan_date = target_time.date() - timedelta(days=age_days)
+        candidates = []
+        for observation in observations_by_day.get(scan_date, []):
+            observation_time = observation["tempo_time"]
+            observation_seconds = observation_time.hour * 3600 + observation_time.minute * 60 + observation_time.second
+            difference = abs((observation_seconds - target_seconds + 43_200) % 86_400 - 43_200)
+            if difference <= EMA_SAME_TIME_TOLERANCE_MINUTES * 60:
+                candidates.append((difference, -int(observation["sampled_pixel_count"]), observation))
+        if candidates:
+            selected.append(min(candidates, key=lambda priority: priority[:2])[2])
+    return sorted(selected, key=lambda row: row["tempo_time"])
 
 
 def _ema_from_scans(
     ema_scan_paths: tuple[str, ...],
     ema_scan_age_days: tuple[float, ...],
 ) -> np.ndarray:
-    # Build one causal EMA from eligible TEMPO cache entries
-    if len(ema_scan_paths) != len(ema_scan_age_days):
-        raise ValueError("EMA scan paths and ages must have equal length")
+    # Build one causal per-pixel EMA from the available historical dates
     ema_scans: list[np.ndarray] = []
-    usable_age_days: list[float] = []
-    for path, age_days in zip(ema_scan_paths, ema_scan_age_days, strict=True):
+    for path in ema_scan_paths:
         with np.load(path, allow_pickle=False) as cache:
-            try:
-                ema_scans.append(_fill_no2(cache["no2"], "EMA scan"))
-            except _InsufficientRasterCoverageError:
-                continue
-        usable_age_days.append(age_days)
-    if len(ema_scans) < EMA_MIN_SCANS:
-        raise ValueError(f"Only {len(ema_scans)} EMA scans meet the {MIN_NO2_FINITE_FRACTION:.0%} coverage threshold")
-    stack = np.stack(ema_scans)
-    weights = np.exp2(-np.asarray(usable_age_days, dtype=np.float64) / EMA_HALF_LIFE_DAYS)
-    return np.average(stack, axis=0, weights=weights)
+            ema_scans.append(np.asarray(cache["no2"], dtype=np.float64))
+
+    return _masked_ema(np.stack(ema_scans), np.asarray(ema_scan_age_days, dtype=np.float64))
+
+
+def _masked_ema(stack: np.ndarray, age_days: np.ndarray) -> np.ndarray:
+    # Compute support-aware temporal weights across the stacked scan axis
+    finite = np.isfinite(stack)
+    support = np.count_nonzero(finite, axis=0)
+    weights = np.exp2(-age_days / EMA_HALF_LIFE_DAYS)[:, None, None]
+    # Broadcasting per-date weights against the finite mask renormalizes each cell over its own dates
+    valid_weights = finite * weights
+    weight_sum = np.sum(valid_weights, axis=0)
+    weighted_sum = np.sum(np.where(finite, stack, 0.0) * weights, axis=0)
+    ema = np.full(stack.shape[1:], np.nan, dtype=np.float64)
+    valid = support >= EMA_MIN_PIXEL_OBSERVATIONS
+    # The where clause leaves the NaN prefill at cells below the support floor
+    np.divide(weighted_sum, weight_sum, out=ema, where=valid)
+    return ema
 
 
 def derive_raster_features(
@@ -784,19 +944,42 @@ def derive_raster_features(
         summaries.
     """
     with np.load(current_path, allow_pickle=False) as current, np.load(previous_path, allow_pickle=False) as previous:
-        paired_valid = np.isfinite(current["no2"]) & np.isfinite(previous["no2"])
-        current_no2 = _fill_no2(current["no2"], "Current scan")
-        previous_no2 = _fill_no2(previous["no2"], "Previous scan")
-        delta_no2 = current_no2 - previous_no2
-        delta_values = delta_no2.ravel()
+        current_no2 = np.asarray(current["no2"], dtype=np.float64)
+        previous_no2 = np.asarray(previous["no2"], dtype=np.float64)
+        current_valid = np.isfinite(current_no2)
+        previous_valid = np.isfinite(previous_no2)
+        current_fraction = _require_coverage(
+            current_valid,
+            MIN_CURRENT_NO2_FINITE_FRACTION,
+            "Current NO2",
+        )
+
+        paired_valid = current_valid & previous_valid
+        paired_fraction = _require_coverage(
+            paired_valid,
+            MIN_DELTA_NO2_FINITE_FRACTION,
+            "One-hour delta",
+        )
+        delta_no2 = np.full_like(current_no2, np.nan)
+        np.subtract(current_no2, previous_no2, out=delta_no2, where=paired_valid)
+
         ema_no2 = _ema_from_scans(ema_scan_paths, ema_scan_age_days)
-        ema_delta_no2 = current_no2 - ema_no2
-        p10, p50, p99 = np.percentile(delta_values, [10, 50, 99])
+        ema_paired_valid = current_valid & np.isfinite(ema_no2)
+        ema_paired_fraction = _require_coverage(
+            ema_paired_valid,
+            MIN_EMA_DELTA_NO2_FINITE_FRACTION,
+            "EMA delta",
+        )
+        ema_delta_no2 = np.full_like(current_no2, np.nan)
+        np.subtract(current_no2, ema_no2, out=ema_delta_no2, where=ema_paired_valid)
+        p10, p50, p99 = np.percentile(delta_no2[paired_valid], [10, 50, 99])
         denominator = p50 - p10
         epsilon = np.finfo(np.float64).eps * max(abs(p10), abs(p50), 1.0)
         features = {
             "plume_score": float((p99 - p50) / max(denominator, epsilon)),
-            PAIRED_FINITE_FRACTION_COL: float(np.mean(paired_valid)),
+            CURRENT_FINITE_FRACTION_COL: current_fraction,
+            PAIRED_FINITE_FRACTION_COL: paired_fraction,
+            EMA_PAIRED_FINITE_FRACTION_COL: ema_paired_fraction,
             "mean_weighted_cloud_fraction": _paired_mean(
                 current["weighted_cloud_fraction"], previous["weighted_cloud_fraction"], paired_valid
             ),
@@ -811,6 +994,9 @@ def derive_raster_features(
         CURRENT_RASTER_NAME: current_no2.astype(np.float32),
         DELTA_RASTER_NAME: delta_no2.astype(np.float32),
         EMA_DELTA_RASTER_NAME: ema_delta_no2.astype(np.float32),
+        CURRENT_MASK_NAME: current_valid.astype(np.uint8),
+        DELTA_MASK_NAME: paired_valid.astype(np.uint8),
+        EMA_DELTA_MASK_NAME: ema_paired_valid.astype(np.uint8),
     }
     return rasters, features
 
@@ -837,6 +1023,20 @@ def _write_npz_atomic(destination: str, **arrays: np.ndarray | float) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
+def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+    # Build and validate one complete raster and scalar feature bundle
+    rasters, features = derive_raster_features(
+        task.current_cache_path,
+        task.previous_cache_path,
+        task.ema_scan_paths,
+        task.ema_scan_age_days,
+    )
+    wind_rasters, weather_features = extract_wind_cache(task.wind_cache_path)
+    rasters.update(wind_rasters)
+    features.update(weather_features)
+    return rasters, features
+
+
 def process_record(task: RecordTask) -> RecordResult:
     """Create one persistent model raster bundle and its tabular features.
 
@@ -847,15 +1047,7 @@ def process_record(task: RecordTask) -> RecordResult:
         Derived scalar features or contextual failure text.
     """
     try:
-        rasters, features = derive_raster_features(
-            task.current_cache_path,
-            task.previous_cache_path,
-            task.ema_scan_paths,
-            task.ema_scan_age_days,
-        )
-        wind_rasters, weather_features = extract_wind_cache(task.wind_cache_path)
-        rasters.update(wind_rasters)
-        features.update(weather_features)
+        rasters, features = _build_model_bundle(task)
         _write_npz_atomic(task.output_path, **rasters)
         return RecordResult(task.split, task.record_index, features, None)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:

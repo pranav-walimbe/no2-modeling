@@ -5,12 +5,9 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable, Iterable, Iterator
-from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date
 from pathlib import Path
-from typing import TypeVar
 
 import polars as pl
 
@@ -21,9 +18,6 @@ from config import (
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WIND_CACHE_DIR,
     DELTA_THRESHOLD,
-    EMA_HISTORY_DAYS,
-    EMA_MIN_SCANS,
-    EMA_SAME_TIME_TOLERANCE_MINUTES,
     HRRR_DIR,
     LABEL_COL,
     NUM_CORES,
@@ -39,28 +33,31 @@ from config import (
 from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
     CANDIDATE_RASTER_PATH_COL,
-    PAIRED_FINITE_FRACTION_COL,
     PROCESSING_FAILURE_SCHEMA,
     SOURCE_RECORD_INDEX_COL,
     DatasetShardStore,
     RecordTask,
-    ScanBatchTask,
     ScanTask,
     ShardTask,
-    WindBatchTask,
     WindTask,
+    bounded_parallel_map,
     build_shard_plan,
     cache_exists,
+    coverage_selection_summary,
+    install_selected_rasters,
     make_scan_task,
     make_wind_task,
     process_record,
     process_scan_batch,
     process_wind_batch,
+    same_time_ema_observations,
+    scan_batches,
     select_final_records,
+    wind_batches,
     write_csv_atomic,
     write_json_atomic,
 )
-from preprocessing.stratify_utils import AOI_ID_COL, classification_summary
+from preprocessing.stratify_utils import classification_summary
 
 SPLIT_PATHS = {
     "train": TRAIN_RECORDS_CSV,
@@ -68,19 +65,13 @@ SPLIT_PATHS = {
     "test": TEST_RECORDS_CSV,
 }
 ARRAY_SPLITS = tuple(SPLIT_PATHS)
-MAX_PENDING_FACTOR = 2
 PROGRESS_INTERVAL = 1_000
 LEGACY_DATASET_JOB_NAME = "generate-dataset"
 SHARD_WORKER_JOB_NAME = "generate-dataset-shard"
 SHARD_FINALIZER_JOB_NAME = "generate-dataset-finalize"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DATASET_BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_dataset.sh"
-DELTA_NO2_PATH_COL = "delta_no2_path"
 FINAL_SPLIT_SIZES = {"train": TRAIN_SIZE, "val": VAL_SIZE, "test": TEST_SIZE}
-InputT = TypeVar("InputT")
-OutputT = TypeVar("OutputT")
-
-
 @dataclass(frozen=True)
 class PreparedRecord:
     """One source row resolved to its cache and output paths."""
@@ -121,32 +112,6 @@ def _slurm_array_spec(task_ids: list[int]) -> str:
     return ",".join(ranges)
 
 
-def _bounded_parallel_map(
-    function: Callable[[InputT], OutputT],
-    tasks: Iterable[InputT],
-    workers: int,
-) -> Iterator[OutputT]:
-    # Bound pending futures to keep large production runs memory-safe
-    task_iterator = iter(tasks)
-    max_pending = max(workers * MAX_PENDING_FACTOR, 1)
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        pending: set[Future[OutputT]] = set()
-        for _ in range(max_pending):
-            try:
-                pending.add(executor.submit(function, next(task_iterator)))
-            except StopIteration:
-                break
-
-        while pending:
-            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
-            for future in completed:
-                yield future.result()
-                try:
-                    pending.add(executor.submit(function, next(task_iterator)))
-                except StopIteration:
-                    pass
-
-
 def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
     # Load inputs before starting expensive worker processes
     splits: dict[str, pl.DataFrame] = {}
@@ -178,38 +143,20 @@ def _load_observations(aoi_ids: list[int]) -> ObservationIndex:
     paths = sorted(Path(TEMPO_AOI_MAPPING).rglob("date=*.parquet"))
     if not paths:
         raise FileNotFoundError(f"No AOI observation shards found under {TEMPO_AOI_MAPPING}")
+    print(f"Indexing {len(paths):,} TEMPO observation shards for {len(aoi_ids):,} AOIs")
     observations = (
         pl.scan_parquet(paths)
         .select("aoi_id", "scan_date", "tempo_time", "granule_paths", "sampled_pixel_count")
         .filter(pl.col("aoi_id").is_in(aoi_ids))
         .collect()
     )
+    print(f"Loaded {observations.height:,} matching TEMPO observations")
     index: ObservationIndex = {}
     for observation in observations.iter_rows(named=True):
         aoi_id = int(observation["aoi_id"])
         scan_date = observation["scan_date"]
         index.setdefault(aoi_id, {}).setdefault(scan_date, []).append(observation)
     return index
-
-
-def _same_time_ema_observations(
-    observations_by_day: dict[date, list[dict[str, object]]], target_time: datetime
-) -> list[dict[str, object]]:
-    # Keep the closest scan per prior day inside the same-time tolerance
-    target_seconds = target_time.hour * 3600 + target_time.minute * 60 + target_time.second
-    selected = []
-    for age_days in range(1, EMA_HISTORY_DAYS + 1):
-        scan_date = target_time.date() - timedelta(days=age_days)
-        candidates = []
-        for observation in observations_by_day.get(scan_date, []):
-            observation_time = observation["tempo_time"]
-            observation_seconds = observation_time.hour * 3600 + observation_time.minute * 60 + observation_time.second
-            difference = abs((observation_seconds - target_seconds + 43_200) % 86_400 - 43_200)
-            if difference <= EMA_SAME_TIME_TOLERANCE_MINUTES * 60:
-                candidates.append((difference, -int(observation["sampled_pixel_count"]), observation))
-        if candidates:
-            selected.append(min(candidates, key=lambda priority: priority[:2])[2])
-    return sorted(selected, key=lambda row: row["tempo_time"])
 
 
 def _prepare_records(
@@ -225,20 +172,21 @@ def _prepare_records(
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in splits}
     aoi_ids = sorted({int(aoi_id) for frame in splits.values() for aoi_id in frame["aoi_id"].unique()})
     observations_by_aoi = _load_observations(aoi_ids)
+    source_count = sum(frame.height for frame in splits.values())
+    prepared_count = 0
     for split, frame in splits.items():
         output_dir = run_dir / "record-rasters" / split
         output_dir.mkdir(parents=True, exist_ok=True)
         for row in frame.iter_rows(named=True):
+            prepared_count += 1
             record_index = int(row[SOURCE_RECORD_INDEX_COL])
             try:
                 current = make_scan_task(row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 wind = make_wind_task(row, Path(HRRR_DIR), wind_cache_dir)
-                ema_observations = _same_time_ema_observations(
+                ema_observations = same_time_ema_observations(
                     observations_by_aoi[int(row["aoi_id"])], row["tempo_time"]
                 )
-                if len(ema_observations) < EMA_MIN_SCANS:
-                    raise ValueError(f"Only {len(ema_observations)} same-time EMA scans are available")
                 ema_scans = []
                 ema_scan_age_days = []
                 for observation in ema_observations:
@@ -272,15 +220,9 @@ def _prepare_records(
                 winds.setdefault(wind.cache_key, wind)
             except (KeyError, TypeError, ValueError) as error:
                 failures[split].append({"record_index": record_index, "error": str(error)})
+            if prepared_count % PROGRESS_INTERVAL == 0 or prepared_count == source_count:
+                print(f"Prepared cache plan for {prepared_count:,}/{source_count:,} source records")
     return records, scans, winds, failures
-
-
-def _scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
-    # Group AOIs by source files so each worker reads a granule set once
-    grouped: dict[tuple[str, ...], list[ScanTask]] = {}
-    for scan in scans:
-        grouped.setdefault(scan.granule_paths, []).append(scan)
-    return [ScanBatchTask(paths, tuple(group)) for paths, group in grouped.items()]
 
 
 def _run_tempo_regridding(
@@ -297,11 +239,11 @@ def _run_tempo_regridding(
     print(f"TEMPO cache: {len(tempo_cache_paths):,} hits; {len(missing):,} scans to generate")
     if not missing:
         return tempo_cache_paths, failures
-    batches = _scan_batches(missing)
+    batches = scan_batches(missing)
     granule_reads = sum(len(batch.granule_paths) for batch in batches)
     print(f"Grouped cache misses into {len(batches):,} batches requiring {granule_reads:,} granule reads")
     completed = 0
-    for batch_results in _bounded_parallel_map(process_scan_batch, batches, workers):
+    for batch_results in bounded_parallel_map(process_scan_batch, batches, workers):
         for result in batch_results:
             completed += 1
             if result.error is None:
@@ -311,14 +253,6 @@ def _run_tempo_regridding(
         if completed % PROGRESS_INTERVAL < len(batch_results) or completed == len(missing):
             print(f"Regridded {completed:,}/{len(missing):,} cache-missing AOI scans")
     return tempo_cache_paths, failures
-
-
-def _wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
-    # Group AOIs by HRRR hour so each full field is read once
-    grouped: dict[str, list[WindTask]] = {}
-    for wind in winds:
-        grouped.setdefault(wind.hrrr_path, []).append(wind)
-    return [WindBatchTask(path, tuple(group)) for path, group in grouped.items()]
 
 
 def _run_wind_alignment(
@@ -336,7 +270,7 @@ def _run_wind_alignment(
     if not missing:
         return cache_paths, failures
     completed = 0
-    for batch_results in _bounded_parallel_map(process_wind_batch, _wind_batches(missing), workers):
+    for batch_results in bounded_parallel_map(process_wind_batch, wind_batches(missing), workers):
         for result in batch_results:
             completed += 1
             if result.error is None:
@@ -372,17 +306,6 @@ def _record_tasks(
             for key, age in zip(record.ema_scan_keys, record.ema_scan_age_days, strict=True)
             if key in tempo_cache_paths
         ]
-        if len(available_ema_scans) < EMA_MIN_SCANS:
-            missing_count = len(record.ema_scan_keys) - len(available_ema_scans)
-            failures[record.split].append(
-                {
-                    "record_index": record.record_index,
-                    "error": (
-                        f"Only {len(available_ema_scans)} EMA scans remain after {missing_count} TEMPO cache failures"
-                    ),
-                }
-            )
-            continue
         if record.wind_cache_key not in wind_cache_paths:
             reason = wind_failures.get(record.wind_cache_key, "wind cache unavailable")
             failures[record.split].append({"record_index": record.record_index, "error": reason})
@@ -413,7 +336,7 @@ def _run_record_processing(
     # Derive delta rasters and scalar features in parallel
     output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in failures}
     total = len(tasks)
-    for completed, result in enumerate(_bounded_parallel_map(process_record, tasks, workers), start=1):
+    for completed, result in enumerate(bounded_parallel_map(process_record, tasks, workers), start=1):
         record_id = (result.split, result.record_index)
         if result.error is not None:
             failures[result.split].append({"record_index": result.record_index, "error": result.error})
@@ -445,8 +368,20 @@ def _write_outputs(
             SOURCE_RECORD_INDEX_COL
         )
         output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
-        selected_coverage = _coverage_selection_summary(output_frame)
+        selected_coverage = coverage_selection_summary(output_frame)
+        eligible_by_class = {str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
+        selection_size = {
+            "requested_size": FINAL_SPLIT_SIZES[split],
+            "actual_size": output_frame.height,
+            "shortfall": FINAL_SPLIT_SIZES[split] - output_frame.height,
+            "eligible_by_class": eligible_by_class,
+        }
         print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
+        if selection_size["shortfall"]:
+            print(
+                f"[{split}] requested {selection_size['requested_size']:,}; "
+                f"using largest balanced subset with {selection_size['shortfall']:,} fewer records"
+            )
         print(
             f"[{split}] full paired coverage: {selected_coverage['full_coverage_records']:,}/"
             f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"
@@ -454,9 +389,10 @@ def _write_outputs(
         classification_report = {
             "split": split,
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
+            "selection_size": selection_size,
             "final_balance": classification_summary(candidates, output_frame),
             "coverage_selection": {
-                "generated": _coverage_selection_summary(candidates),
+                "generated": coverage_selection_summary(candidates),
                 "selected": selected_coverage,
             },
         }
@@ -467,7 +403,7 @@ def _write_outputs(
         )
 
     for split, (output_frame, classification_report, failure_frame) in prepared_outputs.items():
-        output_frame = _install_selected_rasters(split, output_frame)
+        output_frame = install_selected_rasters(split, output_frame)
         write_csv_atomic(
             output_frame.drop(SOURCE_RECORD_INDEX_COL, CANDIDATE_RASTER_PATH_COL),
             Path(DATASET_DF) / f"{split}_df.csv",
@@ -481,69 +417,6 @@ def _write_outputs(
             Path(DATASET_DF) / f"{split}_failures.csv",
         )
         print(f"[{split}] wrote {output_frame.height:,} records; {failure_frame.height:,} processing failures")
-
-
-def _coverage_group_summary(frame: pl.DataFrame) -> dict[str, int | float]:
-    # Summarize retained count and paired coverage for one record group
-    records = frame.height
-    full_coverage = frame.filter(pl.col(PAIRED_FINITE_FRACTION_COL) >= 1.0).height
-    return {
-        "records": records,
-        "full_coverage_records": full_coverage,
-        "full_coverage_fraction": full_coverage / records if records else 0.0,
-        "aoi_count": frame[AOI_ID_COL].n_unique() if records else 0,
-    }
-
-
-def _coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
-    # Report coverage and AOI representation overall and by class
-    return {
-        **_coverage_group_summary(frame),
-        "by_class": {
-            str(label): _coverage_group_summary(frame.filter(pl.col(LABEL_COL) == label))
-            for label in (0, 1)
-        },
-    }
-
-
-def _install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:
-    # Atomically replace one split without consuming resumable shard rasters
-    raster_root = Path(DATASET_RASTER_DIR)
-    raster_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{split}-staging-", dir=raster_root))
-    final_dir = raster_root / split
-    backup = Path(tempfile.mkdtemp(prefix=f".{split}-backup-", dir=raster_root))
-    backup.rmdir()
-    had_previous = final_dir.exists()
-    relative_paths = []
-    try:
-        for output_index, candidate_path in enumerate(frame[CANDIDATE_RASTER_PATH_COL].to_list()):
-            filename = f"{output_index:06d}.npz"
-            destination = staging / filename
-            try:
-                os.link(candidate_path, destination)
-            except OSError:
-                shutil.copy2(candidate_path, destination)
-            relative_paths.append(str(Path("rasters") / split / filename))
-        if had_previous:
-            os.replace(final_dir, backup)
-        os.replace(staging, final_dir)
-    except Exception:
-        if final_dir.exists() and had_previous and backup.exists():
-            shutil.rmtree(final_dir)
-            os.replace(backup, final_dir)
-        elif had_previous and backup.exists():
-            os.replace(backup, final_dir)
-        raise
-    else:
-        if backup.exists():
-            shutil.rmtree(backup)
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
-        if backup.exists() and not had_previous:
-            shutil.rmtree(backup)
-    return frame.with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
 
 
 def _run_shard(task: ShardTask, store: DatasetShardStore) -> None:

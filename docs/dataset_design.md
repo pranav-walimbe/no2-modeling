@@ -2,24 +2,25 @@
 
 Turning the full AOI-hour population into a fixed-size modeling dataset rests on
 one principle: keep scientific eligibility and diversity sampling separate. A
-raster either clears the fixed eligibility rules or does not. Raster coverage
-does not prioritize records after that gate.
+raster either clears the fixed eligibility rules or does not. Hourly paired
+coverage ranks eligible records but does not replace any fixed gate.
 
 ## Output-size contract
 
 The controls in `config.py`:
 
 ```python
-TRAIN_SIZE = 12_000
+TRAIN_SIZE = 16_000
 VAL_SIZE = 4_000
 TEST_SIZE = 4_000
 ```
 
-- Dataset generation produces exactly those sizes or fails with the count of
-  eligible records available.
-- An undersized split never passes silently.
+- Dataset generation produces up to those sizes while preserving exact class
+  balance. If either class is short, finalization writes the largest balanced
+  subset and reports the requested size, actual size, shortfall, and eligible
+  count for each class.
 
-Stratification writes three times each requested size: 36,000 train, 12,000
+Stratification writes three times each requested size: 48,000 train, 12,000
 validation, 12,000 test candidates. The overdraw leaves room for per-scan
 coverage, EMA availability, and operational failures without regridding the
 much larger eligible metadata population. Each generation run reports the new
@@ -81,14 +82,15 @@ The binary target uses raw `delta_nox_mass`:
 Stratification and final generation write JSON summaries carrying overall and
 per-AOI retention, natural pre-balancing prevalence, and selected class counts.
 
-Each sample stores five arrays on one fixed grid:
+Each sample stores five numeric arrays and three masks on one fixed grid:
 
 | Array | Notes |
 |---|---|
-| current regridded NO2 | at least 99% observed before remaining gaps are filled |
-| current minus previous NO2 | difference of two eligible, filled rasters |
-| current minus 14-day same-time EMA NO2 | causal background anomaly with a 5-day half-life |
+| current regridded NO2 | finite where native QA-passing support exists; record coverage must exceed 90% |
+| current minus previous NO2 | finite on the current/previous mask intersection; coverage must exceed 75% |
+| current minus 14-day same-time EMA NO2 | finite on the current/EMA intersection; coverage must exceed 75% |
 | eastward wind, northward wind | bilinearly aligned from the native HRRR grid and finite across the image |
+| three NO2 validity masks | separate binary support for current, hourly delta, and EMA delta |
 
 HRRR temperature and boundary-layer height come from interpolation at the AOI
 centre. Prior-quarter heat input and power generation keep contemporaneous
@@ -112,7 +114,7 @@ Nameplate capacity:
 
 Keep `hard_hour` as the default until both modes compete on frozen splits.
 
-## Raster eligibility and filling
+## Raster eligibility and masks
 
 The native regridder accepts an NO2 contributor only when:
 
@@ -121,14 +123,16 @@ The native regridder accepts an NO2 contributor only when:
 - value and geometry are valid;
 - at least 0.25 km2 of accepted support reaches an output cell.
 
-Every current, previous, and prospective EMA scan must have finite NO2 in at
-least 95% of its 48 by 48 cells. Accepted rasters fill the remaining gaps from
-the nearest finite grid cell. Low-coverage EMA scans are skipped, and a record
-must retain at least seven EMA scans.
+Missing cells are never interpolated. Current coverage must be greater than
+90%. The current/previous intersection must cover more than 75% of the raster.
+The EMA uses a seven-day half-life over the available historical dates and at
+least five finite dates independently at each cell. Weights are
+renormalized over the dates available at that cell. The current/EMA intersection
+must also cover more than 75% of the raster.
 
 After pairing current and previous scans, generated records use
-`paired_finite_fraction` as the only final-selection ranking signal. There is
-no separate paired-coverage gate. Central coverage and retrieval uncertainty do
+`paired_finite_fraction` as the only final-selection ranking signal after the
+fixed gates. Central coverage and retrieval uncertainty do
 not filter or rank records. Generation summaries report retained counts,
 full-coverage rates, and represented AOIs overall and by class. Paired coverage
 remains a dataset diagnostic and is not supplied to the model.
@@ -162,7 +166,7 @@ Successfully generated candidates are selected deterministically:
 3. Interleave temporal strata within each AOI.
 4. Round-robin globally across AOIs.
 5. Break competition within each AOI round by paired coverage and stop at the
-   exact configured split size for each class.
+   configured per-class size or the smaller eligible class count.
 
 Final selection takes equal counts from both labels after raster generation.
 Read balanced metrics against the saved pre-balancing prevalence.
@@ -170,6 +174,11 @@ Read balanced metrics against the saved pre-balancing prevalence.
 ## Performance and persistence
 
 - Metadata operations use Polars and project only the required columns.
+- Per-pixel EMA support and weighting use stacked NumPy arrays without a Python
+  loop over grid cells. On 250 synthetic records this ran 1.4 times the
+  throughput of the removed nearest-fill path and cut EMA compute time by a
+  factor of seven at unchanged peak memory. Archive reads now dominate the
+  per-record cost.
 - Generation bounds the number of pending worker futures and caches each unique
   AOI scan for one run.
 - Candidate delta rasters live in atomic resumable shards until finalization.
