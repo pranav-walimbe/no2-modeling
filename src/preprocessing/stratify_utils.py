@@ -53,10 +53,6 @@ def filter_quantitative_outliers(
     columns: tuple[str, ...] = OUTLIER_FILTER_COLUMNS,
 ) -> dict[str, pl.DataFrame]:
     """Apply training-derived 1st/99th percentile bounds to every split.
-
-    Coordinates, integer counts, clock fields, and bounded quality measures are
-    intentionally excluded. Their tails are meaningful populations rather
-    than obvious continuous-variable anomalies.
     """
     train = splits["train"]
     statistics = train.select(

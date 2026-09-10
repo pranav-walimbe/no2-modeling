@@ -79,7 +79,7 @@ HRRR_END_DATE = EMISSIONS_END_DATE
 # Dataset generation
 # ============================================================================
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
-DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # per-record compressed TEMPO raster bundles
+DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # raster bundles for direct monolithic generation
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
 DATASET_TEMPO_CACHE_DIR = os.path.join(DATASET_DIR, "tempo-cache")  # persistent AOI-scan regridding cache
 DATASET_WIND_CACHE_DIR = os.path.join(DATASET_DIR, "wind-cache")  # persistent aligned AOI-hour wind rasters

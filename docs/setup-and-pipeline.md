@@ -204,19 +204,25 @@ Running the splits:
 - Run `python -u -m preprocessing.generate_dataset --shard-size N` on a login
   node. The CLI assigns at most `N` consecutive source records to each array
   task across train, validation, and test, then submits a dependent finalizer.
-- Each worker publishes a completed shard atomically. A rerun validates and
-  skips completed shards while regenerating missing or inconsistent shards.
-- The finalizer runs only after the array becomes terminal. It requires every
-  expected shard, applies exact class balance and global AOI round-robin
-  selection, publishes the existing flattened output layout, and removes the
-  shard workspace after success.
-- Pass `--refresh-shards` to discard resumable shard output before launching a
-  new run. Persistent TEMPO and wind caches and the published dataset remain
-  intact.
-- `--refresh-cache`, `--refresh-tempo`, and `--refresh-wind` clear the selected
-  shared caches once before fan-out and also discard shards that depend on them.
+- A launch is refused while dataset-generation or `train-no2` jobs are active.
+  It deletes the existing shards and published metadata before submitting every
+  planned shard, so the dataset is unavailable until finalization succeeds.
+- Workers write rasters and candidate/failure CSVs directly under
+  `shards/<split>/<shard>/`. Failed runs may leave partial shards; the next
+  launch deletes the complete shard tree rather than resuming it.
+- The finalizer runs only after every array task succeeds. It validates all
+  source outcomes and referenced rasters, applies exact class balance and
+  global AOI round-robin selection, then atomically publishes metadata whose
+  raster paths point directly into the shards. It does not install or remove
+  raster files, so selected and unselected successful rasters remain in place.
+- `--refresh-cache`, `--refresh-tempo`, and `--refresh-wind` explicitly clear
+  the selected persistent caches once before fan-out. Otherwise caches survive
+  fresh dataset runs and concurrent shards reuse their atomic entries.
+- Worker logs report elapsed time, peak memory, and TEMPO/wind cache hits. The
+  finalizer log reports finalizer time, peak memory, and launch-to-publication
+  wall time for warm-cache benchmark records.
 - Direct `python -u -m preprocessing.generate_dataset` remains available for a
-  monolithic local run. Pass `--split` to limit that run to one split.
+  fresh monolithic local run. Pass `--split` to limit that run to one split.
 
 ### 5. Train and evaluate
 
@@ -231,14 +237,13 @@ valid-pixel fractions by channel and split. It then predicts whether raw
 delta-NOx falls below or above zero outside the fixed deadband and reports
 classification metrics. See `docs/modeling.md` for the full contract.
 
-### Resuming
+### Regeneration
 
-Each stage depends on the preceding stage's outputs. Dataset generation resumes
-from completed record shards and valid TEMPO-cache and wind-cache entries. Use
-`--refresh-shards` after an implementation change that invalidates partial
-record outputs or after replacing a source split CSV. Other scripts resume only
-where their implementation supports it, so check existing output files before
-rerunning a large job.
+Dataset generation has no shard resume mode. Each launch discards the previous
+shards and published metadata but reuses valid TEMPO-cache and wind-cache
+entries. Do not regenerate or refresh caches while dataset generation or model
+training is active. A worker failure leaves no published dataframe; launch the
+complete run again after resolving the failure.
 
 ## Savio jobs
 

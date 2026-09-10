@@ -1,8 +1,4 @@
-"""
-Script to collect ERA5 wind data tiles for a provided date range
-
-Output: era5 monthly files in ERA5_DIR
-"""
+"""Collect ERA5 wind data tiles into monthly files."""
 
 import os
 
@@ -19,7 +15,7 @@ from prerequisites import require_cds_credentials
 
 
 def main():
-    """loop through valid date range and download hourly files"""
+    """Download hourly ERA5 files for the configured dates."""
     require_cds_credentials()
     os.makedirs(ERA5_DIR, exist_ok=True)
     client = cdsapi.Client()

@@ -181,12 +181,15 @@ Read balanced metrics against the saved pre-balancing prevalence.
   per-record cost.
 - Generation bounds the number of pending worker futures and caches each unique
   AOI scan for one run.
-- Candidate delta rasters live in atomic resumable shards until finalization.
-- Only final selected rasters are linked or copied into the persistent split
-  directory.
-- Replacing a split directory clears stale, unreferenced files from earlier runs.
-- Successful finalization removes the shard workspace. Failed runs preserve
-  completed shards for retry.
+- Candidate delta rasters and outcome CSVs are written directly into disposable
+  shards. Every launch first removes the previous shard tree and published
+  metadata while retaining the TEMPO and wind caches.
+- Final dataframes reference selected rasters by paths relative to the dataset
+  root, such as `shards/train/000003/record-rasters/train/000012.npz`.
+- Finalization performs no per-raster link, copy, move, or deletion. Selected
+  and unselected successful rasters remain in the one current shard tree.
+- A failed worker prevents finalization and may leave partial shards. The next
+  launch starts with an empty shard tree rather than resuming them.
 
 For large archives, run stratification and raster generation through Slurm.
 Never regrid the entire metadata population just to rank it. Raise the candidate
