@@ -86,9 +86,9 @@ Each sample stores five numeric arrays and three masks on one fixed grid:
 
 | Array | Notes |
 |---|---|
-| current regridded NO2 | finite where native QA-passing support exists; record coverage must exceed 90% |
-| current minus previous NO2 | finite on the current/previous mask intersection; coverage must exceed 75% |
-| current minus 14-day same-time EMA NO2 | finite on the current/EMA intersection; coverage must exceed 75% |
+| current regridded NO2 | finite where native QA-passing support exists; record coverage must exceed 95% |
+| current minus previous NO2 | finite on the current/previous mask intersection; coverage must exceed 80% |
+| current minus 14-day same-time EMA NO2 | finite on the current/EMA intersection; coverage must exceed 80% |
 | eastward wind, northward wind | bilinearly aligned from the native HRRR grid and finite across the image |
 | three NO2 validity masks | separate binary support for current, hourly delta, and EMA delta |
 
@@ -124,11 +124,11 @@ The native regridder accepts an NO2 contributor only when:
 - at least 0.25 km2 of accepted support reaches an output cell.
 
 Missing cells are never interpolated. Current coverage must be greater than
-90%. The current/previous intersection must cover more than 75% of the raster.
+95%. The current/previous intersection must cover more than 80% of the raster.
 The EMA uses a seven-day half-life over the available historical dates and at
 least five finite dates independently at each cell. Weights are
 renormalized over the dates available at that cell. The current/EMA intersection
-must also cover more than 75% of the raster.
+must also cover more than 80% of the raster.
 
 After pairing current and previous scans, generated records use
 `paired_finite_fraction` as the only final-selection ranking signal after the
@@ -181,12 +181,15 @@ Read balanced metrics against the saved pre-balancing prevalence.
   per-record cost.
 - Generation bounds the number of pending worker futures and caches each unique
   AOI scan for one run.
-- Candidate delta rasters live in atomic resumable shards until finalization.
-- Only final selected rasters are linked or copied into the persistent split
-  directory.
-- Replacing a split directory clears stale, unreferenced files from earlier runs.
-- Successful finalization removes the shard workspace. Failed runs preserve
-  completed shards for retry.
+- Candidate delta rasters and outcome CSVs are written directly into disposable
+  shards. Every launch first removes the previous shard tree and published
+  metadata while retaining the TEMPO and wind caches.
+- Final dataframes reference selected rasters by paths relative to the dataset
+  root, such as `shards/train/000003/record-rasters/train/000012.npz`.
+- Finalization performs no per-raster link, copy, move, or deletion. Selected
+  and unselected successful rasters remain in the one current shard tree.
+- A failed worker prevents finalization and may leave partial shards. The next
+  launch starts with an empty shard tree rather than resuming them.
 
 For large archives, run stratification and raster generation through Slurm.
 Never regrid the entire metadata population just to rank it. Raise the candidate

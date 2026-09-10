@@ -47,7 +47,7 @@ def hourly_times(start: date, end: date) -> Iterator[datetime]:
         start: First UTC calendar date.
         end: Last UTC calendar date.
 
-    Yields:
+    Returns:
         Consecutive timezone-aware UTC hours.
     """
     current = datetime.combine(start, datetime_time.min, tzinfo=timezone.utc)

@@ -79,15 +79,15 @@ HRRR_END_DATE = EMISSIONS_END_DATE
 # Dataset generation
 # ============================================================================
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
-DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # per-record compressed TEMPO raster bundles
+DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # raster bundles for direct monolithic generation
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
 DATASET_TEMPO_CACHE_DIR = os.path.join(DATASET_DIR, "tempo-cache")  # persistent AOI-scan regridding cache
 DATASET_WIND_CACHE_DIR = os.path.join(DATASET_DIR, "wind-cache")  # persistent aligned AOI-hour wind rasters
 IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
-MIN_CURRENT_NO2_FINITE_FRACTION = 0.90  # strict record-level current-scan coverage floor
-MIN_DELTA_NO2_FINITE_FRACTION = 0.75  # strict paired current/previous coverage floor
-MIN_EMA_DELTA_NO2_FINITE_FRACTION = 0.75  # strict paired current/EMA coverage floor
+MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan coverage floor
+MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor
+MIN_EMA_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/EMA coverage floor
 EMA_HISTORY_DAYS = 14  # causal same-time background window before each current scan
 EMA_HALF_LIFE_DAYS = 7.0  # temporal decay applied inside the same-time background
 EMA_SAME_TIME_TOLERANCE_MINUTES = 60  # largest daily scan-time mismatch

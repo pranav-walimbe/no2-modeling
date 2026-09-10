@@ -239,10 +239,6 @@ def compute_stats(
 ) -> NormalizationStats:
     """Compute memory-bounded normalization statistics from one split.
 
-    Current-NO2 and delta-NO2 use pooled valid-pixel medians and robust standard
-    deviations. Wind channels use pooled finite-pixel means and standard
-    deviations.
-
     Args:
         split: Dataset split used to estimate statistics.
         dataset_dir: Root containing raster bundles.

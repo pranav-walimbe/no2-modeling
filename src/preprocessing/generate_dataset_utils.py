@@ -24,7 +24,6 @@ from pyproj import CRS, Proj, Transformer
 from scipy.ndimage import map_coordinates
 
 from config import (
-    DATASET_RASTER_DIR,
     EMA_HALF_LIFE_DAYS,
     EMA_HISTORY_DAYS,
     EMA_MIN_PIXEL_OBSERVATIONS,
@@ -84,7 +83,6 @@ CANDIDATE_FEATURE_SCHEMA = {
 PROCESSING_FAILURE_SCHEMA = {"record_index": pl.Int64, "error": pl.String}
 SHARD_CANDIDATES_FILE = "candidates.csv"
 SHARD_FAILURES_FILE = "failures.csv"
-SHARD_COMPLETION_FILE = "complete.json"
 MAX_PENDING_FACTOR = 2
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")
@@ -102,7 +100,7 @@ def bounded_parallel_map(
         tasks: Task stream consumed lazily so large runs stay memory-safe.
         workers: Number of worker processes.
 
-    Yields:
+    Returns:
         Each worker result as it completes.
     """
     task_iterator = iter(tasks)
@@ -169,12 +167,12 @@ def build_shard_plan(split_paths: dict[str, str], shard_size: int) -> list[Shard
 
 @dataclass(frozen=True)
 class DatasetShardStore:
-    """Manage resumable dataset shards under one validated workspace."""
+    """Manage disposable dataset shards under one workspace."""
 
     root: Path
 
     def load(self, task: ShardTask, resolve_paths: bool = False) -> tuple[pl.DataFrame, pl.DataFrame]:
-        """Load and validate one completed shard.
+        """Load and validate one shard.
 
         Args:
             task: Expected shard identity and source-record range.
@@ -198,71 +196,52 @@ class DatasetShardStore:
         if sorted(candidate_indices + failure_indices) != expected_indices:
             raise ValueError(f"Shard {task.task_id} does not contain one outcome per source record")
 
-        absolute_paths = []
-        for record_index, serialized_path in zip(
-            candidate_indices,
-            candidates[CANDIDATE_RASTER_PATH_COL].to_list(),
-            strict=True,
-        ):
-            relative_path = Path(str(serialized_path))
-            absolute_path = shard_dir / relative_path
-            if not absolute_path.is_file():
-                raise ValueError(f"Shard {task.task_id} is missing raster {relative_path}")
-            absolute_paths.append(str(absolute_path))
+        raster_directory = Path("record-rasters") / task.split
+        relative_paths = [Path(str(value)) for value in candidates[CANDIDATE_RASTER_PATH_COL].to_list()]
+        if any(path.is_absolute() or path.parent != raster_directory for path in relative_paths):
+            raise ValueError(f"Shard {task.task_id} contains a raster path outside {raster_directory}")
+        if len(set(relative_paths)) != len(relative_paths):
+            raise ValueError(f"Shard {task.task_id} contains duplicate raster paths")
+        if any(not (shard_dir / path).is_file() for path in relative_paths):
+            raise ValueError(f"Shard {task.task_id} references a missing raster")
+
         if resolve_paths:
+            absolute_paths = [str(shard_dir / path) for path in relative_paths]
             candidates = candidates.with_columns(pl.Series(CANDIDATE_RASTER_PATH_COL, absolute_paths, dtype=pl.String))
         return candidates, failures
 
-    def is_complete(self, task: ShardTask) -> bool:
-        """Return whether one shard has a valid terminal outcome for each source record.
-
-        Args:
-            task: Expected shard identity and source-record range.
-
-        Returns:
-            True when the shard can be reused or finalized.
-        """
-        try:
-            self.load(task)
-        except (json.JSONDecodeError, OSError, TypeError, ValueError, pl.exceptions.PolarsError):
-            return False
-        return True
-
-    def create_staging(self, task: ShardTask) -> Path:
-        """Clear incomplete attempts and create a private staging directory.
+    def create(self, task: ShardTask) -> Path:
+        """Create the final directory for one fresh shard.
 
         Args:
             task: Shard that the caller will generate.
 
         Returns:
-            Empty directory on the shard filesystem.
+            Empty shard directory.
         """
         split_root = self._prepare_split_root(task.split)
-        self._remove_directory(split_root / f"{task.shard_index:06d}", split_root)
-        temporary_prefix = f".{task.shard_index:06d}-"
-        for path in split_root.iterdir():
-            if path.name.startswith(temporary_prefix):
-                self._remove_directory(path, split_root)
-        return Path(tempfile.mkdtemp(prefix=temporary_prefix, dir=split_root))
+        shard_dir = split_root / f"{task.shard_index:06d}"
+        shard_dir.mkdir()
+        return shard_dir
 
-    def complete(
+    def write(
         self,
         task: ShardTask,
-        staging: Path,
+        shard_dir: Path,
         output_rows: list[dict[str, object]],
         failure_rows: list[dict[str, object]],
     ) -> None:
-        """Write terminal shard artifacts and publish the directory atomically.
+        """Write candidate and failure metadata into a shard.
 
         Args:
             task: Shard identity and expected source-record range.
-            staging: Directory containing generated candidate rasters.
+            shard_dir: Directory containing generated candidate rasters.
             output_rows: Successful record features and raster paths.
             failure_rows: Failed source-record indices and messages.
         """
         candidates = pl.DataFrame(output_rows, schema=CANDIDATE_FEATURE_SCHEMA).sort(SOURCE_RECORD_INDEX_COL)
         relative_paths = [
-            str(Path(candidate_path).relative_to(staging))
+            str(Path(candidate_path).relative_to(shard_dir))
             for candidate_path in candidates[CANDIDATE_RASTER_PATH_COL].to_list()
         ]
         candidates = candidates.with_columns(pl.Series(CANDIDATE_RASTER_PATH_COL, relative_paths, dtype=pl.String))
@@ -270,32 +249,13 @@ class DatasetShardStore:
             sorted(failure_rows, key=lambda row: int(row["record_index"])),
             schema=PROCESSING_FAILURE_SCHEMA,
         )
-        outcome_indices = [int(value) for value in candidates[SOURCE_RECORD_INDEX_COL].to_list()]
-        outcome_indices.extend(int(value) for value in failures["record_index"].to_list())
-        if sorted(outcome_indices) != list(range(task.start, task.stop)):
-            raise ValueError(f"Shard {task.task_id} did not produce one outcome per source record")
+        write_csv_atomic(candidates, shard_dir / SHARD_CANDIDATES_FILE)
+        write_csv_atomic(failures, shard_dir / SHARD_FAILURES_FILE)
 
-        write_csv_atomic(candidates, staging / SHARD_CANDIDATES_FILE)
-        write_csv_atomic(failures, staging / SHARD_FAILURES_FILE)
-        write_json_atomic(
-            self._completion_values(task, candidates.height, failures.height),
-            staging / SHARD_COMPLETION_FILE,
-        )
-        os.replace(staging, self.root / task.split / f"{task.shard_index:06d}")
-
-    def clear_splits(self, splits: Iterable[str]) -> None:
-        """Delete shard workspaces for the supplied split names.
-
-        Args:
-            splits: Iterable of split names under this store.
-        """
-        shard_root = self._prepare_root()
-        for split in splits:
-            split_path = shard_root / str(split)
-            if split_path.exists():
-                self._remove_directory(split_path, shard_root)
-        if not any(shard_root.iterdir()):
-            shard_root.rmdir()
+    def clear(self) -> None:
+        """Delete the complete disposable shard tree."""
+        if self.root.exists():
+            shutil.rmtree(self.root)
 
     def _prepare_root(self) -> Path:
         # Create the shard root before changing descendants
@@ -308,28 +268,6 @@ class DatasetShardStore:
         split_root.mkdir(parents=True, exist_ok=True)
         return split_root
 
-    @staticmethod
-    def _remove_directory(path: Path, parent: Path) -> None:
-        # Restrict recursive deletion to the expected parent directory
-        if path.parent.resolve() != parent.resolve():
-            raise ValueError(f"Refusing to clear shard path outside {parent}: {path}")
-        if path.is_symlink() or (path.exists() and not path.is_dir()):
-            raise ValueError(f"Shard path is not a directory: {path}")
-        if path.exists():
-            shutil.rmtree(path)
-
-    @staticmethod
-    def _completion_values(task: ShardTask, successful_count: int, failure_count: int) -> dict[str, object]:
-        # Describe the shard boundary and its terminal outcomes
-        return {
-            "split": task.split,
-            "shard_index": task.shard_index,
-            "start": task.start,
-            "stop": task.stop,
-            "source_count": task.size,
-            "successful_count": successful_count,
-            "failure_count": failure_count,
-        }
 
 
 def _coverage_group_summary(frame: pl.DataFrame) -> dict[str, int | float]:
@@ -357,58 +295,6 @@ def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
         **_coverage_group_summary(frame),
         "by_class": {str(label): _coverage_group_summary(frame.filter(pl.col(LABEL_COL) == label)) for label in (0, 1)},
     }
-
-
-def install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:
-    """Install selected rasters into one split through an atomic replacement.
-
-    Links or copies each selected raster into a staging directory, swaps it into
-    place, and restores the previous split if any step fails. Shard rasters stay
-    intact so a later run can resume from them.
-
-    Args:
-        split: Split whose raster directory is replaced.
-        frame: Selected records carrying candidate raster paths.
-
-    Returns:
-        The frame with a relative path column for each installed raster.
-    """
-    raster_root = Path(DATASET_RASTER_DIR)
-    raster_root.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f".{split}-staging-", dir=raster_root))
-    final_dir = raster_root / split
-    backup = Path(tempfile.mkdtemp(prefix=f".{split}-backup-", dir=raster_root))
-    backup.rmdir()
-    had_previous = final_dir.exists()
-    relative_paths = []
-    try:
-        for output_index, candidate_path in enumerate(frame[CANDIDATE_RASTER_PATH_COL].to_list()):
-            filename = f"{output_index:06d}.npz"
-            destination = staging / filename
-            try:
-                os.link(candidate_path, destination)
-            except OSError:
-                shutil.copy2(candidate_path, destination)
-            relative_paths.append(str(Path("rasters") / split / filename))
-        if had_previous:
-            os.replace(final_dir, backup)
-        os.replace(staging, final_dir)
-    except Exception:
-        if final_dir.exists() and had_previous and backup.exists():
-            shutil.rmtree(final_dir)
-            os.replace(backup, final_dir)
-        elif had_previous and backup.exists():
-            os.replace(backup, final_dir)
-        raise
-    else:
-        if backup.exists():
-            shutil.rmtree(backup)
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
-        if backup.exists() and not had_previous:
-            shutil.rmtree(backup)
-    return frame.with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
 
 
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
@@ -484,6 +370,7 @@ class ScanBatchTask:
 
     granule_paths: tuple[str, ...]
     scans: tuple[ScanTask, ...]
+    reuse_existing: bool = True
 
 
 @dataclass(frozen=True)
@@ -537,6 +424,7 @@ class WindBatchTask:
 
     hrrr_path: str
     winds: tuple[WindTask, ...]
+    reuse_existing: bool = True
 
 
 @dataclass(frozen=True)
@@ -610,11 +498,37 @@ def cache_exists(path: str | Path) -> bool:
     return Path(path).is_file()
 
 
-def scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
+def _directory_file_names(directory: Path, suffix: str) -> set[str]:
+    # One directory enumeration avoids a metadata lookup for every expected path
+    try:
+        with os.scandir(directory) as entries:
+            return {
+                entry.name
+                for entry in entries
+                if entry.name.endswith(suffix) and entry.is_file(follow_symlinks=False)
+            }
+    except FileNotFoundError:
+        return set()
+
+
+def cache_inventory(directory: str | Path) -> set[str]:
+    """Return complete cache filenames from one directory enumeration.
+
+    Args:
+        directory: Persistent cache directory to scan.
+
+    Returns:
+        Names of regular ``.npz`` cache entries. Temporary files are excluded.
+    """
+    return _directory_file_names(Path(directory), suffix=".npz")
+
+
+def scan_batches(scans: Iterable[ScanTask], reuse_existing: bool = True) -> list[ScanBatchTask]:
     """Group scan tasks so each worker reads one granule set once.
 
     Args:
         scans: Scan tasks awaiting regridding.
+        reuse_existing: Recheck initial inventory misses inside each worker.
 
     Returns:
         One batch per distinct granule set.
@@ -622,7 +536,7 @@ def scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
     grouped: dict[tuple[str, ...], list[ScanTask]] = {}
     for scan in scans:
         grouped.setdefault(scan.granule_paths, []).append(scan)
-    return [ScanBatchTask(paths, tuple(group)) for paths, group in grouped.items()]
+    return [ScanBatchTask(paths, tuple(group), reuse_existing) for paths, group in grouped.items()]
 
 
 def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
@@ -634,23 +548,38 @@ def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
     Returns:
         One cache location or contextual failure for every scan.
     """
+    reusable = {
+        task.cache_key: ScanResult(task.cache_key, task.cache_path, None)
+        for task in batch.scans
+        if batch.reuse_existing and cache_exists(task.cache_path)
+    }
+    pending = [task for task in batch.scans if task.cache_key not in reusable]
+    if not pending:
+        return [reusable[task.cache_key] for task in batch.scans]
+
     try:
         granule_indices = [build_granule_spatial_index(read_granule_pixels(path)) for path in batch.granule_paths]
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = f"TEMPO granule read failed: {error}"
-        return [ScanResult(task.cache_key, task.cache_path, message) for task in batch.scans]
+        reusable.update(
+            (task.cache_key, ScanResult(task.cache_key, task.cache_path, message)) for task in pending
+        )
+        return [reusable[task.cache_key] for task in batch.scans]
 
-    results: list[ScanResult] = []
-    for task in batch.scans:
+    for task in pending:
         try:
             grid = AoiGrid.from_lon_lat(task.aoi_id, task.lon, task.lat)
             pixels = concatenate_pixels([index.select_grid(grid) for index in granule_indices])
             raster = regrid_aoi_raster(pixels, grid)
             write_raster_npz(raster, task.cache_path)
-            results.append(ScanResult(task.cache_key, task.cache_path, None))
+            reusable[task.cache_key] = ScanResult(task.cache_key, task.cache_path, None)
         except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-            results.append(ScanResult(task.cache_key, task.cache_path, f"TEMPO regridding failed: {error}"))
-    return results
+            reusable[task.cache_key] = ScanResult(
+                task.cache_key,
+                task.cache_path,
+                f"TEMPO regridding failed: {error}",
+            )
+    return [reusable[task.cache_key] for task in batch.scans]
 
 
 def process_scan(task: ScanTask) -> ScanResult:
@@ -787,11 +716,12 @@ def _centre_hrrr_features(grid: _HrrrGrid, fields: dict[str, np.ndarray], task: 
     }
 
 
-def wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
+def wind_batches(winds: Iterable[WindTask], reuse_existing: bool = True) -> list[WindBatchTask]:
     """Group wind tasks so each HRRR field is read once.
 
     Args:
         winds: Wind tasks awaiting alignment.
+        reuse_existing: Recheck initial inventory misses inside each worker.
 
     Returns:
         One batch per distinct HRRR file.
@@ -799,7 +729,7 @@ def wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
     grouped: dict[str, list[WindTask]] = {}
     for wind in winds:
         grouped.setdefault(wind.hrrr_path, []).append(wind)
-    return [WindBatchTask(path, tuple(group)) for path, group in grouped.items()]
+    return [WindBatchTask(path, tuple(group), reuse_existing) for path, group in grouped.items()]
 
 
 def process_wind_batch(batch: WindBatchTask) -> list[WindResult]:
@@ -811,22 +741,37 @@ def process_wind_batch(batch: WindBatchTask) -> list[WindResult]:
     Returns:
         One cache result for each requested AOI-hour.
     """
+    reusable = {
+        task.cache_key: WindResult(task.cache_key, task.cache_path, None)
+        for task in batch.winds
+        if batch.reuse_existing and cache_exists(task.cache_path)
+    }
+    pending = [task for task in batch.winds if task.cache_key not in reusable]
+    if not pending:
+        return [reusable[task.cache_key] for task in batch.winds]
+
     try:
         grid, fields = _read_hrrr_fields(batch.hrrr_path)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = f"HRRR read failed: {error}"
-        return [WindResult(task.cache_key, task.cache_path, message) for task in batch.winds]
+        reusable.update(
+            (task.cache_key, WindResult(task.cache_key, task.cache_path, message)) for task in pending
+        )
+        return [reusable[task.cache_key] for task in batch.winds]
 
-    results = []
-    for task in batch.winds:
+    for task in pending:
         try:
             arrays = _align_wind(grid, fields, task)
             arrays.update(_centre_hrrr_features(grid, fields, task))
             _write_npz_atomic(task.cache_path, **arrays)
-            results.append(WindResult(task.cache_key, task.cache_path, None))
+            reusable[task.cache_key] = WindResult(task.cache_key, task.cache_path, None)
         except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-            results.append(WindResult(task.cache_key, task.cache_path, f"HRRR alignment failed: {error}"))
-    return results
+            reusable[task.cache_key] = WindResult(
+                task.cache_key,
+                task.cache_path,
+                f"HRRR alignment failed: {error}",
+            )
+    return [reusable[task.cache_key] for task in batch.winds]
 
 
 def extract_wind_cache(path: str) -> tuple[dict[str, np.ndarray], dict[str, float]]:
