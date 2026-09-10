@@ -20,5 +20,5 @@ Repeated runs held both throughput figures within 3%.
 
 Archive reads now dominate the record cost, so batching and the existing bounded
 worker queue still govern production throughput. This microbenchmark isolates
-raster I/O and EMA construction. Complete-record throughput on the real
-candidate population comes from the cache-only retention audit instead.
+raster I/O and EMA construction, so it does not predict complete-record
+throughput on the real candidate population.

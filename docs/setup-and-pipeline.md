@@ -217,11 +217,6 @@ Running the splits:
   shared caches once before fan-out and also discard shards that depend on them.
 - Direct `python -u -m preprocessing.generate_dataset` remains available for a
   monolithic local run. Pass `--split` to limit that run to one split.
-- Before regeneration, run
-  `python -u -m preprocessing.generate_dataset --audit-retention` to evaluate
-  all fixed gates from existing caches. The audit refuses refresh flags, writes
-  no candidate rasters, and saves its retention report under `DATASET_DF`.
-  Use `--audit-output PATH` to place the report elsewhere.
 
 ### 5. Train and evaluate
 

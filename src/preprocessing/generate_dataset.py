@@ -5,8 +5,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-import time
-from collections import Counter
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
@@ -41,8 +39,6 @@ from config import (
 from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
     CANDIDATE_RASTER_PATH_COL,
-    CURRENT_FINITE_FRACTION_COL,
-    EMA_PAIRED_FINITE_FRACTION_COL,
     PAIRED_FINITE_FRACTION_COL,
     PROCESSING_FAILURE_SCHEMA,
     SOURCE_RECORD_INDEX_COL,
@@ -53,7 +49,6 @@ from preprocessing.generate_dataset_utils import (
     ShardTask,
     WindBatchTask,
     WindTask,
-    audit_record,
     build_shard_plan,
     cache_exists,
     make_scan_task,
@@ -442,145 +437,6 @@ def _run_record_processing(
     return output_rows
 
 
-def _run_record_audit(
-    tasks: list[RecordTask],
-    records_by_id: dict[tuple[str, int], PreparedRecord],
-    failures: dict[str, list[dict[str, object]]],
-    workers: int,
-) -> dict[str, list[dict[str, object]]]:
-    # Evaluate cached records without creating candidate raster archives
-    output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in failures}
-    total = len(tasks)
-    for completed, result in enumerate(_bounded_parallel_map(audit_record, tasks, workers), start=1):
-        if result.error is not None:
-            failures[result.split].append({"record_index": result.record_index, "error": result.error})
-        else:
-            record = records_by_id[(result.split, result.record_index)]
-            output_row: dict[str, object] = {
-                SOURCE_RECORD_INDEX_COL: result.record_index,
-                CANDIDATE_RASTER_PATH_COL: record.delta_no2_path,
-            }
-            output_row.update(result.features)
-            output_rows[result.split].append(output_row)
-        if completed % PROGRESS_INTERVAL == 0 or completed == total:
-            print(f"Audited {completed:,}/{total:,} cached records")
-    return output_rows
-
-
-def _retention_audit_summary(
-    source: pl.DataFrame,
-    candidates: pl.DataFrame,
-    failures: list[dict[str, object]],
-    requested_size: int,
-) -> dict[str, object]:
-    # Summarize cache-only eligibility and balanced final capacity
-    coverage_columns = (
-        CURRENT_FINITE_FRACTION_COL,
-        PAIRED_FINITE_FRACTION_COL,
-        EMA_PAIRED_FINITE_FRACTION_COL,
-    )
-    coverage_distributions = {}
-    for name in coverage_columns:
-        coverage_distributions[name] = {
-            percentile: (
-                float(candidates[name].quantile(quantile, interpolation="linear")) if candidates.height else None
-            )
-            for percentile, quantile in (
-                ("p10", 0.10),
-                ("p25", 0.25),
-                ("p50", 0.50),
-                ("p75", 0.75),
-                ("p90", 0.90),
-                ("p100", 1.0),
-            )
-        }
-    eligible_by_class = {str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
-    retained = select_final_records(candidates, requested_size)
-    source_count = source.height
-    failure_categories = (
-        ("Current NO2 coverage", "current_coverage"),
-        ("One-hour delta coverage", "hourly_delta_coverage"),
-        ("EMA delta coverage", "ema_delta_coverage"),
-        ("same-time EMA scans are available", "insufficient_ema_dates"),
-        ("EMA scans remain", "missing_ema_cache"),
-        ("TEMPO cache unavailable", "missing_tempo_cache"),
-        ("wind cache unavailable", "missing_wind_cache"),
-    )
-    failure_reasons: Counter[str] = Counter()
-    for row in failures:
-        error = str(row["error"])
-        category = next((name for fragment, name in failure_categories if fragment in error), error)
-        failure_reasons[category] += 1
-    return {
-        "candidate_records": source_count,
-        "processing_success_records": candidates.height,
-        "processing_success_fraction": candidates.height / source_count if source_count else 0.0,
-        "retained_records": retained.height,
-        "retained_fraction": retained.height / source_count if source_count else 0.0,
-        "requested_size": requested_size,
-        "shortfall": requested_size - retained.height,
-        "eligible_by_class": eligible_by_class,
-        "can_reach_configured_size": retained.height == requested_size,
-        "coverage": _coverage_selection_summary(candidates),
-        "coverage_distributions": coverage_distributions,
-        "failure_reasons": dict(failure_reasons.most_common()),
-    }
-
-
-def _run_retention_audit(split_paths: dict[str, str], destination: Path) -> None:
-    # Audit all records from existing caches without refreshing shared data
-    started = time.perf_counter()
-    source_splits = _load_splits(split_paths)
-    tempo_cache_dir, wind_cache_dir = _initialize_output_directories()
-    with tempfile.TemporaryDirectory(prefix=".dataset-retention-audit-") as temporary_dir:
-        records, scans, winds, failures = _prepare_records(
-            source_splits,
-            tempo_cache_dir,
-            wind_cache_dir,
-            Path(temporary_dir),
-        )
-        tempo_cache_paths = {key: task.cache_path for key, task in scans.items() if cache_exists(task.cache_path)}
-        wind_cache_paths = {key: task.cache_path for key, task in winds.items() if cache_exists(task.cache_path)}
-        tasks, records_by_id = _record_tasks(
-            records,
-            tempo_cache_paths,
-            {},
-            wind_cache_paths,
-            {},
-            failures,
-        )
-        output_rows = _run_record_audit(tasks, records_by_id, failures, NUM_CORES)
-
-    split_reports = {}
-    combined_candidates = []
-    combined_failures: list[dict[str, object]] = []
-    combined_source = []
-    for split, source in source_splits.items():
-        features = pl.DataFrame(output_rows[split], schema=CANDIDATE_FEATURE_SCHEMA)
-        candidates = source.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left")
-        split_reports[split] = _retention_audit_summary(
-            source,
-            candidates,
-            failures[split],
-            FINAL_SPLIT_SIZES[split],
-        )
-        combined_source.append(source)
-        combined_candidates.append(candidates)
-        combined_failures.extend(failures[split])
-    report = {
-        "elapsed_seconds": time.perf_counter() - started,
-        "splits": split_reports,
-        "overall": _retention_audit_summary(
-            pl.concat(combined_source, how="diagonal_relaxed"),
-            pl.concat(combined_candidates, how="diagonal_relaxed"),
-            combined_failures,
-            sum(FINAL_SPLIT_SIZES[split] for split in split_paths),
-        ),
-    }
-    write_json_atomic(report, destination)
-    print(f"Wrote cache-only retention audit to {destination}")
-
-
 def _write_outputs(
     output_rows: dict[str, list[dict[str, object]]],
     failures: dict[str, list[dict[str, object]]],
@@ -802,17 +658,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="empty the wind image cache before rebuilding entries for the selected split",
     )
-    parser.add_argument(
-        "--audit-retention",
-        action="store_true",
-        help="evaluate eligibility from existing caches without generating dataset rasters",
-    )
-    parser.add_argument(
-        "--audit-output",
-        type=Path,
-        default=Path(DATASET_DF) / "dataset_retention_audit.json",
-        help="JSON destination for --audit-retention",
-    )
     return parser.parse_args()
 
 
@@ -999,13 +844,7 @@ def main() -> None:
     split_paths = SPLIT_PATHS if args.split == "all" else {args.split: SPLIT_PATHS[args.split]}
     if stage in {"worker", "finalize"} and args.shard_size is None:
         raise ValueError("Sharded dataset generation requires --shard-size")
-    if args.audit_retention:
-        if stage != "generate" or args.shard_size is not None:
-            raise ValueError("Retention audit runs directly without sharding")
-        if args.refresh_cache or args.refresh_tempo or args.refresh_wind or args.refresh_shards:
-            raise ValueError("Retention audit cannot refresh caches or shards")
-        _run_retention_audit(split_paths, args.audit_output)
-    elif stage == "worker":
+    if stage == "worker":
         _run_array_shard(split_paths, int(args.shard_size))
     elif stage == "finalize":
         _initialize_output_directories()

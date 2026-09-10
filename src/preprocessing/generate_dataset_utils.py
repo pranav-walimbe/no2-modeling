@@ -927,22 +927,6 @@ def process_record(task: RecordTask) -> RecordResult:
         return RecordResult(task.split, task.record_index, {}, f"Record processing failed: {error}")
 
 
-def audit_record(task: RecordTask) -> RecordResult:
-    """Evaluate one record entirely from persistent caches without writing a raster.
-
-    Args:
-        task: Cached TEMPO and HRRR locations for one record.
-
-    Returns:
-        Derived scalar features or contextual failure text.
-    """
-    try:
-        _, features = _build_model_bundle(task)
-        return RecordResult(task.split, task.record_index, features, None)
-    except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-        return RecordResult(task.split, task.record_index, {}, f"Record audit failed: {error}")
-
-
 def write_json_atomic(values: dict[str, object], destination: Path) -> None:
     """Write a JSON object through an atomic replacement.
 
