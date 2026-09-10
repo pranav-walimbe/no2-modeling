@@ -5,9 +5,12 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
 import polars as pl
@@ -21,8 +24,11 @@ from pyproj import CRS, Proj, Transformer
 from scipy.ndimage import map_coordinates
 
 from config import (
+    DATASET_RASTER_DIR,
     EMA_HALF_LIFE_DAYS,
+    EMA_HISTORY_DAYS,
     EMA_MIN_PIXEL_OBSERVATIONS,
+    EMA_SAME_TIME_TOLERANCE_MINUTES,
     LABEL_COL,
     MIN_CURRENT_NO2_FINITE_FRACTION,
     MIN_DELTA_NO2_FINITE_FRACTION,
@@ -69,6 +75,7 @@ TABULAR_FEATURE_NAMES = (
 )
 SOURCE_RECORD_INDEX_COL = "_source_record_index"
 CANDIDATE_RASTER_PATH_COL = "_candidate_raster_path"
+DELTA_NO2_PATH_COL = "delta_no2_path"
 CANDIDATE_FEATURE_SCHEMA = {
     SOURCE_RECORD_INDEX_COL: pl.UInt32,
     CANDIDATE_RASTER_PATH_COL: pl.String,
@@ -78,6 +85,44 @@ PROCESSING_FAILURE_SCHEMA = {"record_index": pl.Int64, "error": pl.String}
 SHARD_CANDIDATES_FILE = "candidates.csv"
 SHARD_FAILURES_FILE = "failures.csv"
 SHARD_COMPLETION_FILE = "complete.json"
+MAX_PENDING_FACTOR = 2
+InputT = TypeVar("InputT")
+OutputT = TypeVar("OutputT")
+
+
+def bounded_parallel_map(
+    function: Callable[[InputT], OutputT],
+    tasks: Iterable[InputT],
+    workers: int,
+) -> Iterator[OutputT]:
+    """Map a worker function over tasks while bounding pending futures.
+
+    Args:
+        function: Worker callable executed in a separate process.
+        tasks: Task stream consumed lazily so large runs stay memory-safe.
+        workers: Number of worker processes.
+
+    Yields:
+        Each worker result as it completes.
+    """
+    task_iterator = iter(tasks)
+    max_pending = max(workers * MAX_PENDING_FACTOR, 1)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        pending: set[Future[OutputT]] = set()
+        for _ in range(max_pending):
+            try:
+                pending.add(executor.submit(function, next(task_iterator)))
+            except StopIteration:
+                break
+
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                yield future.result()
+                try:
+                    pending.add(executor.submit(function, next(task_iterator)))
+                except StopIteration:
+                    pass
 
 
 @dataclass(frozen=True)
@@ -287,6 +332,85 @@ class DatasetShardStore:
         }
 
 
+def _coverage_group_summary(frame: pl.DataFrame) -> dict[str, int | float]:
+    # Summarize retained count and paired coverage for one record group
+    records = frame.height
+    full_coverage = frame.filter(pl.col(PAIRED_FINITE_FRACTION_COL) >= 1.0).height
+    return {
+        "records": records,
+        "full_coverage_records": full_coverage,
+        "full_coverage_fraction": full_coverage / records if records else 0.0,
+        "aoi_count": frame[AOI_ID_COL].n_unique() if records else 0,
+    }
+
+
+def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
+    """Report paired coverage and AOI representation overall and by class.
+
+    Args:
+        frame: Records carrying paired coverage and class labels.
+
+    Returns:
+        Coverage counts and AOI representation for the frame and each class.
+    """
+    return {
+        **_coverage_group_summary(frame),
+        "by_class": {str(label): _coverage_group_summary(frame.filter(pl.col(LABEL_COL) == label)) for label in (0, 1)},
+    }
+
+
+def install_selected_rasters(split: str, frame: pl.DataFrame) -> pl.DataFrame:
+    """Install selected rasters into one split through an atomic replacement.
+
+    Links or copies each selected raster into a staging directory, swaps it into
+    place, and restores the previous split if any step fails. Shard rasters stay
+    intact so a later run can resume from them.
+
+    Args:
+        split: Split whose raster directory is replaced.
+        frame: Selected records carrying candidate raster paths.
+
+    Returns:
+        The frame with a relative path column for each installed raster.
+    """
+    raster_root = Path(DATASET_RASTER_DIR)
+    raster_root.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{split}-staging-", dir=raster_root))
+    final_dir = raster_root / split
+    backup = Path(tempfile.mkdtemp(prefix=f".{split}-backup-", dir=raster_root))
+    backup.rmdir()
+    had_previous = final_dir.exists()
+    relative_paths = []
+    try:
+        for output_index, candidate_path in enumerate(frame[CANDIDATE_RASTER_PATH_COL].to_list()):
+            filename = f"{output_index:06d}.npz"
+            destination = staging / filename
+            try:
+                os.link(candidate_path, destination)
+            except OSError:
+                shutil.copy2(candidate_path, destination)
+            relative_paths.append(str(Path("rasters") / split / filename))
+        if had_previous:
+            os.replace(final_dir, backup)
+        os.replace(staging, final_dir)
+    except Exception:
+        if final_dir.exists() and had_previous and backup.exists():
+            shutil.rmtree(final_dir)
+            os.replace(backup, final_dir)
+        elif had_previous and backup.exists():
+            os.replace(backup, final_dir)
+        raise
+    else:
+        if backup.exists():
+            shutil.rmtree(backup)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+        if backup.exists() and not had_previous:
+            shutil.rmtree(backup)
+    return frame.with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
+
+
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
     """Select the largest requested balanced coverage-ranked AOI subset.
 
@@ -486,6 +610,21 @@ def cache_exists(path: str | Path) -> bool:
     return Path(path).is_file()
 
 
+def scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
+    """Group scan tasks so each worker reads one granule set once.
+
+    Args:
+        scans: Scan tasks awaiting regridding.
+
+    Returns:
+        One batch per distinct granule set.
+    """
+    grouped: dict[tuple[str, ...], list[ScanTask]] = {}
+    for scan in scans:
+        grouped.setdefault(scan.granule_paths, []).append(scan)
+    return [ScanBatchTask(paths, tuple(group)) for paths, group in grouped.items()]
+
+
 def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
     """Regrid several AOIs while loading each shared granule once.
 
@@ -648,6 +787,21 @@ def _centre_hrrr_features(grid: _HrrrGrid, fields: dict[str, np.ndarray], task: 
     }
 
 
+def wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
+    """Group wind tasks so each HRRR field is read once.
+
+    Args:
+        winds: Wind tasks awaiting alignment.
+
+    Returns:
+        One batch per distinct HRRR file.
+    """
+    grouped: dict[str, list[WindTask]] = {}
+    for wind in winds:
+        grouped.setdefault(wind.hrrr_path, []).append(wind)
+    return [WindBatchTask(path, tuple(group)) for path, group in grouped.items()]
+
+
 def process_wind_batch(batch: WindBatchTask) -> list[WindResult]:
     """Align all AOIs sharing one HRRR source file.
 
@@ -712,6 +866,34 @@ def _require_coverage(valid: np.ndarray, threshold: float, raster_name: str) -> 
             f"{raster_name} coverage must exceed {threshold:.0%}; got {fraction:.2%}"
         )
     return fraction
+
+
+def same_time_ema_observations(
+    observations_by_day: dict[date, list[dict[str, object]]], target_time: datetime
+) -> list[dict[str, object]]:
+    """Select the closest preceding same-time scan for each historical day.
+
+    Args:
+        observations_by_day: Candidate observations indexed by calendar day.
+        target_time: Scan time the history is matched against.
+
+    Returns:
+        At most one observation per preceding day, ordered by scan time.
+    """
+    target_seconds = target_time.hour * 3600 + target_time.minute * 60 + target_time.second
+    selected = []
+    for age_days in range(1, EMA_HISTORY_DAYS + 1):
+        scan_date = target_time.date() - timedelta(days=age_days)
+        candidates = []
+        for observation in observations_by_day.get(scan_date, []):
+            observation_time = observation["tempo_time"]
+            observation_seconds = observation_time.hour * 3600 + observation_time.minute * 60 + observation_time.second
+            difference = abs((observation_seconds - target_seconds + 43_200) % 86_400 - 43_200)
+            if difference <= EMA_SAME_TIME_TOLERANCE_MINUTES * 60:
+                candidates.append((difference, -int(observation["sampled_pixel_count"]), observation))
+        if candidates:
+            selected.append(min(candidates, key=lambda priority: priority[:2])[2])
+    return sorted(selected, key=lambda row: row["tempo_time"])
 
 
 def _ema_from_scans(
