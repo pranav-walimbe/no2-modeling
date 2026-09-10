@@ -42,7 +42,7 @@ from preprocessing.generate_dataset_utils import (
     WindTask,
     bounded_parallel_map,
     build_shard_plan,
-    cache_exists,
+    cache_inventory,
     coverage_selection_summary,
     install_selected_rasters,
     make_scan_task,
@@ -225,21 +225,30 @@ def _prepare_records(
     return records, scans, winds, failures
 
 
+def _cached_task_paths(tasks: dict[str, ScanTask] | dict[str, WindTask]) -> dict[str, str]:
+    # Scan each cache directory once instead of issuing one metadata lookup per task
+    directories = {Path(task.cache_path).parent for task in tasks.values()}
+    inventories = {directory: cache_inventory(directory) for directory in directories}
+    return {
+        key: task.cache_path
+        for key, task in tasks.items()
+        if Path(task.cache_path).name in inventories[Path(task.cache_path).parent]
+    }
+
+
 def _run_tempo_regridding(
     scans: dict[str, ScanTask],
     workers: int,
     refresh_tempo: bool,
 ) -> tuple[dict[str, str], dict[str, str]]:
     # Reuse existing entries and batch only cache misses
-    tempo_cache_paths = {
-        key: task.cache_path for key, task in scans.items() if not refresh_tempo and cache_exists(task.cache_path)
-    }
+    tempo_cache_paths = {} if refresh_tempo else _cached_task_paths(scans)
     failures: dict[str, str] = {}
     missing = [task for key, task in scans.items() if key not in tempo_cache_paths]
     print(f"TEMPO cache: {len(tempo_cache_paths):,} hits; {len(missing):,} scans to generate")
     if not missing:
         return tempo_cache_paths, failures
-    batches = scan_batches(missing)
+    batches = scan_batches(missing, reuse_existing=not refresh_tempo)
     granule_reads = sum(len(batch.granule_paths) for batch in batches)
     print(f"Grouped cache misses into {len(batches):,} batches requiring {granule_reads:,} granule reads")
     completed = 0
@@ -261,16 +270,15 @@ def _run_wind_alignment(
     refresh_wind: bool,
 ) -> tuple[dict[str, str], dict[str, str]]:
     # Reuse cached AOI-hour wind rasters unless refresh is explicit
-    cache_paths = {
-        key: task.cache_path for key, task in winds.items() if not refresh_wind and cache_exists(task.cache_path)
-    }
+    cache_paths = {} if refresh_wind else _cached_task_paths(winds)
     failures: dict[str, str] = {}
     missing = [task for key, task in winds.items() if key not in cache_paths]
     print(f"Wind cache: {len(cache_paths):,} hits; {len(missing):,} AOI-hours to align")
     if not missing:
         return cache_paths, failures
     completed = 0
-    for batch_results in bounded_parallel_map(process_wind_batch, wind_batches(missing), workers):
+    batches = wind_batches(missing, reuse_existing=not refresh_wind)
+    for batch_results in bounded_parallel_map(process_wind_batch, batches, workers):
         for result in batch_results:
             completed += 1
             if result.error is None:

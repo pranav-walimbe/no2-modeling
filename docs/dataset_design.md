@@ -86,9 +86,9 @@ Each sample stores five numeric arrays and three masks on one fixed grid:
 
 | Array | Notes |
 |---|---|
-| current regridded NO2 | finite where native QA-passing support exists; record coverage must exceed 90% |
-| current minus previous NO2 | finite on the current/previous mask intersection; coverage must exceed 75% |
-| current minus 14-day same-time EMA NO2 | finite on the current/EMA intersection; coverage must exceed 75% |
+| current regridded NO2 | finite where native QA-passing support exists; record coverage must exceed 95% |
+| current minus previous NO2 | finite on the current/previous mask intersection; coverage must exceed 80% |
+| current minus 14-day same-time EMA NO2 | finite on the current/EMA intersection; coverage must exceed 80% |
 | eastward wind, northward wind | bilinearly aligned from the native HRRR grid and finite across the image |
 | three NO2 validity masks | separate binary support for current, hourly delta, and EMA delta |
 
@@ -124,11 +124,11 @@ The native regridder accepts an NO2 contributor only when:
 - at least 0.25 km2 of accepted support reaches an output cell.
 
 Missing cells are never interpolated. Current coverage must be greater than
-90%. The current/previous intersection must cover more than 75% of the raster.
+95%. The current/previous intersection must cover more than 80% of the raster.
 The EMA uses a seven-day half-life over the available historical dates and at
 least five finite dates independently at each cell. Weights are
 renormalized over the dates available at that cell. The current/EMA intersection
-must also cover more than 75% of the raster.
+must also cover more than 80% of the raster.
 
 After pairing current and previous scans, generated records use
 `paired_finite_fraction` as the only final-selection ranking signal after the

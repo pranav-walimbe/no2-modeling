@@ -112,8 +112,8 @@ pairs. Production uses:
 - an accepted-overlap floor of 0.25 km2;
 - no additional effective-sample floor.
 
-Dataset generation requires greater than 90% current coverage and greater than
-75% support for both the hourly and EMA deltas. It retains missing cells and
+Dataset generation requires greater than 95% current coverage and greater than
+80% support for both the hourly and EMA deltas. It retains missing cells and
 selects eligible records through temporal and AOI round-robin with hourly paired
 coverage as the sole quality rank. These rules do not change per-scan
 tessellation or its 0.25 km2 cell-support floor. Plume, cloud, uncertainty, and

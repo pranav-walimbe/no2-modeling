@@ -186,7 +186,7 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   record;
 - stores each unique AOI scan and aligned AOI-hour wind raster in persistent
   caches, grouping work so workers reuse each NetCDF or GRIB read;
-- requires greater than 90 percent current coverage and greater than 75 percent
+- requires greater than 95 percent current coverage and greater than 80 percent
   paired coverage for both delta rasters, preserving gaps in separate masks;
 - builds a per-pixel 14-day EMA from the available historical dates, requiring
   five finite dates per cell and using a seven-day half-life;

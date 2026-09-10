@@ -192,24 +192,36 @@ class DatasetShardStore:
             shard_dir / SHARD_FAILURES_FILE,
             schema_overrides=PROCESSING_FAILURE_SCHEMA,
         )
+        with (shard_dir / SHARD_COMPLETION_FILE).open() as source:
+            completion = json.load(source)
+        expected_completion = self._completion_values(task, candidates.height, failures.height)
+        if completion != expected_completion:
+            raise ValueError(f"Shard {task.task_id} has invalid completion metadata")
+
         expected_indices = list(range(task.start, task.stop))
         candidate_indices = [int(value) for value in candidates[SOURCE_RECORD_INDEX_COL].to_list()]
         failure_indices = [int(value) for value in failures["record_index"].to_list()]
         if sorted(candidate_indices + failure_indices) != expected_indices:
             raise ValueError(f"Shard {task.task_id} does not contain one outcome per source record")
 
-        absolute_paths = []
-        for record_index, serialized_path in zip(
-            candidate_indices,
-            candidates[CANDIDATE_RASTER_PATH_COL].to_list(),
-            strict=True,
-        ):
-            relative_path = Path(str(serialized_path))
-            absolute_path = shard_dir / relative_path
-            if not absolute_path.is_file():
-                raise ValueError(f"Shard {task.task_id} is missing raster {relative_path}")
-            absolute_paths.append(str(absolute_path))
+        raster_directory = Path("record-rasters") / task.split
+        relative_paths = [Path(str(value)) for value in candidates[CANDIDATE_RASTER_PATH_COL].to_list()]
+        if any(path.is_absolute() or path.parent != raster_directory for path in relative_paths):
+            raise ValueError(f"Shard {task.task_id} contains a raster path outside {raster_directory}")
+        expected_rasters = {path.name for path in relative_paths}
+        if len(expected_rasters) != len(relative_paths):
+            raise ValueError(f"Shard {task.task_id} contains duplicate raster paths")
+        available_rasters = _directory_file_names(shard_dir / raster_directory, suffix=".npz")
+        if expected_rasters != available_rasters:
+            missing = sorted(expected_rasters - available_rasters)
+            unexpected = sorted(available_rasters - expected_rasters)
+            raise ValueError(
+                f"Shard {task.task_id} raster inventory mismatch; "
+                f"missing={missing[:3]}, unexpected={unexpected[:3]}"
+            )
+
         if resolve_paths:
+            absolute_paths = [str(shard_dir / path) for path in relative_paths]
             candidates = candidates.with_columns(pl.Series(CANDIDATE_RASTER_PATH_COL, absolute_paths, dtype=pl.String))
         return candidates, failures
 
@@ -484,6 +496,7 @@ class ScanBatchTask:
 
     granule_paths: tuple[str, ...]
     scans: tuple[ScanTask, ...]
+    reuse_existing: bool = True
 
 
 @dataclass(frozen=True)
@@ -537,6 +550,7 @@ class WindBatchTask:
 
     hrrr_path: str
     winds: tuple[WindTask, ...]
+    reuse_existing: bool = True
 
 
 @dataclass(frozen=True)
@@ -610,11 +624,37 @@ def cache_exists(path: str | Path) -> bool:
     return Path(path).is_file()
 
 
-def scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
+def _directory_file_names(directory: Path, suffix: str) -> set[str]:
+    # One directory enumeration avoids a metadata lookup for every expected path
+    try:
+        with os.scandir(directory) as entries:
+            return {
+                entry.name
+                for entry in entries
+                if entry.name.endswith(suffix) and entry.is_file(follow_symlinks=False)
+            }
+    except FileNotFoundError:
+        return set()
+
+
+def cache_inventory(directory: str | Path) -> set[str]:
+    """Return complete cache filenames from one directory enumeration.
+
+    Args:
+        directory: Persistent cache directory to scan.
+
+    Returns:
+        Names of regular ``.npz`` cache entries. Temporary files are excluded.
+    """
+    return _directory_file_names(Path(directory), suffix=".npz")
+
+
+def scan_batches(scans: Iterable[ScanTask], reuse_existing: bool = True) -> list[ScanBatchTask]:
     """Group scan tasks so each worker reads one granule set once.
 
     Args:
         scans: Scan tasks awaiting regridding.
+        reuse_existing: Recheck initial inventory misses inside each worker.
 
     Returns:
         One batch per distinct granule set.
@@ -622,7 +662,7 @@ def scan_batches(scans: Iterable[ScanTask]) -> list[ScanBatchTask]:
     grouped: dict[tuple[str, ...], list[ScanTask]] = {}
     for scan in scans:
         grouped.setdefault(scan.granule_paths, []).append(scan)
-    return [ScanBatchTask(paths, tuple(group)) for paths, group in grouped.items()]
+    return [ScanBatchTask(paths, tuple(group), reuse_existing) for paths, group in grouped.items()]
 
 
 def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
@@ -634,23 +674,38 @@ def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
     Returns:
         One cache location or contextual failure for every scan.
     """
+    reusable = {
+        task.cache_key: ScanResult(task.cache_key, task.cache_path, None)
+        for task in batch.scans
+        if batch.reuse_existing and cache_exists(task.cache_path)
+    }
+    pending = [task for task in batch.scans if task.cache_key not in reusable]
+    if not pending:
+        return [reusable[task.cache_key] for task in batch.scans]
+
     try:
         granule_indices = [build_granule_spatial_index(read_granule_pixels(path)) for path in batch.granule_paths]
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = f"TEMPO granule read failed: {error}"
-        return [ScanResult(task.cache_key, task.cache_path, message) for task in batch.scans]
+        reusable.update(
+            (task.cache_key, ScanResult(task.cache_key, task.cache_path, message)) for task in pending
+        )
+        return [reusable[task.cache_key] for task in batch.scans]
 
-    results: list[ScanResult] = []
-    for task in batch.scans:
+    for task in pending:
         try:
             grid = AoiGrid.from_lon_lat(task.aoi_id, task.lon, task.lat)
             pixels = concatenate_pixels([index.select_grid(grid) for index in granule_indices])
             raster = regrid_aoi_raster(pixels, grid)
             write_raster_npz(raster, task.cache_path)
-            results.append(ScanResult(task.cache_key, task.cache_path, None))
+            reusable[task.cache_key] = ScanResult(task.cache_key, task.cache_path, None)
         except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-            results.append(ScanResult(task.cache_key, task.cache_path, f"TEMPO regridding failed: {error}"))
-    return results
+            reusable[task.cache_key] = ScanResult(
+                task.cache_key,
+                task.cache_path,
+                f"TEMPO regridding failed: {error}",
+            )
+    return [reusable[task.cache_key] for task in batch.scans]
 
 
 def process_scan(task: ScanTask) -> ScanResult:
@@ -787,11 +842,12 @@ def _centre_hrrr_features(grid: _HrrrGrid, fields: dict[str, np.ndarray], task: 
     }
 
 
-def wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
+def wind_batches(winds: Iterable[WindTask], reuse_existing: bool = True) -> list[WindBatchTask]:
     """Group wind tasks so each HRRR field is read once.
 
     Args:
         winds: Wind tasks awaiting alignment.
+        reuse_existing: Recheck initial inventory misses inside each worker.
 
     Returns:
         One batch per distinct HRRR file.
@@ -799,7 +855,7 @@ def wind_batches(winds: Iterable[WindTask]) -> list[WindBatchTask]:
     grouped: dict[str, list[WindTask]] = {}
     for wind in winds:
         grouped.setdefault(wind.hrrr_path, []).append(wind)
-    return [WindBatchTask(path, tuple(group)) for path, group in grouped.items()]
+    return [WindBatchTask(path, tuple(group), reuse_existing) for path, group in grouped.items()]
 
 
 def process_wind_batch(batch: WindBatchTask) -> list[WindResult]:
@@ -811,22 +867,37 @@ def process_wind_batch(batch: WindBatchTask) -> list[WindResult]:
     Returns:
         One cache result for each requested AOI-hour.
     """
+    reusable = {
+        task.cache_key: WindResult(task.cache_key, task.cache_path, None)
+        for task in batch.winds
+        if batch.reuse_existing and cache_exists(task.cache_path)
+    }
+    pending = [task for task in batch.winds if task.cache_key not in reusable]
+    if not pending:
+        return [reusable[task.cache_key] for task in batch.winds]
+
     try:
         grid, fields = _read_hrrr_fields(batch.hrrr_path)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = f"HRRR read failed: {error}"
-        return [WindResult(task.cache_key, task.cache_path, message) for task in batch.winds]
+        reusable.update(
+            (task.cache_key, WindResult(task.cache_key, task.cache_path, message)) for task in pending
+        )
+        return [reusable[task.cache_key] for task in batch.winds]
 
-    results = []
-    for task in batch.winds:
+    for task in pending:
         try:
             arrays = _align_wind(grid, fields, task)
             arrays.update(_centre_hrrr_features(grid, fields, task))
             _write_npz_atomic(task.cache_path, **arrays)
-            results.append(WindResult(task.cache_key, task.cache_path, None))
+            reusable[task.cache_key] = WindResult(task.cache_key, task.cache_path, None)
         except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-            results.append(WindResult(task.cache_key, task.cache_path, f"HRRR alignment failed: {error}"))
-    return results
+            reusable[task.cache_key] = WindResult(
+                task.cache_key,
+                task.cache_path,
+                f"HRRR alignment failed: {error}",
+            )
+    return [reusable[task.cache_key] for task in batch.winds]
 
 
 def extract_wind_cache(path: str) -> tuple[dict[str, np.ndarray], dict[str, float]]:
