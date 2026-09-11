@@ -20,6 +20,10 @@ from collection.emissions_schema import (
     TIME_ZONE_COL,
     UTC_STANDARD_OFFSET_HOURS_COL,
 )
+from collection.stack_attributes import (
+    STACK_ATTRIBUTE_YEAR_COL,
+    get_unit_stack_attributes,
+)
 from config import EMISSIONS_RECORDS_PARQUET, FULL_DATA_PARQUET
 from prerequisites import require_campd_credentials
 
@@ -142,6 +146,7 @@ def _fetch_attribute_page(
                 f"{type(error).__name__}; retrying in {delay:.0f}s"
             )
             time.sleep(delay)
+
 
 def _fetch_attribute_year(year: int) -> list[dict[str, object]]:
     # Collect every nationwide page for one year
@@ -327,16 +332,13 @@ def _convert_local_standard_hours_to_utc(frame: pl.LazyFrame) -> pl.LazyFrame:
     # Preserve source clock fields and expose one unambiguous UTC timestamp
     local_hour_start = pl.col("date").cast(pl.Datetime) + pl.duration(hours=pl.col("hour"))
     utc_hour_start = local_hour_start - pl.duration(hours=pl.col(UTC_STANDARD_OFFSET_HOURS_COL))
-    return (
-        frame.with_columns(
-            pl.col("date").alias(LOCAL_STANDARD_DATE_COL),
-            pl.col("hour").alias(LOCAL_STANDARD_HOUR_COL),
-            utc_hour_start.dt.replace_time_zone("UTC").alias(EMISSIONS_HOUR_UTC_COL),
-        )
-        .with_columns(
-            pl.col(EMISSIONS_HOUR_UTC_COL).dt.date().alias("date"),
-            pl.col(EMISSIONS_HOUR_UTC_COL).dt.hour().cast(pl.Int8).alias("hour"),
-        )
+    return frame.with_columns(
+        pl.col("date").alias(LOCAL_STANDARD_DATE_COL),
+        pl.col("hour").alias(LOCAL_STANDARD_HOUR_COL),
+        utc_hour_start.dt.replace_time_zone("UTC").alias(EMISSIONS_HOUR_UTC_COL),
+    ).with_columns(
+        pl.col(EMISSIONS_HOUR_UTC_COL).dt.date().alias("date"),
+        pl.col(EMISSIONS_HOUR_UTC_COL).dt.hour().cast(pl.Int8).alias("hour"),
     )
 
 
@@ -344,6 +346,7 @@ def _build_prediction_year_attribute_lookups(
     prediction_years: pl.DataFrame,
     facility_attributes: pl.DataFrame,
     unit_attributes: pl.DataFrame,
+    stack_attributes: pl.DataFrame | None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     # Resolve temporal attributes on small lookup tables before the hourly joins
     years = prediction_years.select(PREDICTION_YEAR_COL).unique().sort(PREDICTION_YEAR_COL)
@@ -376,6 +379,13 @@ def _build_prediction_year_attribute_lookups(
             check_sortedness=False,
         )
     )
+    if stack_attributes is not None:
+        unit_lookup = unit_lookup.join(
+            stack_attributes,
+            left_on=["facilityId", "unitIdKey", PREDICTION_YEAR_COL],
+            right_on=["facilityId", "unitIdKey", STACK_ATTRIBUTE_YEAR_COL],
+            how="left",
+        )
     return facility_lookup, unit_lookup
 
 
@@ -384,6 +394,7 @@ def write_augmented_parquet(
     output_path: Path,
     facility_attributes: pl.DataFrame,
     unit_attributes: pl.DataFrame,
+    stack_attributes: pl.DataFrame | None = None,
 ) -> int:
     """Stream enriched emissions into one atomic Zstd Parquet file.
 
@@ -392,6 +403,7 @@ def write_augmented_parquet(
         output_path: Final compressed Parquet file.
         facility_attributes: Annual facility attributes and capacity summaries.
         unit_attributes: Annual unit attributes per facility and unit.
+        stack_attributes: Annual unit stack characteristics from monitoring plans.
 
     Returns:
         Number of enriched rows written.
@@ -413,6 +425,7 @@ def write_augmented_parquet(
         prediction_years,
         facility_attributes,
         unit_attributes,
+        stack_attributes,
     )
     augmented = (
         source.with_columns(
@@ -466,23 +479,28 @@ def main() -> None:
     input_path = Path(EMISSIONS_RECORDS_PARQUET)
     source = pl.scan_parquet(input_path)
     facility_ids = (
-        source
-        .select(pl.col("facilityId").cast(pl.Int64, strict=False))
+        source.select(pl.col("facilityId").cast(pl.Int64, strict=False))
         .drop_nulls()
         .unique()
         .sort("facilityId")
         .collect()["facilityId"]
         .to_list()
     )
-    source_years = source.select(
-        pl.col("date").cast(pl.Date, strict=False).dt.year().min().alias("earliest"),
-        pl.col("date").cast(pl.Date, strict=False).dt.year().max().alias("latest"),
-    ).collect().row(0, named=True)
+    source_years = (
+        source.select(
+            pl.col("date").cast(pl.Date, strict=False).dt.year().min().alias("earliest"),
+            pl.col("date").cast(pl.Date, strict=False).dt.year().max().alias("latest"),
+        )
+        .collect()
+        .row(0, named=True)
+    )
+    prediction_years = list(range(int(source_years["earliest"]), int(source_years["latest"]) + 1))
     attribute_records = get_facility_attributes(
         facility_ids=facility_ids,
-        latest_year=int(source_years["latest"]),
-        earliest_year=int(source_years["earliest"]),
+        latest_year=prediction_years[-1],
+        earliest_year=prediction_years[0],
     )
+    stack_attributes = get_unit_stack_attributes(facility_ids, prediction_years)
 
     facility_attributes, unit_attributes = _build_attribute_frames(attribute_records)
     row_count = write_augmented_parquet(
@@ -490,6 +508,7 @@ def main() -> None:
         output_path=Path(FULL_DATA_PARQUET),
         facility_attributes=facility_attributes,
         unit_attributes=unit_attributes,
+        stack_attributes=stack_attributes,
     )
     print(f"Wrote {row_count:,} rows to {FULL_DATA_PARQUET}")
 
