@@ -121,7 +121,7 @@ TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 # Modeling data contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2", "wind_u_10m_mps", "wind_v_10m_mps")
+MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2", "wind_u_80m_mps", "wind_v_80m_mps")
 MODEL_MASK_KEYS = ("current_no2_mask", "delta_no2_mask", "ema_delta_no2_mask")
 MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2")
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS)

@@ -120,8 +120,11 @@ python -u -m collection.scrape_hrrr
   present at their final path. Rerunning a range is idempotent for completed
   files.
 - The HRRR scraper saves one atomic GRIB2 subset per UTC hour under
-  `HRRR/raw/<year>/<month>/<day>`, each holding 10 m U/V wind, 2 m temperature,
+  `HRRR/raw/<year>/<month>/<day>`, each holding 80 m U/V wind, 2 m temperature,
   and boundary-layer height from the hourly `f00` analysis.
+- The Slurm HRRR collector passes `--overwrite` for a full replacement. Wait
+  for every array task to succeed before using the archive, then regenerate
+  the dataset once with `--refresh-wind` to replace aligned 10 m cache entries.
 
 ### 3. Download EPA emissions and facility locations
 

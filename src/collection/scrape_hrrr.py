@@ -25,8 +25,8 @@ COPY_CHUNK_SIZE = 1024 * 1024
 
 FIELD_PATTERNS = {
     "temperature_2m": ":TMP:2 m above ground:",
-    "wind_u_10m": ":UGRD:10 m above ground:",
-    "wind_v_10m": ":VGRD:10 m above ground:",
+    "wind_u_80m": ":UGRD:80 m above ground:",
+    "wind_v_80m": ":VGRD:80 m above ground:",
     "boundary_layer_height": ":HPBL:surface:",
 }
 
