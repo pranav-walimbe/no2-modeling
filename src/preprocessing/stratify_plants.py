@@ -44,8 +44,8 @@ from preprocessing.tempo_mapping import (
     serialize_tempo_path_lists,
 )
 
-TRAIN_FRACTION = 0.70
-VAL_FRACTION = 0.15
+TRAIN_FRACTION = 0.80
+VAL_FRACTION = 0.10
 SPLIT_SEED = 42
 
 OUTPUT_COLUMNS = [

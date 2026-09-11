@@ -17,7 +17,7 @@ largest exactly balanced subset of its surviving candidates.
 
 - Overlapping 72 km AOIs form geographic clusters.
 - Each cluster belongs to exactly one of train, validation, or test.
-- A deterministic shuffle assigns 70 percent of clusters to training, 15
+- A deterministic shuffle assigns 80 percent of clusters to training, 10
   percent to validation, and the remainder to test.
 - Record shares can differ from cluster shares because cluster sizes vary.
 - No plant region leaks across splits, so evaluation measures generalization to

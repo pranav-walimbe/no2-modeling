@@ -177,7 +177,7 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   preceding quarter as `prev_qtr_avg_nox`;
 - retains only AOIs whose coal units supplied more than 50 percent of summed
   previous-quarter average unit generation;
-- assigns overlapping AOI clusters intact to 70/15/15 train/validation/test splits;
+- assigns overlapping AOI clusters intact to 80/10/10 train/validation/test splits;
 - ranks candidates by lagged coal generation, using no current-quarter output;
 - balances each split to its minority-class count without a fixed record limit.
 
