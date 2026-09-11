@@ -263,7 +263,7 @@ The original workflow used these resources:
 | --- | --- | ---: | --- |
 | TEMPO and HRRR download | `savio4_htc` | Range-dependent | 4 CPUs |
 | EPA emissions download | `savio2_bigmem` | 6 hours | 1 CPU |
-| Partition and dataset build | `savio4_htc` | 4 hours | 56 CPUs |
+| Stratification and dataset shards | `savio4_htc` | 2-12 hours | 16 CPUs |
 | Model training | `savio3_gpu` | 2 hours | 8 CPUs, 1 A40 GPU |
 
 Start from `scripts/slurm/example_job.sh` and tailor the command and resources
