@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -22,7 +21,6 @@ from config import (
     HRRR_DIR,
     LABEL_COL,
     NUM_CORES,
-    TEMPO_AOI_MAPPING,
     TEMPO_DIR,
     TEST_RECORDS_CSV,
     TEST_SIZE,
@@ -51,7 +49,6 @@ from preprocessing.generate_dataset_utils import (
     process_record,
     process_scan_batch,
     process_wind_batch,
-    same_time_ema_observations,
     scan_batches,
     select_final_records,
     wind_batches,
@@ -85,8 +82,6 @@ class PreparedRecord:
     record_index: int
     current_scan_key: str
     previous_scan_key: str
-    ema_scan_keys: tuple[str, ...]
-    ema_scan_age_days: tuple[float, ...]
     wind_cache_key: str
     delta_no2_path: str
 
@@ -140,30 +135,6 @@ def _load_shard(task: ShardTask) -> dict[str, pl.DataFrame]:
     return {task.split: frame}
 
 
-ObservationIndex = dict[int, dict[date, list[dict[str, object]]]]
-
-
-def _load_observations(aoi_ids: list[int]) -> ObservationIndex:
-    # Index the shared TEMPO observations once by AOI and calendar day
-    paths = sorted(Path(TEMPO_AOI_MAPPING).rglob("date=*.parquet"))
-    if not paths:
-        raise FileNotFoundError(f"No AOI observation shards found under {TEMPO_AOI_MAPPING}")
-    print(f"Indexing {len(paths):,} TEMPO observation shards for {len(aoi_ids):,} AOIs")
-    observations = (
-        pl.scan_parquet(paths)
-        .select("aoi_id", "scan_date", "tempo_time", "granule_paths", "sampled_pixel_count")
-        .filter(pl.col("aoi_id").is_in(aoi_ids))
-        .collect()
-    )
-    print(f"Loaded {observations.height:,} matching TEMPO observations")
-    index: ObservationIndex = {}
-    for observation in observations.iter_rows(named=True):
-        aoi_id = int(observation["aoi_id"])
-        scan_date = observation["scan_date"]
-        index.setdefault(aoi_id, {}).setdefault(scan_date, []).append(observation)
-    return index
-
-
 def _prepare_records(
     splits: dict[str, pl.DataFrame],
     tempo_cache_dir: Path,
@@ -175,8 +146,6 @@ def _prepare_records(
     scans: dict[str, ScanTask] = {}
     winds: dict[str, WindTask] = {}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in splits}
-    aoi_ids = sorted({int(aoi_id) for frame in splits.values() for aoi_id in frame["aoi_id"].unique()})
-    observations_by_aoi = _load_observations(aoi_ids)
     source_count = sum(frame.height for frame in splits.values())
     prepared_count = 0
     for split, frame in splits.items():
@@ -189,22 +158,6 @@ def _prepare_records(
                 current = make_scan_task(row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 wind = make_wind_task(row, Path(HRRR_DIR), wind_cache_dir)
-                ema_observations = same_time_ema_observations(
-                    observations_by_aoi[int(row["aoi_id"])], row["tempo_time"]
-                )
-                ema_scans = []
-                ema_scan_age_days = []
-                for observation in ema_observations:
-                    ema_row = {
-                        "aoi_id": row["aoi_id"],
-                        "lon": row["lon"],
-                        "lat": row["lat"],
-                        "tempo": observation["granule_paths"],
-                    }
-                    ema_scan = make_scan_task(ema_row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
-                    ema_scans.append(ema_scan)
-                    age = (row["tempo_time"] - observation["tempo_time"]).total_seconds() / 86_400
-                    ema_scan_age_days.append(float(age))
                 delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
                     PreparedRecord(
@@ -212,16 +165,12 @@ def _prepare_records(
                         record_index=record_index,
                         current_scan_key=current.cache_key,
                         previous_scan_key=previous.cache_key,
-                        ema_scan_keys=tuple(scan.cache_key for scan in ema_scans),
-                        ema_scan_age_days=tuple(ema_scan_age_days),
                         wind_cache_key=wind.cache_key,
                         delta_no2_path=str(delta_no2_path),
                     )
                 )
                 scans.setdefault(current.cache_key, current)
                 scans.setdefault(previous.cache_key, previous)
-                for ema_scan in ema_scans:
-                    scans.setdefault(ema_scan.cache_key, ema_scan)
                 winds.setdefault(wind.cache_key, wind)
             except (KeyError, TypeError, ValueError) as error:
                 failures[split].append({"record_index": record_index, "error": str(error)})
@@ -314,11 +263,6 @@ def _record_tasks(
             reasons = [tempo_failures.get(key, "TEMPO cache unavailable") for key in missing_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
-        available_ema_scans = [
-            (tempo_cache_paths[key], age)
-            for key, age in zip(record.ema_scan_keys, record.ema_scan_age_days, strict=True)
-            if key in tempo_cache_paths
-        ]
         if record.wind_cache_key not in wind_cache_paths:
             reason = wind_failures.get(record.wind_cache_key, "wind cache unavailable")
             failures[record.split].append({"record_index": record.record_index, "error": reason})
@@ -331,8 +275,6 @@ def _record_tasks(
                 record_index=record.record_index,
                 current_cache_path=tempo_cache_paths[record.current_scan_key],
                 previous_cache_path=tempo_cache_paths[record.previous_scan_key],
-                ema_scan_paths=tuple(path for path, _ in available_ema_scans),
-                ema_scan_age_days=tuple(age for _, age in available_ema_scans),
                 wind_cache_path=wind_cache_paths[record.wind_cache_key],
                 output_path=record.delta_no2_path,
             )

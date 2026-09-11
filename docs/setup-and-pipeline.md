@@ -174,6 +174,8 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
 - reads the prebuilt TEMPO mapping;
 - normalizes consecutive-hour AOI NOx changes with the previous completed
   quarter's median and MAD;
+- computes each AOI's absolute mean hourly NOx mass from the immediately
+  preceding quarter as `prev_qtr_avg_nox`;
 - assigns overlapping AOI clusters intact to 60/20/20 splits;
 - fits historical-variable percentile bounds on training only;
 - selects lagged coal-output AOIs first, then the general pool by lagged total
@@ -182,16 +184,14 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
 
 `preprocessing.generate_dataset`:
 
-- resolves current, previous, and prior-14-day same-time TEMPO scans through one
+- resolves current and previous TEMPO scans through one
   deduplicated persistent image-cache plan;
-- writes five numeric rasters and three independent NO2 masks per retained
+- writes four numeric rasters and two independent NO2 masks per retained
   record;
 - stores each unique AOI scan and aligned AOI-hour wind raster in persistent
   caches, grouping work so workers reuse each NetCDF or GRIB read;
 - requires greater than 95 percent current coverage and greater than 80 percent
-  paired coverage for both delta rasters, preserving gaps in separate masks;
-- builds a per-pixel 14-day EMA from the available historical dates, requiring
-  five finite dates per cell and using a seven-day half-life;
+  paired coverage for the hourly delta, preserving gaps in separate masks;
 - selects the requested size through deterministic AOI and temporal round-robin,
   or the largest exactly balanced subset when either class is short;
 - uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
@@ -232,7 +232,7 @@ Running the splits:
 python -u -m modeling.train
 ```
 
-The trainer reads current NO2, hourly delta NO2, EMA delta NO2, wind, and three
+The trainer reads current NO2, hourly delta NO2, wind, and two
 validity masks from each selected NPZ on demand. It fits memory-bounded robust
 NO2 normalization statistics on the training split alone and records clipped
 valid-pixel fractions by channel and split. It then predicts whether raw

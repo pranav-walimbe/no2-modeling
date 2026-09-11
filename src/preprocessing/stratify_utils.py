@@ -35,6 +35,7 @@ MAJOR_CITY_DIST_COL = "major_city_dist"
 LABEL_MODE_COL = "label_mode"
 PREVIOUS_QUARTER_COAL_POWER_COL = "_previous_quarter_coal_power"
 PREVIOUS_QUARTER_POWER_COL = "_previous_quarter_power"
+PREV_QTR_AVG_NOX_COL = "prev_qtr_avg_nox"
 METERS_PER_KM = 1000.0
 MAD_NORMAL_SCALE = 1.4826  # puts MAD on a standard-deviation scale under normality
 HRRR_PRODUCT = "wrfsfcf00"  # hourly surface analysis product named in every HRRR filename
@@ -393,6 +394,33 @@ def add_previous_quarter_same_hour_averages(hourly: pl.LazyFrame) -> pl.LazyFram
     )
 
 
+def add_previous_quarter_nox_average(hourly: pl.LazyFrame) -> pl.LazyFrame:
+    """Add the AOI's mean hourly NOx mass level from the prior quarter.
+
+    Args:
+        hourly: AOI-hour rows containing date and aggregate NOx mass.
+
+    Returns:
+        Rows with a leakage-safe ``prev_qtr_avg_nox`` value when the immediately
+        preceding quarter is available.
+    """
+    quarter_columns = hourly.with_columns(
+        pl.col("date").dt.year().alias("_year"),
+        pl.col("date").dt.quarter().alias("_quarter"),
+    )
+    previous_quarter = (
+        quarter_columns.group_by(AOI_ID_COL, "_year", "_quarter")
+        .agg(pl.col(NOX_MASS_COL).mean().alias(PREV_QTR_AVG_NOX_COL))
+        .with_columns(
+            pl.when(pl.col("_quarter") == 4).then(pl.col("_year") + 1).otherwise(pl.col("_year")).alias("_year"),
+            pl.when(pl.col("_quarter") == 4).then(1).otherwise(pl.col("_quarter") + 1).alias("_quarter"),
+        )
+    )
+    return quarter_columns.join(previous_quarter, on=[AOI_ID_COL, "_year", "_quarter"], how="left").drop(
+        "_year", "_quarter"
+    )
+
+
 def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
     """Add hourly NOx changes and a prior-completed-quarter scale.
 
@@ -586,7 +614,7 @@ def aggregate_aoi_hours(
         )
     )
     return (
-        add_delta_nox_targets(add_previous_quarter_same_hour_averages(hourly))
+        add_delta_nox_targets(add_previous_quarter_nox_average(add_previous_quarter_same_hour_averages(hourly)))
         .with_columns(
             pl.col("date").dt.year().alias("_priority_year"),
             pl.col("date").dt.quarter().alias("_priority_quarter"),

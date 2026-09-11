@@ -27,6 +27,7 @@ from preprocessing.stratify_utils import (
     AOI_ID_COL,
     LABEL_MODE_COL,
     MAJOR_CITY_DIST_COL,
+    PREV_QTR_AVG_NOX_COL,
     PREVIOUS_QUARTER_COAL_POWER_COL,
     PREVIOUS_QUARTER_POWER_COL,
     add_aoi_bounds,
@@ -84,6 +85,7 @@ OUTPUT_COLUMNS = [
     "avg_heat_input",
     "avg_pwr_gen",
     NOX_MASS_COL,
+    PREV_QTR_AVG_NOX_COL,
     DELTA_NOX_MASS_COL,
     DELTA_NOX_SCALE_COL,
     LABEL_COL,
@@ -199,6 +201,7 @@ def main() -> None:
     frame = aggregate_aoi_hours(records, aois, membership).filter(
         pl.col("avg_heat_input").is_not_null()
         & pl.col("avg_pwr_gen").is_not_null()
+        & pl.col(PREV_QTR_AVG_NOX_COL).is_finite()
         & pl.col(DELTA_NOX_MASS_COL).is_not_null()
         & pl.col(DELTA_NOX_SCALE_COL).is_not_null()
     )

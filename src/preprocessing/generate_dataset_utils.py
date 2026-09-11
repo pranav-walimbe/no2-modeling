@@ -8,7 +8,6 @@ import tempfile
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TypeVar
 
@@ -24,14 +23,9 @@ from pyproj import CRS, Proj, Transformer
 from scipy.ndimage import map_coordinates
 
 from config import (
-    EMA_HALF_LIFE_DAYS,
-    EMA_HISTORY_DAYS,
-    EMA_MIN_PIXEL_OBSERVATIONS,
-    EMA_SAME_TIME_TOLERANCE_MINUTES,
     LABEL_COL,
     MIN_CURRENT_NO2_FINITE_FRACTION,
     MIN_DELTA_NO2_FINITE_FRACTION,
-    MIN_EMA_DELTA_NO2_FINITE_FRACTION,
     MODEL_IMAGE_KEYS,
     MODEL_MASK_KEYS,
 )
@@ -45,11 +39,10 @@ from preprocessing.regrid import (
 )
 from preprocessing.stratify_utils import AOI_ID_COL
 
-CURRENT_RASTER_NAME, DELTA_RASTER_NAME, EMA_DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
-CURRENT_MASK_NAME, DELTA_MASK_NAME, EMA_DELTA_MASK_NAME = MODEL_MASK_KEYS
+CURRENT_RASTER_NAME, DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
+CURRENT_MASK_NAME, DELTA_MASK_NAME = MODEL_MASK_KEYS
 CURRENT_FINITE_FRACTION_COL = "current_finite_fraction"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
-EMA_PAIRED_FINITE_FRACTION_COL = "ema_paired_finite_fraction"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
@@ -66,7 +59,6 @@ TABULAR_FEATURE_NAMES = (
     "plume_score",
     CURRENT_FINITE_FRACTION_COL,
     PAIRED_FINITE_FRACTION_COL,
-    EMA_PAIRED_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
@@ -381,8 +373,6 @@ class RecordTask:
     record_index: int
     current_cache_path: str
     previous_cache_path: str
-    ema_scan_paths: tuple[str, ...]
-    ema_scan_age_days: tuple[float, ...]
     wind_cache_path: str
     output_path: str
 
@@ -813,76 +803,15 @@ def _require_coverage(valid: np.ndarray, threshold: float, raster_name: str) -> 
     return fraction
 
 
-def same_time_ema_observations(
-    observations_by_day: dict[date, list[dict[str, object]]], target_time: datetime
-) -> list[dict[str, object]]:
-    """Select the closest preceding same-time scan for each historical day.
-
-    Args:
-        observations_by_day: Candidate observations indexed by calendar day.
-        target_time: Scan time the history is matched against.
-
-    Returns:
-        At most one observation per preceding day, ordered by scan time.
-    """
-    target_seconds = target_time.hour * 3600 + target_time.minute * 60 + target_time.second
-    selected = []
-    for age_days in range(1, EMA_HISTORY_DAYS + 1):
-        scan_date = target_time.date() - timedelta(days=age_days)
-        candidates = []
-        for observation in observations_by_day.get(scan_date, []):
-            observation_time = observation["tempo_time"]
-            observation_seconds = observation_time.hour * 3600 + observation_time.minute * 60 + observation_time.second
-            difference = abs((observation_seconds - target_seconds + 43_200) % 86_400 - 43_200)
-            if difference <= EMA_SAME_TIME_TOLERANCE_MINUTES * 60:
-                candidates.append((difference, -int(observation["sampled_pixel_count"]), observation))
-        if candidates:
-            selected.append(min(candidates, key=lambda priority: priority[:2])[2])
-    return sorted(selected, key=lambda row: row["tempo_time"])
-
-
-def _ema_from_scans(
-    ema_scan_paths: tuple[str, ...],
-    ema_scan_age_days: tuple[float, ...],
-) -> np.ndarray:
-    # Build one causal per-pixel EMA from the available historical dates
-    ema_scans: list[np.ndarray] = []
-    for path in ema_scan_paths:
-        with np.load(path, allow_pickle=False) as cache:
-            ema_scans.append(np.asarray(cache["no2"], dtype=np.float64))
-
-    return _masked_ema(np.stack(ema_scans), np.asarray(ema_scan_age_days, dtype=np.float64))
-
-
-def _masked_ema(stack: np.ndarray, age_days: np.ndarray) -> np.ndarray:
-    # Compute support-aware temporal weights across the stacked scan axis
-    finite = np.isfinite(stack)
-    support = np.count_nonzero(finite, axis=0)
-    weights = np.exp2(-age_days / EMA_HALF_LIFE_DAYS)[:, None, None]
-    # Broadcasting per-date weights against the finite mask renormalizes each cell over its own dates
-    valid_weights = finite * weights
-    weight_sum = np.sum(valid_weights, axis=0)
-    weighted_sum = np.sum(np.where(finite, stack, 0.0) * weights, axis=0)
-    ema = np.full(stack.shape[1:], np.nan, dtype=np.float64)
-    valid = support >= EMA_MIN_PIXEL_OBSERVATIONS
-    # The where clause leaves the NaN prefill at cells below the support floor
-    np.divide(weighted_sum, weight_sum, out=ema, where=valid)
-    return ema
-
-
 def derive_raster_features(
     current_path: str,
     previous_path: str,
-    ema_scan_paths: tuple[str, ...],
-    ema_scan_age_days: tuple[float, ...],
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Derive paired model rasters and scan-quality scalar features.
 
     Args:
-        current_path: Cached five-raster bundle for the current scan.
-        previous_path: Cached five-raster bundle for the prior scan.
-        ema_scan_paths: Cached same-time scans from the preceding two weeks.
-        ema_scan_age_days: Exact age of each EMA scan before current.
+        current_path: Cached scan bundle for the current observation.
+        previous_path: Cached scan bundle for the prior observation.
 
     Returns:
         Model raster arrays and their plume, cloud, quality, and uncertainty
@@ -908,15 +837,6 @@ def derive_raster_features(
         delta_no2 = np.full_like(current_no2, np.nan)
         np.subtract(current_no2, previous_no2, out=delta_no2, where=paired_valid)
 
-        ema_no2 = _ema_from_scans(ema_scan_paths, ema_scan_age_days)
-        ema_paired_valid = current_valid & np.isfinite(ema_no2)
-        ema_paired_fraction = _require_coverage(
-            ema_paired_valid,
-            MIN_EMA_DELTA_NO2_FINITE_FRACTION,
-            "EMA delta",
-        )
-        ema_delta_no2 = np.full_like(current_no2, np.nan)
-        np.subtract(current_no2, ema_no2, out=ema_delta_no2, where=ema_paired_valid)
         p10, p50, p99 = np.percentile(delta_no2[paired_valid], [10, 50, 99])
         denominator = p50 - p10
         epsilon = np.finfo(np.float64).eps * max(abs(p10), abs(p50), 1.0)
@@ -924,7 +844,6 @@ def derive_raster_features(
             "plume_score": float((p99 - p50) / max(denominator, epsilon)),
             CURRENT_FINITE_FRACTION_COL: current_fraction,
             PAIRED_FINITE_FRACTION_COL: paired_fraction,
-            EMA_PAIRED_FINITE_FRACTION_COL: ema_paired_fraction,
             "mean_weighted_cloud_fraction": _paired_mean(
                 current["weighted_cloud_fraction"], previous["weighted_cloud_fraction"], paired_valid
             ),
@@ -938,10 +857,8 @@ def derive_raster_features(
     rasters = {
         CURRENT_RASTER_NAME: current_no2.astype(np.float32),
         DELTA_RASTER_NAME: delta_no2.astype(np.float32),
-        EMA_DELTA_RASTER_NAME: ema_delta_no2.astype(np.float32),
         CURRENT_MASK_NAME: current_valid.astype(np.uint8),
         DELTA_MASK_NAME: paired_valid.astype(np.uint8),
-        EMA_DELTA_MASK_NAME: ema_paired_valid.astype(np.uint8),
     }
     return rasters, features
 
@@ -973,8 +890,6 @@ def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[s
     rasters, features = derive_raster_features(
         task.current_cache_path,
         task.previous_cache_path,
-        task.ema_scan_paths,
-        task.ema_scan_age_days,
     )
     wind_rasters, weather_features = extract_wind_cache(task.wind_cache_path)
     rasters.update(wind_rasters)

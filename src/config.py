@@ -85,11 +85,6 @@ IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan coverage floor
 MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor
-MIN_EMA_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/EMA coverage floor
-EMA_HISTORY_DAYS = 14  # causal same-time background window before each current scan
-EMA_HALF_LIFE_DAYS = 7.0  # temporal decay applied inside the same-time background
-EMA_SAME_TIME_TOLERANCE_MINUTES = 60  # largest daily scan-time mismatch
-EMA_MIN_PIXEL_OBSERVATIONS = 5  # least distinct historical dates required per EMA cell
 NOX_MASS_COL = "nox_mass"
 DELTA_NOX_MASS_COL = "delta_nox_mass"
 DELTA_NOX_SCALE_COL = "delta_nox_scale"
@@ -121,9 +116,9 @@ TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
 # Modeling data contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2", "wind_u_80m_mps", "wind_v_80m_mps")
-MODEL_MASK_KEYS = ("current_no2_mask", "delta_no2_mask", "ema_delta_no2_mask")
-MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2", "ema_delta_no2")
+MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "wind_u_80m_mps", "wind_v_80m_mps")
+MODEL_MASK_KEYS = ("current_no2_mask", "delta_no2_mask")
+MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2")
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS)
 MODEL_INPUT_CHANNELS = MODEL_IMAGE_CHANNELS + len(MODEL_MASK_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
@@ -131,6 +126,7 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
     "num_coal_units",
     "num_ng_units",
     "total_nameplate_capacity_mw",
+    "prev_qtr_avg_nox",
     "avg_heat_input",
     "avg_pwr_gen",
     "temperature_2m_k",

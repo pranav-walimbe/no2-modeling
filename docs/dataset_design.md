@@ -22,7 +22,7 @@ TEST_SIZE = 4_000
 
 Stratification writes three times each requested size: 48,000 train, 12,000
 validation, 12,000 test candidates. The overdraw leaves room for per-scan
-coverage, EMA availability, and operational failures without regridding the
+coverage and operational failures without regridding the
 much larger eligible metadata population. Each generation run reports the new
 retention rate so this multiplier can be recalibrated from current evidence.
 
@@ -82,19 +82,20 @@ The binary target uses raw `delta_nox_mass`:
 Stratification and final generation write JSON summaries carrying overall and
 per-AOI retention, natural pre-balancing prevalence, and selected class counts.
 
-Each sample stores five numeric arrays and three masks on one fixed grid:
+Each sample stores four numeric arrays and two masks on one fixed grid:
 
 | Array | Notes |
 |---|---|
 | current regridded NO2 | finite where native QA-passing support exists; record coverage must exceed 95% |
 | current minus previous NO2 | finite on the current/previous mask intersection; coverage must exceed 80% |
-| current minus 14-day same-time EMA NO2 | finite on the current/EMA intersection; coverage must exceed 80% |
 | eastward wind, northward wind | bilinearly aligned from the native HRRR grid and finite across the image |
-| three NO2 validity masks | separate binary support for current, hourly delta, and EMA delta |
+| two NO2 validity masks | separate binary support for current and hourly delta |
 
 HRRR temperature and boundary-layer height come from interpolation at the AOI
 centre. Prior-quarter heat input and power generation keep contemporaneous
-operational leakage out.
+operational leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's
+hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
+delta); it is also supplied as a train-normalized scalar model feature.
 
 Nameplate capacity:
 
@@ -125,10 +126,6 @@ The native regridder accepts an NO2 contributor only when:
 
 Missing cells are never interpolated. Current coverage must be greater than
 95%. The current/previous intersection must cover more than 80% of the raster.
-The EMA uses a seven-day half-life over the available historical dates and at
-least five finite dates independently at each cell. Weights are
-renormalized over the dates available at that cell. The current/EMA intersection
-must also cover more than 80% of the raster.
 
 After pairing current and previous scans, generated records use
 `paired_finite_fraction` as the only final-selection ranking signal after the
@@ -174,11 +171,6 @@ Read balanced metrics against the saved pre-balancing prevalence.
 ## Performance and persistence
 
 - Metadata operations use Polars and project only the required columns.
-- Per-pixel EMA support and weighting use stacked NumPy arrays without a Python
-  loop over grid cells. On 250 synthetic records this ran 1.4 times the
-  throughput of the removed nearest-fill path and cut EMA compute time by a
-  factor of seven at unchanged peak memory. Archive reads now dominate the
-  per-record cost.
 - Generation bounds the number of pending worker futures and caches each unique
   AOI scan for one run.
 - Candidate delta rasters and outcome CSVs are written directly into disposable
