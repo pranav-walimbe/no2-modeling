@@ -392,7 +392,8 @@ def _write_outputs(
         selection_size = {
             "requested_size": FINAL_SPLIT_SIZES[split],
             "actual_size": output_frame.height,
-            "shortfall": FINAL_SPLIT_SIZES[split] - output_frame.height,
+            "shortfall": max(FINAL_SPLIT_SIZES[split] - output_frame.height, 0),
+            "surplus": max(output_frame.height - FINAL_SPLIT_SIZES[split], 0),
             "eligible_by_class": eligible_by_class,
         }
         print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
@@ -401,6 +402,8 @@ def _write_outputs(
                 f"[{split}] requested {selection_size['requested_size']:,}; "
                 f"using largest balanced subset with {selection_size['shortfall']:,} fewer records"
             )
+        elif selection_size["surplus"]:
+            print(f"[{split}] retained a balanced surplus of {selection_size['surplus']:,} records")
         print(
             f"[{split}] full paired coverage: {selected_coverage['full_coverage_records']:,}/"
             f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"

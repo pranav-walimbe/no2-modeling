@@ -1,8 +1,5 @@
 """Utilities for building and splitting AOI-hour records."""
 
-import shutil
-import tempfile
-import urllib.request
 from pathlib import Path
 
 import geopandas as gpd
@@ -13,20 +10,10 @@ from pycanopy import SpatialFrame, distance_to_point
 from pyproj import Transformer
 
 from config import (
-    CITIES_CACHE,
-    CITIES_URL,
-    DELTA_NOX_MASS_COL,
-    DELTA_NOX_SCALE_COL,
-    DELTA_SCALE_LEVEL_FRACTION,
     DELTA_THRESHOLD,
     IMG_RANGE,
     LABEL_COL,
     MIN_CITY_POPULATION,
-    MIN_DELTA_HISTORY,
-    NOX_MASS_COL,
-    OUTLIER_FILTER_COLUMNS,
-    OUTLIER_LOWER_QUANTILE,
-    OUTLIER_UPPER_QUANTILE,
     TARGET_LABEL_MODE,
 )
 
@@ -37,52 +24,13 @@ PREVIOUS_QUARTER_COAL_POWER_COL = "_previous_quarter_coal_power"
 PREVIOUS_QUARTER_POWER_COL = "_previous_quarter_power"
 PREV_QTR_AVG_NOX_COL = "prev_qtr_avg_nox"
 METERS_PER_KM = 1000.0
-MAD_NORMAL_SCALE = 1.4826  # puts MAD on a standard-deviation scale under normality
 HRRR_PRODUCT = "wrfsfcf00"  # hourly surface analysis product named in every HRRR filename
 HRRR_FIELD_SLUG = "wind-temp-blh"  # field subset named in every HRRR filename
 WGS84_TO_CONUS = Transformer.from_crs("EPSG:4326", "EPSG:5070", always_xy=True)
 CONUS_TO_WGS84 = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True)
-
-
-def filter_quantitative_outliers(
-    splits: dict[str, pl.DataFrame],
-    columns: tuple[str, ...] = OUTLIER_FILTER_COLUMNS,
-) -> dict[str, pl.DataFrame]:
-    """Apply training-derived 1st/99th percentile bounds to every split.
-    """
-    train = splits["train"]
-    statistics = train.select(
-        *(
-            expression
-            for column in columns
-            for expression in (
-                pl.col(column)
-                .filter(pl.col(column).is_finite())
-                .quantile(OUTLIER_LOWER_QUANTILE, interpolation="linear")
-                .alias(f"{column}_lower"),
-                pl.col(column)
-                .filter(pl.col(column).is_finite())
-                .quantile(OUTLIER_UPPER_QUANTILE, interpolation="linear")
-                .alias(f"{column}_upper"),
-            )
-        )
-    ).row(0, named=True)
-    bounds = {
-        column: (statistics[f"{column}_lower"], statistics[f"{column}_upper"])
-        for column in columns
-    }
-    print("Training-derived quantitative outlier bounds:")
-    for column, (lower, upper) in bounds.items():
-        print(f"  {column}: [{lower:.6g}, {upper:.6g}]")
-
-    keep = pl.all_horizontal(
-        pl.col(column).is_between(lower, upper, closed="both")
-        for column, (lower, upper) in bounds.items()
-    )
-    filtered = {name: split.filter(keep) for name, split in splits.items()}
-    for name, split in splits.items():
-        print(f"[{name}] quantitative outliers retained {filtered[name].height:,}/{split.height:,} records")
-    return filtered
+POPULATED_PLACES_PATH = Path(
+    "/global/scratch/projects/fc_nitrates/ddp/nox/reference/ne_10m_populated_places_simple.zip"
+)
 
 
 def apply_binary_target(
@@ -100,9 +48,9 @@ def apply_binary_target(
     """
     labeled: dict[str, pl.DataFrame] = {}
     for name, split in splits.items():
-        finite = split.filter(pl.col(DELTA_NOX_MASS_COL).is_finite())
-        labeled[name] = finite.filter(pl.col(DELTA_NOX_MASS_COL).abs() > threshold).with_columns(
-            (pl.col(DELTA_NOX_MASS_COL) > 0).cast(pl.UInt8).alias(LABEL_COL),
+        finite = split.filter(pl.col("delta_nox_mass").is_finite())
+        labeled[name] = finite.filter(pl.col("delta_nox_mass").abs() > threshold).with_columns(
+            (pl.col("delta_nox_mass") > 0).cast(pl.UInt8).alias(LABEL_COL),
         )
         negative = labeled[name].filter(pl.col(LABEL_COL) == 0).height
         positive = labeled[name].filter(pl.col(LABEL_COL) == 1).height
@@ -160,32 +108,17 @@ def classification_summary(source: pl.DataFrame, retained: pl.DataFrame) -> dict
     }
 
 
-def _cache_populated_places(url: str, path: Path) -> None:
-    # Fetch the archive outside GDAL because its embedded curl conflicts with the eccodes copy
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".partial", delete=False) as staged_file:
-        staged = Path(staged_file.name)
-        with urllib.request.urlopen(url) as response:
-            shutil.copyfileobj(response, staged_file)
-    try:
-        staged.replace(path)
-    finally:
-        staged.unlink(missing_ok=True)
-
-
-def load_major_cities(url: str = CITIES_URL, cache_path: str | Path = CITIES_CACHE) -> pl.DataFrame:
+def load_major_cities(path: Path = POPULATED_PLACES_PATH) -> pl.DataFrame:
     """Load centroids of populated places meeting the major-city population threshold.
 
     Args:
-        url: Source of the populated-places shapefile.
-        cache_path: Local archive downloaded once and reused by later runs.
+        path: Required local populated-places shapefile archive.
 
     Returns:
         One row per major city carrying WGS84 ``lon`` and ``lat``.
     """
-    path = Path(cache_path)
-    if not path.exists():
-        _cache_populated_places(url, path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Required populated-places archive is missing: {path}")
     cities = gpd.read_file(path).to_crs("EPSG:4326")
     cities = cities[cities["pop_max"] >= MIN_CITY_POPULATION]
     return pl.DataFrame(
@@ -201,7 +134,7 @@ def add_major_city_distance(frame: pl.DataFrame, cities: pl.DataFrame | None = N
 
     Args:
         frame: AOI rows carrying centroid ``lat`` and ``lon`` columns.
-        cities: City centroids defaulting to the configured populated-places shapefile.
+        cities: City centroids defaulting to the required local archive.
 
     Returns:
         The input frame with a ``major_city_dist`` column.
@@ -410,7 +343,7 @@ def add_previous_quarter_nox_average(hourly: pl.LazyFrame) -> pl.LazyFrame:
     )
     previous_quarter = (
         quarter_columns.group_by(AOI_ID_COL, "_year", "_quarter")
-        .agg(pl.col(NOX_MASS_COL).mean().alias(PREV_QTR_AVG_NOX_COL))
+        .agg(pl.col("nox_mass").mean().alias(PREV_QTR_AVG_NOX_COL))
         .with_columns(
             pl.when(pl.col("_quarter") == 4).then(pl.col("_year") + 1).otherwise(pl.col("_year")).alias("_year"),
             pl.when(pl.col("_quarter") == 4).then(1).otherwise(pl.col("_quarter") + 1).alias("_quarter"),
@@ -422,76 +355,28 @@ def add_previous_quarter_nox_average(hourly: pl.LazyFrame) -> pl.LazyFrame:
 
 
 def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
-    """Add hourly NOx changes and a prior-completed-quarter scale.
+    """Add consecutive-hour raw NOx changes.
 
     Args:
         hourly: AOI-hour rows containing a UTC timestamp, date, hour, and
             aggregate NOx mass.
 
     Returns:
-        Rows with raw NOx changes and lagged scales.
+        Rows with raw NOx changes when the preceding AOI hour is available.
     """
-    with_deltas = (
+    return (
         hourly.with_columns(pl.col("emissions_hour_utc").alias("_hour_start"))
         .sort(AOI_ID_COL, "_hour_start")
         .with_columns(
-            pl.col(NOX_MASS_COL).shift(1).over(AOI_ID_COL).alias("_previous_nox_mass"),
+            pl.col("nox_mass").shift(1).over(AOI_ID_COL).alias("_previous_nox_mass"),
             pl.col("_hour_start").shift(1).over(AOI_ID_COL).alias("_previous_hour_start"),
         )
         .with_columns(
             pl.when(pl.col("_hour_start") - pl.col("_previous_hour_start") == pl.duration(hours=1))
-            .then(pl.col(NOX_MASS_COL) - pl.col("_previous_nox_mass"))
-            .alias(DELTA_NOX_MASS_COL),
-            pl.col("date").dt.year().alias("_year"),
-            pl.col("date").dt.quarter().alias("_quarter"),
+            .then(pl.col("nox_mass") - pl.col("_previous_nox_mass"))
+            .alias("delta_nox_mass"),
         )
-    )
-    quarter_medians = (
-        with_deltas.filter(pl.col(DELTA_NOX_MASS_COL).is_not_null())
-        .group_by(AOI_ID_COL, "_year", "_quarter")
-        .agg(
-            pl.col(DELTA_NOX_MASS_COL).median().alias("_delta_nox_med"),
-            pl.col(NOX_MASS_COL).median().alias("_median_nox_mass"),
-            pl.len().alias("_delta_history_count"),
-        )
-    )
-    quarter_stats = (
-        with_deltas.filter(pl.col(DELTA_NOX_MASS_COL).is_not_null())
-        .join(quarter_medians, on=[AOI_ID_COL, "_year", "_quarter"], how="inner")
-        .group_by(AOI_ID_COL, "_year", "_quarter")
-        .agg(
-            pl.col("_delta_nox_med").first(),
-            pl.col("_median_nox_mass").first(),
-            pl.col("_delta_history_count").first(),
-            (pl.col(DELTA_NOX_MASS_COL) - pl.col("_delta_nox_med")).abs().median().alias("_delta_nox_mad"),
-        )
-        .with_columns(
-            (
-                pl.col("_delta_nox_mad") * MAD_NORMAL_SCALE
-                + pl.col("_median_nox_mass").abs() * DELTA_SCALE_LEVEL_FRACTION
-            ).alias(DELTA_NOX_SCALE_COL),
-            pl.when(pl.col("_quarter") == 4).then(pl.col("_year") + 1).otherwise(pl.col("_year")).alias("_year"),
-            pl.when(pl.col("_quarter") == 4).then(1).otherwise(pl.col("_quarter") + 1).alias("_quarter"),
-        )
-    )
-    return (
-        with_deltas.join(quarter_stats, on=[AOI_ID_COL, "_year", "_quarter"], how="left")
-        .with_columns(
-            pl.when((pl.col("_delta_history_count") >= MIN_DELTA_HISTORY) & (pl.col(DELTA_NOX_SCALE_COL) > 0))
-            .then(pl.col(DELTA_NOX_SCALE_COL))
-            .alias(DELTA_NOX_SCALE_COL)
-        )
-        .drop(
-            "_hour_start",
-            "_previous_nox_mass",
-            "_previous_hour_start",
-            "_year",
-            "_quarter",
-            "_delta_nox_med",
-            "_delta_nox_mad",
-            "_median_nox_mass",
-            "_delta_history_count",
-        )
+        .drop("_hour_start", "_previous_nox_mass", "_previous_hour_start")
     )
 
 
@@ -515,7 +400,7 @@ def apply_target_label_mode(
     label_lookup = indexed.select(
         AOI_ID_COL,
         pl.col("emissions_hour_utc").alias("_contribution_hour"),
-        pl.col(DELTA_NOX_MASS_COL).alias("_contribution_delta"),
+        pl.col("delta_nox_mass").alias("_contribution_delta"),
     )
     contributions = (
         indexed.filter(pl.col("tempo_time").is_not_null() & pl.col("prev_tempo_time").is_not_null())
@@ -560,7 +445,7 @@ def apply_target_label_mode(
     return (
         indexed.join(contributions, on="_label_row", how="left")
         .with_columns(
-            pl.col("_weighted_delta_nox_mass").alias(DELTA_NOX_MASS_COL),
+            pl.col("_weighted_delta_nox_mass").alias("delta_nox_mass"),
             pl.lit(mode).alias(LABEL_MODE_COL),
         )
         .drop("_label_row", "_weighted_delta_nox_mass")
@@ -631,7 +516,7 @@ def aggregate_aoi_hours(
         records_lazy.join(membership.lazy(), on="facilityId", how="inner")
         .group_by(AOI_ID_COL, "emissions_hour_utc")
         .agg(
-            pl.col("noxMass").sum().alias(NOX_MASS_COL),
+            pl.col("noxMass").sum().alias("nox_mass"),
             pl.col("heatInput").mean().alias("_hourly_avg_heat_input"),
             pl.col("grossLoad").mean().alias("_hourly_avg_pwr_gen"),
         )
