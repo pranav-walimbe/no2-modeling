@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -55,7 +56,7 @@ from preprocessing.generate_dataset_utils import (
     write_csv_atomic,
     write_json_atomic,
 )
-from preprocessing.stratify_utils import classification_summary
+from preprocessing.stratify_utils import HRRR_FIELD_SLUG, HRRR_PRODUCT, classification_summary
 
 SPLIT_PATHS = {
     "train": TRAIN_RECORDS_CSV,
@@ -82,7 +83,8 @@ class PreparedRecord:
     record_index: int
     current_scan_key: str
     previous_scan_key: str
-    wind_cache_key: str
+    current_wind_cache_key: str
+    previous_wind_cache_key: str
     delta_no2_path: str
 
 
@@ -135,6 +137,24 @@ def _load_shard(task: ShardTask) -> dict[str, pl.DataFrame]:
     return {task.split: frame}
 
 
+def _observation_wind_task(
+    row: dict[str, object],
+    time_column: str,
+    hrrr_root: Path,
+    wind_cache_dir: Path,
+) -> WindTask:
+    # Resolve wind to the HRRR analysis nearest the TEMPO observation
+    observation_time = row[time_column]
+    if not isinstance(observation_time, datetime):
+        raise TypeError(f"{time_column} must be a datetime")
+    matched_time = (observation_time + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
+    relative_path = (
+        f"raw/{matched_time:%Y/%m/%d}/hrrr_{matched_time:%Y%m%d_%H}z_"
+        f"{HRRR_PRODUCT}_{HRRR_FIELD_SLUG}.grib2"
+    )
+    return make_wind_task({**row, "hrrr": relative_path}, hrrr_root, wind_cache_dir)
+
+
 def _prepare_records(
     splits: dict[str, pl.DataFrame],
     tempo_cache_dir: Path,
@@ -157,7 +177,18 @@ def _prepare_records(
             try:
                 current = make_scan_task(row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
                 previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), tempo_cache_dir)
-                wind = make_wind_task(row, Path(HRRR_DIR), wind_cache_dir)
+                current_wind = _observation_wind_task(
+                    row,
+                    "tempo_time",
+                    Path(HRRR_DIR),
+                    wind_cache_dir,
+                )
+                previous_wind = _observation_wind_task(
+                    row,
+                    "prev_tempo_time",
+                    Path(HRRR_DIR),
+                    wind_cache_dir,
+                )
                 delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
                     PreparedRecord(
@@ -165,13 +196,15 @@ def _prepare_records(
                         record_index=record_index,
                         current_scan_key=current.cache_key,
                         previous_scan_key=previous.cache_key,
-                        wind_cache_key=wind.cache_key,
+                        current_wind_cache_key=current_wind.cache_key,
+                        previous_wind_cache_key=previous_wind.cache_key,
                         delta_no2_path=str(delta_no2_path),
                     )
                 )
                 scans.setdefault(current.cache_key, current)
                 scans.setdefault(previous.cache_key, previous)
-                winds.setdefault(wind.cache_key, wind)
+                winds.setdefault(current_wind.cache_key, current_wind)
+                winds.setdefault(previous_wind.cache_key, previous_wind)
             except (KeyError, TypeError, ValueError) as error:
                 failures[split].append({"record_index": record_index, "error": str(error)})
             if prepared_count % PROGRESS_INTERVAL == 0 or prepared_count == source_count:
@@ -263,9 +296,14 @@ def _record_tasks(
             reasons = [tempo_failures.get(key, "TEMPO cache unavailable") for key in missing_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
-        if record.wind_cache_key not in wind_cache_paths:
-            reason = wind_failures.get(record.wind_cache_key, "wind cache unavailable")
-            failures[record.split].append({"record_index": record.record_index, "error": reason})
+        missing_wind_keys = [
+            key
+            for key in (record.current_wind_cache_key, record.previous_wind_cache_key)
+            if key not in wind_cache_paths
+        ]
+        if missing_wind_keys:
+            reasons = [wind_failures.get(key, "wind cache unavailable") for key in missing_wind_keys]
+            failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
         record_id = (record.split, record.record_index)
         records_by_id[record_id] = record
@@ -275,7 +313,8 @@ def _record_tasks(
                 record_index=record.record_index,
                 current_cache_path=tempo_cache_paths[record.current_scan_key],
                 previous_cache_path=tempo_cache_paths[record.previous_scan_key],
-                wind_cache_path=wind_cache_paths[record.wind_cache_key],
+                current_wind_cache_path=wind_cache_paths[record.current_wind_cache_key],
+                previous_wind_cache_path=wind_cache_paths[record.previous_wind_cache_key],
                 output_path=record.delta_no2_path,
             )
         )

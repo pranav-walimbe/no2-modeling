@@ -86,8 +86,8 @@ Each sample stores four numeric arrays and two masks on one fixed grid:
 
 | Array | Notes |
 |---|---|
-| current regridded NO2 | finite where native QA-passing support exists; record coverage must exceed 95% |
-| current minus previous NO2 | finite on the current/previous mask intersection; coverage must exceed 80% |
+| smoothed current regridded NO2 | finite where native QA-passing support exists; record coverage must exceed 95% |
+| smoothed current minus smoothed previous NO2 | finite on the current/previous mask intersection; coverage must exceed 80% |
 | eastward wind, northward wind | bilinearly aligned from the native HRRR grid and finite across the image |
 | two NO2 validity masks | separate binary support for current and hourly delta |
 
@@ -126,6 +126,8 @@ The native regridder accepts an NO2 contributor only when:
 
 Missing cells are never interpolated. Current coverage must be greater than
 95%. The current/previous intersection must cover more than 80% of the raster.
+After those gates pass, each scan is smoothed independently with its retrieval
+uncertainty and observation-time wind. Smoothing preserves the original masks.
 
 After pairing current and previous scans, generated records use
 `paired_finite_fraction` as the only final-selection ranking signal after the

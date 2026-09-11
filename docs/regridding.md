@@ -64,8 +64,8 @@ Pass the matching flag after changing TEMPO processing or wind alignment.
 Each successful model record persists one compressed NPZ holding four aligned
 `float32` arrays and two `uint8` masks:
 
-- `current_no2`, current-scan NO2 on native QA-passing support;
-- `delta_no2`, current minus previous NO2 on their support intersection;
+- `current_no2`, smoothed current-scan NO2 on native QA-passing support;
+- `delta_no2`, smoothed current minus smoothed previous NO2 on their support intersection;
 - `wind_u_80m_mps`, geographic eastward wind;
 - `wind_v_80m_mps`, geographic northward wind;
 - `current_no2_mask` and `delta_no2_mask`, independent binary support for the
@@ -87,6 +87,10 @@ Wind alignment, on the 3 km HRRR grid NOAA describes:
 1. Project the 48 by 48 TEMPO cell centres onto the native Lambert grid.
 2. Bilinearly interpolate the wind components.
 3. Rotate the grid-relative values to geographic east and north before caching.
+
+Current and previous scans are smoothed independently with retrieval
+uncertainty and winds from each scan's nearest HRRR analysis hour. Coverage is
+validated before smoothing, and the kernel does not expand finite support.
 
 See the [NOAA Global Systems Laboratory HRRR overview](https://rapidrefresh.noaa.gov/).
 

@@ -37,6 +37,7 @@ from preprocessing.regrid import (
     regrid_aoi_raster,
     write_raster_npz,
 )
+from preprocessing.smoothing import smooth_no2
 from preprocessing.stratify_utils import AOI_ID_COL
 
 CURRENT_RASTER_NAME, DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
@@ -373,7 +374,8 @@ class RecordTask:
     record_index: int
     current_cache_path: str
     previous_cache_path: str
-    wind_cache_path: str
+    current_wind_cache_path: str
+    previous_wind_cache_path: str
     output_path: str
 
 
@@ -806,17 +808,23 @@ def _require_coverage(valid: np.ndarray, threshold: float, raster_name: str) -> 
 def derive_raster_features(
     current_path: str,
     previous_path: str,
+    current_wind_path: str,
+    previous_wind_path: str,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Derive paired model rasters and scan-quality scalar features.
 
     Args:
         current_path: Cached scan bundle for the current observation.
         previous_path: Cached scan bundle for the prior observation.
+        current_wind_path: Aligned wind cache for the current observation.
+        previous_wind_path: Aligned wind cache for the prior observation.
 
     Returns:
         Model raster arrays and their plume, cloud, quality, and uncertainty
         summaries.
     """
+    current_wind, weather_features = extract_wind_cache(current_wind_path)
+    previous_wind, _ = extract_wind_cache(previous_wind_path)
     with np.load(current_path, allow_pickle=False) as current, np.load(previous_path, allow_pickle=False) as previous:
         current_no2 = np.asarray(current["no2"], dtype=np.float64)
         previous_no2 = np.asarray(previous["no2"], dtype=np.float64)
@@ -834,8 +842,20 @@ def derive_raster_features(
             MIN_DELTA_NO2_FINITE_FRACTION,
             "One-hour delta",
         )
+        current_smoothed = smooth_no2(
+            current_no2,
+            np.asarray(current["retrieval_uncertainty"], dtype=np.float64),
+            current_wind[WIND_U_RASTER_NAME],
+            current_wind[WIND_V_RASTER_NAME],
+        )
+        previous_smoothed = smooth_no2(
+            previous_no2,
+            np.asarray(previous["retrieval_uncertainty"], dtype=np.float64),
+            previous_wind[WIND_U_RASTER_NAME],
+            previous_wind[WIND_V_RASTER_NAME],
+        )
         delta_no2 = np.full_like(current_no2, np.nan)
-        np.subtract(current_no2, previous_no2, out=delta_no2, where=paired_valid)
+        np.subtract(current_smoothed, previous_smoothed, out=delta_no2, where=paired_valid)
 
         p10, p50, p99 = np.percentile(delta_no2[paired_valid], [10, 50, 99])
         denominator = p50 - p10
@@ -853,10 +873,12 @@ def derive_raster_features(
             MEAN_RETRIEVAL_UNCERTAINTY_COL: _paired_mean(
                 current["retrieval_uncertainty"], previous["retrieval_uncertainty"], paired_valid
             ),
+            **weather_features,
         }
     rasters = {
-        CURRENT_RASTER_NAME: current_no2.astype(np.float32),
+        CURRENT_RASTER_NAME: current_smoothed.astype(np.float32),
         DELTA_RASTER_NAME: delta_no2.astype(np.float32),
+        **current_wind,
         CURRENT_MASK_NAME: current_valid.astype(np.uint8),
         DELTA_MASK_NAME: paired_valid.astype(np.uint8),
     }
@@ -890,10 +912,9 @@ def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[s
     rasters, features = derive_raster_features(
         task.current_cache_path,
         task.previous_cache_path,
+        task.current_wind_cache_path,
+        task.previous_wind_cache_path,
     )
-    wind_rasters, weather_features = extract_wind_cache(task.wind_cache_path)
-    rasters.update(wind_rasters)
-    features.update(weather_features)
     return rasters, features
 
 
