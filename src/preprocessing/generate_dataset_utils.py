@@ -297,15 +297,17 @@ def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
 
 
 def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
-    """Select the largest requested balanced coverage-ranked AOI subset.
+    """Retain a surplus or select the largest balanced undersized subset.
 
     Args:
         frame: Successfully generated candidate records with finite paired coverage.
-        size: Maximum number of records to select.
+        size: Desired number of records for the split.
 
     Returns:
-        Selected records without temporary ranking columns.
+        All surplus records or a balanced subset when the desired size is not met.
     """
+    if frame.height > size:
+        return frame.sort(AOI_ID_COL, "date", "hour")
     eligible_by_class = {label: frame.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
     class_size = min(size // 2, *eligible_by_class.values())
     selected_classes = []

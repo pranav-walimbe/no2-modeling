@@ -35,7 +35,6 @@ TEMPO_VERSION = "V04"  # supported values are V03 and V04
 TEMPO_PRODUCT = f"TEMPO_NO2_{TEMPO_LEVEL}"
 TEMPO_DIR = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION, TEMPO_LEVEL, "raw")
 TEMPO_MAPPING_DIR = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION, TEMPO_LEVEL, "tempo_mapping")
-TEMPO_L3_DIR = os.path.join(TEMPO_BASE_DIR, TEMPO_VERSION)  # NASA Level 3 scan files used as a regridding reference
 TEMPO_GRANULE_MAPPING = os.path.join(TEMPO_MAPPING_DIR, "granules")
 TEMPO_AOI_MAPPING = os.path.join(TEMPO_MAPPING_DIR, "aoi_observations")
 TEMPO_START_DATE = "2023-08-02 00:00:00"  # beginning of the TEMPO science record
@@ -85,25 +84,13 @@ IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan coverage floor
 MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor
-NOX_MASS_COL = "nox_mass"
-DELTA_NOX_MASS_COL = "delta_nox_mass"
-DELTA_NOX_SCALE_COL = "delta_nox_scale"
 LABEL_COL = "delta_nox_class"
-DELTA_THRESHOLD = 100.0  # least raw delta-NOx magnitude kept as a labeled class
+DELTA_THRESHOLD = 75.0  # least raw delta-NOx magnitude kept as a labeled class
+COAL_DOMINANT_POWER_FRACTION = 0.50  # prior-quarter coal share must be strictly greater than this
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
-MIN_DELTA_HISTORY = 168
-DELTA_SCALE_LEVEL_FRACTION = 0.03  # share of an AOI's median hourly NOx added to its scale
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 MIN_MAJOR_CITY_DISTANCE_KM = 50.0  # minimum eligible plant distance from a major city in kilometers
-OUTLIER_LOWER_QUANTILE = 0.01  # learn continuous-variable lower bounds from the training split
-OUTLIER_UPPER_QUANTILE = 0.99  # learn continuous-variable upper bounds from the training split
-OUTLIER_FILTER_COLUMNS = (  # excludes coordinates, counts, time, and already bounded coverage
-    "avg_heat_input",
-    "avg_pwr_gen",
-    DELTA_NOX_SCALE_COL,
-)
-
 TRAIN_SIZE = 16_000
 VAL_SIZE = 4_000
 TEST_SIZE = 4_000
@@ -139,9 +126,3 @@ MODEL_CYCLIC_FEATURES = ("hour", "day_of_year")  # each expands to sine and cosi
 # Other
 # ============================================================================
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))  # number of cores for parallelized jobs
-COUNTRIES_URL = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"  # country polygons for US map background
-CITIES_URL = "https://naciscdn.org/naturalearth/10m/cultural/ne_10m_populated_places_simple.zip"  # populated places shapefile for proximity filtering
-REFERENCE_CACHE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/reference"  # downloaded reference geometry cache
-CITIES_CACHE = os.path.join(
-    REFERENCE_CACHE_DIR, "ne_10m_populated_places_simple.zip"
-)  # local copy read without GDAL networking

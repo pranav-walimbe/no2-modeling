@@ -6,14 +6,12 @@ from pathlib import Path
 import polars as pl
 
 from config import (
-    DELTA_NOX_MASS_COL,
-    DELTA_NOX_SCALE_COL,
+    COAL_DOMINANT_POWER_FRACTION,
     DELTA_THRESHOLD,
     FULL_DATA_PARQUET,
     LABEL_COL,
     MIN_COVERAGE_PERCENT,
     MIN_MAJOR_CITY_DISTANCE_KM,
-    NOX_MASS_COL,
     STRAT_BASE_DIR,
     TEST_RECORDS_CSV,
     TEST_RECORDS_SIZE,
@@ -41,7 +39,6 @@ from preprocessing.stratify_utils import (
     build_aois,
     classification_summary,
     cluster_aois,
-    filter_quantitative_outliers,
     filter_usable_nox_measurements,
 )
 from preprocessing.tempo_mapping import (
@@ -86,10 +83,9 @@ OUTPUT_COLUMNS = [
     "hrrr",
     "avg_heat_input",
     "avg_pwr_gen",
-    NOX_MASS_COL,
+    "nox_mass",
     PREV_QTR_AVG_NOX_COL,
-    DELTA_NOX_MASS_COL,
-    DELTA_NOX_SCALE_COL,
+    "delta_nox_mass",
     LABEL_COL,
     LABEL_MODE_COL,
 ]
@@ -154,18 +150,8 @@ def _limit_splits(
 
 
 def _select_priority_records(frame: pl.DataFrame, limit: int) -> pl.DataFrame:
-    # Exhaust positive coal-output candidates before using the general pool
-    coal_pool = frame.filter(
-        pl.col(PREVIOUS_QUARTER_COAL_POWER_COL).is_finite()
-        & (pl.col(PREVIOUS_QUARTER_COAL_POWER_COL) > 0)
-    )
-    selected_coal = _rank_priority_pool(coal_pool, PREVIOUS_QUARTER_COAL_POWER_COL).head(limit)
-    remaining_count = limit - selected_coal.height
-    if not remaining_count:
-        return selected_coal
-    general_pool = frame.join(selected_coal.select("_priority_row"), on="_priority_row", how="anti")
-    selected_general = _rank_priority_pool(general_pool, PREVIOUS_QUARTER_POWER_COL).head(remaining_count)
-    return pl.concat((selected_coal, selected_general), how="vertical")
+    # Every candidate is coal-dominant before priority selection
+    return _rank_priority_pool(frame, PREVIOUS_QUARTER_COAL_POWER_COL).head(limit)
 
 
 def _rank_priority_pool(frame: pl.DataFrame, priority_column: str) -> pl.DataFrame:
@@ -204,8 +190,7 @@ def main() -> None:
         pl.col("avg_heat_input").is_not_null()
         & pl.col("avg_pwr_gen").is_not_null()
         & pl.col(PREV_QTR_AVG_NOX_COL).is_finite()
-        & pl.col(DELTA_NOX_MASS_COL).is_not_null()
-        & pl.col(DELTA_NOX_SCALE_COL).is_not_null()
+        & pl.col("delta_nox_mass").is_not_null()
     )
     frame = frame.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
     frame = apply_target_label_mode(add_tempo_observations(frame, observations))
@@ -219,22 +204,33 @@ def main() -> None:
         & (pl.col(MAJOR_CITY_DIST_COL) >= MIN_MAJOR_CITY_DISTANCE_KM)
         & pl.col("avg_pwr_gen").is_finite()
         & pl.col(MAJOR_CITY_DIST_COL).is_finite()
+        & pl.col(PREVIOUS_QUARTER_POWER_COL).is_finite()
+        & (pl.col(PREVIOUS_QUARTER_POWER_COL) > 0)
+        & pl.col(PREVIOUS_QUARTER_COAL_POWER_COL).is_finite()
+        & (
+            pl.col(PREVIOUS_QUARTER_COAL_POWER_COL) / pl.col(PREVIOUS_QUARTER_POWER_COL)
+            > COAL_DOMINANT_POWER_FRACTION
+        )
     )
     frame = serialize_tempo_path_lists(frame)
-    filtered_splits = filter_quantitative_outliers(_split_by_cluster(frame))
-    labeled_splits = apply_binary_target(filtered_splits)
+    geographic_splits = _split_by_cluster(frame)
+    labeled_splits = apply_binary_target(geographic_splits)
     splits = _limit_splits(labeled_splits)
     del frame
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     summary = {
+        "coal_dominance": {
+            "power_period": "previous_quarter",
+            "minimum_coal_power_fraction_exclusive": COAL_DOMINANT_POWER_FRACTION,
+        },
         "deadband": {
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
             "retained_rule": "abs(delta_nox_mass) > threshold",
         },
         "splits": {
             name: {
-                "deadband": classification_summary(filtered_splits[name], labeled_splits[name]),
+                "deadband": classification_summary(geographic_splits[name], labeled_splits[name]),
                 "candidate_balance": classification_summary(labeled_splits[name], splits[name]),
             }
             for name in splits

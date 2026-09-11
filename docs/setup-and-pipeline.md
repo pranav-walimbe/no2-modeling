@@ -172,14 +172,13 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
 `preprocessing.stratify_plants`:
 
 - reads the prebuilt TEMPO mapping;
-- normalizes consecutive-hour AOI NOx changes with the previous completed
-  quarter's median and MAD;
+- computes raw consecutive-hour AOI NOx changes;
 - computes each AOI's absolute mean hourly NOx mass from the immediately
   preceding quarter as `prev_qtr_avg_nox`;
+- retains only AOIs whose coal units supplied more than 50 percent of summed
+  previous-quarter average unit generation;
 - assigns overlapping AOI clusters intact to 60/20/20 splits;
-- fits historical-variable percentile bounds on training only;
-- selects lagged coal-output AOIs first, then the general pool by lagged total
-  power, using no target or current-quarter output;
+- ranks candidates by lagged coal generation, using no current-quarter output;
 - emits three times each configured final size as raster candidates.
 
 `preprocessing.generate_dataset`:
@@ -198,8 +197,9 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   lifetime without fitting a chemistry model;
 - requires greater than 95 percent current coverage and greater than 80 percent
   paired coverage for the hourly delta, preserving gaps in separate masks;
-- selects the requested size through deterministic AOI and temporal round-robin,
-  or the largest exactly balanced subset when either class is short;
+- retains every successful record when a split exceeds its desired size;
+- otherwise selects the largest exactly balanced subset through deterministic
+  AOI and temporal round-robin;
 - uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
   allocation.
 

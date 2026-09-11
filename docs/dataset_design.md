@@ -15,10 +15,10 @@ VAL_SIZE = 4_000
 TEST_SIZE = 4_000
 ```
 
-- Dataset generation produces up to those sizes while preserving exact class
-  balance. If either class is short, finalization writes the largest balanced
-  subset and reports the requested size, actual size, shortfall, and eligible
-  count for each class.
+- When successful raster generation exceeds a configured size, finalization
+  retains every successful record without further ranking or balancing. At or
+  below the desired size, it writes the largest balanced subset. Reports include
+  the desired size, actual size, shortfall or surplus, and eligible class counts.
 
 Stratification writes three times each requested size: 48,000 train, 12,000
 validation, 12,000 test candidates. The overdraw leaves room for per-scan
@@ -42,22 +42,12 @@ On a shortfall from a future archive or a stricter filter, raise
 
 Before any image processing, a candidate needs:
 
-- usable CAMPD measurements and enough prior-quarter history for its label;
+- usable CAMPD measurements and a finite previous-quarter NOx average;
 - current and previous TEMPO observations separated by 50 to 70 minutes;
 - at least 50 percent temporal overlap with the assigned emissions hour;
 - a mapped HRRR analysis path, with file existence checked during generation;
 - finite prior-quarter power generation and distance to a city of 500,000 or
   more people for priority sampling.
-
-Outlier bounds:
-
-- Fit 1st/99th percentile bounds on training data alone, covering prior-quarter
-  heat input, prior-quarter power generation, and the robust NOx-change scale.
-- Freeze and reuse those bounds for validation and test.
-- Leave coordinates, time fields, unit counts, city distance, target values, and
-  temporal-overlap percentages untrimmed.
-- Expect the independent filters to remove more than two percent of rows
-  overall.
 
 ## Label and tabular features
 
@@ -72,7 +62,7 @@ One UTC clock governs everything:
 
 The binary target uses raw `delta_nox_mass`:
 
-- Read the fixed 100 lb cutoff from the `DELTA_THRESHOLD` configuration
+- Read the fixed 75 lb cutoff from the `DELTA_THRESHOLD` configuration
   constant.
 - Remove records with absolute change at or below that cutoff in every split.
 - Assign class 0 to negative changes and class 1 to positive changes.
@@ -160,9 +150,8 @@ Before raster generation, apply these rules to every split:
 
 - Require each AOI to sit at least 50 km from a major city.
 - Average each unit's previous-quarter output, then sum the unit averages by AOI.
-- Select records from AOIs with positive coal-unit output first, ranked by coal
-  output.
-- Fill remaining slots from the general pool, ranked by total AOI power.
+- Retain only AOIs where coal units supply more than 50 percent of that total.
+- Rank the retained candidates by previous-quarter coal output.
 - Apply the priority ordering and AOI round-robin within each label
   independently.
 - Keep current-quarter output and target magnitude out of the ordering.
@@ -171,15 +160,14 @@ Before raster generation, apply these rules to every split:
 
 Successfully generated candidates are selected deterministically:
 
-1. Form strata by AOI, year, quarter, and four-hour UTC bin.
-2. Rank records within each stratum by paired raster coverage.
-3. Interleave temporal strata within each AOI.
-4. Round-robin globally across AOIs.
-5. Break competition within each AOI round by paired coverage and stop at the
-   configured per-class size or the smaller eligible class count.
+1. Retain all successful records when their count exceeds the desired size.
+2. Otherwise form strata by AOI, year, quarter, and four-hour UTC bin.
+3. Rank records within each stratum by paired raster coverage.
+4. Interleave temporal strata within each AOI.
+5. Round-robin globally across AOIs and retain the largest balanced subset.
 
-Final selection takes equal counts from both labels after raster generation.
-Read balanced metrics against the saved pre-balancing prevalence.
+Undersized final selection takes equal counts from both labels. Surplus outputs
+retain their post-raster eligibility class distribution without downsampling.
 
 ## Performance and persistence
 
