@@ -403,7 +403,7 @@ def _write_outputs(
                 f"using largest balanced subset with {selection_size['shortfall']:,} fewer records"
             )
         elif selection_size["surplus"]:
-            print(f"[{split}] retained all {selection_size['surplus']:,} records above the desired size")
+            print(f"[{split}] retained a balanced surplus of {selection_size['surplus']:,} records")
         print(
             f"[{split}] full paired coverage: {selected_coverage['full_coverage_records']:,}/"
             f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"
