@@ -659,7 +659,7 @@ def _read_hrrr_fields(path: str) -> tuple[_HrrrGrid, dict[str, np.ndarray]]:
         while (message := codes_grib_new_from_file(source)) is not None:
             try:
                 short_name = str(codes_get(message, "shortName"))
-                if short_name not in {"2t", "10u", "10v", "blh"}:
+                if short_name not in {"2t", "u", "v", "blh"}:
                     continue
                 if grid is None:
                     grid = _hrrr_grid(message)
@@ -690,8 +690,8 @@ def _align_wind(grid: _HrrrGrid, fields: dict[str, np.ndarray], task: WindTask) 
     target_grid = AoiGrid.from_lon_lat(task.aoi_id, task.lon, task.lat)
     x_m, y_m = target_grid.cell_centres()
     coordinates = _hrrr_coordinates(grid, x_m, y_m)
-    grid_u = _interpolate_hrrr(fields["10u"], coordinates)
-    grid_v = _interpolate_hrrr(fields["10v"], coordinates)
+    grid_u = _interpolate_hrrr(fields["u"], coordinates)
+    grid_v = _interpolate_hrrr(fields["v"], coordinates)
     longitudes, latitudes = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True).transform(x_m, y_m)
     convergence = np.deg2rad(Proj(grid.crs).get_factors(longitudes, latitudes).meridian_convergence)
     eastward = grid_u * np.cos(convergence) + grid_v * np.sin(convergence)

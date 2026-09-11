@@ -21,7 +21,7 @@ Each call receives four aligned 48 by 48 rasters:
 | Eastward wind | Sets the local smoothing direction |
 | Northward wind | Sets the local smoothing direction |
 
-The EDA uses geographic 10 m HRRR winds matched to the TEMPO observation time.
+The EDA uses geographic 80 m HRRR winds matched to the TEMPO observation time.
 For an hourly delta, process the current and previous scans with their own
 time-matched winds before subtracting them.
 

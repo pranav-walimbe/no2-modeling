@@ -67,8 +67,8 @@ Each successful model record persists one compressed NPZ holding five aligned
 - `current_no2`, current-scan NO2 on native QA-passing support;
 - `delta_no2`, current minus previous NO2 on their support intersection;
 - `ema_delta_no2`, current minus a causal same-time 14-day NO2 EMA;
-- `wind_u_10m_mps`, geographic eastward wind;
-- `wind_v_10m_mps`, geographic northward wind;
+- `wind_u_80m_mps`, geographic eastward wind;
+- `wind_v_80m_mps`, geographic northward wind;
 - `current_no2_mask`, `delta_no2_mask`, and `ema_delta_no2_mask`, independent
   binary support for the three NO2 arrays.
 
