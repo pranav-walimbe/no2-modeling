@@ -56,28 +56,20 @@ Caching behavior:
 rebuilding entries referenced by the selected split. `--refresh-tempo` and
 `--refresh-wind` fully delete only their respective cache. Refresh must run as a
 single non-array process because all split jobs share these directories. The
-TEMPO rebuild includes current, previous-hour, and EMA scans. Individual
+TEMPO rebuild includes current and previous-hour scans. Individual
 cache files are still written atomically.
 
 Pass the matching flag after changing TEMPO processing or wind alignment.
 
-Each successful model record persists one compressed NPZ holding five aligned
-`float32` arrays and three `uint8` masks:
+Each successful model record persists one compressed NPZ holding four aligned
+`float32` arrays and two `uint8` masks:
 
 - `current_no2`, current-scan NO2 on native QA-passing support;
 - `delta_no2`, current minus previous NO2 on their support intersection;
-- `ema_delta_no2`, current minus a causal same-time 14-day NO2 EMA;
 - `wind_u_80m_mps`, geographic eastward wind;
 - `wind_v_80m_mps`, geographic northward wind;
-- `current_no2_mask`, `delta_no2_mask`, and `ema_delta_no2_mask`, independent
-  binary support for the three NO2 arrays.
-
-The EMA uses one closest scan per preceding calendar day within 60 minutes of
-the current scan time and a seven-day half-life. Each cell needs finite support
-from at least five dates, and its weights are renormalized over only those
-dates. EMA scans use the same
-persistent TEMPO image cache as the current and previous scans. Normalization
-occurs only after forming the EMA delta.
+- `current_no2_mask` and `delta_no2_mask`, independent binary support for the
+  two NO2 arrays.
 
 Every row in the companion split CSV carries its NPZ path in `delta_no2_path`
 plus these derived features:
@@ -113,7 +105,7 @@ pairs. Production uses:
 - no additional effective-sample floor.
 
 Dataset generation requires greater than 95% current coverage and greater than
-80% support for both the hourly and EMA deltas. It retains missing cells and
+80% support for the hourly delta. It retains missing cells and
 selects eligible records through temporal and AOI round-robin with hourly paired
 coverage as the sole quality rank. These rules do not change per-scan
 tessellation or its 0.25 km2 cell-support floor. Plume, cloud, uncertainty, and

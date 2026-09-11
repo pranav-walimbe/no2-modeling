@@ -66,25 +66,19 @@ distortion, so the transform is gone.
 
 ## Image representation and normalization
 
-Five numeric channels and three masks reach the model:
+Four numeric channels and two masks reach the model:
 
 1. current NO2 on finite native support;
 2. current-minus-previous NO2 on paired support;
-3. current-minus-14-day same-time EMA NO2;
-4. geographic eastward wind aligned from the native HRRR grid;
-5. geographic northward wind aligned from the native HRRR grid;
-6. independent binary validity masks for the three NO2 channels.
-
-The causal EMA uses the closest preceding scan from each of 14 calendar days
-within 60 minutes of the current scan time. Daily values receive a seven-day
-half-life. Each EMA cell requires at least five finite dates, and the paired
-current/EMA coverage gate decides whether the record survives.
+3. geographic eastward wind aligned from the native HRRR grid;
+4. geographic northward wind aligned from the native HRRR grid;
+5. independent binary validity masks for current and hourly-delta NO2.
 
 Every statistic comes from training pixels alone:
 
 | Channels | Center | Scale |
 |---|---|---|
-| current NO2, hourly delta NO2, EMA delta NO2 | median of finite pixels | `IQR / 1.349` |
+| current NO2, hourly delta NO2 | median of finite pixels | `IQR / 1.349` |
 | wind u, wind v | mean of finite pixels | population standard deviation |
 
 ```text
@@ -92,12 +86,12 @@ normalized[channel] =
     (raster[channel] - train_center[channel]) / train_scale[channel]
 ```
 
-- Clip all five numeric channels to `[-8, 8]` and replace invalid normalized
+- Clip all four numeric channels to `[-8, 8]` and replace invalid normalized
   values with zero only when loading the model input.
 - Fit every channel on its finite training pixels.
 - Reuse the frozen training statistics for validation, test, and inference.
 
-The three masks remain binary and unscaled. A separate two-layer partial-
+The two masks remain binary and unscaled. A separate two-layer partial-
 convolution stem consumes each NO2 value-mask pair. The resulting features join
 the dense wind stem before the shared residual encoder.
 
