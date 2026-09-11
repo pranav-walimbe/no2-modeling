@@ -126,6 +126,7 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
     "num_coal_units",
     "num_ng_units",
     "total_nameplate_capacity_mw",
+    "prev_qtr_avg_nox",
     "avg_heat_input",
     "avg_pwr_gen",
     "temperature_2m_k",

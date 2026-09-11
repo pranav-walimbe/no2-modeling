@@ -174,6 +174,8 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
 - reads the prebuilt TEMPO mapping;
 - normalizes consecutive-hour AOI NOx changes with the previous completed
   quarter's median and MAD;
+- computes each AOI's absolute mean hourly NOx mass from the immediately
+  preceding quarter as `prev_qtr_avg_nox`;
 - assigns overlapping AOI clusters intact to 60/20/20 splits;
 - fits historical-variable percentile bounds on training only;
 - selects lagged coal-output AOIs first, then the general pool by lagged total

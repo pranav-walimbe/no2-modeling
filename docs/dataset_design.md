@@ -93,7 +93,9 @@ Each sample stores four numeric arrays and two masks on one fixed grid:
 
 HRRR temperature and boundary-layer height come from interpolation at the AOI
 centre. Prior-quarter heat input and power generation keep contemporaneous
-operational leakage out.
+operational leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's
+hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
+delta); it is also supplied as a train-normalized scalar model feature.
 
 Nameplate capacity:
 

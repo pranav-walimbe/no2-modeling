@@ -15,12 +15,13 @@ observations.
 
 ## Inputs and leakage policy
 
-Each sample carries five aligned 48 by 48 raster channels and scalar context.
+Each sample carries four aligned 48 by 48 raster channels and scalar context.
 
 Scalar inputs:
 
 - coal and natural-gas unit counts;
 - total generator nameplate capacity;
+- previous-quarter average AOI hourly NOx mass;
 - previous-quarter average heat input and power generation;
 - coincident HRRR 2 m temperature and boundary-layer height;
 - sine/cosine encodings of UTC hour and day of year.
