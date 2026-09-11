@@ -21,6 +21,7 @@ API_URL = "https://api.epa.gov/easey/facilities-mgmt/facilities/attributes"
 CONFIGURATIONS_URL = "https://api.epa.gov/easey/monitor-plan-mgmt/configurations"
 PLAN_EXPORT_URL = "https://api.epa.gov/easey/monitor-plan-mgmt/plans/export"
 MAX_RETRIES = 3
+MONITOR_PLAN_MAX_RETRIES = 24
 RECORDS_PER_PAGE = 500
 CONFIGURATION_BATCH_SIZE = 100
 REQUEST_INTERVAL_SECONDS = 4
@@ -103,12 +104,17 @@ ATTRIBUTE_SCHEMA = {
 }
 
 
-def _fetch_json(url: str, params: dict[str, object], description: str) -> dict[str, object]:
+def _fetch_json(
+    url: str,
+    params: dict[str, object],
+    description: str,
+    max_retries: int = MAX_RETRIES,
+) -> dict[str, object]:
     # Fetch one EPA resource and fail after bounded retries
     headers = {"x-api-key": require_campd_credentials()}
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_retries + 1):
         try:
-            print(f"Fetching {description} (attempt {attempt}/{MAX_RETRIES})")
+            print(f"Fetching {description} (attempt {attempt}/{max_retries})")
             response = requests.get(url, params=params, headers=headers, timeout=120)
             response.raise_for_status()
             payload = response.json()
@@ -119,7 +125,7 @@ def _fetch_json(url: str, params: dict[str, object], description: str) -> dict[s
         except requests.exceptions.RequestException as error:
             status = error.response.status_code if error.response is not None else None
             detail = type(error).__name__ if status is None else f"{type(error).__name__} (HTTP {status})"
-            if attempt == MAX_RETRIES:
+            if attempt == max_retries:
                 raise RuntimeError(f"EPA request failed for {description}: {detail}") from error
             if status == 429:
                 retry_after = error.response.headers.get("Retry-After")
@@ -129,7 +135,7 @@ def _fetch_json(url: str, params: dict[str, object], description: str) -> dict[s
             print(f"WARNING: EPA request failed for {description}: {detail}; retrying in {delay:.0f}s")
             time.sleep(delay)
         except (TypeError, ValueError) as error:
-            if attempt == MAX_RETRIES:
+            if attempt == max_retries:
                 raise RuntimeError(f"EPA returned invalid data for {description}") from error
             delay = min(INITIAL_RETRY_DELAY_SECONDS * 2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS)
             print(
@@ -154,6 +160,7 @@ def _fetch_stack_plan_ids(facility_ids: list[int]) -> list[str]:
             CONFIGURATIONS_URL,
             {"orisCodes": "|".join(str(facility_id) for facility_id in batch)},
             f"monitoring configurations for {len(batch)} facilities",
+            max_retries=MONITOR_PLAN_MAX_RETRIES,
         )
         items = payload.get("items")
         if not isinstance(items, list):
@@ -176,6 +183,7 @@ def _fetch_stack_plans(facility_ids: list[int]) -> list[dict[str, object]]:
             PLAN_EXPORT_URL,
             {"planId": plan_id, "reportedValuesOnly": True},
             f"monitoring plan {plan_id}",
+            max_retries=MONITOR_PLAN_MAX_RETRIES,
         )
         plans.append(payload)
     return plans
