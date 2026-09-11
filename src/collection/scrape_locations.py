@@ -12,14 +12,6 @@ import polars as pl
 import requests
 from timezonefinder import TimezoneFinder
 
-from collection.emissions_schema import (
-    EMISSIONS_HOUR_UTC_COL,
-    FACILITY_NAMEPLATE_CAPACITY_MW_COL,
-    LOCAL_STANDARD_DATE_COL,
-    LOCAL_STANDARD_HOUR_COL,
-    TIME_ZONE_COL,
-    UTC_STANDARD_OFFSET_HOURS_COL,
-)
 from collection.stack_attributes import (
     STACK_ATTRIBUTE_YEAR_COL,
     get_unit_stack_attributes,
@@ -45,7 +37,7 @@ GENERATOR_CAPACITY_PATTERN = re.compile(
 CAPACITY_ATTRIBUTE_SCHEMA = {
     "facilityId": pl.Int64,
     FACILITY_ATTRIBUTE_YEAR_COL: pl.Int64,
-    FACILITY_NAMEPLATE_CAPACITY_MW_COL: pl.Float64,
+    "facility_nameplate_capacity_mw": pl.Float64,
 }
 
 FacilityYear = tuple[int, int]
@@ -257,7 +249,7 @@ def _summarize_capacity(
     return {
         "facilityId": facility_key[0],
         FACILITY_ATTRIBUTE_YEAR_COL: facility_key[1],
-        FACILITY_NAMEPLATE_CAPACITY_MW_COL: float(resolved_capacity_mw),
+        "facility_nameplate_capacity_mw": float(resolved_capacity_mw),
     }
 
 
@@ -323,22 +315,22 @@ def _add_facility_time_zones(facility_attributes: pl.DataFrame) -> pl.DataFrame:
         time_zone_names.append(time_zone_name)
         standard_offsets.append(_standard_utc_offset_hours(time_zone_name))
     return facility_attributes.with_columns(
-        pl.Series(TIME_ZONE_COL, time_zone_names, dtype=pl.String),
-        pl.Series(UTC_STANDARD_OFFSET_HOURS_COL, standard_offsets, dtype=pl.Int8),
+        pl.Series("time_zone", time_zone_names, dtype=pl.String),
+        pl.Series("utc_standard_offset_hours", standard_offsets, dtype=pl.Int8),
     )
 
 
 def _convert_local_standard_hours_to_utc(frame: pl.LazyFrame) -> pl.LazyFrame:
     # Preserve source clock fields and expose one unambiguous UTC timestamp
     local_hour_start = pl.col("date").cast(pl.Datetime) + pl.duration(hours=pl.col("hour"))
-    utc_hour_start = local_hour_start - pl.duration(hours=pl.col(UTC_STANDARD_OFFSET_HOURS_COL))
+    utc_hour_start = local_hour_start - pl.duration(hours=pl.col("utc_standard_offset_hours"))
     return frame.with_columns(
-        pl.col("date").alias(LOCAL_STANDARD_DATE_COL),
-        pl.col("hour").alias(LOCAL_STANDARD_HOUR_COL),
-        utc_hour_start.dt.replace_time_zone("UTC").alias(EMISSIONS_HOUR_UTC_COL),
+        pl.col("date").alias("local_standard_date"),
+        pl.col("hour").alias("local_standard_hour"),
+        utc_hour_start.dt.replace_time_zone("UTC").alias("emissions_hour_utc"),
     ).with_columns(
-        pl.col(EMISSIONS_HOUR_UTC_COL).dt.date().alias("date"),
-        pl.col(EMISSIONS_HOUR_UTC_COL).dt.hour().cast(pl.Int8).alias("hour"),
+        pl.col("emissions_hour_utc").dt.date().alias("date"),
+        pl.col("emissions_hour_utc").dt.hour().cast(pl.Int8).alias("hour"),
     )
 
 

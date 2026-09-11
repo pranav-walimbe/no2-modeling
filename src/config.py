@@ -5,8 +5,6 @@ from datetime import date, datetime, timezone
 
 from dotenv import load_dotenv
 
-from collection.emissions_schema import TOTAL_NAMEPLATE_CAPACITY_MW_COL
-
 # ============================================================================
 # API
 # ============================================================================
@@ -132,7 +130,7 @@ MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normal
 MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
     "num_coal_units",
     "num_ng_units",
-    TOTAL_NAMEPLATE_CAPACITY_MW_COL,
+    "total_nameplate_capacity_mw",
     "avg_heat_input",
     "avg_pwr_gen",
     "temperature_2m_k",

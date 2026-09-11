@@ -10,12 +10,6 @@ from math import isfinite
 import polars as pl
 import requests
 
-from collection.emissions_schema import (
-    ASSOCIATED_STACK_COUNT_COL,
-    GROUND_ELEVATION_FT_COL,
-    STACK_HEIGHT_FT_COL,
-    STACK_PIPE_ID_COL,
-)
 from prerequisites import require_campd_credentials
 
 CONFIGURATIONS_URL = "https://api.epa.gov/easey/monitor-plan-mgmt/configurations"
@@ -27,14 +21,18 @@ INITIAL_RETRY_DELAY_SECONDS = 30
 MAX_RETRY_DELAY_SECONDS = 300
 RATE_LIMIT_WAIT_SECONDS = 3_600
 STACK_ATTRIBUTE_YEAR_COL = "stackAttributeYear"
+_STACK_PIPE_ID_COL = "stack_pipe_id"
+_STACK_HEIGHT_FT_COL = "stack_height_ft"
+_GROUND_ELEVATION_FT_COL = "ground_elevation_ft"
+_ASSOCIATED_STACK_COUNT_COL = "associated_stack_count"
 STACK_ATTRIBUTE_SCHEMA = {
     "facilityId": pl.Int64,
     "unitIdKey": pl.String,
     STACK_ATTRIBUTE_YEAR_COL: pl.Int64,
-    STACK_PIPE_ID_COL: pl.String,
-    STACK_HEIGHT_FT_COL: pl.Float64,
-    GROUND_ELEVATION_FT_COL: pl.Float64,
-    ASSOCIATED_STACK_COUNT_COL: pl.Int64,
+    _STACK_PIPE_ID_COL: pl.String,
+    _STACK_HEIGHT_FT_COL: pl.Float64,
+    _GROUND_ELEVATION_FT_COL: pl.Float64,
+    _ASSOCIATED_STACK_COUNT_COL: pl.Int64,
 }
 
 
@@ -191,9 +189,9 @@ def _plan_stack_candidates(
                 "facilityId": int(facility_id),
                 "unitIdKey": str(unit_id).strip(),
                 STACK_ATTRIBUTE_YEAR_COL: prediction_year,
-                STACK_PIPE_ID_COL: normalized_stack_id,
-                STACK_HEIGHT_FT_COL: _number_or_none(attribute.get("stackHeight")),
-                GROUND_ELEVATION_FT_COL: _number_or_none(attribute.get("groundElevation")),
+                _STACK_PIPE_ID_COL: normalized_stack_id,
+                _STACK_HEIGHT_FT_COL: _number_or_none(attribute.get("stackHeight")),
+                _GROUND_ELEVATION_FT_COL: _number_or_none(attribute.get("groundElevation")),
             }
         )
     return candidates
@@ -203,21 +201,21 @@ def _select_unit_stack(rows: list[dict[str, object]]) -> dict[str, object]:
     # Choose the tallest stack with stable ID tie-breaking
     unique = {
         (
-            str(row[STACK_PIPE_ID_COL]),
-            row[STACK_HEIGHT_FT_COL],
-            row[GROUND_ELEVATION_FT_COL],
+            str(row[_STACK_PIPE_ID_COL]),
+            row[_STACK_HEIGHT_FT_COL],
+            row[_GROUND_ELEVATION_FT_COL],
         ): row
         for row in rows
     }
     ordered = sorted(
         unique.values(),
         key=lambda row: (
-            -(row[STACK_HEIGHT_FT_COL] if isinstance(row[STACK_HEIGHT_FT_COL], float) else float("-inf")),
-            str(row[STACK_PIPE_ID_COL]),
+            -(row[_STACK_HEIGHT_FT_COL] if isinstance(row[_STACK_HEIGHT_FT_COL], float) else float("-inf")),
+            str(row[_STACK_PIPE_ID_COL]),
         ),
     )
     selected = dict(ordered[0])
-    selected[ASSOCIATED_STACK_COUNT_COL] = len({str(row[STACK_PIPE_ID_COL]) for row in unique.values()})
+    selected[_ASSOCIATED_STACK_COUNT_COL] = len({str(row[_STACK_PIPE_ID_COL]) for row in unique.values()})
     return selected
 
 

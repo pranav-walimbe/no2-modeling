@@ -12,11 +12,6 @@ import shapely
 from pycanopy import SpatialFrame, distance_to_point
 from pyproj import Transformer
 
-from collection.emissions_schema import (
-    EMISSIONS_HOUR_UTC_COL,
-    FACILITY_NAMEPLATE_CAPACITY_MW_COL,
-    TOTAL_NAMEPLATE_CAPACITY_MW_COL,
-)
 from config import (
     CITIES_CACHE,
     CITIES_URL,
@@ -409,7 +404,7 @@ def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
         Rows with raw NOx changes and lagged scales.
     """
     with_deltas = (
-        hourly.with_columns(pl.col(EMISSIONS_HOUR_UTC_COL).alias("_hour_start"))
+        hourly.with_columns(pl.col("emissions_hour_utc").alias("_hour_start"))
         .sort(AOI_ID_COL, "_hour_start")
         .with_columns(
             pl.col(NOX_MASS_COL).shift(1).over(AOI_ID_COL).alias("_previous_nox_mass"),
@@ -491,7 +486,7 @@ def apply_target_label_mode(
     indexed = frame.with_row_index("_label_row")
     label_lookup = indexed.select(
         AOI_ID_COL,
-        pl.col(EMISSIONS_HOUR_UTC_COL).alias("_contribution_hour"),
+        pl.col("emissions_hour_utc").alias("_contribution_hour"),
         pl.col(DELTA_NOX_MASS_COL).alias("_contribution_delta"),
     )
     contributions = (
@@ -567,27 +562,27 @@ def aggregate_aoi_hours(
     facility_capacity = (
         records_lazy.select(
             "facilityId",
-            EMISSIONS_HOUR_UTC_COL,
-            FACILITY_NAMEPLATE_CAPACITY_MW_COL,
+            "emissions_hour_utc",
+            "facility_nameplate_capacity_mw",
         )
-        .unique(subset=["facilityId", EMISSIONS_HOUR_UTC_COL])
+        .unique(subset=["facilityId", "emissions_hour_utc"])
         .join(membership.lazy(), on="facilityId", how="inner")
-        .group_by(AOI_ID_COL, EMISSIONS_HOUR_UTC_COL)
+        .group_by(AOI_ID_COL, "emissions_hour_utc")
         .agg(
-            pl.col(FACILITY_NAMEPLATE_CAPACITY_MW_COL).sum().alias(TOTAL_NAMEPLATE_CAPACITY_MW_COL),
+            pl.col("facility_nameplate_capacity_mw").sum().alias("total_nameplate_capacity_mw"),
         )
     )
     hourly = (
         records_lazy.join(membership.lazy(), on="facilityId", how="inner")
-        .group_by(AOI_ID_COL, EMISSIONS_HOUR_UTC_COL)
+        .group_by(AOI_ID_COL, "emissions_hour_utc")
         .agg(
             pl.col("noxMass").sum().alias(NOX_MASS_COL),
             pl.col("heatInput").mean().alias("_hourly_avg_heat_input"),
             pl.col("grossLoad").mean().alias("_hourly_avg_pwr_gen"),
         )
         .with_columns(
-            pl.col(EMISSIONS_HOUR_UTC_COL).dt.date().alias("date"),
-            pl.col(EMISSIONS_HOUR_UTC_COL).dt.hour().cast(pl.Int8).alias("hour"),
+            pl.col("emissions_hour_utc").dt.date().alias("date"),
+            pl.col("emissions_hour_utc").dt.hour().cast(pl.Int8).alias("hour"),
         )
     )
     return (
@@ -598,7 +593,7 @@ def aggregate_aoi_hours(
         )
         .join(power_priorities, on=[AOI_ID_COL, "_priority_year", "_priority_quarter"], how="left")
         .drop("_priority_year", "_priority_quarter")
-        .join(facility_capacity, on=[AOI_ID_COL, EMISSIONS_HOUR_UTC_COL], how="left")
+        .join(facility_capacity, on=[AOI_ID_COL, "emissions_hour_utc"], how="left")
         .join(unit_counts, on=AOI_ID_COL, how="left")
         .join(aois.select(AOI_ID_COL, "lat", "lon", "x_m", "y_m").lazy(), on=AOI_ID_COL, how="left")
         .sort(AOI_ID_COL, "date", "hour")
