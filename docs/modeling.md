@@ -69,8 +69,8 @@ distortion, so the transform is gone.
 
 Four numeric channels and two masks reach the model:
 
-1. current NO2 on finite native support;
-2. current-minus-previous NO2 on paired support;
+1. smoothed current NO2 on finite native support;
+2. smoothed current-minus-smoothed previous NO2 on paired support;
 3. geographic eastward wind aligned from the native HRRR grid;
 4. geographic northward wind aligned from the native HRRR grid;
 5. independent binary validity masks for current and hourly-delta NO2.

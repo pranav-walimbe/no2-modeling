@@ -190,6 +190,8 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   record;
 - stores each unique AOI scan and aligned AOI-hour wind raster in persistent
   caches, grouping work so workers reuse each NetCDF or GRIB read;
+- smooths current and previous NO2 independently with retrieval uncertainty and
+  winds matched to each observation before forming the hourly delta;
 - requires greater than 95 percent current coverage and greater than 80 percent
   paired coverage for the hourly delta, preserving gaps in separate masks;
 - selects the requested size through deterministic AOI and temporal round-robin,

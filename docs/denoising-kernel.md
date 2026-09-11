@@ -3,8 +3,8 @@
 ## Status
 
 This document records the denoising kernel selected in the September 2026 EDA.
-The kernel is an evaluated preprocessing candidate. The dataset generator and
-model loader do not apply it yet.
+The dataset generator applies it to each current and previous TEMPO scan before
+forming the hourly delta. The model loader consumes the resulting rasters.
 
 The kernel aims to reduce pixel-scale retrieval noise while retaining plume
 shape and magnitude. It processes a single TEMPO scan at a time and does not use
@@ -117,18 +117,9 @@ incoherent speckle close to the smoothed solution.
 
 ## Evaluation
 
-The final comparison used 1,000 records: 500 negative and 500 positive hourly
-NOx changes across 182 AOIs. The candidate and baseline processed the same
-records. AOI-clustered bootstrap intervals used 2,000 resamples.
-
-| Metric | Previous kernel | Selected kernel | Selected minus previous |
-|---|---:|---:|---:|
-| Median background MAD ratio | 0.5669 | 0.5616 | -0.0053 |
-| Median along-wind background roughness ratio | 0.1364 | 0.1361 | -0.0004 |
-| Median significant plume-edge retention | 0.3995 | 0.4278 | +0.0283 |
-| Median delta-pixel correlation | 0.8902 | 0.8927 | +0.0025 |
-| Near-source flux preservation slope | 0.7267 | 0.7270 | +0.0003 |
-| Within-AOI label AUC | 0.5319 | 0.5309 | -0.0009 |
+The final evaluation used 1,000 records: 500 negative and 500 positive hourly
+NOx changes across 182 AOIs. AOI-clustered bootstrap intervals used 2,000
+resamples.
 
 The 95 percent cluster-bootstrap intervals excluded zero for lower background
 MAD, higher edge retention, and higher pixel correlation. The flux-preservation
@@ -155,10 +146,10 @@ Relevant Savio jobs:
   They do not establish that denoising improves the downstream classifier.
 - The kernel handles curved and multi-source scenes through local wind without
   fixed source corridors. Overlapping plumes can still be inseparable.
-- Current and previous scans need separate denoising with their matched winds.
-  Applying one wind field to both hours changes the intended operator.
-- Production integration must fit any later normalization on training data
-  alone and must preserve the existing masks, coverage gates, and split rules.
+- Current and previous scans are denoised separately with winds matched to each
+  observation's nearest HRRR analysis hour.
+- Later normalization is fit on training data alone. Existing masks, coverage
+  gates, and split rules remain unchanged.
 
 ## Method context
 
