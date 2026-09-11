@@ -24,11 +24,8 @@ from config import (
     NUM_CORES,
     TEMPO_DIR,
     TEST_RECORDS_CSV,
-    TEST_SIZE,
     TRAIN_RECORDS_CSV,
-    TRAIN_SIZE,
     VAL_RECORDS_CSV,
-    VAL_SIZE,
 )
 from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
@@ -75,7 +72,6 @@ TRAINING_JOB_NAME = "train-no2"
 RUN_STARTED_ENV = "DATASET_RUN_STARTED_AT"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DATASET_BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_dataset.sh"
-FINAL_SPLIT_SIZES = {"train": TRAIN_SIZE, "val": VAL_SIZE, "test": TEST_SIZE}
 
 
 @dataclass(frozen=True)
@@ -386,24 +382,14 @@ def _write_outputs(
             .log()
             .alias(FLUX_LOG_RATIO_PREV_QTR_COL)
         )
-        output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
+        output_frame = select_final_records(candidates)
         selected_coverage = coverage_selection_summary(output_frame)
         eligible_by_class = {str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
         selection_size = {
-            "requested_size": FINAL_SPLIT_SIZES[split],
             "actual_size": output_frame.height,
-            "shortfall": max(FINAL_SPLIT_SIZES[split] - output_frame.height, 0),
-            "surplus": max(output_frame.height - FINAL_SPLIT_SIZES[split], 0),
             "eligible_by_class": eligible_by_class,
         }
         print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
-        if selection_size["shortfall"]:
-            print(
-                f"[{split}] requested {selection_size['requested_size']:,}; "
-                f"using largest balanced subset with {selection_size['shortfall']:,} fewer records"
-            )
-        elif selection_size["surplus"]:
-            print(f"[{split}] retained a balanced surplus of {selection_size['surplus']:,} records")
         print(
             f"[{split}] full paired coverage: {selected_coverage['full_coverage_records']:,}/"
             f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"

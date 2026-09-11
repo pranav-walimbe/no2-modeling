@@ -5,7 +5,7 @@ observations.
 
 ## Prediction target
 
-- Apply the fixed symmetric 75 lb `DELTA_THRESHOLD` cutoff on
+- Apply the fixed symmetric 100 lb `DELTA_THRESHOLD` cutoff on
   `abs(delta_nox_mass)`.
 - Use the same cutoff for train, validation, test, and inference.
 - Remove records inside the closed deadband.

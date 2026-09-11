@@ -14,11 +14,8 @@ from config import (
     MIN_MAJOR_CITY_DISTANCE_KM,
     STRAT_BASE_DIR,
     TEST_RECORDS_CSV,
-    TEST_RECORDS_SIZE,
     TRAIN_RECORDS_CSV,
-    TRAIN_RECORDS_SIZE,
     VAL_RECORDS_CSV,
-    VAL_RECORDS_SIZE,
 )
 from preprocessing.generate_dataset_utils import write_json_atomic
 from preprocessing.stratify_utils import (
@@ -47,14 +44,9 @@ from preprocessing.tempo_mapping import (
     serialize_tempo_path_lists,
 )
 
-TRAIN_FRACTION = 0.60
-VAL_FRACTION = 0.20
+TRAIN_FRACTION = 0.70
+VAL_FRACTION = 0.15
 SPLIT_SEED = 42
-SPLIT_RECORD_LIMITS = {
-    "train": TRAIN_RECORDS_SIZE,
-    "val": VAL_RECORDS_SIZE,
-    "test": TEST_RECORDS_SIZE,
-}
 
 OUTPUT_COLUMNS = [
     AOI_ID_COL,
@@ -122,31 +114,23 @@ def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
     }
 
 
-def _limit_splits(
-    splits: dict[str, pl.DataFrame],
-    limits: dict[str, int] = SPLIT_RECORD_LIMITS,
-) -> dict[str, pl.DataFrame]:
-    # Balance labels while retaining lagged power priority within each class
-    limited: dict[str, pl.DataFrame] = {}
+def _balance_splits(splits: dict[str, pl.DataFrame]) -> dict[str, pl.DataFrame]:
+    # Match both labels to the minority count in each split
+    balanced: dict[str, pl.DataFrame] = {}
     for name, split in splits.items():
-        limit = limits[name]
         indexed = split.with_row_index("_priority_row").with_columns(
             split.select(AOI_ID_COL, "date", "hour").hash_rows(seed=SPLIT_SEED).alias("_priority_hash")
         )
-        class_limit = limit // 2
+        eligible_by_class = {label: indexed.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
+        class_limit = min(eligible_by_class.values())
         selected_classes = []
         for label in (0, 1):
             class_pool = indexed.filter(pl.col(LABEL_COL) == label)
-            if class_pool.height < class_limit:
-                raise ValueError(
-                    f"{name} class {label} has {class_pool.height:,} records; "
-                    f"cannot select the requested {class_limit:,}"
-                )
             selected_classes.append(_select_priority_records(class_pool, class_limit))
         selected = pl.concat(selected_classes, how="vertical")
-        limited[name] = selected.sort("_priority_row").drop("_priority_row", "_priority_hash", "_priority_round")
-        print(f"[{name}] selected {class_limit:,} records per class from {split.height:,} candidates")
-    return limited
+        balanced[name] = selected.sort("_priority_row").drop("_priority_row", "_priority_hash", "_priority_round")
+        print(f"[{name}] balanced to {class_limit:,} records per class from {split.height:,} candidates")
+    return balanced
 
 
 def _select_priority_records(frame: pl.DataFrame, limit: int) -> pl.DataFrame:
@@ -215,7 +199,7 @@ def main() -> None:
     frame = serialize_tempo_path_lists(frame)
     geographic_splits = _split_by_cluster(frame)
     labeled_splits = apply_binary_target(geographic_splits)
-    splits = _limit_splits(labeled_splits)
+    splits = _balance_splits(labeled_splits)
     del frame
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)

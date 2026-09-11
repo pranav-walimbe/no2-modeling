@@ -1,38 +1,25 @@
 # Dataset design
 
-Turning the full AOI-hour population into a fixed-size modeling dataset rests on
+Turning the full AOI-hour population into a class-balanced modeling dataset rests on
 one principle: keep scientific eligibility and diversity sampling separate. A
 raster either clears the fixed eligibility rules or does not. Hourly paired
 coverage ranks eligible records but does not replace any fixed gate.
 
 ## Output-size contract
 
-The controls in `config.py`:
-
-```python
-TRAIN_SIZE = 16_000
-VAL_SIZE = 4_000
-TEST_SIZE = 4_000
-```
-
-- When successful raster generation exceeds a configured size, finalization
-  retains every successful record without further ranking or balancing. At or
-  below the desired size, it writes the largest balanced subset. Reports include
-  the desired size, actual size, shortfall or surplus, and eligible class counts.
-
-Stratification writes three times each requested size: 48,000 train, 12,000
-validation, 12,000 test candidates. The overdraw leaves room for per-scan
-coverage and operational failures without regridding the
-much larger eligible metadata population. Each generation run reports the new
-retention rate so this multiplier can be recalibrated from current evidence.
-
-On a shortfall from a future archive or a stricter filter, raise
-`STRATIFY_CANDIDATE_MULTIPLIER`. Never weaken a quality threshold to compensate.
+There are no configured record-count targets. Stratification retains every
+eligible record from the minority class and selects the same number from the
+majority class. Dataset finalization repeats this rule after raster quality
+filtering and processing failures. Each published split is therefore the
+largest exactly balanced subset of its surviving candidates.
 
 ## Split independence
 
 - Overlapping 72 km AOIs form geographic clusters.
 - Each cluster belongs to exactly one of train, validation, or test.
+- A deterministic shuffle assigns 70 percent of clusters to training, 15
+  percent to validation, and the remainder to test.
+- Record shares can differ from cluster shares because cluster sizes vary.
 - No plant region leaks across splits, so evaluation measures generalization to
   unseen geographic regions instead of interpolation at known plants.
 - The split precedes quantile fitting, so validation and test data never reach
@@ -62,7 +49,7 @@ One UTC clock governs everything:
 
 The binary target uses raw `delta_nox_mass`:
 
-- Read the fixed 75 lb cutoff from the `DELTA_THRESHOLD` configuration
+- Read the fixed 100 lb cutoff from the `DELTA_THRESHOLD` configuration
   constant.
 - Remove records with absolute change at or below that cutoff in every split.
 - Assign class 0 to negative changes and class 1 to positive changes.
@@ -160,14 +147,11 @@ Before raster generation, apply these rules to every split:
 
 Successfully generated candidates are selected deterministically:
 
-1. Retain all successful records when their count exceeds the desired size.
-2. Otherwise form strata by AOI, year, quarter, and four-hour UTC bin.
-3. Rank records within each stratum by paired raster coverage.
-4. Interleave temporal strata within each AOI.
-5. Round-robin globally across AOIs and retain the largest balanced subset.
-
-Undersized final selection takes equal counts from both labels. Surplus outputs
-retain their post-raster eligibility class distribution without downsampling.
+1. Form strata by AOI, year, quarter, and four-hour UTC bin.
+2. Rank records within each stratum by paired raster coverage.
+3. Interleave temporal strata within each AOI.
+4. Round-robin globally across AOIs.
+5. Match both labels to the surviving minority-class count.
 
 ## Performance and persistence
 
@@ -185,9 +169,6 @@ retain their post-raster eligibility class distribution without downsampling.
   launch starts with an empty shard tree rather than resuming them.
 
 For large archives, run stratification and raster generation through Slurm.
-Never regrid the entire metadata population just to rank it. Raise the candidate
-multiplier only when measured post-QC yield shows the requested final size is out
-of reach.
 
 ## Evaluation checklist
 

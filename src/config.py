@@ -85,20 +85,12 @@ MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan coverage floor
 MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor
 LABEL_COL = "delta_nox_class"
-DELTA_THRESHOLD = 75.0  # least raw delta-NOx magnitude kept as a labeled class
+DELTA_THRESHOLD = 100.0  # least raw delta-NOx magnitude kept as a labeled class
 COAL_DOMINANT_POWER_FRACTION = 0.50  # prior-quarter coal share must be strictly greater than this
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 MIN_MAJOR_CITY_DISTANCE_KM = 50.0  # minimum eligible plant distance from a major city in kilometers
-TRAIN_SIZE = 16_000
-VAL_SIZE = 4_000
-TEST_SIZE = 4_000
-STRATIFY_CANDIDATE_MULTIPLIER = 3  # overdraw for raster eligibility attrition
-TRAIN_RECORDS_SIZE = TRAIN_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
-VAL_RECORDS_SIZE = VAL_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
-TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
-
 # ============================================================================
 # Modeling data contract
 # ============================================================================
