@@ -139,6 +139,12 @@ Facility attributes:
   or enrichment would drop any hourly rows.
 - Generator nameplate capacities are parsed, and conflicting facility-generator
   values stay out of the sum.
+- Unit-to-stack relationships come from the EPA monitoring-plan configuration
+  endpoint. Only stack-bearing plans are exported for their reported physical
+  attributes.
+- `stack_height_ft` is the tallest stack effective on January 1 of the
+  prediction year. `ground_elevation_ft` and `stack_pipe_id` come from that same
+  stack, and `associated_stack_count` records how many stacks were effective.
 
 Time handling:
 
