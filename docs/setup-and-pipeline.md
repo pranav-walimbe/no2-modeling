@@ -192,6 +192,10 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   caches, grouping work so workers reuse each NetCDF or GRIB read;
 - smooths current and previous NO2 independently with retrieval uncertainty and
   winds matched to each observation before forming the hourly delta;
+- estimates aggregate NOx flux from common crosswind sections downstream of
+  every facility in an AOI, using the current smoothed NO2 and 80 m wind;
+- applies the published time-dependent NOx-to-NO2 ratio and a 2.5-hour NOx
+  lifetime without fitting a chemistry model;
 - requires greater than 95 percent current coverage and greater than 80 percent
   paired coverage for the hourly delta, preserving gaps in separate masks;
 - selects the requested size through deterministic AOI and temporal round-robin,
@@ -201,7 +205,10 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
 
 Every successful split-CSV row carries its relative `delta_no2_path`, plume
 score, paired cloud, quality and retrieval-uncertainty means, and
-centre-interpolated HRRR temperature and boundary-layer height.
+centre-interpolated HRRR temperature and boundary-layer height. The three final
+columns are `flux_nox` in pounds per hour, `flux_log_ratio_prev_qtr`, and
+`flux_confidence`. Temperature and boundary-layer height remain independent
+model features and do not alter the fixed NO2-to-NOx chemistry conversion.
 
 Running the splits:
 

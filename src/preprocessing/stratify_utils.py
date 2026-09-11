@@ -576,6 +576,33 @@ def aggregate_aoi_hours(
     records_lazy = records.lazy() if isinstance(records, pl.DataFrame) else records
     coal, natural_gas = _fuel_flags()
     power_priorities = previous_quarter_power_priorities(records_lazy, membership)
+    facility_locations = add_projected_coordinates(
+        records_lazy.select("facilityId", "lat", "lon")
+        .drop_nulls()
+        .unique(subset="facilityId", keep="first")
+        .collect()
+    )
+    source_locations = (
+        facility_locations.lazy()
+        .join(membership.lazy(), on="facilityId", how="inner")
+        .join(
+            aois.select(AOI_ID_COL, "x_m", "y_m").lazy().rename(
+                {"x_m": "_aoi_x_m", "y_m": "_aoi_y_m"}
+            ),
+            on=AOI_ID_COL,
+            how="inner",
+        )
+        .with_columns(
+            ((pl.col("x_m") - pl.col("_aoi_x_m")) / 1_000).alias("_source_east_km"),
+            ((pl.col("y_m") - pl.col("_aoi_y_m")) / 1_000).alias("_source_north_km"),
+        )
+        .sort(AOI_ID_COL, "facilityId")
+        .group_by(AOI_ID_COL, maintain_order=True)
+        .agg(
+            pl.col("_source_east_km").cast(pl.String).str.join(",").alias("_source_east_km"),
+            pl.col("_source_north_km").cast(pl.String).str.join(",").alias("_source_north_km"),
+        )
+    )
     unit_counts = (
         records_lazy.with_columns(coal.alias("is_coal"), natural_gas.alias("is_ng"))
         .group_by("facilityId", "unitId")
@@ -623,6 +650,7 @@ def aggregate_aoi_hours(
         .drop("_priority_year", "_priority_quarter")
         .join(facility_capacity, on=[AOI_ID_COL, "emissions_hour_utc"], how="left")
         .join(unit_counts, on=AOI_ID_COL, how="left")
+        .join(source_locations, on=AOI_ID_COL, how="left")
         .join(aois.select(AOI_ID_COL, "lat", "lon", "x_m", "y_m").lazy(), on=AOI_ID_COL, how="left")
         .sort(AOI_ID_COL, "date", "hour")
         .collect(engine="streaming")

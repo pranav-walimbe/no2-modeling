@@ -34,6 +34,9 @@ from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
     CANDIDATE_RASTER_PATH_COL,
     DELTA_NO2_PATH_COL,
+    FLUX_CONFIDENCE_COL,
+    FLUX_LOG_RATIO_PREV_QTR_COL,
+    FLUX_NOX_COL,
     PROCESSING_FAILURE_SCHEMA,
     SOURCE_RECORD_INDEX_COL,
     DatasetShardStore,
@@ -86,6 +89,16 @@ class PreparedRecord:
     current_wind_cache_key: str
     previous_wind_cache_key: str
     delta_no2_path: str
+    source_east_km: tuple[float, ...]
+    source_north_km: tuple[float, ...]
+
+
+def _parse_source_offsets(value: object) -> tuple[float, ...]:
+    # Parse compact source coordinates while accepting older stratified files
+    if value is None:
+        return (0.0,)
+    offsets = tuple(float(item) for item in str(value).split(",") if item)
+    return offsets or (0.0,)
 
 
 def _positive_int(value: str) -> int:
@@ -199,6 +212,8 @@ def _prepare_records(
                         current_wind_cache_key=current_wind.cache_key,
                         previous_wind_cache_key=previous_wind.cache_key,
                         delta_no2_path=str(delta_no2_path),
+                        source_east_km=_parse_source_offsets(row.get("_source_east_km")),
+                        source_north_km=_parse_source_offsets(row.get("_source_north_km")),
                     )
                 )
                 scans.setdefault(current.cache_key, current)
@@ -316,6 +331,8 @@ def _record_tasks(
                 current_wind_cache_path=wind_cache_paths[record.current_wind_cache_key],
                 previous_wind_cache_path=wind_cache_paths[record.previous_wind_cache_key],
                 output_path=record.delta_no2_path,
+                source_east_km=record.source_east_km,
+                source_north_km=record.source_north_km,
             )
         )
     return tasks, records_by_id
@@ -361,6 +378,14 @@ def _write_outputs(
         candidates = source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left").sort(
             SOURCE_RECORD_INDEX_COL
         )
+        candidates = candidates.with_columns(
+            (
+                (pl.col(FLUX_NOX_COL) + 1.0)
+                / (pl.col("prev_qtr_avg_nox") + 1.0)
+            )
+            .log()
+            .alias(FLUX_LOG_RATIO_PREV_QTR_COL)
+        )
         output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
         selected_coverage = coverage_selection_summary(output_frame)
         eligible_by_class = {str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
@@ -401,7 +426,16 @@ def _write_outputs(
             str(Path(candidate_path).relative_to(DATASET_DIR))
             for candidate_path in output_frame[CANDIDATE_RASTER_PATH_COL].to_list()
         ]
-        output_frame = output_frame.with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
+        output_frame = (
+            output_frame.drop("_source_east_km", "_source_north_km", strict=False)
+            .with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
+            .select(
+                pl.exclude(FLUX_NOX_COL, FLUX_LOG_RATIO_PREV_QTR_COL, FLUX_CONFIDENCE_COL),
+                FLUX_NOX_COL,
+                FLUX_LOG_RATIO_PREV_QTR_COL,
+                FLUX_CONFIDENCE_COL,
+            )
+        )
         write_csv_atomic(
             output_frame.drop(SOURCE_RECORD_INDEX_COL, CANDIDATE_RASTER_PATH_COL),
             Path(DATASET_DF) / f"{split}_df.csv",

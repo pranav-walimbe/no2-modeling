@@ -29,6 +29,7 @@ from config import (
     MODEL_IMAGE_KEYS,
     MODEL_MASK_KEYS,
 )
+from preprocessing.flux_model import estimate_aggregate_flux
 from preprocessing.regrid import (
     AoiGrid,
     build_granule_spatial_index,
@@ -45,6 +46,9 @@ CURRENT_MASK_NAME, DELTA_MASK_NAME = MODEL_MASK_KEYS
 CURRENT_FINITE_FRACTION_COL = "current_finite_fraction"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
+FLUX_NOX_COL = "flux_nox"
+FLUX_CONFIDENCE_COL = "flux_confidence"
+FLUX_LOG_RATIO_PREV_QTR_COL = "flux_log_ratio_prev_qtr"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
     "_selection_quarter",
@@ -63,6 +67,8 @@ TABULAR_FEATURE_NAMES = (
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
+    FLUX_NOX_COL,
+    FLUX_CONFIDENCE_COL,
     *HRRR_FIELDS.values(),
 )
 SOURCE_RECORD_INDEX_COL = "_source_record_index"
@@ -377,6 +383,8 @@ class RecordTask:
     current_wind_cache_path: str
     previous_wind_cache_path: str
     output_path: str
+    source_east_km: tuple[float, ...] = (0.0,)
+    source_north_km: tuple[float, ...] = (0.0,)
 
 
 @dataclass(frozen=True)
@@ -810,6 +818,8 @@ def derive_raster_features(
     previous_path: str,
     current_wind_path: str,
     previous_wind_path: str,
+    source_east_km: tuple[float, ...] = (0.0,),
+    source_north_km: tuple[float, ...] = (0.0,),
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Derive paired model rasters and scan-quality scalar features.
 
@@ -818,6 +828,8 @@ def derive_raster_features(
         previous_path: Cached scan bundle for the prior observation.
         current_wind_path: Aligned wind cache for the current observation.
         previous_wind_path: Aligned wind cache for the prior observation.
+        source_east_km: Facility offsets east of the AOI centre.
+        source_north_km: Facility offsets north of the AOI centre.
 
     Returns:
         Model raster arrays and their plume, cloud, quality, and uncertainty
@@ -854,6 +866,14 @@ def derive_raster_features(
             previous_wind[WIND_U_RASTER_NAME],
             previous_wind[WIND_V_RASTER_NAME],
         )
+        flux = estimate_aggregate_flux(
+            current_smoothed,
+            np.asarray(current["retrieval_uncertainty"], dtype=np.float64),
+            current_wind[WIND_U_RASTER_NAME],
+            current_wind[WIND_V_RASTER_NAME],
+            source_east_km,
+            source_north_km,
+        )
         delta_no2 = np.full_like(current_no2, np.nan)
         np.subtract(current_smoothed, previous_smoothed, out=delta_no2, where=paired_valid)
 
@@ -873,6 +893,8 @@ def derive_raster_features(
             MEAN_RETRIEVAL_UNCERTAINTY_COL: _paired_mean(
                 current["retrieval_uncertainty"], previous["retrieval_uncertainty"], paired_valid
             ),
+            FLUX_NOX_COL: flux.flux_nox,
+            FLUX_CONFIDENCE_COL: flux.confidence,
             **weather_features,
         }
     rasters = {
@@ -914,6 +936,8 @@ def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[s
         task.previous_cache_path,
         task.current_wind_cache_path,
         task.previous_wind_cache_path,
+        task.source_east_km,
+        task.source_north_km,
     )
     return rasters, features
 
