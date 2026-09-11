@@ -97,6 +97,17 @@ operational leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's
 hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
 delta); it is also supplied as a train-normalized scalar model feature.
 
+The current NO2 raster also produces a source-aware aggregate flux estimate.
+Common crosswind sections downstream of all facilities prevent overlapping
+plumes from being counted once per source. A fixed published time-dependent
+NOx-to-NO2 ratio and 2.5-hour decay correction produce `flux_nox` in pounds per
+hour. `flux_log_ratio_prev_qtr` compares it with `prev_qtr_avg_nox`, while
+`flux_confidence` summarizes wind strength, retrieval signal, coverage,
+background fit support, and agreement among sections. These three values are
+the final dataframe columns. Only `flux_log_ratio_prev_qtr` is a
+train-normalized model feature; raw flux and confidence remain available for
+diagnostics and filtering.
+
 Nameplate capacity:
 
 - Collection parses each CAMPD generator-capacity pair and deduplicates

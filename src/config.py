@@ -131,6 +131,7 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
     "avg_pwr_gen",
     "temperature_2m_k",
     "boundary_layer_height_m",
+    "flux_log_ratio_prev_qtr",
 )
 MODEL_CYCLIC_FEATURES = ("hour", "day_of_year")  # each expands to sine and cosine
 
