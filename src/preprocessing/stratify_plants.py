@@ -12,6 +12,8 @@ from config import (
     LABEL_COL,
     MIN_COVERAGE_PERCENT,
     MIN_MAJOR_CITY_DISTANCE_KM,
+    NOX_LOWER_PERCENTILE,
+    NOX_UPPER_PERCENTILE,
     STRAT_BASE_DIR,
     TEST_RECORDS_CSV,
     TEST_RECORDS_SIZE,
@@ -105,6 +107,29 @@ REQUIRED_COLUMNS = [
     "attributePrimaryFuelInfo",
     "facility_nameplate_capacity_mw",
 ]
+
+
+def _filter_nox_mass_percentiles(
+    frame: pl.DataFrame,
+    lower_percentile: float = NOX_LOWER_PERCENTILE,
+    upper_percentile: float = NOX_UPPER_PERCENTILE,
+) -> tuple[pl.DataFrame, float, float]:
+    # Calculate global bounds from finite aggregate AOI-hour NOx values
+    if not 0 <= lower_percentile < upper_percentile <= 100:
+        raise ValueError("NOx percentiles must satisfy 0 <= lower < upper <= 100")
+    finite = frame.filter(pl.col("nox_mass").is_finite())
+    if finite.is_empty():
+        raise ValueError("Cannot calculate NOx percentiles without finite nox_mass values")
+    lower_bound, upper_bound = finite.select(
+        pl.col("nox_mass").quantile(lower_percentile / 100, interpolation="linear").alias("lower"),
+        pl.col("nox_mass").quantile(upper_percentile / 100, interpolation="linear").alias("upper"),
+    ).row(0)
+    filtered = finite.filter(pl.col("nox_mass").is_between(lower_bound, upper_bound, closed="both"))
+    print(
+        f"Aggregate AOI-hour NOx percentiles retained {filtered.height:,}/{frame.height:,} records; "
+        f"P{lower_percentile:g}={lower_bound:.6g}, P{upper_percentile:g}={upper_bound:.6g}"
+    )
+    return filtered, float(lower_bound), float(upper_bound)
 
 
 def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
@@ -207,11 +232,9 @@ def main() -> None:
         & pl.col(PREVIOUS_QUARTER_POWER_COL).is_finite()
         & (pl.col(PREVIOUS_QUARTER_POWER_COL) > 0)
         & pl.col(PREVIOUS_QUARTER_COAL_POWER_COL).is_finite()
-        & (
-            pl.col(PREVIOUS_QUARTER_COAL_POWER_COL) / pl.col(PREVIOUS_QUARTER_POWER_COL)
-            > COAL_DOMINANT_POWER_FRACTION
-        )
+        & (pl.col(PREVIOUS_QUARTER_COAL_POWER_COL) / pl.col(PREVIOUS_QUARTER_POWER_COL) > COAL_DOMINANT_POWER_FRACTION)
     )
+    frame, nox_lower_bound, nox_upper_bound = _filter_nox_mass_percentiles(frame)
     frame = serialize_tempo_path_lists(frame)
     geographic_splits = _split_by_cluster(frame)
     labeled_splits = apply_binary_target(geographic_splits)
@@ -227,6 +250,13 @@ def main() -> None:
         "deadband": {
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
             "retained_rule": "abs(delta_nox_mass) > threshold",
+        },
+        "nox_mass_outlier_filter": {
+            "lower_percentile": NOX_LOWER_PERCENTILE,
+            "upper_percentile": NOX_UPPER_PERCENTILE,
+            "lower_bound": nox_lower_bound,
+            "upper_bound": nox_upper_bound,
+            "retained_rule": "lower_bound <= nox_mass <= upper_bound",
         },
         "splits": {
             name: {

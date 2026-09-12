@@ -86,6 +86,8 @@ MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan cover
 MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor
 LABEL_COL = "delta_nox_class"
 DELTA_THRESHOLD = 75.0  # least raw delta-NOx magnitude kept as a labeled class
+NOX_LOWER_PERCENTILE = 1.0  # lower aggregate AOI-hour NOx percentile retained during stratification
+NOX_UPPER_PERCENTILE = 99.0  # upper aggregate AOI-hour NOx percentile retained during stratification
 COAL_DOMINANT_POWER_FRACTION = 0.50  # prior-quarter coal share must be strictly greater than this
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
@@ -118,7 +120,6 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
     "avg_pwr_gen",
     "temperature_2m_k",
     "boundary_layer_height_m",
-    "flux_log_ratio_prev_qtr",
 )
 MODEL_CYCLIC_FEATURES = ("hour", "day_of_year")  # each expands to sine and cosine
 

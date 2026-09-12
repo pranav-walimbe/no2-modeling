@@ -177,6 +177,8 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   preceding quarter as `prev_qtr_avg_nox`;
 - retains only AOIs whose coal units supplied more than 50 percent of summed
   previous-quarter average unit generation;
+- filters finite aggregate AOI-hour NOx to the configured inclusive 1st through
+  99th percentile bounds and records the fitted bounds in its summary;
 - assigns overlapping AOI clusters intact to 60/20/20 splits;
 - ranks candidates by lagged coal generation, using no current-quarter output;
 - emits three times each configured final size as raster candidates.
@@ -191,10 +193,11 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   caches, grouping work so workers reuse each NetCDF or GRIB read;
 - smooths current and previous NO2 independently with retrieval uncertainty and
   winds matched to each observation before forming the hourly delta;
-- estimates aggregate NOx flux from common crosswind sections downstream of
-  every facility in an AOI, using the current smoothed NO2 and 80 m wind;
-- applies the published time-dependent NOx-to-NO2 ratio and a 2.5-hour NOx
-  lifetime without fitting a chemistry model;
+- estimates aggregate NOx flux from positive enhancement integrated over the
+  union of 12 km by 9 km source-relative downwind plumes, using an upwind
+  median background and 80 m wind;
+- applies the published time-dependent NOx-to-NO2 ratio, a 1.5-hour NOx
+  lifetime, and a fixed cross-validated multiplicative calibration;
 - requires greater than 95 percent current coverage and greater than 80 percent
   paired coverage for the hourly delta, preserving gaps in separate masks;
 - retains every successful record when a split exceeds its desired size;
@@ -209,6 +212,8 @@ centre-interpolated HRRR temperature and boundary-layer height. The three final
 columns are `flux_nox` in pounds per hour, `flux_log_ratio_prev_qtr`, and
 `flux_confidence`. Temperature and boundary-layer height remain independent
 model features and do not alter the fixed NO2-to-NOx chemistry conversion.
+The three flux columns remain available for diagnostics but are currently
+excluded from model inputs.
 
 Running the splits:
 

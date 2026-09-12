@@ -1,4 +1,4 @@
-"""Aggregate cross-sectional NOx flux estimation from TEMPO NO2."""
+"""Aggregate integrated-mass NOx flux estimation from TEMPO NO2."""
 
 from __future__ import annotations
 
@@ -14,10 +14,16 @@ MIN_WIND_SPEED_MPS = 1.0
 NOX_NO2_INITIAL_EXCESS = 1.6
 NOX_NO2_CONVERSION_RATE_SECONDS = 1_638.0
 NOX_NO2_EQUILIBRIUM_RATIO = 1.31
-NOX_LIFETIME_SECONDS = 2.5 * 60 * 60
-PLUME_HALF_WIDTH_KM = 12.0
-SECTION_OFFSETS_KM = (4.5, 9.0, 13.5, 18.0)
+NOX_LIFETIME_SECONDS = 1.5 * 60 * 60
+PLUME_HALF_WIDTH_KM = 4.5
+PLUME_LENGTH_KM = 12.0
+UPWIND_MIN_DISTANCE_KM = 7.5
+UPWIND_MAX_DISTANCE_KM = 30.0
+UPWIND_HALF_WIDTH_KM = 25.0
+# Fitted on 700 shard samples with five-fold cross-validation
+FLUX_CALIBRATION_FACTOR = 1.4158915687682765
 MIN_BACKGROUND_PIXELS = 8
+MIN_UPWIND_PIXELS = 16
 MIN_PLUME_PIXELS = 2
 CONFIDENCE_SNR_SCALE = 3.0
 
@@ -72,10 +78,80 @@ def _robust_background(
 
 def _conversion_factor(age_seconds: np.ndarray) -> np.ndarray:
     # Convert observed NO2 to emitted NOx and reverse first-order NOx loss
-    nox_to_no2 = NOX_NO2_INITIAL_EXCESS * np.exp(
-        -age_seconds / NOX_NO2_CONVERSION_RATE_SECONDS
-    ) + NOX_NO2_EQUILIBRIUM_RATIO
+    nox_to_no2 = (
+        NOX_NO2_INITIAL_EXCESS * np.exp(-age_seconds / NOX_NO2_CONVERSION_RATE_SECONDS) + NOX_NO2_EQUILIBRIUM_RATIO
+    )
     return nox_to_no2 * np.exp(age_seconds / NOX_LIFETIME_SECONDS)
+
+
+def _source_relative_coordinates(
+    along_km: np.ndarray,
+    cross_km: np.ndarray,
+    source_along_km: np.ndarray,
+    source_cross_km: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    # Project every raster cell relative to every source
+    relative_along = along_km[..., None] - source_along_km[None, None, :]
+    relative_cross = cross_km[..., None] - source_cross_km[None, None, :]
+    return relative_along, relative_cross
+
+
+def _upwind_background(
+    no2: np.ndarray,
+    valid: np.ndarray,
+    relative_along: np.ndarray,
+    relative_cross: np.ndarray,
+) -> tuple[float, float] | None:
+    # Estimate a common background from source-relative upwind corridors
+    corridor = np.any(
+        (relative_along <= -UPWIND_MIN_DISTANCE_KM)
+        & (relative_along >= -UPWIND_MAX_DISTANCE_KM)
+        & (np.abs(relative_cross) <= UPWIND_HALF_WIDTH_KM),
+        axis=2,
+    )
+    background = corridor & valid
+    if np.count_nonzero(background) < MIN_UPWIND_PIXELS:
+        return None
+    coverage = float(np.mean(valid[corridor]))
+    return float(np.median(no2[background])), coverage
+
+
+def _plume_mask_and_ages(
+    valid: np.ndarray,
+    relative_along: np.ndarray,
+    relative_cross: np.ndarray,
+    transport_speed_mps: float,
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    # Select the compact downwind union and calculate nearest-source ages
+    eligible = (
+        (relative_along > 0) & (relative_along <= PLUME_LENGTH_KM) & (np.abs(relative_cross) <= PLUME_HALF_WIDTH_KM)
+    )
+    corridor = np.any(eligible, axis=2)
+    plume = corridor & valid
+    if np.count_nonzero(plume) < MIN_PLUME_PIXELS:
+        return None
+    nearest_distance_km = np.min(np.where(eligible, relative_along, np.inf), axis=2)
+    ages_seconds = nearest_distance_km[plume] * 1_000 / transport_speed_mps
+    coverage = float(np.mean(valid[corridor]))
+    return plume, ages_seconds, coverage
+
+
+def _flux_confidence(
+    enhancement: np.ndarray,
+    uncertainty: np.ndarray,
+    observed_speed_mps: float,
+    plume_coverage: float,
+    background_coverage: float,
+) -> float:
+    # Combine plume signal, wind strength and spatial coverage
+    finite_uncertainty = uncertainty[np.isfinite(uncertainty) & (uncertainty > 0)]
+    noise = float(np.sqrt(np.square(finite_uncertainty).sum())) if finite_uncertainty.size else float("inf")
+    signal = float(np.sum(enhancement))
+    signal_to_noise = signal / noise if noise > 0 else 0.0
+    signal_confidence = signal_to_noise / (signal_to_noise + CONFIDENCE_SNR_SCALE)
+    wind_confidence = min(observed_speed_mps / 3.0, 1.0)
+    confidence = signal_confidence * wind_confidence * plume_coverage * background_coverage
+    return float(np.clip(confidence, 0.0, 1.0))
 
 
 def estimate_aggregate_flux(
@@ -87,7 +163,7 @@ def estimate_aggregate_flux(
     source_north_km: tuple[float, ...] = (0.0,),
     cell_size_m: float = 1_500.0,
 ) -> FluxEstimate:
-    """Estimate aggregate AOI NOx with common downwind cross-sections.
+    """Estimate aggregate AOI NOx with integrated downwind plume mass.
 
     Args:
         no2: Smoothed tropospheric NO2 column in molecules per square centimetre.
@@ -135,71 +211,34 @@ def estimate_aggregate_flux(
     if not source_along.size:
         return FluxEstimate(0.0, 0.0)
 
-    plume_cross = np.any(
-        np.abs(cross_km[..., None] - source_cross[None, None, :]) <= PLUME_HALF_WIDTH_KM,
-        axis=2,
+    relative_along, relative_cross = _source_relative_coordinates(
+        along_km,
+        cross_km,
+        source_along,
+        source_cross,
     )
-    half_section_km = cell_size_m / 2_000
-    section_fluxes: list[float] = []
-    section_snrs: list[float] = []
-    background_retention: list[float] = []
-    section_coverages: list[float] = []
-    for offset_km in SECTION_OFFSETS_KM:
-        section_along = float(np.max(source_along) + offset_km)
-        section = np.abs(along_km - section_along) <= half_section_km
-        plume = section & plume_cross
-        usable_plume = plume & valid
-        background = section & ~plume_cross & valid
-        if np.count_nonzero(usable_plume) < MIN_PLUME_PIXELS:
-            continue
-        if np.count_nonzero(background) < MIN_BACKGROUND_PIXELS:
-            continue
-        fitted_background, retained = _robust_background(no2, uncertainty, cross_km, background)
-        enhancement = no2 - fitted_background
-
-        distances_km = section_along - source_along
-        eligible_sources = distances_km > 0
-        if not np.any(eligible_sources):
-            continue
-        cross_distances = np.abs(cross_km[..., None] - source_cross[None, None, eligible_sources])
-        nearest_source = np.argmin(cross_distances, axis=2)
-        pixel_distances_km = distances_km[eligible_sources][nearest_source]
-        age_seconds = pixel_distances_km * 1_000 / transport_speed
-        conversion = _conversion_factor(age_seconds)
-        along_wind = wind_u * downwind_east + wind_v * downwind_north
-        pixel_speed = np.maximum(along_wind, MIN_WIND_SPEED_MPS)
-        corrected_mass = enhancement * MOLECULES_CM2_TO_KG_M2 * conversion
-        section_width_m = 2 * half_section_km * 1_000
-        flux_kg_s = float(
-            np.sum(corrected_mass[usable_plume] * pixel_speed[usable_plume] * cell_size_m**2)
-            / section_width_m
-        )
-        sigma = uncertainty[usable_plume]
-        finite_sigma = sigma[np.isfinite(sigma) & (sigma > 0)]
-        noise = float(np.sqrt(np.square(finite_sigma).sum())) if finite_sigma.size else float("inf")
-        signal = float(np.sum(np.maximum(enhancement[usable_plume], 0.0)))
-        section_fluxes.append(max(flux_kg_s, 0.0) * KG_S_TO_LB_HOUR)
-        section_snrs.append(signal / noise if noise > 0 else 0.0)
-        background_retention.append(retained)
-        section_coverages.append(float(np.mean(valid[plume])))
-
-    if not section_fluxes:
+    background_result = _upwind_background(no2, valid, relative_along, relative_cross)
+    plume_result = _plume_mask_and_ages(valid, relative_along, relative_cross, transport_speed)
+    if background_result is None or plume_result is None:
         return FluxEstimate(0.0, 0.0)
-    fluxes = np.asarray(section_fluxes)
-    flux_nox = float(np.median(fluxes))
-    median_absolute_deviation = float(np.median(np.abs(fluxes - flux_nox)))
-    agreement = np.exp(-median_absolute_deviation / max(flux_nox, 1.0))
-    signal_confidence = float(np.median(section_snrs)) / (
-        float(np.median(section_snrs)) + CONFIDENCE_SNR_SCALE
+
+    background_level, background_coverage = background_result
+    plume, ages_seconds, plume_coverage = plume_result
+    enhancement = np.maximum(no2[plume] - background_level, 0.0)
+    if not np.any(enhancement > 0):
+        return FluxEstimate(0.0, 0.0)
+    projected_speed = np.maximum(
+        wind_u * downwind_east + wind_v * downwind_north,
+        MIN_WIND_SPEED_MPS,
     )
-    wind_confidence = min(observed_speed / 3.0, 1.0)
-    section_confidence = min(len(section_fluxes) / len(SECTION_OFFSETS_KM), 1.0)
-    confidence = (
-        agreement
-        * signal_confidence
-        * wind_confidence
-        * section_confidence
-        * float(np.mean(background_retention))
-        * float(np.mean(section_coverages))
+    corrected_mass = enhancement * MOLECULES_CM2_TO_KG_M2 * _conversion_factor(ages_seconds)
+    flux_kg_s = float(np.sum(corrected_mass * projected_speed[plume] * cell_size_m**2) / (PLUME_LENGTH_KM * 1_000))
+    flux_nox = max(flux_kg_s * KG_S_TO_LB_HOUR * FLUX_CALIBRATION_FACTOR, 0.0)
+    confidence = _flux_confidence(
+        enhancement,
+        uncertainty[plume],
+        observed_speed,
+        plume_coverage,
+        background_coverage,
     )
     return FluxEstimate(flux_nox, float(np.clip(confidence, 0.0, 1.0)))

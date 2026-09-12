@@ -33,6 +33,7 @@ Excluded inputs and the reason for each:
 | Coordinates, AOI IDs | Prevent geographic memorization |
 | Current emissions | Direct target leakage |
 | Plume score, raster-quality scores | Diagnostics extracted from the response image |
+| Flux estimate, ratio, and confidence | Experimental diagnostics derived from the current response raster |
 | Prior-quarter NOx-change scale | Encodes how far a plant usually swings, which tracks crossing a fixed magnitude cutoff |
 
 Coverage stays available for sliced evaluation but is not a model input.
