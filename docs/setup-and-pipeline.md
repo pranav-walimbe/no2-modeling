@@ -176,7 +176,7 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
 - computes each AOI's absolute mean hourly NOx mass from the immediately
   preceding quarter as `prev_qtr_avg_nox`;
 - stores absolute delta NOx relative to that prior-quarter level as
-  `prev_qtr_rel_delta` and drops the bottom configured 10 percent after the
+  `prev_qtr_rel_delta` and requires a configured minimum of 0.10 after the
   absolute deadband;
 - retains only AOIs whose coal units supplied more than 50 percent of summed
   previous-quarter average unit generation;

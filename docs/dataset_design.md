@@ -57,10 +57,10 @@ inside the inclusive bounds. `NOX_LOWER_PERCENTILE` and
 rule are written to the stratification summary.
 
 After the fixed absolute deadband, stratification calculates
-`prev_qtr_rel_delta` as `abs(delta_nox_mass) / abs(prev_qtr_avg_nox)`. It drops
-records below the configured global 10th percentile. The dataframe retains the
-metric for diagnostics, but the model does not receive it or
-`prev_qtr_avg_nox` as an input.
+`prev_qtr_rel_delta` as `abs(delta_nox_mass) / abs(prev_qtr_avg_nox)`. It
+requires a value of at least the configured `MIN_PREV_QTR_REL_DELTA`, currently
+0.10. The dataframe retains the metric for diagnostics, but the model does not
+receive it or `prev_qtr_avg_nox` as an input.
 
 ## Label and tabular features
 
@@ -77,7 +77,7 @@ One UTC clock governs everything:
 
 The binary target uses raw `delta_nox_mass`:
 
-- Read the fixed 75 lb cutoff from the `DELTA_THRESHOLD` configuration
+- Read the fixed 100 lb cutoff from the `DELTA_THRESHOLD` configuration
   constant.
 - Remove records with absolute change at or below that cutoff in every split.
 - Assign class 0 to negative changes and class 1 to positive changes.
@@ -171,8 +171,8 @@ Before raster generation, apply these rules to every split:
 - Average each unit's previous-quarter output, then sum the unit averages by AOI.
 - Retain only AOIs where coal units supply more than 50 percent of that total.
 - Retain records within the configured aggregate AOI-hour NOx percentile bounds.
-- Drop the bottom configured percentile of deadband-eligible
-  `prev_qtr_rel_delta` values.
+- Require deadband-eligible records to meet the configured
+  `MIN_PREV_QTR_REL_DELTA` floor.
 - Rank the retained candidates by previous-quarter coal output.
 - Apply the priority ordering and AOI round-robin within each label
   independently.

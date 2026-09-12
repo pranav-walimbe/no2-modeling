@@ -12,9 +12,9 @@ from config import (
     LABEL_COL,
     MIN_COVERAGE_PERCENT,
     MIN_MAJOR_CITY_DISTANCE_KM,
+    MIN_PREV_QTR_REL_DELTA,
     NOX_LOWER_PERCENTILE,
     NOX_UPPER_PERCENTILE,
-    PREV_QTR_REL_DELTA_LOWER_PERCENTILE,
     STRAT_BASE_DIR,
     TEST_RECORDS_CSV,
     TEST_RECORDS_SIZE,
@@ -160,26 +160,17 @@ def _add_prev_qtr_rel_delta(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _filter_relative_delta_percentile(
+def _filter_relative_delta(
     splits: dict[str, pl.DataFrame],
-    lower_percentile: float = PREV_QTR_REL_DELTA_LOWER_PERCENTILE,
-) -> tuple[dict[str, pl.DataFrame], float]:
-    # Fit one cutoff across deadband-eligible records from every geographic split
-    if not 0 <= lower_percentile < 100:
-        raise ValueError("Relative-delta percentile must satisfy 0 <= lower < 100")
-    relative_delta = pl.concat(
-        [split.select(PREV_QTR_REL_DELTA_COL) for split in splits.values()],
-        how="vertical",
-    ).filter(pl.col(PREV_QTR_REL_DELTA_COL).is_finite())
-    if relative_delta.is_empty():
-        raise ValueError("Cannot calculate a relative-delta percentile without finite values")
-    lower_bound = relative_delta.select(
-        pl.col(PREV_QTR_REL_DELTA_COL).quantile(lower_percentile / 100, interpolation="linear")
-    ).item()
+    minimum: float = MIN_PREV_QTR_REL_DELTA,
+) -> dict[str, pl.DataFrame]:
+    # Apply one fixed relative-change floor to every geographic split
+    if not 0 <= minimum:
+        raise ValueError("Minimum relative delta must be nonnegative")
     filtered = {
         name: split.filter(
             pl.col(PREV_QTR_REL_DELTA_COL).is_finite()
-            & (pl.col(PREV_QTR_REL_DELTA_COL) >= lower_bound)
+            & (pl.col(PREV_QTR_REL_DELTA_COL) >= minimum)
         )
         for name, split in splits.items()
     }
@@ -187,8 +178,8 @@ def _filter_relative_delta_percentile(
         print(
             f"[{name}] relative-delta filter retained {filtered[name].height:,}/{splits[name].height:,} records"
         )
-    print(f"Relative-delta lower bound: P{lower_percentile:g}={lower_bound:.6g}")
-    return filtered, float(lower_bound)
+    print(f"Minimum relative delta: {minimum:.6g}")
+    return filtered
 
 
 def _limit_splits(
@@ -282,7 +273,7 @@ def main() -> None:
     frame = serialize_tempo_path_lists(frame)
     geographic_splits = _split_by_cluster(frame)
     labeled_splits = apply_binary_target(geographic_splits)
-    relative_delta_splits, relative_delta_lower_bound = _filter_relative_delta_percentile(labeled_splits)
+    relative_delta_splits = _filter_relative_delta(labeled_splits)
     splits = _limit_splits(relative_delta_splits)
     del frame
 
@@ -298,9 +289,8 @@ def main() -> None:
         },
         "relative_delta_filter": {
             "column": PREV_QTR_REL_DELTA_COL,
-            "lower_percentile": PREV_QTR_REL_DELTA_LOWER_PERCENTILE,
-            "lower_bound": relative_delta_lower_bound,
-            "retained_rule": "prev_qtr_rel_delta >= lower_bound",
+            "minimum": MIN_PREV_QTR_REL_DELTA,
+            "retained_rule": "prev_qtr_rel_delta >= minimum",
         },
         "nox_mass_outlier_filter": {
             "lower_percentile": NOX_LOWER_PERCENTILE,
