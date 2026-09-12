@@ -69,7 +69,7 @@ One UTC clock governs everything:
 
 The binary target uses raw `delta_nox_mass`:
 
-- Read the fixed 75 lb cutoff from the `DELTA_THRESHOLD` configuration
+- Read the fixed 100 lb cutoff from the `DELTA_THRESHOLD` configuration
   constant.
 - Remove records with absolute change at or below that cutoff in every split.
 - Assign class 0 to negative changes and class 1 to positive changes.
