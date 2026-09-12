@@ -35,8 +35,9 @@ On a shortfall from a future archive or a stricter filter, raise
 - Each cluster belongs to exactly one of train, validation, or test.
 - No plant region leaks across splits, so evaluation measures generalization to
   unseen geographic regions instead of interpolation at known plants.
-- The split precedes quantile fitting, so validation and test data never reach
-  preprocessing statistics.
+- The split precedes train-only raster and tabular normalization. The aggregate
+  NOx eligibility percentiles are a global metadata gate applied before the
+  split and are recorded in the stratification summary.
 
 ## Metadata eligibility and outliers
 
@@ -48,6 +49,12 @@ Before any image processing, a candidate needs:
 - a mapped HRRR analysis path, with file existence checked during generation;
 - finite prior-quarter power generation and distance to a city of 500,000 or
   more people for priority sampling.
+
+After coal-dominance eligibility, stratification calculates the global 1st and
+99th percentiles of finite aggregate AOI-hour `nox_mass` and retains records
+inside the inclusive bounds. `NOX_LOWER_PERCENTILE` and
+`NOX_UPPER_PERCENTILE` configure the cutoffs. The fitted values and retention
+rule are written to the stratification summary.
 
 ## Label and tabular features
 
@@ -88,15 +95,18 @@ hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
 delta); it is also supplied as a train-normalized scalar model feature.
 
 The current NO2 raster also produces a source-aware aggregate flux estimate.
-Common crosswind sections downstream of all facilities prevent overlapping
-plumes from being counted once per source. A fixed published time-dependent
-NOx-to-NO2 ratio and 2.5-hour decay correction produce `flux_nox` in pounds per
-hour. `flux_log_ratio_prev_qtr` compares it with `prev_qtr_avg_nox`, while
-`flux_confidence` summarizes wind strength, retrieval signal, coverage,
-background fit support, and agreement among sections. These three values are
-the final dataframe columns. Only `flux_log_ratio_prev_qtr` is a
-train-normalized model feature; raw flux and confidence remain available for
-diagnostics and filtering.
+The estimator integrates positive NO2 enhancement within the union of compact
+source-relative plumes extending 12 km downwind and 4.5 km to either side.
+Overlapping plume pixels are counted once. A median background comes from
+source-relative corridors 7.5 to 30 km upwind. Pixel distance and 80 m wind
+give transport age, which drives the published time-dependent NOx-to-NO2 ratio
+and a 1.5-hour decay correction. Dividing corrected mass by plume residence
+time and applying the fixed cross-validated calibration produces `flux_nox` in
+pounds per hour. `flux_log_ratio_prev_qtr` compares it with
+`prev_qtr_avg_nox`, while `flux_confidence` summarizes retrieval signal, wind
+strength, and plume and background coverage. All three remain dataframe
+diagnostics and are excluded from model inputs while the estimator is being
+validated across AOIs.
 
 Nameplate capacity:
 
@@ -151,6 +161,7 @@ Before raster generation, apply these rules to every split:
 - Require each AOI to sit at least 50 km from a major city.
 - Average each unit's previous-quarter output, then sum the unit averages by AOI.
 - Retain only AOIs where coal units supply more than 50 percent of that total.
+- Retain records within the configured aggregate AOI-hour NOx percentile bounds.
 - Rank the retained candidates by previous-quarter coal output.
 - Apply the priority ordering and AOI round-robin within each label
   independently.
