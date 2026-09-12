@@ -175,6 +175,9 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
 - computes raw consecutive-hour AOI NOx changes;
 - computes each AOI's absolute mean hourly NOx mass from the immediately
   preceding quarter as `prev_qtr_avg_nox`;
+- stores absolute delta NOx relative to that prior-quarter level as
+  `prev_qtr_rel_delta` and drops the bottom configured 10 percent after the
+  absolute deadband;
 - retains only AOIs whose coal units supplied more than 50 percent of summed
   previous-quarter average unit generation;
 - filters finite aggregate AOI-hour NOx to the configured inclusive 1st through
@@ -247,7 +250,8 @@ python -u -m modeling.train
 ```
 
 The trainer reads current NO2, hourly delta NO2, wind, and two
-validity masks from each selected NPZ on demand. It fits memory-bounded robust
+validity masks from each selected NPZ on demand. It derives local mean solar
+hour from the stored UTC hour and AOI longitude. It fits memory-bounded robust
 NO2 normalization statistics on the training split alone and records clipped
 valid-pixel fractions by channel and split. It then predicts whether raw
 delta-NOx falls below or above zero outside the fixed deadband and reports

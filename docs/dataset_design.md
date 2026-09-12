@@ -56,6 +56,12 @@ inside the inclusive bounds. `NOX_LOWER_PERCENTILE` and
 `NOX_UPPER_PERCENTILE` configure the cutoffs. The fitted values and retention
 rule are written to the stratification summary.
 
+After the fixed absolute deadband, stratification calculates
+`prev_qtr_rel_delta` as `abs(delta_nox_mass) / abs(prev_qtr_avg_nox)`. It drops
+records below the configured global 10th percentile. The dataframe retains the
+metric for diagnostics, but the model does not receive it or
+`prev_qtr_avg_nox` as an input.
+
 ## Label and tabular features
 
 One UTC clock governs everything:
@@ -64,6 +70,8 @@ One UTC clock governs everything:
   time to UTC.
 - AOI aggregation, TEMPO pairing, HRRR lookup, and the emitted `date` and `hour`
   all share that clock.
+- The model converts UTC hour and AOI longitude to local mean solar hour at load
+  time. UTC remains the stored and joined clock.
 - The enriched archive keeps the source local-standard fields, each facility's
   timezone, and its standard offset for auditability.
 
@@ -92,7 +100,8 @@ HRRR temperature and boundary-layer height come from interpolation at the AOI
 centre. Prior-quarter heat input and power generation keep contemporaneous
 operational leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's
 hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
-delta); it is also supplied as a train-normalized scalar model feature.
+delta). Stratification uses it to calculate `prev_qtr_rel_delta`, but the model
+does not receive either field.
 
 The current NO2 raster also produces a source-aware aggregate flux estimate.
 The estimator integrates positive NO2 enhancement within the union of compact
@@ -162,6 +171,8 @@ Before raster generation, apply these rules to every split:
 - Average each unit's previous-quarter output, then sum the unit averages by AOI.
 - Retain only AOIs where coal units supply more than 50 percent of that total.
 - Retain records within the configured aggregate AOI-hour NOx percentile bounds.
+- Drop the bottom configured percentile of deadband-eligible
+  `prev_qtr_rel_delta` values.
 - Rank the retained candidates by previous-quarter coal output.
 - Apply the priority ordering and AOI round-robin within each label
   independently.

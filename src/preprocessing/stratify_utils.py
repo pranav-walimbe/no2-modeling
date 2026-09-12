@@ -23,6 +23,7 @@ LABEL_MODE_COL = "label_mode"
 PREVIOUS_QUARTER_COAL_POWER_COL = "_previous_quarter_coal_power"
 PREVIOUS_QUARTER_POWER_COL = "_previous_quarter_power"
 PREV_QTR_AVG_NOX_COL = "prev_qtr_avg_nox"
+PREV_QTR_REL_DELTA_COL = "prev_qtr_rel_delta"
 METERS_PER_KM = 1000.0
 HRRR_PRODUCT = "wrfsfcf00"  # hourly surface analysis product named in every HRRR filename
 HRRR_FIELD_SLUG = "wind-temp-blh"  # field subset named in every HRRR filename

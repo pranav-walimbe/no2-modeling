@@ -34,6 +34,7 @@ ROBUST_IMAGE_CHANNELS = tuple(MODEL_IMAGE_KEYS.index(name) for name in MODEL_ROB
 STANDARD_IMAGE_CHANNELS = tuple(
     channel for channel in range(len(MODEL_IMAGE_KEYS)) if channel not in ROBUST_IMAGE_CHANNELS
 )
+DEGREES_PER_SOLAR_HOUR = 15.0
 
 
 def _model_feature_names() -> tuple[str, ...]:
@@ -105,8 +106,10 @@ def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
     ]
 
     for cyclic_feature in MODEL_CYCLIC_FEATURES:
-        if cyclic_feature == "hour":
-            values = pd.to_numeric(frame["hour"], errors="coerce").to_numpy(dtype=np.float64)
+        if cyclic_feature == "local_solar_hour":
+            utc_hour = pd.to_numeric(frame["hour"], errors="coerce").to_numpy(dtype=np.float64)
+            longitude = pd.to_numeric(frame["lon"], errors="coerce").to_numpy(dtype=np.float64)
+            values = np.mod(utc_hour + longitude / DEGREES_PER_SOLAR_HOUR, 24.0)
             angle = 2 * np.pi * values / 24.0
         elif cyclic_feature == "day_of_year":
             dates = pd.to_datetime(frame["date"], errors="coerce")

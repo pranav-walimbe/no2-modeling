@@ -21,20 +21,20 @@ Scalar inputs:
 
 - coal and natural-gas unit counts;
 - total generator nameplate capacity;
-- previous-quarter average AOI hourly NOx mass;
 - previous-quarter average heat input and power generation;
 - coincident HRRR 2 m temperature and boundary-layer height;
-- sine/cosine encodings of UTC hour and day of year.
+- sine/cosine encodings of local mean solar hour and day of year.
 
 Excluded inputs and the reason for each:
 
 | Excluded | Reason |
 |---|---|
-| Coordinates, AOI IDs | Prevent geographic memorization |
+| Raw coordinates, AOI IDs | Prevent geographic memorization; longitude only converts UTC to local solar hour |
 | Current emissions | Direct target leakage |
+| Previous-quarter average NOx | Defines the relative-change filter and can identify plant operating regimes |
+| `prev_qtr_rel_delta` | Contains target magnitude and is used only for stratification |
 | Plume score, raster-quality scores | Diagnostics extracted from the response image |
 | Flux estimate, ratio, and confidence | Experimental diagnostics derived from the current response raster |
-| Prior-quarter NOx-change scale | Encodes how far a plant usually swings, which tracks crossing a fixed magnitude cutoff |
 
 Coverage stays available for sliced evaluation but is not a model input.
 
@@ -46,9 +46,11 @@ standard deviation. Validation, test, and inference reuse those statistics.
 | Transform | Features |
 |---|---|
 | None | all scalar inputs |
-| Sine and cosine | UTC hour, day of year |
+| Sine and cosine | Local mean solar hour, day of year |
 
-Sine and cosine keep hour 23 adjacent to hour 0.
+Local mean solar hour is `(UTC hour + longitude / 15) mod 24`. This keeps solar
+time continuous across civil-time boundaries and daylight-saving changes. Sine
+and cosine keep hour 23 adjacent to hour 0.
 
 No feature carries a `log1p` transform. Measurements on the first generated
 training split rejected it, split by feature:
