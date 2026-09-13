@@ -196,6 +196,8 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   caches, grouping work so workers reuse each NetCDF or GRIB read;
 - smooths current and previous NO2 independently with retrieval uncertainty and
   winds matched to each observation before forming the hourly delta;
+- subtracts scan-specific Huber backgrounds from source-relative 24 to 36 km
+  upwind corridors when both scans have at least 12 paired-valid pixels;
 - estimates aggregate NOx flux from positive enhancement integrated over the
   union of 12 km by 9 km source-relative downwind plumes, using an upwind
   median background and 80 m wind;

@@ -64,8 +64,8 @@ Pass the matching flag after changing TEMPO processing or wind alignment.
 Each successful model record persists one compressed NPZ holding four aligned
 `float32` arrays and two `uint8` masks:
 
-- `current_no2`, smoothed current-scan NO2 on native QA-passing support;
-- `delta_no2`, smoothed current minus smoothed previous NO2 on their support intersection;
+- `current_no2`, smoothed and upwind-normalized current NO2 on native QA-passing support;
+- `delta_no2`, current minus previous smoothed and upwind-normalized NO2 on their support intersection;
 - `wind_u_80m_mps`, geographic eastward wind;
 - `wind_v_80m_mps`, geographic northward wind;
 - `current_no2_mask` and `delta_no2_mask`, independent binary support for the
@@ -90,7 +90,10 @@ Wind alignment, on the 3 km HRRR grid NOAA describes:
 
 Current and previous scans are smoothed independently with retrieval
 uncertainty and winds from each scan's nearest HRRR analysis hour. Coverage is
-validated before smoothing, and the kernel does not expand finite support.
+validated before smoothing, and the kernel does not expand finite support. A
+scan-specific Huber location from the 24 to 36 km source-relative upwind
+corridor is then subtracted from each scan. Both scans remain unchanged when
+either background has fewer than 12 paired-valid pixels.
 
 See the [NOAA Global Systems Laboratory HRRR overview](https://rapidrefresh.noaa.gov/).
 
