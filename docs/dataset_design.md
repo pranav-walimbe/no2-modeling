@@ -110,12 +110,12 @@ Overlapping plume pixels are counted once. A median background comes from
 source-relative corridors 7.5 to 30 km upwind. Pixel distance and 80 m wind
 give transport age, which drives the published time-dependent NOx-to-NO2 ratio
 and a 1.5-hour decay correction. Dividing corrected mass by plume residence
-time and applying the fixed cross-validated calibration produces `flux_nox` in
-pounds per hour. `flux_log_ratio_prev_qtr` compares it with
-`prev_qtr_avg_nox`, while `flux_confidence` summarizes retrieval signal, wind
-strength, and plume and background coverage. All three remain dataframe
-diagnostics and are excluded from model inputs while the estimator is being
-validated across AOIs.
+time and applying the fixed cross-validated calibration produces flux in pounds
+per hour. The estimator runs on current and previous smoothed NO2 using common
+valid-pixel support and the current transport wind. `delta_flux_norm` is
+`(flux_nox - previous_flux_nox) / abs(prev_qtr_avg_nox)` and enters the model.
+The two flux levels, the current-level prior-quarter ratio, and current and
+paired confidence remain dataframe diagnostics.
 
 Nameplate capacity:
 

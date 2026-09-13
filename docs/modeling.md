@@ -23,6 +23,7 @@ Scalar inputs:
 - total generator nameplate capacity;
 - previous-quarter average heat input and power generation;
 - coincident HRRR 2 m temperature and boundary-layer height;
+- current-minus-previous flux normalized by absolute prior-quarter mean NOx;
 - sine/cosine encodings of local mean solar hour and day of year.
 
 Excluded inputs and the reason for each:
@@ -34,7 +35,7 @@ Excluded inputs and the reason for each:
 | Previous-quarter average NOx | Defines the relative-change filter and can identify plant operating regimes |
 | `prev_qtr_rel_delta` | Contains target magnitude and is used only for stratification |
 | Plume score, raster-quality scores | Diagnostics extracted from the response image |
-| Flux estimate, ratio, and confidence | Experimental diagnostics derived from the current response raster |
+| Current and previous flux levels, ratio, and confidence | Retained as diagnostics; the normalized paired difference is the model input |
 
 Coverage stays available for sliced evaluation but is not a model input.
 

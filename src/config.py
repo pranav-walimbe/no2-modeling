@@ -112,7 +112,7 @@ MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2")
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS)
 MODEL_INPUT_CHANNELS = MODEL_IMAGE_CHANNELS + len(MODEL_MASK_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
-MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
+MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular and fused models
     "num_coal_units",
     "num_ng_units",
     "total_nameplate_capacity_mw",
@@ -120,6 +120,7 @@ MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from c
     "avg_pwr_gen",
     "temperature_2m_k",
     "boundary_layer_height_m",
+    "delta_flux_norm",
 )
 MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to sine and cosine
 
