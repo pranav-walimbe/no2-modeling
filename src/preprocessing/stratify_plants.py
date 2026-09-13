@@ -229,29 +229,6 @@ def _filter_relative_delta(
     return filtered
 
 
-def _balance_classes(splits: dict[str, pl.DataFrame]) -> dict[str, pl.DataFrame]:
-    # Retain the complete smaller class and a deterministic sample of the larger class
-    balanced: dict[str, pl.DataFrame] = {}
-    for name, split in splits.items():
-        indexed = split.with_row_index("_balance_row").with_columns(
-            split.select(AOI_ID_COL, "date", "hour").hash_rows(seed=SPLIT_SEED).alias("_balance_hash")
-        )
-        class_size = min(indexed.filter(pl.col(LABEL_COL) == label).height for label in (0, 1))
-        balanced[name] = (
-            pl.concat(
-                [
-                    indexed.filter(pl.col(LABEL_COL) == label).sort("_balance_hash").head(class_size)
-                    for label in (0, 1)
-                ],
-                how="vertical",
-            )
-            .sort("_balance_row")
-            .drop("_balance_row", "_balance_hash")
-        )
-        print(f"[{name}] balanced to {class_size:,} records per class")
-    return balanced
-
-
 def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
     source = pl.scan_parquet(FULL_DATA_PARQUET)
@@ -293,8 +270,7 @@ def main() -> None:
     frame, nox_lower_bound, nox_upper_bound = _filter_nox_mass_percentiles(frame)
     labeled = apply_binary_target({"all": frame})["all"]
     eligible = _filter_relative_delta({"all": labeled})["all"]
-    geographic_splits = _split_by_cluster(serialize_tempo_path_lists(eligible))
-    splits = _balance_classes(geographic_splits)
+    splits = _split_by_cluster(serialize_tempo_path_lists(eligible))
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     summary = {
@@ -324,21 +300,16 @@ def main() -> None:
         },
         "split_assignment": {
             "target_fractions": SPLIT_FRACTIONS,
-            "achieved_fractions_before_balance": {
-                name: geographic_splits[name].height / eligible.height for name in geographic_splits
-            },
-            "achieved_fractions_after_balance": {
-                name: splits[name].height / sum(split.height for split in splits.values()) for name in splits
-            },
+            "achieved_fractions": {name: splits[name].height / eligible.height for name in splits},
         },
         "splits": {
             name: {
-                "class_balance": classification_summary(geographic_splits[name], splits[name]),
+                "natural_class_distribution": classification_summary(split, split),
             }
-            for name in splits
+            for name, split in splits.items()
         },
     }
-    del frame, labeled, eligible, geographic_splits
+    del frame, labeled, eligible
     write_json_atomic(summary, Path(STRAT_BASE_DIR) / "classification_summary.json")
     # Project and write one split at a time so the copies never coexist
     for name, destination in (("train", TRAIN_RECORDS_CSV), ("val", VAL_RECORDS_CSV), ("test", TEST_RECORDS_CSV)):

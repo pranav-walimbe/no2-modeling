@@ -184,8 +184,7 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   99th percentile bounds and records the fitted bounds in its summary;
 - assigns overlapping AOI clusters intact toward 70/15/15 record targets,
   accounting for total and per-class counts;
-- balances each split to 50/50 by retaining the complete smaller class and a
-  deterministic sample of the larger class, without a row-count target.
+- emits every eligible record without class balancing or a row-count target.
 
 `preprocessing.generate_dataset`:
 
