@@ -138,8 +138,6 @@ Normalization choices:
 - GroupNorm throughout the image encoder, since it avoids batch-level
   statistics and holds up when memory pressure forces small batches. See the
   [Group Normalization paper](https://arxiv.org/abs/1803.08494).
-- The amplitude branch can be disabled with `--no-amplitude-bypass` for a
-  matched ablation against the GroupNorm-only image encoder.
 - LayerNorm in the MLP projections.
 
 The DenseNet alternative is gone. It duplicated an obsolete input signature and
