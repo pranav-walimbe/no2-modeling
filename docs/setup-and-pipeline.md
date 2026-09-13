@@ -182,9 +182,10 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   previous-quarter average unit generation;
 - filters finite aggregate AOI-hour NOx to the configured inclusive 1st through
   99th percentile bounds and records the fitted bounds in its summary;
-- assigns overlapping AOI clusters intact to 60/20/20 splits;
-- ranks candidates by lagged coal generation, using no current-quarter output;
-- emits three times each configured final size as raster candidates.
+- assigns overlapping AOI clusters intact toward 70/15/15 record targets,
+  accounting for total and per-class counts;
+- balances each split to 50/50 by retaining the complete smaller class and a
+  deterministic sample of the larger class, without a row-count target.
 
 `preprocessing.generate_dataset`:
 
@@ -203,9 +204,8 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   lifetime, and a fixed cross-validated multiplicative calibration;
 - requires greater than 95 percent current coverage and greater than 80 percent
   paired coverage for the hourly delta, preserving gaps in separate masks;
-- retains every successful record when a split exceeds its desired size;
-- otherwise selects the largest exactly balanced subset through deterministic
-  AOI and temporal round-robin;
+- selects the largest exactly balanced successful subset through deterministic
+  AOI and temporal round-robin, limited only by the smaller class;
 - uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
   allocation.
 
