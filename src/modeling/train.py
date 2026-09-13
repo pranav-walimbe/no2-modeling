@@ -381,6 +381,7 @@ def main() -> None:
     )
     run_config["xgboost"] = {
         **xgboost_run.config.to_dict(),
+        "feature_names": list(xgboost_run.feature_names),
         "best_iteration": xgboost_run.best_iteration,
         "best_validation_logloss": xgboost_run.best_validation_logloss,
     }

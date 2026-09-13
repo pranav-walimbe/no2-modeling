@@ -18,6 +18,8 @@ from modeling.eval_utils import (
     TRUE_CLASS_COL,
 )
 
+XGBOOST_EXCLUDED_FEATURES = frozenset({"delta_flux_norm"})
+XGBOOST_FEATURE_NAMES = tuple(name for name in MODEL_FEATURE_NAMES if name not in XGBOOST_EXCLUDED_FEATURES)
 DEFAULT_ESTIMATORS = 1_000
 DEFAULT_LEARNING_RATE = 0.03
 DEFAULT_MAX_DEPTH = 3
@@ -57,13 +59,15 @@ class XGBoostRun:
 
     split_frames: dict[str, pd.DataFrame]
     config: XGBoostConfig
+    feature_names: tuple[str, ...]
     best_iteration: int
     best_validation_logloss: float
 
 
 def _feature_frame(dataset: NOxDataset) -> pd.DataFrame:
     # Retain feature names in the fitted booster and its saved artifact
-    return pd.DataFrame(dataset.features, columns=MODEL_FEATURE_NAMES)
+    features = pd.DataFrame(dataset.features, columns=MODEL_FEATURE_NAMES)
+    return features.loc[:, XGBOOST_FEATURE_NAMES]
 
 
 def _prediction_frame(dataset: NOxDataset, classifier: XGBClassifier) -> pd.DataFrame:
@@ -122,6 +126,7 @@ def train_xgboost_baseline(
     return XGBoostRun(
         split_frames=split_frames,
         config=resolved_config,
+        feature_names=XGBOOST_FEATURE_NAMES,
         best_iteration=int(classifier.best_iteration),
         best_validation_logloss=float(classifier.best_score),
     )

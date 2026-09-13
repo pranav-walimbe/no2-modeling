@@ -6,7 +6,6 @@ from pathlib import Path
 import polars as pl
 
 from config import (
-    COAL_DOMINANT_POWER_FRACTION,
     DELTA_THRESHOLD,
     FULL_DATA_PARQUET,
     LABEL_COL,
@@ -27,7 +26,6 @@ from preprocessing.stratify_utils import (
     MAJOR_CITY_DIST_COL,
     PREV_QTR_AVG_NOX_COL,
     PREV_QTR_REL_DELTA_COL,
-    PREVIOUS_QUARTER_COAL_POWER_COL,
     PREVIOUS_QUARTER_POWER_COL,
     add_aoi_bounds,
     add_hrrr_files,
@@ -229,6 +227,18 @@ def _filter_relative_delta(
     return filtered
 
 
+def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
+    # Apply non-raster candidate quality requirements
+    return frame.filter(
+        (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT)
+        & (pl.col(MAJOR_CITY_DIST_COL) >= MIN_MAJOR_CITY_DISTANCE_KM)
+        & pl.col("avg_pwr_gen").is_finite()
+        & pl.col(MAJOR_CITY_DIST_COL).is_finite()
+        & pl.col(PREVIOUS_QUARTER_POWER_COL).is_finite()
+        & (pl.col(PREVIOUS_QUARTER_POWER_COL) > 0)
+    )
+
+
 def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
     source = pl.scan_parquet(FULL_DATA_PARQUET)
@@ -257,16 +267,7 @@ def main() -> None:
         AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
     )
     frame = add_hrrr_files(frame.join(bounds, on=AOI_ID_COL, how="left"))
-    frame = frame.filter(
-        (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT)
-        & (pl.col(MAJOR_CITY_DIST_COL) >= MIN_MAJOR_CITY_DISTANCE_KM)
-        & pl.col("avg_pwr_gen").is_finite()
-        & pl.col(MAJOR_CITY_DIST_COL).is_finite()
-        & pl.col(PREVIOUS_QUARTER_POWER_COL).is_finite()
-        & (pl.col(PREVIOUS_QUARTER_POWER_COL) > 0)
-        & pl.col(PREVIOUS_QUARTER_COAL_POWER_COL).is_finite()
-        & (pl.col(PREVIOUS_QUARTER_COAL_POWER_COL) / pl.col(PREVIOUS_QUARTER_POWER_COL) > COAL_DOMINANT_POWER_FRACTION)
-    )
+    frame = _filter_metadata_eligibility(frame)
     frame, nox_lower_bound, nox_upper_bound = _filter_nox_mass_percentiles(frame)
     labeled = apply_binary_target({"all": frame})["all"]
     eligible = _filter_relative_delta({"all": labeled})["all"]
@@ -274,10 +275,6 @@ def main() -> None:
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     summary = {
-        "coal_dominance": {
-            "power_period": "previous_quarter",
-            "minimum_coal_power_fraction_exclusive": COAL_DOMINANT_POWER_FRACTION,
-        },
         "deadband": {
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
             "retained_rule": "abs(delta_nox_mass) > threshold",
