@@ -41,7 +41,13 @@ from modeling.plot_utils import (
     plot_model_comparison,
     plot_spatial_accuracy,
 )
-from modeling.resnet import DEFAULT_DROPOUT, DEFAULT_HEAD_DIM, NOxModel
+from modeling.resnet import (
+    AMPLITUDE_STATISTIC_NAMES,
+    DEFAULT_AMPLITUDE_DIM,
+    DEFAULT_DROPOUT,
+    DEFAULT_HEAD_DIM,
+    NOxModel,
+)
 from modeling.xgboost import train_xgboost_baseline
 
 DEFAULT_BATCH_SIZE = 128
@@ -79,6 +85,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--inputs", choices=("full", "image", "tabular"), default="full")
+    parser.add_argument(
+        "--no-amplitude-bypass",
+        action="store_false",
+        dest="amplitude_bypass",
+        help="disable the pre-GroupNorm NO2 amplitude branch",
+    )
     return parser.parse_args()
 
 
@@ -276,6 +288,7 @@ def main() -> None:
         n_tabular_features=len(MODEL_FEATURE_NAMES),
         use_image=args.inputs in ("full", "image"),
         use_tabular=args.inputs in ("full", "tabular"),
+        use_amplitude_bypass=args.amplitude_bypass,
         head_dim=args.head_dim,
         dropout=args.dropout,
     ).to(device)
@@ -305,6 +318,9 @@ def main() -> None:
         "seed": args.seed,
         "head_dim": args.head_dim,
         "dropout": args.dropout,
+        "amplitude_bypass": model.use_amplitude_bypass,
+        "amplitude_statistics": list(AMPLITUDE_STATISTIC_NAMES) if model.use_amplitude_bypass else [],
+        "amplitude_embedding_dim": DEFAULT_AMPLITUDE_DIM if model.use_amplitude_bypass else 0,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip_norm": args.gradient_clip_norm,

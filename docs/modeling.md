@@ -124,6 +124,12 @@ A compact residual CNN plus an MLP scalar branch:
 - A 3 by 3 adaptive average pool retains coarse plume location.
 - A global maximum pool preserves localized enhancements that an average
   dilutes.
+- A mask-aware amplitude branch summarizes each train-normalized NO2 channel
+  before GroupNorm using its mean, robust scale, RMS, and signed one-percent
+  tails. A small MLP carries those summaries past every sample-wise
+  normalization layer and joins the main representation immediately before the
+  final classifier. This follows the normalization-and-restitution pattern from
+  [Jin et al. (2020)](https://openaccess.thecvf.com/content_CVPR_2020/html/Jin_Style_Normalization_and_Restitution_for_Generalizable_Person_Re-Identification_CVPR_2020_paper.html).
 - The fused image embedding joins the scalar embedding for one classification
   logit.
 
@@ -132,6 +138,8 @@ Normalization choices:
 - GroupNorm throughout the image encoder, since it avoids batch-level
   statistics and holds up when memory pressure forces small batches. See the
   [Group Normalization paper](https://arxiv.org/abs/1803.08494).
+- The amplitude branch can be disabled with `--no-amplitude-bypass` for a
+  matched ablation against the GroupNorm-only image encoder.
 - LayerNorm in the MLP projections.
 
 The DenseNet alternative is gone. It duplicated an obsolete input signature and
