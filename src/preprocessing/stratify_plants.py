@@ -48,8 +48,7 @@ from preprocessing.tempo_mapping import (
     serialize_tempo_path_lists,
 )
 
-TRAIN_FRACTION = 0.60
-VAL_FRACTION = 0.20
+SPLIT_FRACTIONS = {"train": 0.70, "val": 0.15, "test": 0.15}
 SPLIT_SEED = 42
 OUTPUT_COLUMNS = [
     AOI_ID_COL,
@@ -127,18 +126,75 @@ def _filter_nox_mass_percentiles(
 
 
 def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
-    # Assign each geographic cluster to exactly one split
-    clusters = frame.select("cluster").unique().sort("cluster").sample(fraction=1.0, shuffle=True, seed=SPLIT_SEED)
-    train_count = min(clusters.height - 2, max(1, int(clusters.height * TRAIN_FRACTION)))
-    val_count = min(clusters.height - train_count - 1, max(1, int(clusters.height * VAL_FRACTION)))
-    cluster_splits = {
-        "train": clusters.slice(0, train_count),
-        "val": clusters.slice(train_count, val_count),
-        "test": clusters.slice(train_count + val_count),
+    # Greedily assign large clusters against total and per-class record targets
+    cluster_counts = (
+        frame.group_by("cluster")
+        .agg(
+            pl.len().alias("records"),
+            (pl.col(LABEL_COL) == 0).sum().alias("negative_records"),
+            (pl.col(LABEL_COL) == 1).sum().alias("positive_records"),
+        )
+        .with_columns(pl.col("cluster").hash(seed=SPLIT_SEED).alias("_tie_breaker"))
+        .sort(["records", "_tie_breaker"], descending=[True, False])
+    )
+    if cluster_counts.height < len(SPLIT_FRACTIONS):
+        raise ValueError("At least three geographic clusters are required")
+
+    count_columns = ("records", "negative_records", "positive_records")
+    totals = {column: float(cluster_counts[column].sum()) for column in count_columns}
+    targets = {
+        split: {column: total * SPLIT_FRACTIONS[split] for column, total in totals.items()}
+        for split in SPLIT_FRACTIONS
     }
-    return {
-        name: frame.join(split_clusters, on="cluster", how="inner") for name, split_clusters in cluster_splits.items()
+    assigned = {
+        split: {column: 0.0 for column in count_columns}
+        for split in SPLIT_FRACTIONS
     }
+    cluster_assignments: list[dict[str, object]] = []
+    assigned_cluster_counts = {split: 0 for split in SPLIT_FRACTIONS}
+    for index, cluster in enumerate(cluster_counts.iter_rows(named=True)):
+        empty_splits = [split for split, count in assigned_cluster_counts.items() if count == 0]
+        remaining_clusters = cluster_counts.height - index
+        destinations = empty_splits if remaining_clusters == len(empty_splits) else SPLIT_FRACTIONS
+        destination = min(
+            destinations,
+            key=lambda destination: sum(
+                (
+                    (
+                        assigned[split][column]
+                        + (float(cluster[column]) if split == destination else 0.0)
+                        - targets[split][column]
+                    )
+                    / max(totals[column], 1.0)
+                )
+                ** 2
+                for split in SPLIT_FRACTIONS
+                for column in count_columns
+            ),
+        )
+        cluster_assignments.append({"cluster": cluster["cluster"], "split": destination})
+        assigned_cluster_counts[destination] += 1
+        for column in count_columns:
+            assigned[destination][column] += float(cluster[column])
+
+    assignments = pl.DataFrame(
+        cluster_assignments,
+        schema={"cluster": frame.schema["cluster"], "split": pl.String},
+    )
+    splits = {
+        split: frame.join(
+            assignments.filter(pl.col("split") == split).select("cluster"),
+            on="cluster",
+            how="inner",
+        )
+        for split in SPLIT_FRACTIONS
+    }
+    for split, split_frame in splits.items():
+        print(
+            f"[{split}] assigned {split_frame.height:,}/{frame.height:,} eligible records "
+            f"({split_frame.height / frame.height:.1%}; target {SPLIT_FRACTIONS[split]:.1%})"
+        )
+    return splits
 
 
 def _add_prev_qtr_rel_delta(frame: pl.DataFrame) -> pl.DataFrame:
@@ -171,6 +227,29 @@ def _filter_relative_delta(
         )
     print(f"Minimum relative delta: {minimum:.6g}")
     return filtered
+
+
+def _balance_classes(splits: dict[str, pl.DataFrame]) -> dict[str, pl.DataFrame]:
+    # Retain the complete smaller class and a deterministic sample of the larger class
+    balanced: dict[str, pl.DataFrame] = {}
+    for name, split in splits.items():
+        indexed = split.with_row_index("_balance_row").with_columns(
+            split.select(AOI_ID_COL, "date", "hour").hash_rows(seed=SPLIT_SEED).alias("_balance_hash")
+        )
+        class_size = min(indexed.filter(pl.col(LABEL_COL) == label).height for label in (0, 1))
+        balanced[name] = (
+            pl.concat(
+                [
+                    indexed.filter(pl.col(LABEL_COL) == label).sort("_balance_hash").head(class_size)
+                    for label in (0, 1)
+                ],
+                how="vertical",
+            )
+            .sort("_balance_row")
+            .drop("_balance_row", "_balance_hash")
+        )
+        print(f"[{name}] balanced to {class_size:,} records per class")
+    return balanced
 
 
 def main() -> None:
@@ -212,11 +291,10 @@ def main() -> None:
         & (pl.col(PREVIOUS_QUARTER_COAL_POWER_COL) / pl.col(PREVIOUS_QUARTER_POWER_COL) > COAL_DOMINANT_POWER_FRACTION)
     )
     frame, nox_lower_bound, nox_upper_bound = _filter_nox_mass_percentiles(frame)
-    frame = serialize_tempo_path_lists(frame)
-    geographic_splits = _split_by_cluster(frame)
-    labeled_splits = apply_binary_target(geographic_splits)
-    splits = _filter_relative_delta(labeled_splits)
-    del frame
+    labeled = apply_binary_target({"all": frame})["all"]
+    eligible = _filter_relative_delta({"all": labeled})["all"]
+    geographic_splits = _split_by_cluster(serialize_tempo_path_lists(eligible))
+    splits = _balance_classes(geographic_splits)
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     summary = {
@@ -240,14 +318,27 @@ def main() -> None:
             "upper_bound": nox_upper_bound,
             "retained_rule": "lower_bound <= nox_mass <= upper_bound",
         },
+        "filter_retention": {
+            "deadband": classification_summary(frame, labeled),
+            "relative_delta_filter": classification_summary(labeled, eligible),
+        },
+        "split_assignment": {
+            "target_fractions": SPLIT_FRACTIONS,
+            "achieved_fractions_before_balance": {
+                name: geographic_splits[name].height / eligible.height for name in geographic_splits
+            },
+            "achieved_fractions_after_balance": {
+                name: splits[name].height / sum(split.height for split in splits.values()) for name in splits
+            },
+        },
         "splits": {
             name: {
-                "deadband": classification_summary(geographic_splits[name], labeled_splits[name]),
-                "relative_delta_filter": classification_summary(labeled_splits[name], splits[name]),
+                "class_balance": classification_summary(geographic_splits[name], splits[name]),
             }
             for name in splits
         },
     }
+    del frame, labeled, eligible, geographic_splits
     write_json_atomic(summary, Path(STRAT_BASE_DIR) / "classification_summary.json")
     # Project and write one split at a time so the copies never coexist
     for name, destination in (("train", TRAIN_RECORDS_CSV), ("val", VAL_RECORDS_CSV), ("test", TEST_RECORDS_CSV)):

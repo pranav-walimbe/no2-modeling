@@ -6,17 +6,20 @@ determines whether it has sufficient coverage.
 
 ## Output contract
 
-There are no configured row-count targets. Stratification writes every eligible
-record in each geographic split, and dataset generation attempts every one.
-Finalization preserves class balance by retaining all successful records from
-the smaller class and an equal, deterministically selected set from the larger
-class. Reports include the actual size, discarded imbalance, and eligible class
-counts.
+There are no configured row-count targets. Stratification assigns intact
+geographic clusters toward a 70/15/15 record split, then retains the complete
+smaller class and an equal, deterministically selected set from the larger
+class within each split. Dataset generation attempts every retained record.
+Finalization restores exact class balance after raster failures using the same
+smaller-class rule. Reports include the actual size, discarded imbalance, and
+eligible class counts.
 
 ## Split independence
 
 - Overlapping 72 km AOIs form geographic clusters.
 - Each cluster belongs to exactly one of train, validation, or test.
+- A deterministic largest-cluster-first assignment minimizes deviations from
+  70/15/15 targets for total, negative, and positive eligible record counts.
 - No plant region leaks across splits, so evaluation measures generalization to
   unseen geographic regions instead of interpolation at known plants.
 - The split precedes train-only raster and tabular normalization. The aggregate
@@ -65,7 +68,7 @@ The binary target uses raw `delta_nox_mass`:
   constant.
 - Remove records with absolute change at or below that cutoff in every split.
 - Assign class 0 to negative changes and class 1 to positive changes.
-- Select equal class counts in every candidate and final split.
+- Select equal class counts after geographic assignment and in every final split.
 - Record the cutoff in each stratification and generation summary.
 
 Stratification and final generation write JSON summaries carrying overall and

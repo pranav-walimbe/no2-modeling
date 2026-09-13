@@ -182,8 +182,10 @@ python -u -m preprocessing.generate_dataset --shard-size 20000
   previous-quarter average unit generation;
 - filters finite aggregate AOI-hour NOx to the configured inclusive 1st through
   99th percentile bounds and records the fitted bounds in its summary;
-- assigns overlapping AOI clusters intact to 60/20/20 splits;
-- emits every eligible record in each split without a row-count target.
+- assigns overlapping AOI clusters intact toward 70/15/15 record targets,
+  accounting for total and per-class counts;
+- balances each split to 50/50 by retaining the complete smaller class and a
+  deterministic sample of the larger class, without a row-count target.
 
 `preprocessing.generate_dataset`:
 
