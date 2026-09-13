@@ -213,9 +213,9 @@ score, paired cloud, quality and retrieval-uncertainty means, and
 centre-interpolated HRRR temperature and boundary-layer height. Flux inference
 runs on both smoothed observations with common valid-pixel support and the
 current transport wind. `delta_flux_norm` is the current-minus-previous flux
-divided by `abs(prev_qtr_avg_nox)` and is a model input. The current and previous
-flux levels, their paired confidence, and the current-level prior-quarter ratio
-remain diagnostic columns.
+divided by `abs(prev_qtr_avg_nox)`. It is a fused-CNN input but is excluded from
+the XGBoost baseline. The current and previous flux levels, their paired
+confidence, and the current-level prior-quarter ratio remain diagnostic columns.
 
 Running the splits:
 

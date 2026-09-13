@@ -36,9 +36,10 @@ Before any image processing, a candidate needs:
 - finite prior-quarter power generation and distance to a city of 500,000 or
   more people for priority sampling.
 
-After coal-dominance eligibility, stratification calculates the global 1st and
-99th percentiles of finite aggregate AOI-hour `nox_mass` and retains records
-inside the inclusive bounds. `NOX_LOWER_PERCENTILE` and
+After metadata eligibility, stratification calculates the global 1st and 99th
+percentiles of finite aggregate AOI-hour `nox_mass` and retains records inside
+the inclusive bounds. Coal share is not an eligibility constraint, so gas and
+mixed-fuel AOIs remain candidates. `NOX_LOWER_PERCENTILE` and
 `NOX_UPPER_PERCENTILE` configure the cutoffs. The fitted values and retention
 rule are written to the stratification summary.
 
@@ -100,9 +101,10 @@ and a 1.5-hour decay correction. Dividing corrected mass by plume residence
 time and applying the fixed cross-validated calibration produces flux in pounds
 per hour. The estimator runs on current and previous smoothed NO2 using common
 valid-pixel support and the current transport wind. `delta_flux_norm` is
-`(flux_nox - previous_flux_nox) / abs(prev_qtr_avg_nox)` and enters the model.
-The two flux levels, the current-level prior-quarter ratio, and current and
-paired confidence remain dataframe diagnostics.
+`(flux_nox - previous_flux_nox) / abs(prev_qtr_avg_nox)`. It enters the fused
+CNN but is excluded from the XGBoost baseline. The two flux levels, the
+current-level prior-quarter ratio, and current and paired confidence remain
+dataframe diagnostics.
 
 Nameplate capacity:
 

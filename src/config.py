@@ -89,7 +89,6 @@ DELTA_THRESHOLD = 100.0  # least raw delta-NOx magnitude kept as a labeled class
 MIN_PREV_QTR_REL_DELTA = 0.10  # least absolute change relative to prior-quarter mean NOx
 NOX_LOWER_PERCENTILE = 1.0  # lower aggregate AOI-hour NOx percentile retained during stratification
 NOX_UPPER_PERCENTILE = 99.0  # upper aggregate AOI-hour NOx percentile retained during stratification
-COAL_DOMINANT_POWER_FRACTION = 0.50  # prior-quarter coal share must be strictly greater than this
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
