@@ -180,19 +180,16 @@ class NOxModel(nn.Module):
         *,
         use_image: bool = True,
         use_tabular: bool = True,
-        use_amplitude_bypass: bool = True,
         head_dim: int = DEFAULT_HEAD_DIM,
         dropout: float = DEFAULT_DROPOUT,
     ) -> None:
         super().__init__()
         self.use_image = use_image
         self.use_tabular = use_tabular
-        self.use_amplitude_bypass = use_image and use_amplitude_bypass
 
         if use_image:
             self.no2_stems = nn.ModuleList(MaskedNO2Stem() for _ in MODEL_MASK_KEYS)
-            if self.use_amplitude_bypass:
-                self.amplitude_encoder = MaskedAmplitudeEncoder(len(MODEL_MASK_KEYS))
+            self.amplitude_encoder = MaskedAmplitudeEncoder(len(MODEL_MASK_KEYS))
             self.wind_stem = nn.Sequential(
                 nn.Conv2d(MODEL_IMAGE_CHANNELS - len(MODEL_MASK_KEYS), 16, kernel_size=5, padding=2, bias=False),
                 _group_norm(16),
@@ -238,7 +235,7 @@ class NOxModel(nn.Module):
             nn.SiLU(inplace=True),
             nn.Dropout(dropout),
         )
-        classifier_features = head_dim + DEFAULT_AMPLITUDE_DIM * int(self.use_amplitude_bypass)
+        classifier_features = head_dim + DEFAULT_AMPLITUDE_DIM * int(use_image)
         self.classifier = nn.Linear(classifier_features, 1)
 
     def forward(self, image: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
@@ -246,8 +243,7 @@ class NOxModel(nn.Module):
         amplitude = None
         if self.use_image:
             masks = image[:, MODEL_IMAGE_CHANNELS:]
-            if self.use_amplitude_bypass:
-                amplitude = self.amplitude_encoder(image[:, : len(MODEL_MASK_KEYS)], masks)
+            amplitude = self.amplitude_encoder(image[:, : len(MODEL_MASK_KEYS)], masks)
             no2_features = [
                 stem(image[:, channel : channel + 1], masks[:, channel : channel + 1])
                 for channel, stem in enumerate(self.no2_stems)
