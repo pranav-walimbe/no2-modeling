@@ -1,5 +1,7 @@
 """Compact residual network for emissions-change classification."""
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -8,6 +10,16 @@ from config import MODEL_IMAGE_CHANNELS, MODEL_MASK_KEYS
 
 DEFAULT_HEAD_DIM = 128
 DEFAULT_DROPOUT = 0.30
+DEFAULT_AMPLITUDE_HIDDEN_DIM = 32
+DEFAULT_AMPLITUDE_DIM = 16
+AMPLITUDE_TAIL_FRACTION = 0.01
+AMPLITUDE_STATISTIC_NAMES = (
+    "masked_mean",
+    "robust_scale",
+    "root_mean_square",
+    "upper_tail_mean",
+    "lower_tail_mean",
+)
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -97,6 +109,68 @@ class MaskedNO2Stem(nn.Module):
         return self.activation(self.second_norm(features)) * mask
 
 
+def _masked_amplitude_statistics(values: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    # Summarize physical amplitude before sample-wise activation normalization
+    valid = masks > 0
+    flattened = values.flatten(2)
+    flattened_valid = valid.flatten(2)
+    counts = flattened_valid.sum(dim=2)
+    safe_counts = counts.clamp_min(1)
+    masked_values = torch.where(flattened_valid, flattened, torch.zeros_like(flattened))
+    mean = masked_values.sum(dim=2) / safe_counts
+    root_mean_square = torch.sqrt(masked_values.square().sum(dim=2) / safe_counts)
+
+    nan_masked = flattened.masked_fill(~flattened_valid, torch.nan)
+    median = torch.nanmedian(nan_masked, dim=2).values
+    absolute_deviation = torch.abs(flattened - median.unsqueeze(2)).masked_fill(~flattened_valid, torch.nan)
+    robust_scale = 1.4826 * torch.nanmedian(absolute_deviation, dim=2).values
+
+    pixel_count = flattened.shape[2]
+    tail_count = max(1, math.ceil(AMPLITUDE_TAIL_FRACTION * pixel_count))
+    upper_values = torch.topk(flattened.masked_fill(~flattened_valid, -torch.inf), tail_count, dim=2).values
+    lower_values = torch.topk(flattened.masked_fill(~flattened_valid, torch.inf), tail_count, dim=2, largest=False).values
+
+    def finite_mean(selected: torch.Tensor) -> torch.Tensor:
+        finite = torch.isfinite(selected)
+        return torch.where(finite, selected, torch.zeros_like(selected)).sum(dim=2) / finite.sum(dim=2).clamp_min(1)
+
+    statistics = torch.stack(
+        (mean, robust_scale, root_mean_square, finite_mean(upper_values), finite_mean(lower_values)),
+        dim=2,
+    )
+    return torch.where(counts.unsqueeze(2) > 0, statistics, torch.zeros_like(statistics)).flatten(1)
+
+
+class MaskedAmplitudeEncoder(nn.Module):
+    """Preserve scene-level NO2 amplitude outside the GroupNorm path."""
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_dim: int = DEFAULT_AMPLITUDE_HIDDEN_DIM,
+        output_dim: int = DEFAULT_AMPLITUDE_DIM,
+    ) -> None:
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.Linear(channels * len(AMPLITUDE_STATISTIC_NAMES), hidden_dim),
+            nn.SiLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim),
+            nn.SiLU(inplace=True),
+        )
+
+    def forward(self, values: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+        """Encode masked pre-GroupNorm amplitude summaries.
+
+        Args:
+            values: Train-normalized NO2 rasters before activation normalization.
+            masks: Binary validity masks aligned with the NO2 rasters.
+
+        Returns:
+            Learned scene-amplitude embedding.
+        """
+        return self.projection(_masked_amplitude_statistics(values, masks))
+
+
 class NOxModel(nn.Module):
     """Fuse TEMPO and wind rasters with leakage-safe scalar features."""
 
@@ -106,15 +180,19 @@ class NOxModel(nn.Module):
         *,
         use_image: bool = True,
         use_tabular: bool = True,
+        use_amplitude_bypass: bool = True,
         head_dim: int = DEFAULT_HEAD_DIM,
         dropout: float = DEFAULT_DROPOUT,
     ) -> None:
         super().__init__()
         self.use_image = use_image
         self.use_tabular = use_tabular
+        self.use_amplitude_bypass = use_image and use_amplitude_bypass
 
         if use_image:
             self.no2_stems = nn.ModuleList(MaskedNO2Stem() for _ in MODEL_MASK_KEYS)
+            if self.use_amplitude_bypass:
+                self.amplitude_encoder = MaskedAmplitudeEncoder(len(MODEL_MASK_KEYS))
             self.wind_stem = nn.Sequential(
                 nn.Conv2d(MODEL_IMAGE_CHANNELS - len(MODEL_MASK_KEYS), 16, kernel_size=5, padding=2, bias=False),
                 _group_norm(16),
@@ -154,18 +232,22 @@ class NOxModel(nn.Module):
                 nn.SiLU(inplace=True),
             )
         fusion_features = 256 * int(use_image) + 64 * int(use_tabular)
-        self.head = nn.Sequential(
+        self.head_projection = nn.Sequential(
             nn.Linear(fusion_features, head_dim),
             nn.LayerNorm(head_dim),
             nn.SiLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(head_dim, 1),
         )
+        classifier_features = head_dim + DEFAULT_AMPLITUDE_DIM * int(self.use_amplitude_bypass)
+        self.classifier = nn.Linear(classifier_features, 1)
 
     def forward(self, image: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
         features = []
+        amplitude = None
         if self.use_image:
             masks = image[:, MODEL_IMAGE_CHANNELS:]
+            if self.use_amplitude_bypass:
+                amplitude = self.amplitude_encoder(image[:, : len(MODEL_MASK_KEYS)], masks)
             no2_features = [
                 stem(image[:, channel : channel + 1], masks[:, channel : channel + 1])
                 for channel, stem in enumerate(self.no2_stems)
@@ -177,7 +259,10 @@ class NOxModel(nn.Module):
             features.append(self.image_projection(torch.cat((spatial, peak), dim=1)))
         if self.use_tabular:
             features.append(self.tabular_projection(tabular))
-        return self.head(torch.cat(features, dim=1)).squeeze(1)
+        hidden = self.head_projection(torch.cat(features, dim=1))
+        if amplitude is not None:
+            hidden = torch.cat((hidden, amplitude), dim=1)
+        return self.classifier(hidden).squeeze(1)
 
     def num_params(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
