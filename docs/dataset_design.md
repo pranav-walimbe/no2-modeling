@@ -1,33 +1,17 @@
 # Dataset design
 
-Turning the full AOI-hour population into a fixed-size modeling dataset rests on
-one principle: keep scientific eligibility and diversity sampling separate. A
-raster either clears the fixed eligibility rules or does not. Hourly paired
-coverage ranks eligible records but does not replace any fixed gate.
+Turning the full AOI-hour population into a modeling dataset rests on one
+principle: retain every scientifically eligible record until raster generation
+determines whether it has sufficient coverage.
 
-## Output-size contract
+## Output contract
 
-The controls in `config.py`:
-
-```python
-TRAIN_SIZE = 16_000
-VAL_SIZE = 4_000
-TEST_SIZE = 4_000
-```
-
-- When successful raster generation exceeds a configured size, finalization
-  retains every successful record without further ranking or balancing. At or
-  below the desired size, it writes the largest balanced subset. Reports include
-  the desired size, actual size, shortfall or surplus, and eligible class counts.
-
-Stratification writes three times each requested size: 48,000 train, 12,000
-validation, 12,000 test candidates. The overdraw leaves room for per-scan
-coverage and operational failures without regridding the
-much larger eligible metadata population. Each generation run reports the new
-retention rate so this multiplier can be recalibrated from current evidence.
-
-On a shortfall from a future archive or a stricter filter, raise
-`STRATIFY_CANDIDATE_MULTIPLIER`. Never weaken a quality threshold to compensate.
+There are no configured row-count targets. Stratification writes every eligible
+record in each geographic split, and dataset generation attempts every one.
+Finalization preserves class balance by retaining all successful records from
+the smaller class and an equal, deterministically selected set from the larger
+class. Reports include the actual size, discarded imbalance, and eligible class
+counts.
 
 ## Split independence
 
@@ -173,23 +157,17 @@ Before raster generation, apply these rules to every split:
 - Retain records within the configured aggregate AOI-hour NOx percentile bounds.
 - Require deadband-eligible records to meet the configured
   `MIN_PREV_QTR_REL_DELTA` floor.
-- Rank the retained candidates by previous-quarter coal output.
-- Apply the priority ordering and AOI round-robin within each label
-  independently.
-- Keep current-quarter output and target magnitude out of the ordering.
+- Keep every record that passes the eligibility rules.
 
 ## Final raster selection
 
 Successfully generated candidates are selected deterministically:
 
-1. Retain all successful records when their count exceeds the desired size.
-2. Otherwise form strata by AOI, year, quarter, and four-hour UTC bin.
-3. Rank records within each stratum by paired raster coverage.
-4. Interleave temporal strata within each AOI.
-5. Round-robin globally across AOIs and retain the largest balanced subset.
-
-Undersized final selection takes equal counts from both labels. Surplus outputs
-retain their post-raster eligibility class distribution without downsampling.
+1. Form strata by AOI, year, quarter, and four-hour UTC bin.
+2. Rank records within each stratum by paired raster coverage.
+3. Interleave temporal strata within each AOI.
+4. Round-robin globally across AOIs.
+5. Retain the largest balanced subset, limited only by the smaller class.
 
 ## Performance and persistence
 
@@ -207,9 +185,6 @@ retain their post-raster eligibility class distribution without downsampling.
   launch starts with an empty shard tree rather than resuming them.
 
 For large archives, run stratification and raster generation through Slurm.
-Never regrid the entire metadata population just to rank it. Raise the candidate
-multiplier only when measured post-QC yield shows the requested final size is out
-of reach.
 
 ## Evaluation checklist
 

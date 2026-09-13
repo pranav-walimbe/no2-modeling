@@ -94,14 +94,6 @@ TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 MIN_MAJOR_CITY_DISTANCE_KM = 50.0  # minimum eligible plant distance from a major city in kilometers
-TRAIN_SIZE = 16_000
-VAL_SIZE = 4_000
-TEST_SIZE = 4_000
-STRATIFY_CANDIDATE_MULTIPLIER = 3  # overdraw for raster eligibility attrition
-TRAIN_RECORDS_SIZE = TRAIN_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
-VAL_RECORDS_SIZE = VAL_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
-TEST_RECORDS_SIZE = TEST_SIZE * STRATIFY_CANDIDATE_MULTIPLIER
-
 # ============================================================================
 # Modeling data contract
 # ============================================================================

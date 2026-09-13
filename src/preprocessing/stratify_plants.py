@@ -17,11 +17,8 @@ from config import (
     NOX_UPPER_PERCENTILE,
     STRAT_BASE_DIR,
     TEST_RECORDS_CSV,
-    TEST_RECORDS_SIZE,
     TRAIN_RECORDS_CSV,
-    TRAIN_RECORDS_SIZE,
     VAL_RECORDS_CSV,
-    VAL_RECORDS_SIZE,
 )
 from preprocessing.generate_dataset_utils import write_json_atomic
 from preprocessing.stratify_utils import (
@@ -54,12 +51,6 @@ from preprocessing.tempo_mapping import (
 TRAIN_FRACTION = 0.60
 VAL_FRACTION = 0.20
 SPLIT_SEED = 42
-SPLIT_RECORD_LIMITS = {
-    "train": TRAIN_RECORDS_SIZE,
-    "val": VAL_RECORDS_SIZE,
-    "test": TEST_RECORDS_SIZE,
-}
-
 OUTPUT_COLUMNS = [
     AOI_ID_COL,
     "lat",
@@ -182,55 +173,6 @@ def _filter_relative_delta(
     return filtered
 
 
-def _limit_splits(
-    splits: dict[str, pl.DataFrame],
-    limits: dict[str, int] = SPLIT_RECORD_LIMITS,
-) -> dict[str, pl.DataFrame]:
-    # Balance labels while retaining lagged power priority within each class
-    limited: dict[str, pl.DataFrame] = {}
-    for name, split in splits.items():
-        limit = limits[name]
-        indexed = split.with_row_index("_priority_row").with_columns(
-            split.select(AOI_ID_COL, "date", "hour").hash_rows(seed=SPLIT_SEED).alias("_priority_hash")
-        )
-        class_limit = limit // 2
-        selected_classes = []
-        for label in (0, 1):
-            class_pool = indexed.filter(pl.col(LABEL_COL) == label)
-            if class_pool.height < class_limit:
-                raise ValueError(
-                    f"{name} class {label} has {class_pool.height:,} records; "
-                    f"cannot select the requested {class_limit:,}"
-                )
-            selected_classes.append(_select_priority_records(class_pool, class_limit))
-        selected = pl.concat(selected_classes, how="vertical")
-        limited[name] = selected.sort("_priority_row").drop("_priority_row", "_priority_hash", "_priority_round")
-        print(f"[{name}] selected {class_limit:,} records per class from {split.height:,} candidates")
-    return limited
-
-
-def _select_priority_records(frame: pl.DataFrame, limit: int) -> pl.DataFrame:
-    # Every candidate is coal-dominant before priority selection
-    return _rank_priority_pool(frame, PREVIOUS_QUARTER_COAL_POWER_COL).head(limit)
-
-
-def _rank_priority_pool(frame: pl.DataFrame, priority_column: str) -> pl.DataFrame:
-    # Round-robin across AOIs before taking another record from the same AOI
-    return (
-        frame.sort(
-            [AOI_ID_COL, priority_column, PREVIOUS_QUARTER_POWER_COL, "_priority_hash"],
-            descending=[False, True, True, False],
-            nulls_last=True,
-        )
-        .with_columns(pl.col(AOI_ID_COL).cum_count().over(AOI_ID_COL).alias("_priority_round"))
-        .sort(
-            ["_priority_round", priority_column, PREVIOUS_QUARTER_POWER_COL, AOI_ID_COL, "_priority_hash"],
-            descending=[False, True, True, False, False],
-            nulls_last=True,
-        )
-    )
-
-
 def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
     source = pl.scan_parquet(FULL_DATA_PARQUET)
@@ -273,8 +215,7 @@ def main() -> None:
     frame = serialize_tempo_path_lists(frame)
     geographic_splits = _split_by_cluster(frame)
     labeled_splits = apply_binary_target(geographic_splits)
-    relative_delta_splits = _filter_relative_delta(labeled_splits)
-    splits = _limit_splits(relative_delta_splits)
+    splits = _filter_relative_delta(labeled_splits)
     del frame
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
@@ -302,8 +243,7 @@ def main() -> None:
         "splits": {
             name: {
                 "deadband": classification_summary(geographic_splits[name], labeled_splits[name]),
-                "relative_delta_filter": classification_summary(labeled_splits[name], relative_delta_splits[name]),
-                "candidate_balance": classification_summary(relative_delta_splits[name], splits[name]),
+                "relative_delta_filter": classification_summary(labeled_splits[name], splits[name]),
             }
             for name in splits
         },

@@ -301,15 +301,15 @@ def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
     }
 
 
-def select_final_records(frame: pl.DataFrame, size: int) -> pl.DataFrame:
-    """Select the largest class-balanced subset without truncating a surplus.
+def select_final_records(frame: pl.DataFrame) -> pl.DataFrame:
+    """Select the largest class-balanced subset.
 
     Args:
         frame: Successfully generated candidate records with finite paired coverage.
-        size: Desired number of records for the split.
 
     Returns:
-        The largest balanced subset, which may exceed the desired size.
+        Every successful record from the smaller class and an equal number from
+        the larger class.
     """
     eligible_by_class = {label: frame.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
     class_size = min(eligible_by_class.values())
