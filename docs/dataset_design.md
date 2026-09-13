@@ -7,12 +7,11 @@ determines whether it has sufficient coverage.
 ## Output contract
 
 There are no configured row-count targets. Stratification assigns intact
-geographic clusters toward a 70/15/15 record split, then retains the complete
-smaller class and an equal, deterministically selected set from the larger
-class within each split. Dataset generation attempts every retained record.
-Finalization restores exact class balance after raster failures using the same
-smaller-class rule. Reports include the actual size, discarded imbalance, and
-eligible class counts.
+geographic clusters toward a 70/15/15 record split and retains every eligible
+record. Dataset generation attempts every one. Finalization establishes exact
+class balance after raster failures by retaining the complete smaller class and
+an equal, deterministically selected set from the larger class. Reports include
+the actual size, discarded imbalance, and eligible class counts.
 
 ## Split independence
 
@@ -68,11 +67,12 @@ The binary target uses raw `delta_nox_mass`:
   constant.
 - Remove records with absolute change at or below that cutoff in every split.
 - Assign class 0 to negative changes and class 1 to positive changes.
-- Select equal class counts after geographic assignment and in every final split.
+- Select equal class counts only in the final generated splits.
 - Record the cutoff in each stratification and generation summary.
 
-Stratification and final generation write JSON summaries carrying overall and
-per-AOI retention, natural pre-balancing prevalence, and selected class counts.
+Stratification reports natural class prevalence. Final generation reports
+overall and per-AOI retention, natural pre-balancing prevalence, and selected
+class counts.
 
 Each sample stores four numeric arrays and two masks on one fixed grid:
 
