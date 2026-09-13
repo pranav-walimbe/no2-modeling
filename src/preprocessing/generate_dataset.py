@@ -33,10 +33,13 @@ from config import (
 from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
     CANDIDATE_RASTER_PATH_COL,
+    DELTA_FLUX_CONFIDENCE_COL,
+    DELTA_FLUX_NORM_COL,
     DELTA_NO2_PATH_COL,
     FLUX_CONFIDENCE_COL,
     FLUX_LOG_RATIO_PREV_QTR_COL,
     FLUX_NOX_COL,
+    PREVIOUS_FLUX_NOX_COL,
     PROCESSING_FAILURE_SCHEMA,
     SOURCE_RECORD_INDEX_COL,
     DatasetShardStore,
@@ -364,6 +367,22 @@ def _run_record_processing(
     return output_rows
 
 
+def _add_derived_flux_features(frame: pl.DataFrame) -> pl.DataFrame:
+    # Derive current-level and paired-delta features after joining plant history
+    prior_nox_magnitude = pl.col("prev_qtr_avg_nox").abs()
+    return frame.with_columns(
+        (
+            (pl.col(FLUX_NOX_COL) + 1.0)
+            / (pl.col("prev_qtr_avg_nox") + 1.0)
+        )
+        .log()
+        .alias(FLUX_LOG_RATIO_PREV_QTR_COL),
+        pl.when(prior_nox_magnitude > 0)
+        .then((pl.col(FLUX_NOX_COL) - pl.col(PREVIOUS_FLUX_NOX_COL)) / prior_nox_magnitude)
+        .alias(DELTA_FLUX_NORM_COL),
+    )
+
+
 def _write_outputs(
     output_rows: dict[str, list[dict[str, object]]],
     failures: dict[str, list[dict[str, object]]],
@@ -378,14 +397,7 @@ def _write_outputs(
         candidates = source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left").sort(
             SOURCE_RECORD_INDEX_COL
         )
-        candidates = candidates.with_columns(
-            (
-                (pl.col(FLUX_NOX_COL) + 1.0)
-                / (pl.col("prev_qtr_avg_nox") + 1.0)
-            )
-            .log()
-            .alias(FLUX_LOG_RATIO_PREV_QTR_COL)
-        )
+        candidates = _add_derived_flux_features(candidates)
         output_frame = select_final_records(candidates, FINAL_SPLIT_SIZES[split])
         selected_coverage = coverage_selection_summary(output_frame)
         eligible_by_class = {str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
@@ -433,10 +445,20 @@ def _write_outputs(
             output_frame.drop("_source_east_km", "_source_north_km", strict=False)
             .with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
             .select(
-                pl.exclude(FLUX_NOX_COL, FLUX_LOG_RATIO_PREV_QTR_COL, FLUX_CONFIDENCE_COL),
+                pl.exclude(
+                    FLUX_NOX_COL,
+                    PREVIOUS_FLUX_NOX_COL,
+                    FLUX_LOG_RATIO_PREV_QTR_COL,
+                    DELTA_FLUX_NORM_COL,
+                    FLUX_CONFIDENCE_COL,
+                    DELTA_FLUX_CONFIDENCE_COL,
+                ),
                 FLUX_NOX_COL,
+                PREVIOUS_FLUX_NOX_COL,
                 FLUX_LOG_RATIO_PREV_QTR_COL,
+                DELTA_FLUX_NORM_COL,
                 FLUX_CONFIDENCE_COL,
+                DELTA_FLUX_CONFIDENCE_COL,
             )
         )
         write_csv_atomic(

@@ -12,6 +12,7 @@ from config import (
     LABEL_COL,
     MIN_COVERAGE_PERCENT,
     MIN_MAJOR_CITY_DISTANCE_KM,
+    MIN_PREV_QTR_REL_DELTA,
     NOX_LOWER_PERCENTILE,
     NOX_UPPER_PERCENTILE,
     STRAT_BASE_DIR,
@@ -28,6 +29,7 @@ from preprocessing.stratify_utils import (
     LABEL_MODE_COL,
     MAJOR_CITY_DIST_COL,
     PREV_QTR_AVG_NOX_COL,
+    PREV_QTR_REL_DELTA_COL,
     PREVIOUS_QUARTER_COAL_POWER_COL,
     PREVIOUS_QUARTER_POWER_COL,
     add_aoi_bounds,
@@ -87,6 +89,7 @@ OUTPUT_COLUMNS = [
     "avg_pwr_gen",
     "nox_mass",
     PREV_QTR_AVG_NOX_COL,
+    PREV_QTR_REL_DELTA_COL,
     "delta_nox_mass",
     LABEL_COL,
     LABEL_MODE_COL,
@@ -145,6 +148,38 @@ def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
     return {
         name: frame.join(split_clusters, on="cluster", how="inner") for name, split_clusters in cluster_splits.items()
     }
+
+
+def _add_prev_qtr_rel_delta(frame: pl.DataFrame) -> pl.DataFrame:
+    # Normalize absolute change by the absolute prior-quarter NOx level
+    denominator = pl.col(PREV_QTR_AVG_NOX_COL).abs()
+    return frame.with_columns(
+        pl.when(denominator > 0)
+        .then(pl.col("delta_nox_mass").abs() / denominator)
+        .alias(PREV_QTR_REL_DELTA_COL)
+    )
+
+
+def _filter_relative_delta(
+    splits: dict[str, pl.DataFrame],
+    minimum: float = MIN_PREV_QTR_REL_DELTA,
+) -> dict[str, pl.DataFrame]:
+    # Apply one fixed relative-change floor to every geographic split
+    if not 0 <= minimum:
+        raise ValueError("Minimum relative delta must be nonnegative")
+    filtered = {
+        name: split.filter(
+            pl.col(PREV_QTR_REL_DELTA_COL).is_finite()
+            & (pl.col(PREV_QTR_REL_DELTA_COL) >= minimum)
+        )
+        for name, split in splits.items()
+    }
+    for name in splits:
+        print(
+            f"[{name}] relative-delta filter retained {filtered[name].height:,}/{splits[name].height:,} records"
+        )
+    print(f"Minimum relative delta: {minimum:.6g}")
+    return filtered
 
 
 def _limit_splits(
@@ -218,7 +253,7 @@ def main() -> None:
         & pl.col("delta_nox_mass").is_not_null()
     )
     frame = frame.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
-    frame = apply_target_label_mode(add_tempo_observations(frame, observations))
+    frame = _add_prev_qtr_rel_delta(apply_target_label_mode(add_tempo_observations(frame, observations)))
     frame = frame.filter(pl.col("tempo").is_not_null() & pl.col("prev_tempo").is_not_null())
     bounds = add_major_city_distance(bounded_aois).select(
         AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
@@ -238,7 +273,8 @@ def main() -> None:
     frame = serialize_tempo_path_lists(frame)
     geographic_splits = _split_by_cluster(frame)
     labeled_splits = apply_binary_target(geographic_splits)
-    splits = _limit_splits(labeled_splits)
+    relative_delta_splits = _filter_relative_delta(labeled_splits)
+    splits = _limit_splits(relative_delta_splits)
     del frame
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
@@ -251,6 +287,11 @@ def main() -> None:
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
             "retained_rule": "abs(delta_nox_mass) > threshold",
         },
+        "relative_delta_filter": {
+            "column": PREV_QTR_REL_DELTA_COL,
+            "minimum": MIN_PREV_QTR_REL_DELTA,
+            "retained_rule": "prev_qtr_rel_delta >= minimum",
+        },
         "nox_mass_outlier_filter": {
             "lower_percentile": NOX_LOWER_PERCENTILE,
             "upper_percentile": NOX_UPPER_PERCENTILE,
@@ -261,7 +302,8 @@ def main() -> None:
         "splits": {
             name: {
                 "deadband": classification_summary(geographic_splits[name], labeled_splits[name]),
-                "candidate_balance": classification_summary(labeled_splits[name], splits[name]),
+                "relative_delta_filter": classification_summary(labeled_splits[name], relative_delta_splits[name]),
+                "candidate_balance": classification_summary(relative_delta_splits[name], splits[name]),
             }
             for name in splits
         },

@@ -85,7 +85,8 @@ MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan coverage floor
 MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor
 LABEL_COL = "delta_nox_class"
-DELTA_THRESHOLD = 75.0  # least raw delta-NOx magnitude kept as a labeled class
+DELTA_THRESHOLD = 100.0  # least raw delta-NOx magnitude kept as a labeled class
+MIN_PREV_QTR_REL_DELTA = 0.10  # least absolute change relative to prior-quarter mean NOx
 NOX_LOWER_PERCENTILE = 1.0  # lower aggregate AOI-hour NOx percentile retained during stratification
 NOX_UPPER_PERCENTILE = 99.0  # upper aggregate AOI-hour NOx percentile retained during stratification
 COAL_DOMINANT_POWER_FRACTION = 0.50  # prior-quarter coal share must be strictly greater than this
@@ -111,17 +112,17 @@ MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2")
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS)
 MODEL_INPUT_CHANNELS = MODEL_IMAGE_CHANNELS + len(MODEL_MASK_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
-MODEL_RAW_FEATURES = (  # columns available before the prediction hour or from coincident meteorology
+MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular and fused models
     "num_coal_units",
     "num_ng_units",
     "total_nameplate_capacity_mw",
-    "prev_qtr_avg_nox",
     "avg_heat_input",
     "avg_pwr_gen",
     "temperature_2m_k",
     "boundary_layer_height_m",
+    "delta_flux_norm",
 )
-MODEL_CYCLIC_FEATURES = ("hour", "day_of_year")  # each expands to sine and cosine
+MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to sine and cosine
 
 # ============================================================================
 # Other

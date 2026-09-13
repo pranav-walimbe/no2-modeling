@@ -47,8 +47,11 @@ CURRENT_FINITE_FRACTION_COL = "current_finite_fraction"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
 FLUX_NOX_COL = "flux_nox"
+PREVIOUS_FLUX_NOX_COL = "previous_flux_nox"
 FLUX_CONFIDENCE_COL = "flux_confidence"
+DELTA_FLUX_CONFIDENCE_COL = "delta_flux_confidence"
 FLUX_LOG_RATIO_PREV_QTR_COL = "flux_log_ratio_prev_qtr"
+DELTA_FLUX_NORM_COL = "delta_flux_norm"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
     "_selection_quarter",
@@ -68,7 +71,9 @@ TABULAR_FEATURE_NAMES = (
     "mean_good_quality_fraction",
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
     FLUX_NOX_COL,
+    PREVIOUS_FLUX_NOX_COL,
     FLUX_CONFIDENCE_COL,
+    DELTA_FLUX_CONFIDENCE_COL,
     *HRRR_FIELDS.values(),
 )
 SOURCE_RECORD_INDEX_COL = "_source_record_index"
@@ -866,9 +871,19 @@ def derive_raster_features(
             previous_wind[WIND_U_RASTER_NAME],
             previous_wind[WIND_V_RASTER_NAME],
         )
-        flux = estimate_aggregate_flux(
-            current_smoothed,
+        paired_current_smoothed = np.where(paired_valid, current_smoothed, np.nan)
+        paired_previous_smoothed = np.where(paired_valid, previous_smoothed, np.nan)
+        current_flux = estimate_aggregate_flux(
+            paired_current_smoothed,
             np.asarray(current["retrieval_uncertainty"], dtype=np.float64),
+            current_wind[WIND_U_RASTER_NAME],
+            current_wind[WIND_V_RASTER_NAME],
+            source_east_km,
+            source_north_km,
+        )
+        previous_flux = estimate_aggregate_flux(
+            paired_previous_smoothed,
+            np.asarray(previous["retrieval_uncertainty"], dtype=np.float64),
             current_wind[WIND_U_RASTER_NAME],
             current_wind[WIND_V_RASTER_NAME],
             source_east_km,
@@ -893,8 +908,10 @@ def derive_raster_features(
             MEAN_RETRIEVAL_UNCERTAINTY_COL: _paired_mean(
                 current["retrieval_uncertainty"], previous["retrieval_uncertainty"], paired_valid
             ),
-            FLUX_NOX_COL: flux.flux_nox,
-            FLUX_CONFIDENCE_COL: flux.confidence,
+            FLUX_NOX_COL: current_flux.flux_nox,
+            PREVIOUS_FLUX_NOX_COL: previous_flux.flux_nox,
+            FLUX_CONFIDENCE_COL: current_flux.confidence,
+            DELTA_FLUX_CONFIDENCE_COL: min(current_flux.confidence, previous_flux.confidence),
             **weather_features,
         }
     rasters = {

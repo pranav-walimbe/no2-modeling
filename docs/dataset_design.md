@@ -56,6 +56,12 @@ inside the inclusive bounds. `NOX_LOWER_PERCENTILE` and
 `NOX_UPPER_PERCENTILE` configure the cutoffs. The fitted values and retention
 rule are written to the stratification summary.
 
+After the fixed absolute deadband, stratification calculates
+`prev_qtr_rel_delta` as `abs(delta_nox_mass) / abs(prev_qtr_avg_nox)`. It
+requires a value of at least the configured `MIN_PREV_QTR_REL_DELTA`, currently
+0.10. The dataframe retains the metric for diagnostics, but the model does not
+receive it or `prev_qtr_avg_nox` as an input.
+
 ## Label and tabular features
 
 One UTC clock governs everything:
@@ -64,12 +70,14 @@ One UTC clock governs everything:
   time to UTC.
 - AOI aggregation, TEMPO pairing, HRRR lookup, and the emitted `date` and `hour`
   all share that clock.
+- The model converts UTC hour and AOI longitude to local mean solar hour at load
+  time. UTC remains the stored and joined clock.
 - The enriched archive keeps the source local-standard fields, each facility's
   timezone, and its standard offset for auditability.
 
 The binary target uses raw `delta_nox_mass`:
 
-- Read the fixed 75 lb cutoff from the `DELTA_THRESHOLD` configuration
+- Read the fixed 100 lb cutoff from the `DELTA_THRESHOLD` configuration
   constant.
 - Remove records with absolute change at or below that cutoff in every split.
 - Assign class 0 to negative changes and class 1 to positive changes.
@@ -92,7 +100,8 @@ HRRR temperature and boundary-layer height come from interpolation at the AOI
 centre. Prior-quarter heat input and power generation keep contemporaneous
 operational leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's
 hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
-delta); it is also supplied as a train-normalized scalar model feature.
+delta). Stratification uses it to calculate `prev_qtr_rel_delta`, but the model
+does not receive either field.
 
 The current NO2 raster also produces a source-aware aggregate flux estimate.
 The estimator integrates positive NO2 enhancement within the union of compact
@@ -101,12 +110,12 @@ Overlapping plume pixels are counted once. A median background comes from
 source-relative corridors 7.5 to 30 km upwind. Pixel distance and 80 m wind
 give transport age, which drives the published time-dependent NOx-to-NO2 ratio
 and a 1.5-hour decay correction. Dividing corrected mass by plume residence
-time and applying the fixed cross-validated calibration produces `flux_nox` in
-pounds per hour. `flux_log_ratio_prev_qtr` compares it with
-`prev_qtr_avg_nox`, while `flux_confidence` summarizes retrieval signal, wind
-strength, and plume and background coverage. All three remain dataframe
-diagnostics and are excluded from model inputs while the estimator is being
-validated across AOIs.
+time and applying the fixed cross-validated calibration produces flux in pounds
+per hour. The estimator runs on current and previous smoothed NO2 using common
+valid-pixel support and the current transport wind. `delta_flux_norm` is
+`(flux_nox - previous_flux_nox) / abs(prev_qtr_avg_nox)` and enters the model.
+The two flux levels, the current-level prior-quarter ratio, and current and
+paired confidence remain dataframe diagnostics.
 
 Nameplate capacity:
 
@@ -162,6 +171,8 @@ Before raster generation, apply these rules to every split:
 - Average each unit's previous-quarter output, then sum the unit averages by AOI.
 - Retain only AOIs where coal units supply more than 50 percent of that total.
 - Retain records within the configured aggregate AOI-hour NOx percentile bounds.
+- Require deadband-eligible records to meet the configured
+  `MIN_PREV_QTR_REL_DELTA` floor.
 - Rank the retained candidates by previous-quarter coal output.
 - Apply the priority ordering and AOI round-robin within each label
   independently.
