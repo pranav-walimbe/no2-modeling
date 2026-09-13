@@ -138,8 +138,8 @@ Missing cells are never interpolated. Current coverage must be greater than
 After those gates pass, each scan is smoothed independently with its retrieval
 uncertainty and observation-time wind. Each scan then receives a source-relative
 upwind background subtraction using its own wind. The paired operation becomes
-a no-op unless both scans have at least 12 background pixels. Smoothing and
-normalization preserve the original masks.
+eligible only when both scans have at least 12 paired-valid background pixels.
+Smoothing and normalization preserve the original masks.
 
 After pairing current and previous scans, generated records use
 `paired_finite_fraction` as the only final-selection ranking signal after the

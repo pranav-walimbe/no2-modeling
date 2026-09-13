@@ -92,8 +92,8 @@ Current and previous scans are smoothed independently with retrieval
 uncertainty and winds from each scan's nearest HRRR analysis hour. Coverage is
 validated before smoothing, and the kernel does not expand finite support. A
 scan-specific Huber location from the 24 to 36 km source-relative upwind
-corridor is then subtracted from each scan. Both scans remain unchanged when
-either background has fewer than 12 paired-valid pixels.
+corridor is then subtracted from each scan. Dataset generation rejects the
+record when either background has fewer than 12 paired-valid pixels.
 
 See the [NOAA Global Systems Laboratory HRRR overview](https://rapidrefresh.noaa.gov/).
 

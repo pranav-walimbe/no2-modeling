@@ -116,7 +116,8 @@ mask, excluding every region's 24 km by 15 km downwind corridor.
 Estimate one background with a Huber location over at least 12 finite pixels.
 Current and previous scans use their own observation-time wind and backgrounds.
 The estimator uses paired finite support, subtracts both backgrounds, and then
-forms the hourly delta. If either scan lacks support, neither raster is shifted.
+forms the hourly delta. If either scan lacks support, dataset generation rejects
+the record.
 
 ## Selected settings
 
@@ -169,8 +170,8 @@ Relevant Savio jobs:
 - The upwind subtraction did not reliably improve heldout plume-score
   correlation. Its within-AOI correlation was 0.0459 versus 0.0497 without the
   subtraction under matched geometry.
-- Later normalization is fit on training data alone. Existing masks, coverage
-  gates, and split rules remain unchanged.
+- Later normalization is fit on training data alone. Existing masks and split
+  rules remain unchanged, while upwind support adds a record-level gate.
 
 ## Method context
 

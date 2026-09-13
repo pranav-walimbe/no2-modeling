@@ -38,9 +38,8 @@ from preprocessing.regrid import (
     regrid_aoi_raster,
     write_raster_npz,
 )
-from preprocessing.smoothing import smooth_no2
+from preprocessing.smoothing import normalize_smoothed_pair, smooth_no2
 from preprocessing.stratify_utils import AOI_ID_COL
-from preprocessing.upwind_normalization import normalize_smoothed_pair
 
 CURRENT_RASTER_NAME, DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
 CURRENT_MASK_NAME, DELTA_MASK_NAME = MODEL_MASK_KEYS
@@ -872,7 +871,7 @@ def derive_raster_features(
             previous_wind[WIND_U_RASTER_NAME],
             previous_wind[WIND_V_RASTER_NAME],
         )
-        normalized = normalize_smoothed_pair(
+        current_smoothed, previous_smoothed = normalize_smoothed_pair(
             current_smoothed,
             previous_smoothed,
             current_wind[WIND_U_RASTER_NAME],
@@ -882,8 +881,6 @@ def derive_raster_features(
             source_east_km,
             source_north_km,
         )
-        current_smoothed = normalized.current_no2
-        previous_smoothed = normalized.previous_no2
         paired_current_smoothed = np.where(paired_valid, current_smoothed, np.nan)
         paired_previous_smoothed = np.where(paired_valid, previous_smoothed, np.nan)
         current_flux = estimate_aggregate_flux(
