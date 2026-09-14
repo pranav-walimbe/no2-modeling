@@ -23,6 +23,7 @@ UPWIND_HALF_WIDTH_KM = 6.0
 DOWNWIND_LENGTH_KM = 24.0
 DOWNWIND_HALF_WIDTH_KM = 7.5
 MIN_BACKGROUND_PIXELS = 12
+COHERENCE_SIGMA_THRESHOLD = 1.0
 HUBER_TUNING = 1.345
 HUBER_ITERATIONS = 12
 
@@ -145,10 +146,105 @@ def _upwind_background_mask(
     return upwind_union & ~downwind_union
 
 
+def _downwind_masks(
+    shape: tuple[int, int],
+    wind_u: np.ndarray,
+    wind_v: np.ndarray,
+    sources: tuple[tuple[float, float], ...],
+) -> tuple[np.ndarray, ...]:
+    # Build one source-region corridor per resolved wind direction
+    east_km, north_km = _grid_coordinates(shape)
+    masks = []
+    for source_east_km, source_north_km in sources:
+        wind = _source_wind(wind_u, wind_v, source_east_km, source_north_km)
+        if wind is None:
+            continue
+        u_value, v_value = wind
+        speed = float(np.hypot(u_value, v_value))
+        downwind_east = u_value / speed
+        downwind_north = v_value / speed
+        relative_east = east_km - source_east_km
+        relative_north = north_km - source_north_km
+        along_km = relative_east * downwind_east + relative_north * downwind_north
+        cross_km = -relative_east * downwind_north + relative_north * downwind_east
+        masks.append(
+            (along_km > 0)
+            & (along_km <= DOWNWIND_LENGTH_KM)
+            & (np.abs(cross_km) <= DOWNWIND_HALF_WIDTH_KM)
+        )
+    return tuple(masks)
+
+
 def _mad(values: np.ndarray) -> float:
     # Return the Gaussian-consistent median absolute deviation
     median = float(np.median(values))
     return 1.4826 * float(np.median(np.abs(values - median)))
+
+
+def _positive_coherence(signal: np.ndarray, valid: np.ndarray, noise: float) -> float:
+    # Reward the largest connected positive enhancement in one corridor
+    significant = valid & (signal > COHERENCE_SIGMA_THRESHOLD * noise)
+    labels, count = ndimage.label(significant, structure=np.ones((3, 3), dtype=np.uint8))
+    if count == 0:
+        return 0.0
+    largest = int(np.bincount(labels.ravel())[1:].max())
+    return float(np.sqrt(largest / max(np.count_nonzero(valid), 1)))
+
+
+def regional_plume_score(
+    no2: np.ndarray,
+    wind_u: np.ndarray,
+    wind_v: np.ndarray,
+    source_east_km: tuple[float, ...] = (0.0,),
+    source_north_km: tuple[float, ...] = (0.0,),
+) -> tuple[float, np.ndarray, np.ndarray]:
+    """Score the strongest positive source-region plume in one NO2 raster.
+
+    Args:
+        no2: Smoothed NO2 raster.
+        wind_u: Eastward wind component at every raster cell.
+        wind_v: Northward wind component at every raster cell.
+        source_east_km: Facility offsets east of the AOI centre.
+        source_north_km: Facility offsets north of the AOI centre.
+
+    Returns:
+        AOI score, shared upwind mask, and strongest downwind mask.
+    """
+    if no2.ndim != 2 or wind_u.shape != no2.shape or wind_v.shape != no2.shape:
+        raise ValueError("NO2 and wind arrays must share one two-dimensional shape")
+    if len(source_east_km) != len(source_north_km) or not source_east_km:
+        raise ValueError("Source east and north offsets must describe at least one common location")
+    sources = _group_sources(source_east_km, source_north_km)
+    upwind_mask = _upwind_background_mask(no2.shape, wind_u, wind_v, sources)
+    downwind_masks = _downwind_masks(no2.shape, wind_u, wind_v, sources)
+    valid = np.isfinite(no2)
+    upwind_values = no2[upwind_mask & valid]
+    if upwind_values.size < MIN_BACKGROUND_PIXELS:
+        raise InsufficientUpwindBackgroundError(
+            f"Plume score upwind background requires {MIN_BACKGROUND_PIXELS} pixels; got {upwind_values.size}"
+        )
+    if not downwind_masks:
+        raise ValueError("Plume score lacks downwind support")
+    upwind_center = float(np.median(upwind_values))
+    noise = _mad(upwind_values)
+    epsilon = np.finfo(np.float64).eps * max(float(np.max(np.abs(upwind_values))), 1.0)
+    noise = max(noise, epsilon)
+    centered = no2 - upwind_center
+    scored_regions = []
+    for corridor in downwind_masks:
+        corridor_valid = corridor & valid
+        valid_count = int(np.count_nonzero(corridor_valid))
+        total_count = int(np.count_nonzero(corridor))
+        if valid_count == 0 or total_count == 0:
+            continue
+        enhancement = max(float(np.median(no2[corridor_valid]) - upwind_center), 0.0)
+        coverage = valid_count / total_count
+        coherence = _positive_coherence(centered, corridor_valid, noise)
+        scored_regions.append((coherence * coverage * enhancement / noise, corridor))
+    if not scored_regions:
+        raise ValueError("Plume score lacks valid downwind pixels")
+    score, strongest_mask = max(scored_regions, key=lambda item: item[0])
+    return float(score), upwind_mask, strongest_mask
 
 
 def _huber_location(values: np.ndarray) -> float:

@@ -28,6 +28,7 @@ from config import (
     MIN_DELTA_NO2_FINITE_FRACTION,
     MODEL_IMAGE_KEYS,
     MODEL_MASK_KEYS,
+    PLUME_SCORE_FILTER_PERCENTILE,
 )
 from preprocessing.flux_model import estimate_aggregate_flux
 from preprocessing.regrid import (
@@ -38,7 +39,7 @@ from preprocessing.regrid import (
     regrid_aoi_raster,
     write_raster_npz,
 )
-from preprocessing.smoothing import normalize_smoothed_pair, smooth_no2
+from preprocessing.smoothing import normalize_smoothed_pair, regional_plume_score, smooth_no2
 from preprocessing.stratify_utils import AOI_ID_COL
 
 CURRENT_RASTER_NAME, DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
@@ -52,6 +53,7 @@ FLUX_CONFIDENCE_COL = "flux_confidence"
 DELTA_FLUX_CONFIDENCE_COL = "delta_flux_confidence"
 FLUX_LOG_RATIO_PREV_QTR_COL = "flux_log_ratio_prev_qtr"
 DELTA_FLUX_NORM_COL = "delta_flux_norm"
+PLUME_SCORE_COL = "plume_score"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
     "_selection_quarter",
@@ -64,7 +66,7 @@ HRRR_FIELDS = {
     "blh": "boundary_layer_height_m",
 }
 TABULAR_FEATURE_NAMES = (
-    "plume_score",
+    PLUME_SCORE_COL,
     CURRENT_FINITE_FRACTION_COL,
     PAIRED_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
@@ -318,6 +320,22 @@ def select_final_records(frame: pl.DataFrame) -> pl.DataFrame:
         class_records = frame.filter(pl.col(LABEL_COL) == label)
         selected_classes.append(_rank_final_records(class_records).head(class_size))
     return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
+
+
+def training_plume_score_threshold(frame: pl.DataFrame) -> float:
+    """Calculate the shared plume-score cutoff from training records.
+
+    Args:
+        frame: Successfully generated training candidates.
+
+    Returns:
+        Linear 40th-percentile plume score.
+    """
+    scores = frame.select(PLUME_SCORE_COL).filter(pl.col(PLUME_SCORE_COL).is_finite())
+    if scores.is_empty():
+        raise ValueError("Training candidates contain no finite plume scores")
+    threshold = scores[PLUME_SCORE_COL].quantile(PLUME_SCORE_FILTER_PERCENTILE / 100, interpolation="linear")
+    return float(threshold)
 
 
 def _rank_final_records(frame: pl.DataFrame) -> pl.DataFrame:
@@ -871,6 +889,20 @@ def derive_raster_features(
             previous_wind[WIND_U_RASTER_NAME],
             previous_wind[WIND_V_RASTER_NAME],
         )
+        current_plume_score, _, _ = regional_plume_score(
+            current_smoothed,
+            current_wind[WIND_U_RASTER_NAME],
+            current_wind[WIND_V_RASTER_NAME],
+            source_east_km,
+            source_north_km,
+        )
+        previous_plume_score, _, _ = regional_plume_score(
+            previous_smoothed,
+            previous_wind[WIND_U_RASTER_NAME],
+            previous_wind[WIND_V_RASTER_NAME],
+            source_east_km,
+            source_north_km,
+        )
         current_smoothed, previous_smoothed = normalize_smoothed_pair(
             current_smoothed,
             previous_smoothed,
@@ -902,11 +934,8 @@ def derive_raster_features(
         delta_no2 = np.full_like(current_no2, np.nan)
         np.subtract(current_smoothed, previous_smoothed, out=delta_no2, where=paired_valid)
 
-        p10, p50, p99 = np.percentile(delta_no2[paired_valid], [10, 50, 99])
-        denominator = p50 - p10
-        epsilon = np.finfo(np.float64).eps * max(abs(p10), abs(p50), 1.0)
         features = {
-            "plume_score": float((p99 - p50) / max(denominator, epsilon)),
+            PLUME_SCORE_COL: max(current_plume_score, previous_plume_score),
             CURRENT_FINITE_FRACTION_COL: current_fraction,
             PAIRED_FINITE_FRACTION_COL: paired_fraction,
             "mean_weighted_cloud_fraction": _paired_mean(

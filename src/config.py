@@ -84,6 +84,7 @@ IMG_SIZE = 48  # image size in pixels (48x48)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan coverage floor
 MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor
+PLUME_SCORE_FILTER_PERCENTILE = 40.0  # training-score percentile used as the shared split cutoff
 LABEL_COL = "delta_nox_class"
 DELTA_THRESHOLD = 100.0  # least raw delta-NOx magnitude kept as a labeled class
 MIN_PREV_QTR_REL_DELTA = 0.10  # least absolute change relative to prior-quarter mean NOx
