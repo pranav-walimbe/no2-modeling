@@ -28,6 +28,7 @@ from config import (
     MIN_DELTA_NO2_FINITE_FRACTION,
     MODEL_IMAGE_KEYS,
     MODEL_MASK_KEYS,
+    PLUME_SCORE_FILTER_PERCENTILE,
 )
 from preprocessing.flux_model import estimate_aggregate_flux
 from preprocessing.regrid import (
@@ -53,7 +54,6 @@ DELTA_FLUX_CONFIDENCE_COL = "delta_flux_confidence"
 FLUX_LOG_RATIO_PREV_QTR_COL = "flux_log_ratio_prev_qtr"
 DELTA_FLUX_NORM_COL = "delta_flux_norm"
 PLUME_SCORE_COL = "plume_score"
-PLUME_SCORE_DROP_FRACTION = 0.40
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
     "_selection_quarter",
@@ -334,7 +334,7 @@ def training_plume_score_threshold(frame: pl.DataFrame) -> float:
     scores = frame.select(PLUME_SCORE_COL).filter(pl.col(PLUME_SCORE_COL).is_finite())
     if scores.is_empty():
         raise ValueError("Training candidates contain no finite plume scores")
-    threshold = scores[PLUME_SCORE_COL].quantile(PLUME_SCORE_DROP_FRACTION, interpolation="linear")
+    threshold = scores[PLUME_SCORE_COL].quantile(PLUME_SCORE_FILTER_PERCENTILE / 100, interpolation="linear")
     return float(threshold)
 
 
