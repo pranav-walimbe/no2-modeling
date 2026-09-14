@@ -313,6 +313,7 @@ def main() -> None:
         "dropout": args.dropout,
         "amplitude_statistics": list(AMPLITUDE_STATISTIC_NAMES) if load_images else [],
         "amplitude_embedding_dim": DEFAULT_AMPLITUDE_DIM if load_images else 0,
+        "amplitude_fusion": "pre_head" if load_images else None,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip_norm": args.gradient_clip_norm,

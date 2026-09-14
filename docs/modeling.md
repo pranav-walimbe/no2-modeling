@@ -124,12 +124,13 @@ A compact residual CNN plus an MLP scalar branch:
 - A 3 by 3 adaptive average pool retains coarse plume location.
 - A global maximum pool preserves localized enhancements that an average
   dilutes.
-- A mask-aware amplitude branch summarizes each train-normalized NO2 channel
-  before GroupNorm using its mean, robust scale, RMS, and signed one-percent
-  tails. A small MLP carries those summaries past every sample-wise
-  normalization layer and joins the main representation immediately before the
-  final classifier. This follows the normalization-and-restitution pattern from
-  [Jin et al. (2020)](https://openaccess.thecvf.com/content_CVPR_2020/html/Jin_Style_Normalization_and_Restitution_for_Generalizable_Person_Re-Identification_CVPR_2020_paper.html).
+- A mask-aware amplitude branch summarizes current NO2 with its mean, robust
+  scale, and upper five-percent mean. It summarizes delta NO2 with its mean,
+  robust scale, and signed five-percent tail imbalance. Tail sizes use valid
+  pixels only. A small MLP carries those summaries past every sample-wise
+  normalization layer and joins the image and scalar embeddings before the
+  nonlinear fusion head. This follows the normalization-and-restitution pattern
+  from [Jin et al. (2020)](https://openaccess.thecvf.com/content_CVPR_2020/html/Jin_Style_Normalization_and_Restitution_for_Generalizable_Person_Re-Identification_CVPR_2020_paper.html).
 - The fused image embedding joins the scalar embedding for one classification
   logit.
 

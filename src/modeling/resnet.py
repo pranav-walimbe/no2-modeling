@@ -12,13 +12,14 @@ DEFAULT_HEAD_DIM = 128
 DEFAULT_DROPOUT = 0.30
 DEFAULT_AMPLITUDE_HIDDEN_DIM = 32
 DEFAULT_AMPLITUDE_DIM = 16
-AMPLITUDE_TAIL_FRACTION = 0.01
+AMPLITUDE_TAIL_FRACTION = 0.05
 AMPLITUDE_STATISTIC_NAMES = (
-    "masked_mean",
-    "robust_scale",
-    "root_mean_square",
-    "upper_tail_mean",
-    "lower_tail_mean",
+    "current_mean",
+    "current_robust_scale",
+    "current_upper_tail_mean",
+    "delta_mean",
+    "delta_robust_scale",
+    "delta_signed_tail_imbalance",
 )
 
 
@@ -109,36 +110,59 @@ class MaskedNO2Stem(nn.Module):
         return self.activation(self.second_norm(features)) * mask
 
 
+def _masked_tail_mean(
+    flattened: torch.Tensor,
+    flattened_valid: torch.Tensor,
+    *,
+    largest: bool,
+) -> torch.Tensor:
+    # Average an extreme fraction defined from each channel's valid pixels
+    fill_value = -torch.inf if largest else torch.inf
+    maximum_tail_count = max(1, math.ceil(flattened.shape[2] * AMPLITUDE_TAIL_FRACTION))
+    tail_values = torch.topk(
+        flattened.masked_fill(~flattened_valid, fill_value),
+        maximum_tail_count,
+        dim=2,
+        largest=largest,
+    ).values
+    counts = flattened_valid.sum(dim=2)
+    tail_counts = torch.ceil(counts * AMPLITUDE_TAIL_FRACTION).to(torch.long).clamp_min(1)
+    ranks = torch.arange(maximum_tail_count, device=flattened.device)[None, None, :]
+    selected = (ranks < tail_counts.unsqueeze(2)) & torch.isfinite(tail_values)
+    selected_values = torch.where(selected, tail_values, torch.zeros_like(tail_values))
+    return selected_values.sum(dim=2) / selected.sum(dim=2).clamp_min(1)
+
+
 def _masked_amplitude_statistics(values: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
     # Summarize physical amplitude before sample-wise activation normalization
-    valid = masks > 0
     flattened = values.flatten(2)
-    flattened_valid = valid.flatten(2)
+    flattened_valid = (masks > 0).flatten(2)
     counts = flattened_valid.sum(dim=2)
-    safe_counts = counts.clamp_min(1)
     masked_values = torch.where(flattened_valid, flattened, torch.zeros_like(flattened))
-    mean = masked_values.sum(dim=2) / safe_counts
-    root_mean_square = torch.sqrt(masked_values.square().sum(dim=2) / safe_counts)
+    mean = masked_values.sum(dim=2) / counts.clamp_min(1)
 
     nan_masked = flattened.masked_fill(~flattened_valid, torch.nan)
     median = torch.nanmedian(nan_masked, dim=2).values
     absolute_deviation = torch.abs(flattened - median.unsqueeze(2)).masked_fill(~flattened_valid, torch.nan)
     robust_scale = 1.4826 * torch.nanmedian(absolute_deviation, dim=2).values
+    upper_tail = _masked_tail_mean(flattened, flattened_valid, largest=True)
+    lower_tail = _masked_tail_mean(flattened, flattened_valid, largest=False)
 
-    pixel_count = flattened.shape[2]
-    tail_count = max(1, math.ceil(AMPLITUDE_TAIL_FRACTION * pixel_count))
-    upper_values = torch.topk(flattened.masked_fill(~flattened_valid, -torch.inf), tail_count, dim=2).values
-    lower_values = torch.topk(flattened.masked_fill(~flattened_valid, torch.inf), tail_count, dim=2, largest=False).values
-
-    def finite_mean(selected: torch.Tensor) -> torch.Tensor:
-        finite = torch.isfinite(selected)
-        return torch.where(finite, selected, torch.zeros_like(selected)).sum(dim=2) / finite.sum(dim=2).clamp_min(1)
-
+    present = counts > 0
+    mean = torch.where(present, mean, torch.zeros_like(mean))
+    robust_scale = torch.where(present, robust_scale, torch.zeros_like(robust_scale))
     statistics = torch.stack(
-        (mean, robust_scale, root_mean_square, finite_mean(upper_values), finite_mean(lower_values)),
-        dim=2,
+        (
+            mean[:, 0],
+            robust_scale[:, 0],
+            upper_tail[:, 0],
+            mean[:, 1],
+            robust_scale[:, 1],
+            upper_tail[:, 1] + lower_tail[:, 1],
+        ),
+        dim=1,
     )
-    return torch.where(counts.unsqueeze(2) > 0, statistics, torch.zeros_like(statistics)).flatten(1)
+    return statistics
 
 
 class MaskedAmplitudeEncoder(nn.Module):
@@ -146,13 +170,12 @@ class MaskedAmplitudeEncoder(nn.Module):
 
     def __init__(
         self,
-        channels: int,
         hidden_dim: int = DEFAULT_AMPLITUDE_HIDDEN_DIM,
         output_dim: int = DEFAULT_AMPLITUDE_DIM,
     ) -> None:
         super().__init__()
         self.projection = nn.Sequential(
-            nn.Linear(channels * len(AMPLITUDE_STATISTIC_NAMES), hidden_dim),
+            nn.Linear(len(AMPLITUDE_STATISTIC_NAMES), hidden_dim),
             nn.SiLU(inplace=True),
             nn.Linear(hidden_dim, output_dim),
             nn.SiLU(inplace=True),
@@ -189,7 +212,7 @@ class NOxModel(nn.Module):
 
         if use_image:
             self.no2_stems = nn.ModuleList(MaskedNO2Stem() for _ in MODEL_MASK_KEYS)
-            self.amplitude_encoder = MaskedAmplitudeEncoder(len(MODEL_MASK_KEYS))
+            self.amplitude_encoder = MaskedAmplitudeEncoder()
             self.wind_stem = nn.Sequential(
                 nn.Conv2d(MODEL_IMAGE_CHANNELS - len(MODEL_MASK_KEYS), 16, kernel_size=5, padding=2, bias=False),
                 _group_norm(16),
@@ -228,19 +251,17 @@ class NOxModel(nn.Module):
                 nn.Linear(64, 64),
                 nn.SiLU(inplace=True),
             )
-        fusion_features = 256 * int(use_image) + 64 * int(use_tabular)
+        fusion_features = (256 + DEFAULT_AMPLITUDE_DIM) * int(use_image) + 64 * int(use_tabular)
         self.head_projection = nn.Sequential(
             nn.Linear(fusion_features, head_dim),
             nn.LayerNorm(head_dim),
             nn.SiLU(inplace=True),
             nn.Dropout(dropout),
         )
-        classifier_features = head_dim + DEFAULT_AMPLITUDE_DIM * int(use_image)
-        self.classifier = nn.Linear(classifier_features, 1)
+        self.classifier = nn.Linear(head_dim, 1)
 
     def forward(self, image: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
         features = []
-        amplitude = None
         if self.use_image:
             masks = image[:, MODEL_IMAGE_CHANNELS:]
             amplitude = self.amplitude_encoder(image[:, : len(MODEL_MASK_KEYS)], masks)
@@ -253,11 +274,10 @@ class NOxModel(nn.Module):
             spatial = self.spatial_pool(encoded).flatten(1)
             peak = self.peak_pool(encoded).flatten(1)
             features.append(self.image_projection(torch.cat((spatial, peak), dim=1)))
+            features.append(amplitude)
         if self.use_tabular:
             features.append(self.tabular_projection(tabular))
         hidden = self.head_projection(torch.cat(features, dim=1))
-        if amplitude is not None:
-            hidden = torch.cat((hidden, amplitude), dim=1)
         return self.classifier(hidden).squeeze(1)
 
     def num_params(self) -> int:
