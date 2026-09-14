@@ -1,8 +1,19 @@
-# Setup and pipeline guide
+# Setup and pipeline
 
-This project predicts hourly power-plant NOx emissions from TEMPO satellite
-imagery, EPA CAMPD records, HRRR meteorology, and plant-level features. ERA5
-stays available as a benchmark weather input.
+This project predicts the direction of hourly power-plant NOx changes from
+TEMPO imagery, EPA CAMPD records, HRRR weather, and plant attributes. ERA5 is
+an optional weather benchmark.
+
+## Quick path
+
+| Step | Action |
+|---|---|
+| 1 | Load Python 3.11 and run `make setup` |
+| 2 | Add CAMPD and Earthdata credentials to `.env` |
+| 3 | Review paths and thresholds in `src/config.py` |
+| 4 | Collect TEMPO, HRRR, emissions, and facility data |
+| 5 | Build mappings, split AOIs, and generate rasters |
+| 6 | Train with `python -m modeling.train` |
 
 ## Prerequisites
 
@@ -16,33 +27,29 @@ stays available as a benchmark weather input.
 
 ## Initial Python environment setup
 
-Install `uv` once on a login node with its official installer. The default
-location under `~/.local/bin` is visible from compute nodes, and jobs stop
-needing `uv` once the environment exists:
+Install `uv` once on a login node:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-From the repository root, load Savio's Python 3.11 module and create the locked
-environment:
+Create the locked environment from the repository root:
 
 ```bash
 module load python/3.11.6-gcc-11.4.0
 make setup
 ```
 
-`uv` creates `.venv` by default. When the environment exceeds your home quota,
-place it in scratch and use the same path in Slurm jobs:
+`uv` creates `.venv`. To keep it in scratch, pass an explicit path and use that
+path in Slurm jobs:
 
 ```bash
 UV_CACHE_DIR=/global/scratch/users/$USER/uv-cache \
     make setup VENV=/global/scratch/users/$USER/no2-modeling-venv
 ```
 
-Run this step only when `.venv` is missing or `pyproject.toml` or `uv.lock`
-changes. Slurm jobs activate the existing environment and run neither
-`make setup` nor `uv sync`.
+Rerun setup when the environment is missing or the dependency files change.
+Batch jobs activate the existing environment.
 
 Static and syntax checks:
 
@@ -60,10 +67,7 @@ EARTHDATA_USERNAME=your_nasa_earthdata_username
 EARTHDATA_PASSWORD=your_nasa_earthdata_password
 ```
 
-These cover EPA CAMPD hourly NOx data and NASA Earthdata TEMPO downloads.
-
-Optional ERA5 benchmark downloads use the CDS API. Create `~/.cdsapirc` from
-your CDS account's API setup page:
+For ERA5 downloads, create `~/.cdsapirc` from the CDS account setup page:
 
 ```yaml
 url: https://cds.climate.copernicus.eu/api
@@ -72,13 +76,8 @@ key: your-api-key
 
 ## Configuration
 
-Review `src/config.py` before running the pipeline. It holds:
-
-- Savio input and output paths
-- collection date ranges and filtering thresholds
-- train, validation, and test sample sizes
-- image parameters
-- model and training hyperparameters
+Review `src/config.py` before running the pipeline. It holds paths, date ranges,
+filters, image parameters, and model settings.
 
 The checked-in paths point at the `fc_nitrates` Savio project and one user's
 home directory, so update user-specific entries such as `VIS_DIR` and
@@ -89,26 +88,26 @@ mkdir -p /global/home/users/<USERNAME>/no2-modeling/logs
 mkdir -p /global/home/users/<USERNAME>/vis
 ```
 
-## Pipeline order
+## Run the pipeline
 
-Run commands from the repository root so `.env` resolves consistently. Load the
-module and activate the environment once per shell or job:
+Run commands from the repository root. Load the module and environment once per
+shell or job:
 
 ```bash
 module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
 ```
 
-### 1. Select the TEMPO collection
+### 1. Choose the TEMPO collection
 
-In `src/config.py`, preprocessing uses `TEMPO_LEVEL = "L2"`, and
-`TEMPO_VERSION` accepts `V03` or `V04`. V04 is the default. Files land under:
+Set `TEMPO_VERSION` to `V03` or `V04` in `src/config.py`; `V04` is the default.
+Preprocessing uses `TEMPO_LEVEL = "L2"`. Files land under:
 
 ```text
 TEMPO/<version>/<level>/raw/<year>/<month>/
 ```
 
-### 2. Download TEMPO and HRRR data
+### 2. Download TEMPO and HRRR
 
 ```bash
 python -u -m collection.scrape_tempo
@@ -126,7 +125,7 @@ python -u -m collection.scrape_hrrr
   for every array task to succeed before using the archive, then regenerate
   the dataset once with `--refresh-wind` to replace aligned 10 m cache entries.
 
-### 3. Download EPA emissions and facility locations
+### 3. Download emissions and facility locations
 
 ```bash
 python -u -m collection.scrape_emissions
@@ -155,11 +154,16 @@ Time handling:
 ### 4. Build mappings, partition plants, generate datasets
 
 ```bash
-scripts/slurm/submit_tempo_mapping.sh --overwrite
-# Wait for the observation job array to finish successfully.
+python -u -m preprocessing.tempo_mapping index --overwrite
+python -u -m preprocessing.tempo_mapping observations \
+    --task-id <TASK_ID> --task-count 32 --overwrite
 python -u -m preprocessing.stratify_plants
 python -u -m preprocessing.generate_dataset --shard-size 20000
 ```
+
+Run the observation command once for each `TASK_ID` from 0 through 31. Start
+those tasks after the index command succeeds. On Savio, use a dependent job
+array such as `0-31%14`.
 
 `preprocessing.tempo_mapping`:
 
@@ -269,52 +273,51 @@ complete run again after resolving the failure.
 
 ## Savio jobs
 
-The original workflow used these resources:
+Each batch job should:
 
-| Stage | Savio partition | Typical time | CPU/GPU |
-| --- | --- | ---: | --- |
-| TEMPO and HRRR download | `savio4_htc` | Range-dependent | 4 CPUs |
-| EPA emissions download | `savio2_bigmem` | 6 hours | 1 CPU |
-| Partition and dataset build | `savio4_htc` | 4 hours | 56 CPUs |
-| Model training | `savio3_gpu` | 2 hours | 8 CPUs, 1 A40 GPU |
+1. Use Bash with `set -euo pipefail`. Request the `fc_nitrates` account, one
+   node, one task, and the stage resources listed below.
+2. Write stdout and stderr to `logs/%x-%j.log` and `logs/%x-%j.err`; use `%A_%a`
+   for arrays. Request `BEGIN`, `END`, and `FAIL` email notifications.
+3. Change to the repository root, load `python/3.11.6-gcc-11.4.0`, activate
+   `.venv`, and add `src` to `PYTHONPATH`.
+4. Export `SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"`, then launch the stage
+   command with `srun`.
 
-Start from `scripts/slurm/example_job.sh` and tailor the command and resources
-per stage. A representative job body:
+Use these stage-specific allocations and commands:
+
+| Stage | Savio request | Command and scheduler logic |
+|---|---|---|
+| TEMPO download | `savio4_htc`, `savio_normal`, 4 CPUs, 72 hours | Confirm `TEMPO_LEVEL="L2"` and `TEMPO_VERSION="V04"`, then run `python -u -m collection.scrape_tempo` |
+| HRRR download | `savio4_htc`, `savio_normal`, 4 CPUs per task, 48 hours | Split the date range across an array; pass each range to `collection.scrape_hrrr` with `--workers "$SLURM_CPUS_PER_TASK" --overwrite` |
+| Facility metadata | `savio4_htc`, `savio_normal`, 4 CPUs, 8 hours | Run `python -u -m collection.scrape_locations` |
+| TEMPO index | `savio4_htc`, `savio_normal`, 16 CPUs, 2 hours | Run `python -u -m preprocessing.tempo_mapping index`; require success before observation tasks start |
+| TEMPO observations | `savio4_htc`, `savio_normal`, 4 CPUs per task, 8 hours | Use a `0-31%14` array and run `preprocessing.tempo_mapping observations --task-id "$SLURM_ARRAY_TASK_ID" --task-count 32` |
+| Stratification | `savio4_htc`, `savio_normal`, `savio4_m512`, 16 CPUs, 2 hours | Run `python -u -m preprocessing.stratify_plants` |
+| Dataset generation | `savio4_htc`, `savio_normal`, 16 CPUs, 12 hours | Set BLAS threads to 1 and `POLARS_MAX_THREADS` to the CPU count, then run `python -u -m preprocessing.generate_dataset --shard-size 20000` |
+| Model training | `savio3_gpu`, `a40_gpu3_normal`, 8 CPUs, 1 A40, 2 hours | Run the training command below |
 
 ```bash
-#!/bin/bash
-#SBATCH --job-name=no2_pipeline
-#SBATCH --account=fc_nitrates
-#SBATCH --partition=savio2_bigmem
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --time=08:00:00
-#SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=<EMAIL>
-#SBATCH --output=/global/home/users/<USERNAME>/no2-modeling/logs/%x-%j.log
-#SBATCH --error=/global/home/users/<USERNAME>/no2-modeling/logs/%x-%j.err
-
-cd /global/home/users/<USERNAME>/no2-modeling
-module load python/3.11.6-gcc-11.4.0
-source .venv/bin/activate
-srun python -u -m collection.scrape_tempo
-srun python -u -m collection.scrape_hrrr
+srun python -u -m modeling.train \
+    --device cuda \
+    --inputs full \
+    --batch-size 128 \
+    --epochs 300 \
+    --workers "$SLURM_CPUS_PER_TASK" \
+    --prefetch-factor 2 \
+    --seed 42 \
+    --head-dim 128 \
+    --dropout 0.30 \
+    --learning-rate 3e-4 \
+    --weight-decay 1e-4 \
+    --gradient-clip-norm 5.0 \
+    --scheduler-patience 10 \
+    --scheduler-factor 0.50 \
+    --early-stop-patience 25
 ```
 
-Notes:
-
-- For a scratch environment, swap the activation line for the exact environment
-  path.
-- Create or update environments on a login node. Batch jobs activate and run
-  them.
-- For training, use the GPU partition and add the GPU and QoS directives:
-
-  ```bash
-  #SBATCH --partition=savio3_gpu
-  #SBATCH --qos=a40_gpu3_normal
-  #SBATCH --gres=gpu:A40:1
-  ```
+Create or update environments on a login node. Batch jobs activate the existing
+environment. Adjust the activation path when the environment lives in scratch.
 
 Cluster partitions, QoS names, and account policies change over time. Verify
 them against current Savio documentation before submitting long-running jobs.

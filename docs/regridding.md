@@ -4,7 +4,7 @@ TEMPO Level 2 reports one NO2 value per irregular ground footprint. The model
 needs a fixed 48 by 48 raster covering 72 km around each AOI, with the same
 1.5 km cells in both scans of every delta.
 
-How the regridder bridges that gap:
+The regridder:
 
 - Projects each footprint and output cell to the equal-area EPSG:5070 system.
 - Intersects their polygons and averages accepted NO2 by overlap area in square
@@ -12,7 +12,7 @@ How the regridder bridges that gap:
 - Uses a spatial index to find only the cells a footprint can touch, so it never
   builds a dense `native pixels x output cells` matrix.
 
-## Filtering and diagnostics
+## Filter native pixels
 
 A native value enters the NO2 mean when:
 
@@ -23,7 +23,7 @@ A native value enters the NO2 mean when:
 Filtering runs before averaging. Cloud and quality diagnostics still cover all
 geometrically valid overlapping footprints, which keeps rejected inputs visible.
 
-## Saved raster bundle
+## Save each AOI scan
 
 Each AOI scan is saved as one compressed `.npz` holding five aligned 48 by 48
 `float32` rasters:
@@ -40,7 +40,7 @@ The ancillary rasters stay populated where `no2` is `NaN`, which preserves
 information about cloudy or low-overlap cells. Downstream code preserves these
 gaps and forms explicit masks instead of interpolating them.
 
-## Dataset-generation output
+## Build model records
 
 `preprocessing.generate_dataset` deduplicates AOI-scan work and writes the
 five-raster bundles to the persistent TEMPO cache under `DATASET_DIR`.
@@ -118,7 +118,7 @@ coverage as the sole quality rank. These rules do not change per-scan
 tessellation or its 0.25 km2 cell-support floor. Plume, cloud, uncertainty, and
 quality summaries remain diagnostics and rank nothing.
 
-What the measurements showed:
+Measured tradeoffs:
 
 | Choice | Effect |
 |---|---|

@@ -7,10 +7,19 @@ The dataset generator applies it to each current and previous TEMPO scan, then
 subtracts a source-relative upwind background before forming the hourly delta.
 The model loader consumes the resulting rasters.
 
-The kernel aims to reduce pixel-scale retrieval noise while retaining plume
-shape and magnitude. Its graph solve processes one scan without emissions or
-labels. The following background step uses facility coordinates but not unit
-activity or target values.
+The kernel reduces pixel-scale retrieval noise while retaining plume shape and
+magnitude. Its graph solve uses no emissions or labels. Background subtraction
+uses facility coordinates but no activity or target values.
+
+## Method summary
+
+| Stage | Operation | Purpose |
+|---|---|---|
+| Graph | Connect valid neighboring pixels | Preserve the native support mask |
+| Fidelity | Weight pixels by retrieval uncertainty | Trust lower-uncertainty observations more |
+| Smoothing | Favor edges aligned with local wind | Suppress noise without erasing plume direction |
+| Restoration | Restore coherent wind-aligned residuals | Retain narrow plume detail |
+| Background | Subtract a robust upwind estimate | Remove regional NO2 level |
 
 ## Inputs
 
