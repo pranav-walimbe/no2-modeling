@@ -124,7 +124,7 @@ A compact residual CNN plus an MLP scalar branch:
 - A 3 by 3 adaptive average pool retains coarse plume location.
 - A global maximum pool preserves localized enhancements that an average
   dilutes.
-- A mask-aware amplitude branch summarizes current NO2 with its mean, robust
+- A mask-aware magnitude branch summarizes current NO2 with its mean, robust
   scale, and upper five-percent mean. It summarizes delta NO2 with its mean,
   robust scale, and signed five-percent tail imbalance. Tail sizes use valid
   pixels only. A small MLP carries those summaries past every sample-wise

@@ -42,10 +42,10 @@ from modeling.plot_utils import (
     plot_spatial_accuracy,
 )
 from modeling.resnet import (
-    AMPLITUDE_STATISTIC_NAMES,
-    DEFAULT_AMPLITUDE_DIM,
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
+    DEFAULT_MAGNITUDE_DIM,
+    MAGNITUDE_STATISTIC_NAMES,
     NOxModel,
 )
 from modeling.xgboost import train_xgboost_baseline
@@ -311,9 +311,9 @@ def main() -> None:
         "seed": args.seed,
         "head_dim": args.head_dim,
         "dropout": args.dropout,
-        "amplitude_statistics": list(AMPLITUDE_STATISTIC_NAMES) if load_images else [],
-        "amplitude_embedding_dim": DEFAULT_AMPLITUDE_DIM if load_images else 0,
-        "amplitude_fusion": "pre_head" if load_images else None,
+        "magnitude_statistics": list(MAGNITUDE_STATISTIC_NAMES) if load_images else [],
+        "magnitude_embedding_dim": DEFAULT_MAGNITUDE_DIM if load_images else 0,
+        "magnitude_fusion": "pre_head" if load_images else None,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip_norm": args.gradient_clip_norm,
