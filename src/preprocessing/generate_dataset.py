@@ -36,6 +36,8 @@ from preprocessing.generate_dataset_utils import (
     FLUX_CONFIDENCE_COL,
     FLUX_LOG_RATIO_PREV_QTR_COL,
     FLUX_NOX_COL,
+    PLUME_SCORE_COL,
+    PLUME_SCORE_DROP_FRACTION,
     PREVIOUS_FLUX_NOX_COL,
     PROCESSING_FAILURE_SCHEMA,
     SOURCE_RECORD_INDEX_COL,
@@ -55,6 +57,7 @@ from preprocessing.generate_dataset_utils import (
     process_wind_batch,
     scan_batches,
     select_final_records,
+    training_plume_score_threshold,
     wind_batches,
     write_csv_atomic,
     write_json_atomic,
@@ -392,24 +395,46 @@ def _write_outputs(
     source_splits: dict[str, pl.DataFrame],
 ) -> None:
     # Sort asynchronous results back into source-record order
-    prepared_outputs: dict[str, tuple[pl.DataFrame, dict[str, object], pl.DataFrame]] = {}
+    candidates_by_split: dict[str, pl.DataFrame] = {}
+    failure_frames: dict[str, pl.DataFrame] = {}
     for split, source_frame in source_splits.items():
-        rows = output_rows[split]
-        failure_rows = sorted(failures[split], key=lambda row: int(row["record_index"]))
-        features = pl.DataFrame(rows, schema=CANDIDATE_FEATURE_SCHEMA)
-        candidates = source_frame.join(features, on=SOURCE_RECORD_INDEX_COL, how="inner", maintain_order="left").sort(
-            SOURCE_RECORD_INDEX_COL
+        features = pl.DataFrame(output_rows[split], schema=CANDIDATE_FEATURE_SCHEMA)
+        candidates = source_frame.join(
+            features,
+            on=SOURCE_RECORD_INDEX_COL,
+            how="inner",
+            maintain_order="left",
+        ).sort(SOURCE_RECORD_INDEX_COL)
+        candidates_by_split[split] = _add_derived_flux_features(candidates)
+        failure_frames[split] = pl.DataFrame(
+            sorted(failures[split], key=lambda row: int(row["record_index"])),
+            schema=PROCESSING_FAILURE_SCHEMA,
         )
-        candidates = _add_derived_flux_features(candidates)
-        output_frame = select_final_records(candidates)
+
+    if "train" not in candidates_by_split:
+        raise ValueError("Plume-score filtering requires generated training candidates")
+    plume_score_threshold = training_plume_score_threshold(candidates_by_split["train"])
+
+    prepared_outputs: dict[str, tuple[pl.DataFrame, dict[str, object], pl.DataFrame]] = {}
+    for split, candidates in candidates_by_split.items():
+        plume_filtered = candidates.filter(
+            pl.col(PLUME_SCORE_COL).is_finite() & (pl.col(PLUME_SCORE_COL) >= plume_score_threshold)
+        )
+        output_frame = select_final_records(plume_filtered)
         selected_coverage = coverage_selection_summary(output_frame)
-        eligible_by_class = {str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
+        eligible_by_class = {
+            str(label): plume_filtered.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)
+        }
         selection_size = {
             "actual_size": output_frame.height,
-            "discarded_for_balance": candidates.height - output_frame.height,
+            "discarded_for_plume_score": candidates.height - plume_filtered.height,
+            "discarded_for_balance": plume_filtered.height - output_frame.height,
             "eligible_by_class": eligible_by_class,
         }
-        print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
+        print(
+            f"[{split}] {candidates.height:,} generated; {plume_filtered.height:,} passed plume score; "
+            f"{output_frame.height:,} selected"
+        )
         if selection_size["discarded_for_balance"]:
             print(f"[{split}] discarded {selection_size['discarded_for_balance']:,} records for class balance")
         print(
@@ -419,17 +444,24 @@ def _write_outputs(
         classification_report = {
             "split": split,
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
+            "plume_score_filter": {
+                "threshold_source_split": "train",
+                "drop_fraction": PLUME_SCORE_DROP_FRACTION,
+                "threshold": plume_score_threshold,
+                "retention": classification_summary(candidates, plume_filtered),
+            },
             "selection_size": selection_size,
-            "final_balance": classification_summary(candidates, output_frame),
+            "final_balance": classification_summary(plume_filtered, output_frame),
             "coverage_selection": {
                 "generated": coverage_selection_summary(candidates),
+                "after_plume_score": coverage_selection_summary(plume_filtered),
                 "selected": selected_coverage,
             },
         }
         prepared_outputs[split] = (
             output_frame,
             classification_report,
-            pl.DataFrame(failure_rows, schema=PROCESSING_FAILURE_SCHEMA),
+            failure_frames[split],
         )
 
     for split, (output_frame, classification_report, failure_frame) in prepared_outputs.items():
