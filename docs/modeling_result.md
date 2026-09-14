@@ -36,7 +36,7 @@ The single-seed ablation does not support the magnitude branch.
 | Reference dual encoder | 0.6443 | 0.6784 | 0.6577 | 0.7107 |
 | Magnitude encoder disabled | 0.6416 | 0.6762 | **0.6652** | **0.7164** |
 
-Removing the magnitude encoder improves test accuracy by 0.75 points, test AUC by 0.57 points, and test log loss by 0.0045. AOI-cluster bootstrap intervals for the test improvement exclude zero, but they do not include training-seed variance. Validation moves slightly in the other direction. Keep the simpler spatial encoder as the working model and run at least five seeds before making the architecture decision permanent.
+Removing the magnitude encoder improves test accuracy by 0.75 points, test AUC by 0.57 points, and test log loss by 0.0045. AOI-cluster bootstrap intervals for the test improvement exclude zero, but they do not include training-seed variance. Validation moves slightly in the other direction. The magnitude and restitution paths are now removed from the working architecture rather than exposed as runtime options. A future architecture comparison should still use several seeds.
 
 ### Would persistent-change framing increase accuracy?
 
@@ -69,7 +69,7 @@ No measurable accuracy benefit appears in the controlled ablation.
 | Reference with `delta_flux_norm` | 0.6443 | 0.6784 | 0.6577 | 0.7107 |
 | Flux scalar disabled | **0.6470** | **0.6795** | 0.6577 | **0.7133** |
 
-Removing the scalar leaves test accuracy unchanged and improves test AUC by 0.26 points and log loss by 0.0020. The AOI-cluster AUC interval is +0.14 to +0.36 points, conditional on this seed. Remove `delta_flux_norm` from the next model. Preserve flux outputs as diagnostics for physical agreement and observability.
+Removing the scalar leaves test accuracy unchanged and improves test AUC by 0.26 points and log loss by 0.0020. The AOI-cluster AUC interval is +0.14 to +0.36 points, conditional on this seed. `delta_flux_norm` is now absent from dataset generation and model inputs. The standalone flux estimator remains available for separate analysis.
 
 ### Would scan-time interpolation help?
 
@@ -90,7 +90,7 @@ Implement overlap weighting for correctness and continuous-target fidelity. Do n
 ## Recommended next model
 
 1. Rebuild the label and eligibility logic around three-hour `effective_delta_nox`, sustained regimes, complete emissions, coherent winds, corridor coverage, and raster extent.
-2. Remove plume-score filtering and the CNN flux scalar. Start with the spatial encoder without the magnitude branch.
+2. Keep plume score diagnostic-only. Use the spatial encoder without magnitude or restitution paths, and keep flux outputs outside dataset generation.
 3. Predict continuous effective delta and binary direction together. Select loss weights and probability calibration on validation AOIs.
 4. Compare XGBoost, tabular MLP, image-only CNN, and fused CNN on identical records across at least five seeds. Report AUC, log loss, calibration, accuracy, recall, specificity, and AOI-cluster intervals.
 5. Add wind-advection residuals and nested downwind context only after the revised target establishes a clean baseline.
@@ -113,4 +113,3 @@ The current 25-epoch early-stopping patience adds about 15 unproductive epochs a
 - Does the spatial encoder retain its advantage after removing response-based plume selection?
 - Does a wind-advected residual improve decreases, where the previous plume should decay or leave the corridor?
 - Do temperature and calendar features remain useful after sustained-regime selection?
-- Does the magnitude branch help under the revised continuous target across training seeds?

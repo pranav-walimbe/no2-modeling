@@ -100,20 +100,10 @@ hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
 delta). Stratification uses it to calculate `prev_qtr_rel_delta`, but the model
 does not receive either field.
 
-The current NO2 raster also produces a source-aware aggregate flux estimate.
-The estimator integrates positive NO2 enhancement within the union of compact
-source-relative plumes extending 12 km downwind and 4.5 km to either side.
-Overlapping plume pixels are counted once. A median background comes from
-source-relative corridors 7.5 to 30 km upwind. Pixel distance and 80 m wind
-give transport age, which drives the published time-dependent NOx-to-NO2 ratio
-and a 1.5-hour decay correction. Dividing corrected mass by plume residence
-time and applying the fixed cross-validated calibration produces flux in pounds
-per hour. The estimator runs on current and previous smoothed NO2 using common
-valid-pixel support and the current transport wind. `delta_flux_norm` is
-`(flux_nox - previous_flux_nox) / abs(prev_qtr_avg_nox)`. It enters the fused
-CNN but is excluded from the XGBoost baseline. The two flux levels, the
-current-level prior-quarter ratio, and current and paired confidence remain
-dataframe diagnostics.
+The source-aware aggregate flux estimator remains available as a standalone
+analysis module. Dataset generation does not run it, store its outputs, or use
+a flux-derived model feature. This keeps the generated data contract independent
+of the experimental flux formulation.
 
 Nameplate capacity:
 
@@ -162,6 +152,9 @@ remains a dataset diagnostic and is not supplied to the model.
 |---|---|---|
 | `plume_score` | Diagnostic | Selecting visible plumes conditions the dataset on an easily observed response and biases evaluation toward easy cases. Its percentile-ratio definition also destabilizes as the lower spread approaches zero. |
 | Mean cloud and quality fractions | Diagnostics | Native cloud and quality filtering already decides whether NO2 is accepted. |
+
+`plume_score` remains in each output row for post-hoc stratification. It is not
+required to be finite and never affects eligibility, ranking, or class balance.
 
 ## Candidate selection
 

@@ -9,9 +9,9 @@ observations.
 |---|---|
 | Target | Sign of hourly NOx change outside a 100 lb deadband |
 | Image input | Current NO2, hourly NO2 delta, wind U/V, and two validity masks |
-| Context input | Plant attributes, prior-quarter activity, weather, time, and paired flux change |
+| Context input | Plant attributes, prior-quarter activity, weather, and time |
 | Split | Geographic AOI clusters, approximately 70/15/15 |
-| Image encoder | Separate NO2 restitution stems plus a shared residual CNN |
+| Image encoder | Separate mask-aware NO2 stems plus a shared residual CNN |
 | Fusion | Image and scalar embeddings before a nonlinear head |
 | Selection metric | Validation log loss |
 | Final metrics | ROC AUC and log loss across seeds, with subgroup results |
@@ -36,7 +36,6 @@ Scalar inputs:
 - total generator nameplate capacity;
 - previous-quarter average heat input and power generation;
 - coincident HRRR 2 m temperature and boundary-layer height;
-- current-minus-previous flux normalized by absolute prior-quarter mean NOx;
 - sine/cosine encodings of local mean solar hour and day of year.
 
 Leakage controls:
@@ -48,7 +47,7 @@ Leakage controls:
 | Previous-quarter average NOx | Defines the relative-change filter and can identify plant operating regimes |
 | `prev_qtr_rel_delta` | Contains target magnitude and is used only for stratification |
 | Plume score, raster-quality scores | Diagnostics extracted from the response image |
-| Current and previous flux levels, ratio, and confidence | Retained as diagnostics; the normalized paired difference is the model input |
+| Flux-model outputs | The standalone estimator remains experimental and is not run during dataset generation |
 
 Coverage stays available for sliced evaluation but is not a model input.
 
@@ -142,8 +141,8 @@ flowchart TB
     end
 
     subgraph Stems[Separate image stems]
-        CurrentStem[Current stem<br/>PartialConv + mask-aware<br/>InstanceNorm and restitution x2]
-        DeltaStem[Delta stem<br/>PartialConv + mask-aware<br/>InstanceNorm and restitution x2]
+        CurrentStem[Current stem<br/>PartialConv + GroupNorm x2]
+        DeltaStem[Delta stem<br/>PartialConv + GroupNorm x2]
         WindStem[Wind stem<br/>Conv + GroupNorm]
     end
 
@@ -164,38 +163,23 @@ flowchart TB
     ImageProjection -->|concatenate| FusionHead[Nonlinear fusion head]
     TabularProjection -->|concatenate| FusionHead
     FusionHead -->|classify| Logit[Emissions-change logit]
-
-    subgraph TrainingOnly[Training-only objective]
-        CurrentAux[Current restitution heads x2]
-        DeltaAux[Delta restitution heads x2]
-        DualLoss[Dual causality loss]
-        CurrentAux -->|normalized, restored, rejected logits| DualLoss
-        DeltaAux -->|normalized, restored, rejected logits| DualLoss
-    end
-
-    CurrentStem -.->|intermediate branches| CurrentAux
-    DeltaStem -.->|intermediate branches| DeltaAux
 ```
 
 - Residual stages reduce 48 by 48 images to a 6 by 6 feature map.
 - A 3 by 3 adaptive average pool retains coarse plume location.
 - A global maximum pool preserves localized enhancements that an average
   dilutes.
-- The current and delta NO2 stems use separate mask-aware style normalization
-  and restitution modules. Each module applies per-channel InstanceNorm, learns
-  channel gates with a 12-to-4-to-12 MLP, and restores the selected feature
-  residual before the streams join the wind features. Training-only auxiliary
-  heads apply the dual causality objective from
-  [Jin et al. (2020)](https://openaccess.thecvf.com/content_CVPR_2020/html/Jin_Style_Normalization_and_Restitution_for_Generalizable_Person_Re-Identification_CVPR_2020_paper.html).
+- The current and delta NO2 rasters retain separate mask-aware spatial stems
+  before their features join the wind stream. There is no magnitude encoder,
+  restitution branch, or auxiliary magnitude loss.
 - The fused image embedding joins the scalar embedding for one classification
   logit.
 
 Normalization choices:
 
-- Mask-aware InstanceNorm with learned restitution in the current and delta NO2
-  stems. GroupNorm remains in the wind stem and shared image encoder because it
-  avoids batch-level statistics when memory pressure forces small batches. See
-  the [Group Normalization paper](https://arxiv.org/abs/1803.08494).
+- GroupNorm in the NO2 stems, wind stem, and shared image encoder avoids
+  batch-level statistics when memory pressure forces small batches. See the
+  [Group Normalization paper](https://arxiv.org/abs/1803.08494).
 - LayerNorm in the MLP projections.
 
 The DenseNet alternative is gone. It duplicated an obsolete input signature and
