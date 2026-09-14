@@ -1,17 +1,26 @@
 # Dataset design
 
-Turning the full AOI-hour population into a modeling dataset rests on one
-principle: retain every scientifically eligible record until raster generation
-determines whether it has sufficient coverage.
+Retain each scientifically eligible AOI-hour until raster generation determines
+whether it has enough coverage.
+
+## Design summary
+
+| Decision | Rule |
+|---|---|
+| Split unit | Geographic clusters of overlapping 72 km AOIs |
+| Split target | Approximately 70% train, 15% validation, 15% test |
+| Label | Sign of raw hourly NOx change outside a 100 lb deadband |
+| Metadata filters | Required source data, NOx percentile bounds, relative-change floor, and coal dominance |
+| Raster gates | More than 95% current coverage and 80% paired coverage |
+| Final selection | Largest balanced subset after deterministic AOI and temporal round-robin |
+| Model selection | Validation data only; freeze test data for final comparison |
 
 ## Output contract
 
-There are no configured row-count targets. Stratification assigns intact
-geographic clusters toward a 70/15/15 record split and retains every eligible
-record. Dataset generation attempts every one. Finalization establishes exact
-class balance after raster failures by retaining the complete smaller class and
-an equal, deterministically selected set from the larger class. Reports include
-the actual size, discarded imbalance, and eligible class counts.
+Stratification assigns intact geographic clusters toward a 70/15/15 split and
+keeps each eligible record. After raster failures, finalization keeps the
+complete smaller class and a deterministic equal-size sample from the larger
+class. Reports record eligible counts, final size, and discarded imbalance.
 
 ## Split independence
 
@@ -51,7 +60,7 @@ receive it or `prev_qtr_avg_nox` as an input.
 
 ## Label and tabular features
 
-One UTC clock governs everything:
+All joins use UTC:
 
 - Facility-location enrichment converts emission hours from CAMPD local standard
   time to UTC.
@@ -62,7 +71,7 @@ One UTC clock governs everything:
 - The enriched archive keeps the source local-standard fields, each facility's
   timezone, and its standard offset for auditability.
 
-The binary target uses raw `delta_nox_mass`:
+The target uses raw `delta_nox_mass`:
 
 - Read the fixed 100 lb cutoff from the `DELTA_THRESHOLD` configuration
   constant.
@@ -75,7 +84,7 @@ Stratification reports natural class prevalence. Final generation reports
 overall and per-AOI retention, natural pre-balancing prevalence, and selected
 class counts.
 
-Each sample stores four numeric arrays and two masks on one fixed grid:
+Each sample stores four numeric arrays and two masks on a fixed grid:
 
 | Array | Notes |
 |---|---|
@@ -141,10 +150,9 @@ upwind background subtraction using its own wind. The paired operation becomes
 eligible only when both scans have at least 12 paired-valid background pixels.
 Smoothing and normalization preserve the original masks.
 
-After pairing current and previous scans, generated records use
-`paired_finite_fraction` as the only final-selection ranking signal after the
-fixed gates. Central coverage and retrieval uncertainty do
-not filter or rank records. Generation summaries report retained counts,
+After pairing scans, generated records use `paired_finite_fraction` as the only
+ranking signal after the fixed gates. Central coverage and retrieval uncertainty
+do not filter or rank records. Generation summaries report retained counts,
 full-coverage rates, and represented AOIs overall and by class. Paired coverage
 remains a dataset diagnostic and is not supplied to the model.
 

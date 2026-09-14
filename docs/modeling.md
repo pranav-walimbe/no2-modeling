@@ -3,6 +3,19 @@
 The binary baseline classifies hourly power-plant NOx changes from paired TEMPO
 observations.
 
+## Baseline at a glance
+
+| Component | Choice |
+|---|---|
+| Target | Sign of hourly NOx change outside a 100 lb deadband |
+| Image input | Current NO2, hourly NO2 delta, wind U/V, and two validity masks |
+| Context input | Plant attributes, prior-quarter activity, weather, time, and paired flux change |
+| Split | Geographic AOI clusters, approximately 70/15/15 |
+| Image encoder | Separate NO2 restitution stems plus a shared residual CNN |
+| Fusion | Image and scalar embeddings before a nonlinear head |
+| Selection metric | Validation log loss |
+| Final metrics | ROC AUC and log loss across seeds, with subgroup results |
+
 ## Prediction target
 
 - Apply the fixed symmetric 100 lb `DELTA_THRESHOLD` cutoff on
@@ -26,7 +39,7 @@ Scalar inputs:
 - current-minus-previous flux normalized by absolute prior-quarter mean NOx;
 - sine/cosine encodings of local mean solar hour and day of year.
 
-Excluded inputs and the reason for each:
+Leakage controls:
 
 | Excluded | Reason |
 |---|---|
@@ -107,11 +120,8 @@ Two design notes:
 - Per-image normalization stays unsuitable because absolute enhancement
   magnitude carries part of the emissions signal.
 
-Where the numbers live:
-
-- `normalization_stats.json` holds the center, scale, and valid-pixel count per
-  channel.
-- `run_config.json` holds the clipped valid-pixel fraction per channel and split.
+Run outputs store centers, scales, and valid counts in
+`normalization_stats.json`; `run_config.json` stores clipped-pixel fractions.
 
 Exact quartiles come from temporary node-local arrays, so the fit never builds
 an in-memory pixel archive.
@@ -121,19 +131,50 @@ an in-memory pixel archive.
 A compact residual CNN plus an MLP scalar branch:
 
 ```mermaid
-flowchart LR
-    Current[Current NO2 + mask] -->|encode| CurrentStem[Masked NO2 stem<br/>PartialConv + restitution x2]
-    Delta[Delta NO2 + mask] -->|encode| DeltaStem[Masked NO2 stem<br/>PartialConv + restitution x2]
-    Wind[Wind rasters] -->|encode| WindStem[Conv + GroupNorm]
-    CurrentStem -->|concatenate| StemFusion[1x1 stem fusion]
-    DeltaStem -->|concatenate| StemFusion
-    WindStem -->|concatenate| StemFusion
-    StemFusion -->|extract plume structure| Encoder[Shared residual encoder]
-    Encoder -->|average + maximum pool| ImageProjection[Image projection]
-    Tabular[Tabular features] -->|encode| TabularProjection[Tabular MLP]
+flowchart TB
+    subgraph Inputs
+        Current[Current NO2]
+        CurrentMask[Current mask]
+        Delta[Hourly NO2 delta]
+        DeltaMask[Delta mask]
+        Wind[Wind U and V]
+        Tabular[Scalar context]
+    end
+
+    subgraph Stems[Separate image stems]
+        CurrentStem[Current stem<br/>PartialConv + mask-aware<br/>InstanceNorm and restitution x2]
+        DeltaStem[Delta stem<br/>PartialConv + mask-aware<br/>InstanceNorm and restitution x2]
+        WindStem[Wind stem<br/>Conv + GroupNorm]
+    end
+
+    Current -->|values| CurrentStem
+    CurrentMask -->|support| CurrentStem
+    Delta -->|values| DeltaStem
+    DeltaMask -->|support| DeltaStem
+    Wind -->|encode| WindStem
+
+    CurrentStem -->|features| StemFusion[Concatenate + 1x1 convolution]
+    DeltaStem -->|features| StemFusion
+    WindStem -->|features| StemFusion
+
+    StemFusion -->|extract spatial structure| Encoder[Shared residual encoder]
+    Encoder -->|3x3 average + global maximum| Pool[Spatial pooling]
+    Pool -->|project| ImageProjection[Image embedding]
+    Tabular -->|MLP + LayerNorm| TabularProjection[Scalar embedding]
     ImageProjection -->|concatenate| FusionHead[Nonlinear fusion head]
     TabularProjection -->|concatenate| FusionHead
     FusionHead -->|classify| Logit[Emissions-change logit]
+
+    subgraph TrainingOnly[Training-only objective]
+        CurrentAux[Current restitution heads x2]
+        DeltaAux[Delta restitution heads x2]
+        DualLoss[Dual causality loss]
+        CurrentAux -->|normalized, restored, rejected logits| DualLoss
+        DeltaAux -->|normalized, restored, rejected logits| DualLoss
+    end
+
+    CurrentStem -.->|intermediate branches| CurrentAux
+    DeltaStem -.->|intermediate branches| DeltaAux
 ```
 
 - Residual stages reduce 48 by 48 images to a 6 by 6 feature map.
@@ -226,15 +267,15 @@ non-overlapping plant regions rather than memorization of known AOIs.
 
 ## Required comparisons
 
-Before treating the CNN as scientifically useful, compare it with:
-
-1. constant and natural-prevalence classifiers;
-2. an XGBoost tabular baseline trained after every deep-learning run;
-3. a tabular-only MLP with the same scalar features;
-4. an image-only model;
-5. the full image-plus-tabular model;
-6. a delta-plus-mask versus current-plus-delta-plus-mask ablation;
-7. a mask ablation over the same eligible records.
+| Comparison | Question |
+|---|---|
+| Constant and prevalence classifiers | Does the model beat trivial predictions? |
+| XGBoost | Does the CNN beat a strong tabular baseline? |
+| Tabular-only MLP | Does image data add value to the neural model? |
+| Image-only CNN | Does scalar context add value? |
+| Full fused model | Does fusion improve validation loss? |
+| Delta versus current-plus-delta | Does the current NO2 level add value? |
+| With and without masks | Does explicit support information add value? |
 
 Report every comparison on the same frozen validation and test records. The full
 model earns its place only when image information improves held-out-AOI error
@@ -244,21 +285,18 @@ default `--inputs full`.
 
 ## Run artifacts
 
-Each UTC-stamped directory under `RUNS_DIR` holds:
+Each UTC-stamped directory under `RUNS_DIR` contains:
 
-- `normalization_stats.json` with train-only preprocessing and the deadband
-  cutoff;
-- `run_config.json` with features, settings, clipped-pixel fractions, and
-  parameter count;
-- `checkpoints/best_model.pt` selected by validation loss;
-- `results.json` with deep-learning and XGBoost metrics, direct metric
-  differences, and pre-balancing prevalence. Existing top-level metric fields
-  continue to describe the deep-learning model;
-- one deep-learning prediction CSV per split plus matching
-  `xgboost_*_predictions.csv` files;
-- `checkpoints/xgboost_model.json` selected by validation log loss;
-- `model_comparison.png` with side-by-side split metrics;
-- loss, probability-distribution, and spatial-accuracy plots.
+| Artifact | Contents |
+|---|---|
+| `normalization_stats.json` | Train-only preprocessing and deadband cutoff |
+| `run_config.json` | Features, settings, clipping rates, and parameter count |
+| `checkpoints/best_model.pt` | CNN checkpoint selected by validation loss |
+| `checkpoints/xgboost_model.json` | XGBoost model selected by validation log loss |
+| `results.json` | Metrics, CNN-minus-XGBoost differences, and prevalence |
+| `*_predictions.csv` | Row-level predictions for each model and split |
+| `model_comparison.png` | Side-by-side split metrics |
+| Other plots | Loss, probability distributions, and spatial accuracy |
 
 Run training on a compute node:
 
