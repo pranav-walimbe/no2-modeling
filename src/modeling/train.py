@@ -10,12 +10,14 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from config import (
     DATASET_DF,
     LABEL_COL,
     MODEL_IMAGE_CLIP_ABS,
+    MODEL_MASK_KEYS,
     NUM_CORES,
     RUNS_DIR,
     STRAT_BASE_DIR,
@@ -44,9 +46,8 @@ from modeling.plot_utils import (
 from modeling.resnet import (
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
-    DEFAULT_MAGNITUDE_DIM,
-    MAGNITUDE_STATISTIC_NAMES,
     NOxModel,
+    RestitutionPredictions,
 )
 from modeling.xgboost import train_xgboost_baseline
 
@@ -61,6 +62,7 @@ DEFAULT_GRADIENT_CLIP_NORM = 5.0
 DEFAULT_SCHEDULER_PATIENCE = 10
 DEFAULT_SCHEDULER_FACTOR = 0.50
 DEFAULT_EARLY_STOP_PATIENCE = 25
+DEFAULT_RESTITUTION_LOSS_WEIGHT = 0.01
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,6 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
     parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
+    parser.add_argument("--restitution-loss-weight", type=float, default=DEFAULT_RESTITUTION_LOSS_WEIGHT)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--inputs", choices=("full", "image", "tabular"), default="full")
     return parser.parse_args()
@@ -119,13 +122,14 @@ def _move_batch(batch: tuple[torch.Tensor, ...], device: torch.device) -> tuple[
 
 
 def train_epoch(
-    model: nn.Module,
+    model: NOxModel,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     scaler: torch.cuda.amp.GradScaler,
     device: torch.device,
     gradient_clip_norm: float,
+    restitution_loss_weight: float,
 ) -> float:
     """Train the model for one epoch.
 
@@ -137,6 +141,7 @@ def train_epoch(
         scaler: Mixed-precision gradient scaler.
         device: Training device.
         gradient_clip_norm: Maximum gradient norm.
+        restitution_loss_weight: Weight applied to the dual causality loss.
 
     Returns:
         Mean training loss per record.
@@ -148,8 +153,11 @@ def train_epoch(
         image, tabular, target, _ = _move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
-            prediction = model(image, tabular)
-            loss = criterion(prediction, target)
+            prediction, restitution_predictions = model.forward_with_restitution(image, tabular)
+            loss = criterion(prediction, target) + restitution_loss_weight * _restitution_loss(
+                restitution_predictions,
+                target,
+            )
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
@@ -157,6 +165,28 @@ def train_epoch(
         scaler.update()
         total_loss += loss.detach().item() * target.numel()
     return total_loss / len(loader.dataset)
+
+
+def _binary_entropy(logits: torch.Tensor) -> torch.Tensor:
+    probabilities = torch.sigmoid(logits)
+    return (F.softplus(logits) - probabilities * logits).mean()
+
+
+def _restitution_loss(
+    predictions: tuple[RestitutionPredictions, ...],
+    target: torch.Tensor,
+) -> torch.Tensor:
+    # Rank restored and rejected information around the normalized baseline
+    loss = target.new_zeros(())
+    for branch in predictions:
+        normalized_entropy = _binary_entropy(branch.normalized)
+        restored_entropy = _binary_entropy(branch.restored)
+        rejected_entropy = _binary_entropy(branch.rejected)
+        loss = loss + F.softplus(restored_entropy - normalized_entropy)
+        loss = loss + F.softplus(normalized_entropy - rejected_entropy)
+        if branch.supervise_restored:
+            loss = loss + F.binary_cross_entropy_with_logits(branch.restored, target)
+    return loss
 
 
 def val_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device) -> float:
@@ -311,9 +341,13 @@ def main() -> None:
         "seed": args.seed,
         "head_dim": args.head_dim,
         "dropout": args.dropout,
-        "magnitude_statistics": list(MAGNITUDE_STATISTIC_NAMES) if load_images else [],
-        "magnitude_embedding_dim": DEFAULT_MAGNITUDE_DIM if load_images else 0,
-        "magnitude_fusion": "pre_head" if load_images else None,
+        "no2_restitution": {
+            "enabled": load_images,
+            "streams": list(MODEL_MASK_KEYS) if load_images else [],
+            "normalization": "masked_instance_norm",
+            "layers_per_stream": 2 if load_images else 0,
+            "causality_loss_weight": args.restitution_loss_weight if load_images else 0.0,
+        },
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip_norm": args.gradient_clip_norm,
@@ -343,6 +377,7 @@ def main() -> None:
             scaler,
             device,
             args.gradient_clip_norm,
+            args.restitution_loss_weight,
         )
         validation_loss = val_epoch(model, eval_loaders["val"], eval_criterion, device)
         scheduler.step(validation_loss)
