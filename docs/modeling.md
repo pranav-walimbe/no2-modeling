@@ -120,24 +120,41 @@ an in-memory pixel archive.
 
 A compact residual CNN plus an MLP scalar branch:
 
+```mermaid
+flowchart LR
+    Current[Current NO2 + mask] -->|encode| CurrentStem[Masked NO2 stem<br/>PartialConv + restitution x2]
+    Delta[Delta NO2 + mask] -->|encode| DeltaStem[Masked NO2 stem<br/>PartialConv + restitution x2]
+    Wind[Wind rasters] -->|encode| WindStem[Conv + GroupNorm]
+    CurrentStem -->|concatenate| StemFusion[1x1 stem fusion]
+    DeltaStem -->|concatenate| StemFusion
+    WindStem -->|concatenate| StemFusion
+    StemFusion -->|extract plume structure| Encoder[Shared residual encoder]
+    Encoder -->|average + maximum pool| ImageProjection[Image projection]
+    Tabular[Tabular features] -->|encode| TabularProjection[Tabular MLP]
+    ImageProjection -->|concatenate| FusionHead[Nonlinear fusion head]
+    TabularProjection -->|concatenate| FusionHead
+    FusionHead -->|classify| Logit[Emissions-change logit]
+```
+
 - Residual stages reduce 48 by 48 images to a 6 by 6 feature map.
 - A 3 by 3 adaptive average pool retains coarse plume location.
 - A global maximum pool preserves localized enhancements that an average
   dilutes.
-- A mask-aware amplitude branch summarizes each train-normalized NO2 channel
-  before GroupNorm using its mean, robust scale, RMS, and signed one-percent
-  tails. A small MLP carries those summaries past every sample-wise
-  normalization layer and joins the main representation immediately before the
-  final classifier. This follows the normalization-and-restitution pattern from
+- The current and delta NO2 stems use separate mask-aware style normalization
+  and restitution modules. Each module applies per-channel InstanceNorm, learns
+  channel gates with a 12-to-4-to-12 MLP, and restores the selected feature
+  residual before the streams join the wind features. Training-only auxiliary
+  heads apply the dual causality objective from
   [Jin et al. (2020)](https://openaccess.thecvf.com/content_CVPR_2020/html/Jin_Style_Normalization_and_Restitution_for_Generalizable_Person_Re-Identification_CVPR_2020_paper.html).
 - The fused image embedding joins the scalar embedding for one classification
   logit.
 
 Normalization choices:
 
-- GroupNorm throughout the image encoder, since it avoids batch-level
-  statistics and holds up when memory pressure forces small batches. See the
-  [Group Normalization paper](https://arxiv.org/abs/1803.08494).
+- Mask-aware InstanceNorm with learned restitution in the current and delta NO2
+  stems. GroupNorm remains in the wind stem and shared image encoder because it
+  avoids batch-level statistics when memory pressure forces small batches. See
+  the [Group Normalization paper](https://arxiv.org/abs/1803.08494).
 - LayerNorm in the MLP projections.
 
 The DenseNet alternative is gone. It duplicated an obsolete input signature and
