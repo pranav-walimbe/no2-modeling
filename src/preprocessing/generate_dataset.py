@@ -66,6 +66,10 @@ SPLIT_PATHS = {
     "val": VAL_RECORDS_CSV,
     "test": TEST_RECORDS_CSV,
 }
+SOURCE_OFFSET_SCHEMA = {
+    "_source_east_km": pl.String,
+    "_source_north_km": pl.String,
+}
 ARRAY_SPLITS = tuple(SPLIT_PATHS)
 PROGRESS_INTERVAL = 1_000
 LEGACY_DATASET_JOB_NAME = "generate-dataset"
@@ -106,6 +110,11 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _scan_split(path: str) -> pl.LazyFrame:
+    # Keep comma-delimited source lists from being inferred as scalar floats
+    return pl.scan_csv(path, try_parse_dates=True, schema_overrides=SOURCE_OFFSET_SCHEMA)
+
+
 def _slurm_array_spec(task_ids: list[int]) -> str:
     # Compress consecutive task IDs into Slurm array ranges
     if not task_ids:
@@ -129,7 +138,7 @@ def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
     splits: dict[str, pl.DataFrame] = {}
     for split, path in split_paths.items():
         splits[split] = (
-            pl.scan_csv(path, try_parse_dates=True).with_row_index(SOURCE_RECORD_INDEX_COL).collect(engine="streaming")
+            _scan_split(path).with_row_index(SOURCE_RECORD_INDEX_COL).collect(engine="streaming")
         )
     return splits
 
@@ -137,7 +146,7 @@ def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
 def _load_shard(task: ShardTask) -> dict[str, pl.DataFrame]:
     # Materialize only the source range assigned to this worker
     frame = (
-        pl.scan_csv(SPLIT_PATHS[task.split], try_parse_dates=True)
+        _scan_split(SPLIT_PATHS[task.split])
         .with_row_index(SOURCE_RECORD_INDEX_COL)
         .slice(task.start, task.size)
         .collect(engine="streaming")
