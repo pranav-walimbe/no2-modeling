@@ -120,6 +120,22 @@ an in-memory pixel archive.
 
 A compact residual CNN plus an MLP scalar branch:
 
+```mermaid
+flowchart LR
+    Current[Current NO2 + mask] -->|encode| CurrentStem[Masked NO2 stem<br/>PartialConv + restitution x2]
+    Delta[Delta NO2 + mask] -->|encode| DeltaStem[Masked NO2 stem<br/>PartialConv + restitution x2]
+    Wind[Wind rasters] -->|encode| WindStem[Conv + GroupNorm]
+    CurrentStem -->|concatenate| StemFusion[1x1 stem fusion]
+    DeltaStem -->|concatenate| StemFusion
+    WindStem -->|concatenate| StemFusion
+    StemFusion -->|extract plume structure| Encoder[Shared residual encoder]
+    Encoder -->|average + maximum pool| ImageProjection[Image projection]
+    Tabular[Tabular features] -->|encode| TabularProjection[Tabular MLP]
+    ImageProjection -->|concatenate| FusionHead[Nonlinear fusion head]
+    TabularProjection -->|concatenate| FusionHead
+    FusionHead -->|classify| Logit[Emissions-change logit]
+```
+
 - Residual stages reduce 48 by 48 images to a 6 by 6 feature map.
 - A 3 by 3 adaptive average pool retains coarse plume location.
 - A global maximum pool preserves localized enhancements that an average
