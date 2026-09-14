@@ -46,6 +46,7 @@ from modeling.plot_utils import (
 from modeling.resnet import (
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
+    DEFAULT_RESTITUTION_HIDDEN_DIM,
     NOxModel,
     RestitutionPredictions,
 )
@@ -346,6 +347,7 @@ def main() -> None:
             "streams": list(MODEL_MASK_KEYS) if load_images else [],
             "normalization": "masked_instance_norm",
             "layers_per_stream": 2 if load_images else 0,
+            "gate_hidden_dim": DEFAULT_RESTITUTION_HIDDEN_DIM if load_images else 0,
             "causality_loss_weight": args.restitution_loss_weight if load_images else 0.0,
         },
         "learning_rate": args.learning_rate,

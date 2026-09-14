@@ -142,8 +142,8 @@ flowchart LR
   dilutes.
 - The current and delta NO2 stems use separate mask-aware style normalization
   and restitution modules. Each module applies per-channel InstanceNorm, learns
-  which part of the removed feature residual is label-relevant, and restores
-  that part before the streams join the wind features. Training-only auxiliary
+  channel gates with a 12-to-4-to-12 MLP, and restores the selected feature
+  residual before the streams join the wind features. Training-only auxiliary
   heads apply the dual causality objective from
   [Jin et al. (2020)](https://openaccess.thecvf.com/content_CVPR_2020/html/Jin_Style_Normalization_and_Restitution_for_Generalizable_Person_Re-Identification_CVPR_2020_paper.html).
 - The fused image embedding joins the scalar embedding for one classification

@@ -10,7 +10,7 @@ from config import MODEL_IMAGE_CHANNELS, MODEL_MASK_KEYS
 
 DEFAULT_HEAD_DIM = 128
 DEFAULT_DROPOUT = 0.30
-DEFAULT_RESTITUTION_REDUCTION = 16
+DEFAULT_RESTITUTION_HIDDEN_DIM = 4
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -102,15 +102,14 @@ class _RestitutionFeatures:
 class MaskedStyleRestitution(nn.Module):
     """Restore label-relevant information removed by masked InstanceNorm."""
 
-    def __init__(self, channels: int, reduction: int = DEFAULT_RESTITUTION_REDUCTION) -> None:
+    def __init__(self, channels: int, hidden_dim: int = DEFAULT_RESTITUTION_HIDDEN_DIM) -> None:
         super().__init__()
-        hidden_channels = max(1, channels // reduction)
         self.weight = nn.Parameter(torch.ones(channels))
         self.bias = nn.Parameter(torch.zeros(channels))
         self.gate = nn.Sequential(
-            nn.Linear(channels, hidden_channels),
+            nn.Linear(channels, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_channels, channels),
+            nn.Linear(hidden_dim, channels),
             nn.Sigmoid(),
         )
 
