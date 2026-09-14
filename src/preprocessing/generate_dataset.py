@@ -22,7 +22,6 @@ from config import (
     HRRR_DIR,
     LABEL_COL,
     NUM_CORES,
-    PLUME_SCORE_FILTER_PERCENTILE,
     TEMPO_DIR,
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
@@ -31,14 +30,8 @@ from config import (
 from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
     CANDIDATE_RASTER_PATH_COL,
-    DELTA_FLUX_CONFIDENCE_COL,
-    DELTA_FLUX_NORM_COL,
     DELTA_NO2_PATH_COL,
-    FLUX_CONFIDENCE_COL,
-    FLUX_LOG_RATIO_PREV_QTR_COL,
-    FLUX_NOX_COL,
     PLUME_SCORE_COL,
-    PREVIOUS_FLUX_NOX_COL,
     PROCESSING_FAILURE_SCHEMA,
     SOURCE_RECORD_INDEX_COL,
     DatasetShardStore,
@@ -57,7 +50,6 @@ from preprocessing.generate_dataset_utils import (
     process_wind_batch,
     scan_batches,
     select_final_records,
-    training_plume_score_threshold,
     wind_batches,
     write_csv_atomic,
     write_json_atomic,
@@ -373,22 +365,6 @@ def _run_record_processing(
     return output_rows
 
 
-def _add_derived_flux_features(frame: pl.DataFrame) -> pl.DataFrame:
-    # Derive current-level and paired-delta features after joining plant history
-    prior_nox_magnitude = pl.col("prev_qtr_avg_nox").abs()
-    return frame.with_columns(
-        (
-            (pl.col(FLUX_NOX_COL) + 1.0)
-            / (pl.col("prev_qtr_avg_nox") + 1.0)
-        )
-        .log()
-        .alias(FLUX_LOG_RATIO_PREV_QTR_COL),
-        pl.when(prior_nox_magnitude > 0)
-        .then((pl.col(FLUX_NOX_COL) - pl.col(PREVIOUS_FLUX_NOX_COL)) / prior_nox_magnitude)
-        .alias(DELTA_FLUX_NORM_COL),
-    )
-
-
 def _write_outputs(
     output_rows: dict[str, list[dict[str, object]]],
     failures: dict[str, list[dict[str, object]]],
@@ -405,36 +381,26 @@ def _write_outputs(
             how="inner",
             maintain_order="left",
         ).sort(SOURCE_RECORD_INDEX_COL)
-        candidates_by_split[split] = _add_derived_flux_features(candidates)
+        candidates_by_split[split] = candidates
         failure_frames[split] = pl.DataFrame(
             sorted(failures[split], key=lambda row: int(row["record_index"])),
             schema=PROCESSING_FAILURE_SCHEMA,
         )
 
-    if "train" not in candidates_by_split:
-        raise ValueError("Plume-score filtering requires generated training candidates")
-    plume_score_threshold = training_plume_score_threshold(candidates_by_split["train"])
-
     prepared_outputs: dict[str, tuple[pl.DataFrame, dict[str, object], pl.DataFrame]] = {}
     for split, candidates in candidates_by_split.items():
-        plume_filtered = candidates.filter(
-            pl.col(PLUME_SCORE_COL).is_finite() & (pl.col(PLUME_SCORE_COL) >= plume_score_threshold)
-        )
-        output_frame = select_final_records(plume_filtered)
+        output_frame = select_final_records(candidates)
         selected_coverage = coverage_selection_summary(output_frame)
+        finite_plume_records = candidates.filter(pl.col(PLUME_SCORE_COL).is_finite().fill_null(False)).height
         eligible_by_class = {
-            str(label): plume_filtered.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)
+            str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)
         }
         selection_size = {
             "actual_size": output_frame.height,
-            "discarded_for_plume_score": candidates.height - plume_filtered.height,
-            "discarded_for_balance": plume_filtered.height - output_frame.height,
+            "discarded_for_balance": candidates.height - output_frame.height,
             "eligible_by_class": eligible_by_class,
         }
-        print(
-            f"[{split}] {candidates.height:,} generated; {plume_filtered.height:,} passed plume score; "
-            f"{output_frame.height:,} selected"
-        )
+        print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
         if selection_size["discarded_for_balance"]:
             print(f"[{split}] discarded {selection_size['discarded_for_balance']:,} records for class balance")
         print(
@@ -444,17 +410,15 @@ def _write_outputs(
         classification_report = {
             "split": split,
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
-            "plume_score_filter": {
-                "threshold_source_split": "train",
-                "percentile": PLUME_SCORE_FILTER_PERCENTILE,
-                "threshold": plume_score_threshold,
-                "retention": classification_summary(candidates, plume_filtered),
+            "plume_score_diagnostic": {
+                "selection_role": "diagnostic_only",
+                "finite_records": finite_plume_records,
+                "missing_records": candidates.height - finite_plume_records,
             },
             "selection_size": selection_size,
-            "final_balance": classification_summary(plume_filtered, output_frame),
+            "final_balance": classification_summary(candidates, output_frame),
             "coverage_selection": {
                 "generated": coverage_selection_summary(candidates),
-                "after_plume_score": coverage_selection_summary(plume_filtered),
                 "selected": selected_coverage,
             },
         }
@@ -469,25 +433,8 @@ def _write_outputs(
             str(Path(candidate_path).relative_to(DATASET_DIR))
             for candidate_path in output_frame[CANDIDATE_RASTER_PATH_COL].to_list()
         ]
-        output_frame = (
-            output_frame.drop("_source_east_km", "_source_north_km", strict=False)
-            .with_columns(pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String))
-            .select(
-                pl.exclude(
-                    FLUX_NOX_COL,
-                    PREVIOUS_FLUX_NOX_COL,
-                    FLUX_LOG_RATIO_PREV_QTR_COL,
-                    DELTA_FLUX_NORM_COL,
-                    FLUX_CONFIDENCE_COL,
-                    DELTA_FLUX_CONFIDENCE_COL,
-                ),
-                FLUX_NOX_COL,
-                PREVIOUS_FLUX_NOX_COL,
-                FLUX_LOG_RATIO_PREV_QTR_COL,
-                DELTA_FLUX_NORM_COL,
-                FLUX_CONFIDENCE_COL,
-                DELTA_FLUX_CONFIDENCE_COL,
-            )
+        output_frame = output_frame.drop("_source_east_km", "_source_north_km", strict=False).with_columns(
+            pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String)
         )
         write_csv_atomic(
             output_frame.drop(SOURCE_RECORD_INDEX_COL, CANDIDATE_RASTER_PATH_COL),

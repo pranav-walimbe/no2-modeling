@@ -28,9 +28,7 @@ from config import (
     MIN_DELTA_NO2_FINITE_FRACTION,
     MODEL_IMAGE_KEYS,
     MODEL_MASK_KEYS,
-    PLUME_SCORE_FILTER_PERCENTILE,
 )
-from preprocessing.flux_model import estimate_aggregate_flux
 from preprocessing.regrid import (
     AoiGrid,
     build_granule_spatial_index,
@@ -47,12 +45,6 @@ CURRENT_MASK_NAME, DELTA_MASK_NAME = MODEL_MASK_KEYS
 CURRENT_FINITE_FRACTION_COL = "current_finite_fraction"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
-FLUX_NOX_COL = "flux_nox"
-PREVIOUS_FLUX_NOX_COL = "previous_flux_nox"
-FLUX_CONFIDENCE_COL = "flux_confidence"
-DELTA_FLUX_CONFIDENCE_COL = "delta_flux_confidence"
-FLUX_LOG_RATIO_PREV_QTR_COL = "flux_log_ratio_prev_qtr"
-DELTA_FLUX_NORM_COL = "delta_flux_norm"
 PLUME_SCORE_COL = "plume_score"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
@@ -72,10 +64,6 @@ TABULAR_FEATURE_NAMES = (
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
-    FLUX_NOX_COL,
-    PREVIOUS_FLUX_NOX_COL,
-    FLUX_CONFIDENCE_COL,
-    DELTA_FLUX_CONFIDENCE_COL,
     *HRRR_FIELDS.values(),
 )
 SOURCE_RECORD_INDEX_COL = "_source_record_index"
@@ -320,22 +308,6 @@ def select_final_records(frame: pl.DataFrame) -> pl.DataFrame:
         class_records = frame.filter(pl.col(LABEL_COL) == label)
         selected_classes.append(_rank_final_records(class_records).head(class_size))
     return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
-
-
-def training_plume_score_threshold(frame: pl.DataFrame) -> float:
-    """Calculate the shared plume-score cutoff from training records.
-
-    Args:
-        frame: Successfully generated training candidates.
-
-    Returns:
-        Linear 40th-percentile plume score.
-    """
-    scores = frame.select(PLUME_SCORE_COL).filter(pl.col(PLUME_SCORE_COL).is_finite())
-    if scores.is_empty():
-        raise ValueError("Training candidates contain no finite plume scores")
-    threshold = scores[PLUME_SCORE_COL].quantile(PLUME_SCORE_FILTER_PERCENTILE / 100, interpolation="linear")
-    return float(threshold)
 
 
 def _rank_final_records(frame: pl.DataFrame) -> pl.DataFrame:
@@ -855,8 +827,7 @@ def derive_raster_features(
         source_north_km: Facility offsets north of the AOI centre.
 
     Returns:
-        Model raster arrays and their plume, cloud, quality, and uncertainty
-        summaries.
+        Model raster arrays and their plume and retrieval-quality diagnostics.
     """
     current_wind, weather_features = extract_wind_cache(current_wind_path)
     previous_wind, _ = extract_wind_cache(previous_wind_path)
@@ -913,24 +884,6 @@ def derive_raster_features(
             source_east_km,
             source_north_km,
         )
-        paired_current_smoothed = np.where(paired_valid, current_smoothed, np.nan)
-        paired_previous_smoothed = np.where(paired_valid, previous_smoothed, np.nan)
-        current_flux = estimate_aggregate_flux(
-            paired_current_smoothed,
-            np.asarray(current["retrieval_uncertainty"], dtype=np.float64),
-            current_wind[WIND_U_RASTER_NAME],
-            current_wind[WIND_V_RASTER_NAME],
-            source_east_km,
-            source_north_km,
-        )
-        previous_flux = estimate_aggregate_flux(
-            paired_previous_smoothed,
-            np.asarray(previous["retrieval_uncertainty"], dtype=np.float64),
-            current_wind[WIND_U_RASTER_NAME],
-            current_wind[WIND_V_RASTER_NAME],
-            source_east_km,
-            source_north_km,
-        )
         delta_no2 = np.full_like(current_no2, np.nan)
         np.subtract(current_smoothed, previous_smoothed, out=delta_no2, where=paired_valid)
 
@@ -947,10 +900,6 @@ def derive_raster_features(
             MEAN_RETRIEVAL_UNCERTAINTY_COL: _paired_mean(
                 current["retrieval_uncertainty"], previous["retrieval_uncertainty"], paired_valid
             ),
-            FLUX_NOX_COL: current_flux.flux_nox,
-            PREVIOUS_FLUX_NOX_COL: previous_flux.flux_nox,
-            FLUX_CONFIDENCE_COL: current_flux.confidence,
-            DELTA_FLUX_CONFIDENCE_COL: min(current_flux.confidence, previous_flux.confidence),
             **weather_features,
         }
     rasters = {
