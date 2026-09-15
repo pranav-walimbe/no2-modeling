@@ -115,30 +115,35 @@ def _model_results(split_frames: dict[str, pd.DataFrame]) -> dict[str, object]:
     return results
 
 
-def _model_comparison(model_results: dict[str, dict[str, object]]) -> dict[str, object]:
-    # Place both scores and their deep-learning difference beside each other
-    deep_learning = model_results["deep_learning"]["splits"]
-    xgboost = model_results["xgboost"]["splits"]
+def _model_comparison(
+    model_results: dict[str, dict[str, object]],
+    primary_model_name: str,
+    comparison_model_name: str,
+) -> dict[str, object]:
+    # Place both scores and the primary model advantage beside each other
+    primary = model_results[primary_model_name]["splits"]
+    comparison = model_results[comparison_model_name]["splits"]
+
     def metric_values(split: str, metric: str) -> dict[str, float | None]:
-        deep_value = deep_learning[split][metric]
-        xgboost_value = xgboost[split][metric]
-        difference = None if deep_value is None or xgboost_value is None else deep_value - xgboost_value
+        primary_value = primary[split][metric]
+        comparison_value = comparison[split][metric]
+        difference = None if primary_value is None or comparison_value is None else primary_value - comparison_value
         return {
-            "deep_learning": deep_value,
-            "xgboost": xgboost_value,
-            "deep_learning_minus_xgboost": difference,
+            primary_model_name: primary_value,
+            comparison_model_name: comparison_value,
+            f"{primary_model_name}_minus_{comparison_model_name}": difference,
         }
 
-    return {
-        split: {metric: metric_values(split, metric) for metric in MODEL_COMPARISON_METRICS}
-        for split in deep_learning
-    }
+    return {split: {metric: metric_values(split, metric) for metric in MODEL_COMPARISON_METRICS} for split in primary}
 
 
 def save_results(
     model_frames: dict[str, dict[str, pd.DataFrame]],
     classification_summaries: dict[str, object],
     run_dir: str | Path,
+    *,
+    primary_model_name: str,
+    comparison_model_name: str | None = None,
 ) -> None:
     """Save classification metrics and row-level predictions.
 
@@ -146,15 +151,23 @@ def save_results(
         model_frames: Row-level predictions by model and data split.
         classification_summaries: Pre-balancing retention and prevalence data.
         run_dir: Model-run output directory.
+        primary_model_name: Model copied into the top-level result summary.
+        comparison_model_name: Baseline model used to calculate differences.
     """
     model_results = {name: _model_results(split_frames) for name, split_frames in model_frames.items()}
-    deep_learning_results = model_results["deep_learning"]
+    primary_results = model_results[primary_model_name]
     results: dict[str, object] = {
-        "splits": deep_learning_results["splits"],
-        "test_absolute_delta_tertiles": deep_learning_results["test_absolute_delta_tertiles"],
+        "primary_model": primary_model_name,
+        "splits": primary_results["splits"],
+        "test_absolute_delta_tertiles": primary_results["test_absolute_delta_tertiles"],
         "models": model_results,
     }
-    results["comparison"] = _model_comparison(model_results)
+    if comparison_model_name is not None:
+        results["comparison"] = _model_comparison(
+            model_results,
+            primary_model_name,
+            comparison_model_name,
+        )
     results["dataset_classification_summaries"] = classification_summaries
 
     output_dir = Path(run_dir)
@@ -164,7 +177,7 @@ def save_results(
         for split, frame in split_frames.items():
             filename = (
                 f"{split}_predictions.csv"
-                if model_name == "deep_learning"
+                if model_name == primary_model_name
                 else f"{model_name}_{split}_predictions.csv"
             )
             frame.to_csv(output_dir / filename, index=False)
