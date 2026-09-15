@@ -77,11 +77,12 @@ DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root out
 DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # raster bundles for direct monolithic generation
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
 DATASET_TEMPO_CACHE_DIR = os.path.join(DATASET_DIR, "tempo-cache")  # persistent AOI-scan regridding cache
-DATASET_WIND_CACHE_DIR = os.path.join(DATASET_DIR, "wind-cache")  # persistent aligned AOI-hour wind rasters
+DATASET_WEATHER_CACHE_DIR = os.path.join(DATASET_DIR, "weather-cache")  # persistent aligned AOI-hour weather rasters
 IMG_SIZE = 24  # image size in pixels (24x24)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
-MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan coverage floor
-MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor
+MIN_TIMESTEP_NO2_FINITE_FRACTION = 0.95  # inclusive coverage floor applied independently to every timestep
+HOTSPOT_WINDOW_SIZE = 3  # odd source-centred square required to have complete NO2 support
+MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applied to every timestep
 LABEL_COL = "delta_nox_class"
 EMA_DELTA_THRESHOLD = 100.0  # least absolute current-minus-previous effective NOx retained
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
@@ -106,7 +107,6 @@ MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular a
     "total_nameplate_capacity_mw",
     "avg_heat_input",
     "avg_pwr_gen",
-    "temperature_2m_k",
 )
 MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to sine and cosine
 

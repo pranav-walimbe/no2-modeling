@@ -83,6 +83,7 @@ OUTPUT_COLUMNS = [
     "total_nameplate_capacity_mw",
     "_source_east_km",
     "_source_north_km",
+    "_source_unit_count",
     "date",
     "hour",
     "emissions_hour_utc",

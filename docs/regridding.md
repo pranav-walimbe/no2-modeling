@@ -50,36 +50,33 @@ Caching behavior:
 | Cache | Key | Batching | Refresh flag |
 |---|---|---|---|
 | TEMPO scans | AOI and source granules | Scans sharing a granule set run together, so a worker opens each large NetCDF granule once for several AOIs | `--refresh-tempo` |
-| Aligned wind | AOI and hour | HRRR files are grouped so each full grid is read once for several AOIs | `--refresh-wind` |
+| Aligned weather | AOI and hour | HRRR files are grouped so each full grid is read once for several AOIs | `--refresh-weather` |
 
 `--refresh-cache` fully deletes both configured cache directories before
 rebuilding entries referenced by the selected split. `--refresh-tempo` and
-`--refresh-wind` fully delete only their respective cache. Refresh must run as a
+`--refresh-weather` fully delete only their respective cache. Refresh must run as a
 single non-array process because all split jobs share these directories. The
-TEMPO rebuild includes current and previous-hour scans. Individual
+TEMPO rebuild includes all configured sequence scans. Individual
 cache files are still written atomically.
 
 Pass the matching flag after changing TEMPO processing or wind alignment.
 
-Each successful model record persists one compressed NPZ holding four aligned
-`float32` arrays and two `uint8` masks:
+Each successful model record persists one compressed NPZ holding five
+oldest-to-newest arrays with shape `T x 24 x 24`:
 
-- `current_no2`, directly regridded current NO2 on native QA-passing support;
-- `delta_no2`, current minus previous directly regridded NO2 on their support intersection;
+- `no2`, directly regridded NO2 on each timestep's native QA-passing support;
+- `no2_mask`, an independent `uint8` validity mask for every NO2 timestep;
+- `temperature_2m_k`, bilinearly sampled temperature at AOI cell centers;
 - `wind_u_80m_mps`, geographic eastward wind;
-- `wind_v_80m_mps`, geographic northward wind;
-- `current_no2_mask` and `delta_no2_mask`, independent binary support for the
-  two NO2 arrays.
+- `wind_v_80m_mps`, geographic northward wind.
 
-Every row in the companion split CSV carries its NPZ path in `delta_no2_path`
+Every row in the companion split CSV carries its NPZ path in `raster_bundle_path`
 plus these derived features:
 
-- `mean_weighted_cloud_fraction` and `mean_good_quality_fraction`, each averaged
-  over both scans at their original paired-valid cells;
-- `mean_retrieval_uncertainty`, averaged over both scans at their original
-  paired-valid cells;
-- `temperature_2m_k` and `boundary_layer_height_m`, bilinearly interpolated at
-  the AOI centroid.
+- `no2_finite_fraction_t0` through `no2_finite_fraction_t{T-1}`;
+- `min_no2_finite_fraction`, used to rank otherwise eligible records;
+- cloud, native-pixel quality, and retrieval-uncertainty summaries over each
+  timestep's valid NO2 support.
 
 Wind alignment, on the 3 km HRRR grid NOAA describes:
 
@@ -87,8 +84,8 @@ Wind alignment, on the 3 km HRRR grid NOAA describes:
 2. Bilinearly interpolate the wind components.
 3. Rotate the grid-relative values to geographic east and north before caching.
 
-Current and previous scans retain their directly regridded values. Coverage is
-validated on those values before the delta is formed.
+Every scan retains its directly regridded values. Every timestep must have at
+least 95 percent finite NO2 coverage or the complete record is rejected.
 
 See the [NOAA Global Systems Laboratory HRRR overview](https://rapidrefresh.noaa.gov/).
 
@@ -106,10 +103,12 @@ pairs. Production uses:
 - no positive accepted-overlap floor;
 - no additional effective-sample floor.
 
-Dataset generation requires greater than 95% current coverage and greater than
-80% support for the hourly delta. It retains missing cells and
-selects eligible records through temporal and AOI round-robin with hourly paired
-coverage as the sole quality rank. Plume, cloud, uncertainty, and quality
+Dataset generation requires at least 95% finite NO2 coverage independently at
+every configured timestep. It also requires complete coverage in the 3 by 3
+window centred on the highest-unit source cell in every timestep. It retains
+missing cells elsewhere and selects eligible records through temporal and AOI
+round-robin with minimum sequence coverage as the sole quality rank. Hotspot,
+cloud, uncertainty, and quality
 summaries remain diagnostics and rank nothing.
 
 Measured tradeoffs:
