@@ -213,9 +213,7 @@ array such as `0-31%14`.
 
 Every successful split-CSV row carries its relative `delta_no2_path`, paired
 cloud, quality and retrieval-uncertainty means, and centre-interpolated HRRR
-temperature and boundary-layer height. The standalone flux estimator and its
-analysis scripts remain available, but dataset generation does not run the
-estimator or publish flux-derived columns.
+temperature and boundary-layer height.
 
 Running the splits:
 

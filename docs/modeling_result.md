@@ -104,7 +104,7 @@ No measurable accuracy benefit appears in the controlled ablation.
 | Reference with `delta_flux_norm` | 0.6443 | 0.6784 | 0.6577 | 0.7107 |
 | Flux scalar disabled | **0.6470** | **0.6795** | 0.6577 | **0.7133** |
 
-Removing the scalar leaves test accuracy unchanged and improves test AUC by 0.26 points and log loss by 0.0020. The AOI-cluster AUC interval is +0.14 to +0.36 points, conditional on this seed. `delta_flux_norm` is now absent from dataset generation and model inputs. The standalone flux estimator remains available for separate analysis.
+Removing the scalar leaves test accuracy unchanged and improves test AUC by 0.26 points and log loss by 0.0020. The AOI-cluster AUC interval is +0.14 to +0.36 points, conditional on this seed. `delta_flux_norm` is absent from dataset generation and model inputs, and the standalone estimator has been removed.
 
 ### Would scan-time interpolation help?
 
