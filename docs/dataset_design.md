@@ -45,18 +45,8 @@ Before any image processing, a candidate needs:
 - finite prior-quarter power generation and distance to a city of 500,000 or
   more people for priority sampling.
 
-After metadata eligibility, stratification calculates the global 1st and 99th
-percentiles of finite aggregate AOI-hour `nox_mass` and retains records inside
-the inclusive bounds. Coal share is not an eligibility constraint, so gas and
-mixed-fuel AOIs remain candidates. `NOX_LOWER_PERCENTILE` and
-`NOX_UPPER_PERCENTILE` configure the cutoffs. The fitted values and retention
-rule are written to the stratification summary.
-
-After the fixed absolute deadband, stratification calculates
-`prev_qtr_rel_delta` as `abs(delta_nox_mass) / abs(prev_qtr_avg_nox)`. It
-requires a value of at least the configured `MIN_PREV_QTR_REL_DELTA`, currently
-0.10. The dataframe retains the metric for diagnostics, but the model does not
-receive it or `prev_qtr_avg_nox` as an input.
+Coal share is not an eligibility constraint, so gas and mixed-fuel AOIs remain
+candidates.
 
 ## Label and tabular features
 
@@ -71,9 +61,9 @@ All joins use UTC:
 - The enriched archive keeps the source local-standard fields, each facility's
   timezone, and its standard offset for auditability.
 
-The target uses raw `delta_nox_mass`:
+The target uses the current-minus-previous effective EMA emissions difference:
 
-- Read the fixed 100 lb cutoff from the `DELTA_THRESHOLD` configuration
+- Read the fixed 100 lb cutoff from the `EMA_DELTA_THRESHOLD` configuration
   constant.
 - Remove records with absolute change at or below that cutoff in every split.
 - Assign class 0 to negative changes and class 1 to positive changes.
@@ -151,9 +141,6 @@ Before raster generation, apply these rules to every split:
 - Require each AOI to sit at least 50 km from a major city.
 - Average each unit's previous-quarter output, then sum the unit averages by AOI.
 - Retain only AOIs where coal units supply more than 50 percent of that total.
-- Retain records within the configured aggregate AOI-hour NOx percentile bounds.
-- Require deadband-eligible records to meet the configured
-  `MIN_PREV_QTR_REL_DELTA` floor.
 - Keep every record that passes the eligibility rules.
 
 ## Final raster selection

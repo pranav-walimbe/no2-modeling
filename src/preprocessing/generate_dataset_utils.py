@@ -53,7 +53,6 @@ SELECTION_HELPER_COLUMNS = (
 )
 HRRR_FIELDS = {
     "2t": "temperature_2m_k",
-    "blh": "boundary_layer_height_m",
 }
 TABULAR_FEATURE_NAMES = (
     CURRENT_FINITE_FRACTION_COL,
@@ -648,7 +647,7 @@ def _read_hrrr_fields(path: str) -> tuple[_HrrrGrid, dict[str, np.ndarray]]:
         while (message := codes_grib_new_from_file(source)) is not None:
             try:
                 short_name = str(codes_get(message, "shortName"))
-                if short_name not in {"2t", "u", "v", "blh"}:
+                if short_name not in {"2t", "u", "v"}:
                     continue
                 if grid is None:
                     grid = _hrrr_grid(message)

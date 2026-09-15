@@ -18,13 +18,13 @@ observations.
 
 ## Prediction target
 
-- Apply the fixed symmetric 100 lb `DELTA_THRESHOLD` cutoff on
-  `abs(delta_nox_mass)`.
+- Apply the fixed symmetric 100 lb `EMA_DELTA_THRESHOLD` cutoff on the absolute
+  current-minus-previous effective EMA emissions difference.
 - Use the same cutoff for train, validation, test, and inference.
 - Remove records inside the closed deadband.
 - Label negative changes as 0 and positive changes as 1.
 - Balance each split to equal label counts after raster QC.
-- Preserve raw `delta_nox_mass` for reporting, never as an input.
+- Preserve the continuous EMA difference for reporting, never as an input.
 
 ## Inputs and leakage policy
 
