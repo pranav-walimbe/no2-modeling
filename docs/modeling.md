@@ -130,7 +130,7 @@ that reduce each 24 by 24 timestep to 6 by 6, then a 96-channel ConvGRU fuses th
 ordered sequence. Global average and maximum pooling produce a 128-value raster
 embedding.
 
-The tabular branch is a 64-value hidden layer followed by a 32-value embedding
+The tabular branch is a 32-value hidden layer followed by a 16-value embedding
 and its own Bernoulli classifier. It is trained independently, selected on
 validation loss, and frozen. During fused training, the raster embedding and
 frozen tabular embedding feed a nonlinear head. The head returns one logit; its
