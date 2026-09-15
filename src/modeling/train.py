@@ -24,7 +24,6 @@ from modeling.convgru import (
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
     NOxModel,
-    TabularMLP,
 )
 from modeling.dataset import (
     LABEL_MODE_COL,
@@ -41,13 +40,13 @@ from modeling.eval_utils import (
     TRUE_CLASS_COL,
     save_results,
 )
+from modeling.mlp import TabularMLP
 from modeling.plot_utils import (
     plot_class_probabilities,
     plot_loss_curve,
     plot_model_comparison,
     plot_spatial_accuracy,
 )
-from modeling.xgboost import train_xgboost_baseline
 
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 300
@@ -360,21 +359,28 @@ def main() -> None:
     }
     tabular_model: TabularMLP | None = None
     tabular_run: dict[str, object] | None = None
+    tabular_split_frames: dict[str, pd.DataFrame] | None = None
     if args.inputs in ("full", "tabular"):
         tabular_model = TabularMLP(len(MODEL_FEATURE_NAMES)).to(device)
         if args.inputs == "full":
-            tabular_datasets = {split: NOxDataset(split, stats, load_images=False) for split in ("train", "val")}
+            tabular_datasets = {
+                split: NOxDataset(split, stats, load_images=False) for split in ("train", "val", "test")
+            }
             tabular_train_loader = _loader(tabular_datasets["train"], shuffle=True, args=args, device=device)
-            tabular_val_loader = _loader(tabular_datasets["val"], shuffle=False, args=args, device=device)
+            tabular_eval_loaders = {
+                split: _loader(dataset, shuffle=False, args=args, device=device)
+                for split, dataset in tabular_datasets.items()
+            }
         else:
+            tabular_datasets = datasets
             tabular_train_loader = train_loader
-            tabular_val_loader = eval_loaders["val"]
+            tabular_eval_loaders = eval_loaders
         tabular_path = checkpoint_dir / ("best_model.pt" if args.inputs == "tabular" else "best_tabular_mlp.pt")
         print(f"Pretraining {tabular_model.num_params():,}-parameter tabular MLP on {device}")
         tabular_train_losses, tabular_val_losses, tabular_best_loss = fit_model(
             tabular_model,
             tabular_train_loader,
-            tabular_val_loader,
+            tabular_eval_loaders["val"],
             device=device,
             epochs=args.tabular_epochs,
             learning_rate=args.tabular_learning_rate,
@@ -397,8 +403,12 @@ def main() -> None:
             "best_validation_loss": tabular_best_loss,
             "frozen_during_fusion": args.inputs == "full",
         }
+        tabular_split_frames = {}
+        for split, loader in tabular_eval_loaders.items():
+            logits, indices = run_inference(tabular_model, loader, device)
+            tabular_split_frames[split] = _prediction_frame(tabular_datasets[split], logits, indices)
         if args.inputs == "full":
-            del tabular_train_loader, tabular_val_loader, tabular_datasets
+            del tabular_train_loader, tabular_eval_loaders, tabular_datasets
 
     best_path = checkpoint_dir / "best_model.pt"
     if args.inputs == "tabular":
@@ -460,31 +470,32 @@ def main() -> None:
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
-    split_frames = {}
-    for split, loader in eval_loaders.items():
-        logits, indices = run_inference(model, loader, device)
-        split_frames[split] = _prediction_frame(datasets[split], logits, indices)
+    if args.inputs == "tabular":
+        assert tabular_split_frames is not None
+        split_frames = tabular_split_frames
+    else:
+        split_frames = {}
+        for split, loader in eval_loaders.items():
+            logits, indices = run_inference(model, loader, device)
+            split_frames[split] = _prediction_frame(datasets[split], logits, indices)
 
     plot_class_probabilities(split_frames, run_dir)
     plot_spatial_accuracy(split_frames, run_dir)
-    print("Training XGBoost tabular baseline")
-    xgboost_run = train_xgboost_baseline(
-        datasets,
-        checkpoint_dir / "xgboost_model.json",
-        seed=args.seed,
-        workers=args.workers,
+    primary_model_name = {"full": "convgru_mlp", "image": "convgru", "tabular": "mlp"}[args.inputs]
+    model_frames = {primary_model_name: split_frames}
+    comparison_model_name = None
+    if args.inputs == "full":
+        assert tabular_split_frames is not None
+        model_frames["mlp"] = tabular_split_frames
+        comparison_model_name = "mlp"
+        plot_model_comparison(model_frames, run_dir)
+    save_results(
+        model_frames,
+        classification_summaries,
+        run_dir,
+        primary_model_name=primary_model_name,
+        comparison_model_name=comparison_model_name,
     )
-    run_config["xgboost"] = {
-        **xgboost_run.config.to_dict(),
-        "feature_names": list(xgboost_run.feature_names),
-        "best_iteration": xgboost_run.best_iteration,
-        "best_validation_logloss": xgboost_run.best_validation_logloss,
-    }
-    with (run_dir / "run_config.json").open("w") as destination:
-        json.dump(run_config, destination, indent=2)
-    model_frames = {"deep_learning": split_frames, "xgboost": xgboost_run.split_frames}
-    plot_model_comparison(model_frames, run_dir)
-    save_results(model_frames, classification_summaries, run_dir)
 
 
 if __name__ == "__main__":

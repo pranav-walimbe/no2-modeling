@@ -250,7 +250,8 @@ normalization statistics on the training split alone and records clipped
 valid-pixel fractions by channel and split. A tabular MLP is trained first and
 then frozen while its embedding is fused with the mask-aware ConvGRU raster
 encoder. The model returns a Bernoulli probability for the emissions-change
-class. See `docs/modeling.md` for the full contract.
+class. The report compares that fused model directly with the selected MLP
+checkpoint on the same records. See `docs/modeling.md` for the full contract.
 
 ### Regeneration
 

@@ -1,15 +1,14 @@
-"""Mask-aware ConvGRU and tabular models for emissions-change prediction."""
+"""Mask-aware ConvGRU model for emissions-change prediction."""
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from config import MODEL_IMAGE_CHANNELS
+from modeling.mlp import TabularMLP
 
 DEFAULT_HEAD_DIM = 128
 DEFAULT_DROPOUT = 0.20
-TABULAR_HIDDEN_DIM = 32
-TABULAR_EMBEDDING_DIM = 16
 VISION_EMBEDDING_DIM = 128
 CONVGRU_HIDDEN_CHANNELS = 96
 
@@ -107,38 +106,6 @@ class ConvGRUCell(nn.Module):
         reset, update = self.gates(torch.cat((inputs, hidden), dim=1)).sigmoid().chunk(2, dim=1)
         candidate = self.candidate(torch.cat((inputs, reset * hidden), dim=1)).tanh()
         return (1.0 - update) * hidden + update * candidate
-
-
-class TabularMLP(nn.Module):
-    """Independently trainable tabular classifier with a reusable embedding."""
-
-    def __init__(
-        self,
-        n_features: int,
-        hidden_dim: int = TABULAR_HIDDEN_DIM,
-        embedding_dim: int = TABULAR_EMBEDDING_DIM,
-    ) -> None:
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.encoder = nn.Sequential(
-            nn.Linear(n_features, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(inplace=True),
-            nn.Linear(hidden_dim, embedding_dim),
-            nn.LayerNorm(embedding_dim),
-            nn.SiLU(inplace=True),
-        )
-        self.classifier = nn.Linear(embedding_dim, 1)
-
-    def encode(self, tabular: torch.Tensor) -> torch.Tensor:
-        return self.encoder(tabular)
-
-    def forward(self, image: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
-        del image
-        return self.classifier(self.encode(tabular)).squeeze(1)
-
-    def num_params(self) -> int:
-        return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
 
 
 class NOxModel(nn.Module):

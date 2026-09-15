@@ -169,7 +169,8 @@ Where settings live:
 |---|---|
 | `config.py` | Shared data contract: paths, raster keys and channels, image clipping, input-feature definitions |
 | `modeling/train.py` | Training defaults |
-| `modeling/convgru.py` | Architecture defaults |
+| `modeling/convgru.py` | Mask-aware spatial and temporal raster model |
+| `modeling/mlp.py` | Compact tabular model and embedding dimensions |
 
 Training CLI flags expose the last two, which keeps preprocessing and collection
 code independent of any single run while each run still records its resolved
@@ -218,7 +219,6 @@ non-overlapping plant regions rather than memorization of known AOIs.
 | Comparison | Question |
 |---|---|
 | Constant and prevalence classifiers | Does the model beat trivial predictions? |
-| XGBoost | Does the ConvGRU beat a strong tabular baseline? |
 | Tabular-only MLP | Does image data add value to the neural model? |
 | Raster-only ConvGRU | Does scalar context add value? |
 | Full fused model | Does fusion improve validation loss? |
@@ -228,7 +228,9 @@ Report every comparison on the same frozen validation and test records. The full
 model earns its place only when image information improves held-out-AOI error
 and the gain extends past unusually clear or high-plume scenes. The trainer
 exposes these ablations through `--inputs tabular`, `--inputs image`, and the
-default `--inputs full`.
+default `--inputs full`. The default run reports the fused model minus the exact
+validation-selected MLP checkpoint that is frozen for fusion, isolating the
+incremental value of the raster branch without changing tabular models.
 
 ## Run artifacts
 
@@ -240,8 +242,7 @@ Each UTC-stamped directory under `RUNS_DIR` contains:
 | `run_config.json` | Features, settings, clipping rates, and parameter count |
 | `checkpoints/best_model.pt` | Selected ConvGRU-fusion or ablation checkpoint |
 | `checkpoints/best_tabular_mlp.pt` | Independently selected MLP used by the fused model |
-| `checkpoints/xgboost_model.json` | XGBoost model selected by validation log loss |
-| `results.json` | Metrics, ConvGRU-minus-XGBoost differences, and prevalence |
+| `results.json` | Metrics, ConvGRU-plus-MLP minus MLP differences, and prevalence |
 | `*_predictions.csv` | Row-level predictions for each model and split |
 | `model_comparison.png` | Side-by-side split metrics |
 | Other plots | Loss, probability distributions, and spatial accuracy |

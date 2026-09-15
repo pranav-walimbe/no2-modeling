@@ -14,7 +14,11 @@ from modeling.eval_utils import (
 )
 
 SPLIT_ORDER = ("train", "val", "test")
-MODEL_DISPLAY_NAMES = {"deep_learning": "Deep learning", "xgboost": "XGBoost"}
+MODEL_DISPLAY_NAMES = {
+    "convgru_mlp": "ConvGRU + MLP",
+    "convgru": "ConvGRU",
+    "mlp": "MLP",
+}
 COMPARISON_METRIC_NAMES = {
     "accuracy": "Accuracy",
     "balanced_accuracy": "Balanced accuracy",
@@ -109,7 +113,7 @@ def plot_spatial_accuracy(split_frames: dict[str, pd.DataFrame], run_dir: str | 
 
 
 def plot_model_comparison(model_frames: dict[str, dict[str, pd.DataFrame]], run_dir: str | Path) -> None:
-    """Compare deep-learning and XGBoost metrics on every frozen split.
+    """Compare model metrics on every frozen split.
 
     Args:
         model_frames: Row-level predictions by model and data split.
