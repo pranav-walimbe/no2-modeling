@@ -243,13 +243,14 @@ Running the splits:
 python -u -m modeling.train
 ```
 
-The trainer reads current NO2, hourly delta NO2, wind, and two
-validity masks from each selected NPZ on demand. It derives local mean solar
-hour from the stored UTC hour and AOI longitude. It fits memory-bounded robust
-NO2 normalization statistics on the training split alone and records clipped
-valid-pixel fractions by channel and split. It then predicts whether raw
-delta-NOx falls below or above zero outside the fixed deadband and reports
-classification metrics. See `docs/modeling.md` for the full contract.
+The trainer reads the hourly NO2, validity-mask, temperature, and geographic
+wind sequences from each selected NPZ on demand. It derives local mean solar
+hour from the stored UTC hour and AOI longitude. It fits memory-bounded
+normalization statistics on the training split alone and records clipped
+valid-pixel fractions by channel and split. A tabular MLP is trained first and
+then frozen while its embedding is fused with the mask-aware ConvGRU raster
+encoder. The model returns a Bernoulli probability for the emissions-change
+class. See `docs/modeling.md` for the full contract.
 
 ### Regeneration
 

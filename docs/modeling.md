@@ -1,18 +1,18 @@
 # Modeling
 
-The binary baseline classifies hourly power-plant NOx changes from paired TEMPO
-observations.
+The binary baseline classifies power-plant NOx changes from causal hourly TEMPO
+and HRRR sequences.
 
 ## Baseline at a glance
 
 | Component | Choice |
 |---|---|
 | Target | Sign of hourly NOx change outside a 100 lb deadband |
-| Image input | Current NO2, hourly NO2 delta, wind U/V, and two validity masks |
-| Context input | Plant attributes, prior-quarter activity, weather, and time |
+| Raster input | `T` hourly NO2, validity mask, 2 m temperature, and wind U/V fields |
+| Context input | Plant attributes, prior-quarter activity, and time |
 | Split | Geographic AOI clusters, approximately 70/15/15 |
-| Image encoder | Separate mask-aware NO2 stems plus a shared residual CNN |
-| Fusion | Image and scalar embeddings before a nonlinear head |
+| Raster encoder | Shared mask-aware spatial encoder followed by a ConvGRU |
+| Fusion | Frozen pretrained tabular embedding plus the raster-sequence embedding |
 | Selection metric | Validation log loss |
 | Final metrics | ROC AUC and log loss across seeds, with subgroup results |
 
@@ -28,14 +28,13 @@ observations.
 
 ## Inputs and leakage policy
 
-Each sample carries four aligned 48 by 48 raster channels and scalar context.
+Each sample carries `T` aligned 24 by 24 raster timesteps and scalar context.
 
 Scalar inputs:
 
 - coal and natural-gas unit counts;
 - total generator nameplate capacity;
 - previous-quarter average heat input and power generation;
-- coincident HRRR 2 m temperature and boundary-layer height;
 - sine/cosine encodings of local mean solar hour and day of year.
 
 Leakage controls:
@@ -71,44 +70,42 @@ training split rejected it, split by feature:
 | `avg_heat_input` | 0.378 | -0.673 | 0.032 | 0.041 |
 | `total_nameplate_capacity_mw` | 0.789 | -0.643 | 0.038 | 0.044 |
 | `avg_pwr_gen` | 0.062 | -1.009 | 0.027 | 0.046 |
-| `boundary_layer_height_m` | 1.401 | -0.875 | 0.058 | 0.051 |
 
 Tail share is the fraction of total absolute deviation from the median held by
-the top 1 percent of records. Only `boundary_layer_height_m` improves on both
-measures, and a logistic probe on the tabular features moved validation AUC by
-less than 0.005 across every combination tested. Nothing justified the added
-distortion, so the transform is gone.
+the top 1 percent of records. A logistic probe on the retained tabular features
+moved validation AUC by less than 0.005 across every combination tested. Nothing
+justified the added distortion, so the transform is gone.
 
-## Image representation and normalization
+## Raster representation and normalization
 
-Four numeric channels and two masks reach the model:
+Four numeric channels and one mask reach the model at every timestep:
 
-1. directly regridded current NO2 on finite native support;
-2. current-minus-previous directly regridded NO2 on paired support;
-3. geographic eastward wind aligned from the native HRRR grid;
-4. geographic northward wind aligned from the native HRRR grid;
-5. independent binary validity masks for current and hourly-delta NO2.
+1. directly regridded NO2 on finite native support;
+2. HRRR 2 m temperature sampled at AOI cell centers;
+3. geographic eastward wind sampled at AOI cell centers;
+4. geographic northward wind sampled at AOI cell centers;
+5. an independent binary NO2 validity mask.
 
 Every statistic comes from training pixels alone:
 
 | Channels | Center | Scale |
 |---|---|---|
-| current NO2, hourly delta NO2 | median of finite pixels | `IQR / 1.349` |
-| wind u, wind v | mean of finite pixels | population standard deviation |
+| NO2 | median of finite pixels | `IQR / 1.349` |
+| temperature, wind u, wind v | mean of finite pixels | population standard deviation |
 
 ```text
 normalized[channel] =
     (raster[channel] - train_center[channel]) / train_scale[channel]
 ```
 
-- Clip all four numeric channels to `[-8, 8]` and replace invalid normalized
+- Clip all four numeric channels to `[-8, 8]` and represent invalid normalized
   values with zero only when loading the model input.
 - Fit every channel on its finite training pixels.
 - Reuse the frozen training statistics for validation, test, and inference.
 
-The two masks remain binary and unscaled. A separate two-layer partial-
-convolution stem consumes each NO2 value-mask pair. The resulting features join
-the dense wind stem before the shared residual encoder.
+The mask remains binary and unscaled. A two-layer partial-convolution stem
+consumes each hourly NO2 value-mask pair. The resulting features join the dense
+weather stem before the shared residual encoder.
 
 Two design notes:
 
@@ -125,57 +122,26 @@ an in-memory pixel archive.
 
 ## Network
 
-A compact residual CNN plus an MLP scalar branch:
+The raster branch applies the same spatial encoder to every hour. A partial-
+convolution NO2 stem uses the validity mask to renormalize local support rather
+than treating missing cells as physical zeros. A conventional weather stem
+encodes temperature and wind. Their fused features pass through residual blocks
+that reduce each 24 by 24 timestep to 6 by 6, then a 96-channel ConvGRU fuses the
+ordered sequence. Global average and maximum pooling produce a 128-value raster
+embedding.
 
-```mermaid
-flowchart TB
-    subgraph Inputs
-        Current[Current NO2]
-        CurrentMask[Current mask]
-        Delta[Hourly NO2 delta]
-        DeltaMask[Delta mask]
-        Wind[Wind U and V]
-        Tabular[Scalar context]
-    end
-
-    subgraph Stems[Separate image stems]
-        CurrentStem[Current stem<br/>PartialConv + GroupNorm x2]
-        DeltaStem[Delta stem<br/>PartialConv + GroupNorm x2]
-        WindStem[Wind stem<br/>Conv + GroupNorm]
-    end
-
-    Current -->|values| CurrentStem
-    CurrentMask -->|support| CurrentStem
-    Delta -->|values| DeltaStem
-    DeltaMask -->|support| DeltaStem
-    Wind -->|encode| WindStem
-
-    CurrentStem -->|features| StemFusion[Concatenate + 1x1 convolution]
-    DeltaStem -->|features| StemFusion
-    WindStem -->|features| StemFusion
-
-    StemFusion -->|extract spatial structure| Encoder[Shared residual encoder]
-    Encoder -->|3x3 average + global maximum| Pool[Spatial pooling]
-    Pool -->|project| ImageProjection[Image embedding]
-    Tabular -->|MLP + LayerNorm| TabularProjection[Scalar embedding]
-    ImageProjection -->|concatenate| FusionHead[Nonlinear fusion head]
-    TabularProjection -->|concatenate| FusionHead
-    FusionHead -->|classify| Logit[Emissions-change logit]
-```
-
-- Residual stages reduce 48 by 48 images to a 6 by 6 feature map.
-- A 3 by 3 adaptive average pool retains coarse plume location.
-- A global maximum pool preserves localized enhancements that an average
-  dilutes.
-- The current and delta NO2 rasters retain separate mask-aware spatial stems
-  before their features join the wind stream. There is no magnitude encoder,
-  restitution branch, or auxiliary magnitude loss.
-- The fused image embedding joins the scalar embedding for one classification
-  logit.
+The tabular branch is a 32-value hidden layer followed by a 16-value embedding
+and its own Bernoulli classifier. It is trained independently, selected on
+validation loss, and frozen. During fused training, the raster embedding and
+frozen tabular embedding feed a nonlinear head. The head returns one logit; its
+sigmoid is the predicted Bernoulli distribution over decrease and increase.
+This is preferable to emitting a hard class because training and evaluation
+retain confidence and calibration information without a redundant two-logit
+binary head.
 
 Normalization choices:
 
-- GroupNorm in the NO2 stems, wind stem, and shared image encoder avoids
+- GroupNorm in the NO2 stem, weather stem, and shared spatial encoder avoids
   batch-level statistics when memory pressure forces small batches. See the
   [Group Normalization paper](https://arxiv.org/abs/1803.08494).
 - LayerNorm in the MLP projections.
@@ -203,7 +169,7 @@ Where settings live:
 |---|---|
 | `config.py` | Shared data contract: paths, raster keys and channels, image clipping, input-feature definitions |
 | `modeling/train.py` | Training defaults |
-| `modeling/resnet.py` | Architecture defaults |
+| `modeling/convgru.py` | Architecture defaults |
 
 Training CLI flags expose the last two, which keeps preprocessing and collection
 code independent of any single run while each run still records its resolved
@@ -252,11 +218,10 @@ non-overlapping plant regions rather than memorization of known AOIs.
 | Comparison | Question |
 |---|---|
 | Constant and prevalence classifiers | Does the model beat trivial predictions? |
-| XGBoost | Does the CNN beat a strong tabular baseline? |
+| XGBoost | Does the ConvGRU beat a strong tabular baseline? |
 | Tabular-only MLP | Does image data add value to the neural model? |
-| Image-only CNN | Does scalar context add value? |
+| Raster-only ConvGRU | Does scalar context add value? |
 | Full fused model | Does fusion improve validation loss? |
-| Delta versus current-plus-delta | Does the current NO2 level add value? |
 | With and without masks | Does explicit support information add value? |
 
 Report every comparison on the same frozen validation and test records. The full
@@ -273,9 +238,10 @@ Each UTC-stamped directory under `RUNS_DIR` contains:
 |---|---|
 | `normalization_stats.json` | Train-only preprocessing and deadband cutoff |
 | `run_config.json` | Features, settings, clipping rates, and parameter count |
-| `checkpoints/best_model.pt` | CNN checkpoint selected by validation loss |
+| `checkpoints/best_model.pt` | Selected ConvGRU-fusion or ablation checkpoint |
+| `checkpoints/best_tabular_mlp.pt` | Independently selected MLP used by the fused model |
 | `checkpoints/xgboost_model.json` | XGBoost model selected by validation log loss |
-| `results.json` | Metrics, CNN-minus-XGBoost differences, and prevalence |
+| `results.json` | Metrics, ConvGRU-minus-XGBoost differences, and prevalence |
 | `*_predictions.csv` | Row-level predictions for each model and split |
 | `model_comparison.png` | Side-by-side split metrics |
 | Other plots | Loss, probability distributions, and spatial accuracy |
