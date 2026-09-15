@@ -123,7 +123,7 @@ python -u -m collection.scrape_hrrr
   and boundary-layer height from the hourly `f00` analysis.
 - The Slurm HRRR collector passes `--overwrite` for a full replacement. Wait
   for every array task to succeed before using the archive, then regenerate
-  the dataset once with `--refresh-wind` to replace aligned 10 m cache entries.
+  the dataset once with `--refresh-weather` to replace aligned weather cache entries.
 
 ### 3. Download emissions and facility locations
 
@@ -192,28 +192,22 @@ array such as `0-31%14`.
 
 `preprocessing.generate_dataset`:
 
-- resolves current and previous TEMPO scans through one
+- resolves all configured TEMPO timesteps through one
   deduplicated persistent image-cache plan;
-- writes four numeric rasters and two independent NO2 masks per retained
-  record;
-- stores each unique AOI scan and aligned AOI-hour wind raster in persistent
+- writes NO2, NO2 validity, temperature, eastward wind, and northward wind as
+  `T x 24 x 24` arrays per retained record;
+- stores each unique AOI scan and aligned AOI-hour weather raster in persistent
   caches, grouping work so workers reuse each NetCDF or GRIB read;
-- preserves each directly regridded NO2 scan when forming the hourly delta;
-- estimates aggregate NOx flux from positive enhancement integrated over the
-  union of 12 km by 9 km source-relative downwind plumes, using an upwind
-  median background and 80 m wind;
-- applies the published time-dependent NOx-to-NO2 ratio, a 1.5-hour NOx
-  lifetime, and a fixed cross-validated multiplicative calibration;
-- requires greater than 95 percent current coverage and greater than 80 percent
-  paired coverage for the hourly delta, preserving gaps in separate masks;
+- preserves each directly regridded NO2 scan and its independent mask;
+- requires at least 90 percent finite NO2 coverage in every timestep;
 - selects the largest exactly balanced successful subset through deterministic
   AOI and temporal round-robin, limited only by the smaller class;
 - uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
   allocation.
 
-Every successful split-CSV row carries its relative `delta_no2_path`, paired
-cloud, quality and retrieval-uncertainty means, and centre-interpolated HRRR
-temperature and boundary-layer height.
+Every successful split-CSV row carries its relative `raster_bundle_path`,
+per-timestep NO2 coverage, and sequence-level cloud, quality, and
+retrieval-uncertainty summaries. Temperature is stored only as a raster.
 
 Running the splits:
 
@@ -231,10 +225,10 @@ Running the splits:
   global AOI round-robin selection, then atomically publishes metadata whose
   raster paths point directly into the shards. It does not install or remove
   raster files, so selected and unselected successful rasters remain in place.
-- `--refresh-cache`, `--refresh-tempo`, and `--refresh-wind` explicitly clear
+- `--refresh-cache`, `--refresh-tempo`, and `--refresh-weather` explicitly clear
   the selected persistent caches once before fan-out. Otherwise caches survive
   fresh dataset runs and concurrent shards reuse their atomic entries.
-- Worker logs report elapsed time, peak memory, and TEMPO/wind cache hits. The
+- Worker logs report elapsed time, peak memory, and TEMPO/weather cache hits. The
   finalizer log reports finalizer time, peak memory, and launch-to-publication
   wall time for warm-cache benchmark records.
 - Direct `python -u -m preprocessing.generate_dataset` remains available for a

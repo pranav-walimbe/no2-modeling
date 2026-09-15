@@ -117,15 +117,14 @@ The native regridder accepts an NO2 contributor only when:
 - value and geometry are valid;
 - a positive area of accepted support reaches an output cell.
 
-Missing cells are never interpolated. Current coverage must be greater than
-95%. The current/previous intersection must cover more than 80% of the raster.
-After those gates pass, each scan retains its directly regridded values. The
-paired delta uses the current/previous mask intersection.
+Missing cells are never interpolated. Every configured timestep must have at
+least 90% finite NO2 coverage. After that gate passes, each scan retains its
+directly regridded values and its own validity mask.
 
-After pairing scans, generated records use `paired_finite_fraction` as the only
-ranking signal after the fixed gates. Central coverage and retrieval uncertainty
+Generated records use `min_no2_finite_fraction` across the sequence as the only
+ranking signal after the fixed gate. Central coverage and retrieval uncertainty
 do not filter or rank records. Generation summaries report retained counts,
-full-coverage rates, and represented AOIs overall and by class. Paired coverage
+full-sequence coverage rates, and represented AOIs overall and by class. Coverage
 remains a dataset diagnostic and is not supplied to the model.
 
 ## Quantities that do not select records

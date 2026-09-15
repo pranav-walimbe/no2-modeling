@@ -1,4 +1,4 @@
-"""Generate paired TEMPO rasters and tabular features for every data split."""
+"""Generate temporal TEMPO and HRRR raster bundles for every data split."""
 
 import argparse
 import os
@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -17,11 +16,13 @@ from config import (
     DATASET_DIR,
     DATASET_RASTER_DIR,
     DATASET_TEMPO_CACHE_DIR,
-    DATASET_WIND_CACHE_DIR,
+    DATASET_WEATHER_CACHE_DIR,
     EMA_DELTA_THRESHOLD,
     HRRR_DIR,
     LABEL_COL,
+    MIN_TIMESTEP_NO2_FINITE_FRACTION,
     NUM_CORES,
+    SEQUENCE_TIMESTEPS,
     TEMPO_DIR,
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
@@ -30,30 +31,30 @@ from config import (
 from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
     CANDIDATE_RASTER_PATH_COL,
-    DELTA_NO2_PATH_COL,
     PROCESSING_FAILURE_SCHEMA,
+    RASTER_BUNDLE_PATH_COL,
     SOURCE_RECORD_INDEX_COL,
     DatasetShardStore,
     RecordTask,
     ScanTask,
     ShardTask,
-    WindTask,
+    WeatherTask,
     bounded_parallel_map,
     build_shard_plan,
     cache_inventory,
     coverage_selection_summary,
     make_scan_task,
-    make_wind_task,
+    make_weather_task,
     process_record,
     process_scan_batch,
-    process_wind_batch,
+    process_weather_batch,
     scan_batches,
     select_final_records,
-    wind_batches,
+    weather_batches,
     write_csv_atomic,
     write_json_atomic,
 )
-from preprocessing.stratify_utils import HRRR_FIELD_SLUG, HRRR_PRODUCT, classification_summary
+from preprocessing.stratify_utils import classification_summary
 
 SPLIT_PATHS = {
     "train": TRAIN_RECORDS_CSV,
@@ -69,16 +70,17 @@ TRAINING_JOB_NAME = "train-no2"
 RUN_STARTED_ENV = "DATASET_RUN_STARTED_AT"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DATASET_BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_dataset.sh"
+
+
 @dataclass(frozen=True)
 class PreparedRecord:
     """One source row resolved to its cache and output paths."""
 
     split: str
     record_index: int
-    current_scan_key: str
-    previous_scan_key: str
-    current_wind_cache_key: str
-    delta_no2_path: str
+    scan_keys: tuple[str, ...]
+    weather_cache_keys: tuple[str, ...]
+    raster_bundle_path: str
 
 
 def _positive_int(value: str) -> int:
@@ -135,34 +137,16 @@ def _load_shard(task: ShardTask) -> dict[str, pl.DataFrame]:
     return {task.split: frame}
 
 
-def _observation_wind_task(
-    row: dict[str, object],
-    time_column: str,
-    hrrr_root: Path,
-    wind_cache_dir: Path,
-) -> WindTask:
-    # Resolve wind to the HRRR analysis nearest the TEMPO observation
-    observation_time = row[time_column]
-    if not isinstance(observation_time, datetime):
-        raise TypeError(f"{time_column} must be a datetime")
-    matched_time = (observation_time + timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
-    relative_path = (
-        f"raw/{matched_time:%Y/%m/%d}/hrrr_{matched_time:%Y%m%d_%H}z_"
-        f"{HRRR_PRODUCT}_{HRRR_FIELD_SLUG}.grib2"
-    )
-    return make_wind_task({**row, "hrrr": relative_path}, hrrr_root, wind_cache_dir)
-
-
 def _prepare_records(
     splits: dict[str, pl.DataFrame],
     tempo_cache_dir: Path,
-    wind_cache_dir: Path,
+    weather_cache_dir: Path,
     run_dir: Path,
-) -> tuple[list[PreparedRecord], dict[str, ScanTask], dict[str, WindTask], dict[str, list[dict[str, object]]]]:
+) -> tuple[list[PreparedRecord], dict[str, ScanTask], dict[str, WeatherTask], dict[str, list[dict[str, object]]]]:
     # Build one global scan plan across train, validation, and test
     records: list[PreparedRecord] = []
     scans: dict[str, ScanTask] = {}
-    winds: dict[str, WindTask] = {}
+    weather: dict[str, WeatherTask] = {}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in splits}
     source_count = sum(frame.height for frame in splits.values())
     prepared_count = 0
@@ -173,36 +157,42 @@ def _prepare_records(
             prepared_count += 1
             record_index = int(row[SOURCE_RECORD_INDEX_COL])
             try:
-                current = make_scan_task(row, "tempo", Path(TEMPO_DIR), tempo_cache_dir)
-                previous = make_scan_task(row, "prev_tempo", Path(TEMPO_DIR), tempo_cache_dir)
-                current_wind = _observation_wind_task(
-                    row,
-                    "tempo_time",
-                    Path(HRRR_DIR),
-                    wind_cache_dir,
+                record_scans = tuple(
+                    make_scan_task(row, f"no2_paths_t{index}", Path(TEMPO_DIR), tempo_cache_dir)
+                    for index in range(SEQUENCE_TIMESTEPS)
                 )
-                delta_no2_path = output_dir / f"{record_index:06d}.npz"
+                record_weather = tuple(
+                    make_weather_task(
+                        row,
+                        f"wind_path_t{index}",
+                        f"temperature_path_t{index}",
+                        Path(HRRR_DIR),
+                        weather_cache_dir,
+                    )
+                    for index in range(SEQUENCE_TIMESTEPS)
+                )
+                raster_bundle_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
                     PreparedRecord(
                         split=split,
                         record_index=record_index,
-                        current_scan_key=current.cache_key,
-                        previous_scan_key=previous.cache_key,
-                        current_wind_cache_key=current_wind.cache_key,
-                        delta_no2_path=str(delta_no2_path),
+                        scan_keys=tuple(scan.cache_key for scan in record_scans),
+                        weather_cache_keys=tuple(item.cache_key for item in record_weather),
+                        raster_bundle_path=str(raster_bundle_path),
                     )
                 )
-                scans.setdefault(current.cache_key, current)
-                scans.setdefault(previous.cache_key, previous)
-                winds.setdefault(current_wind.cache_key, current_wind)
+                for scan in record_scans:
+                    scans.setdefault(scan.cache_key, scan)
+                for item in record_weather:
+                    weather.setdefault(item.cache_key, item)
             except (KeyError, TypeError, ValueError) as error:
                 failures[split].append({"record_index": record_index, "error": str(error)})
             if prepared_count % PROGRESS_INTERVAL == 0 or prepared_count == source_count:
                 print(f"Prepared cache plan for {prepared_count:,}/{source_count:,} source records")
-    return records, scans, winds, failures
+    return records, scans, weather, failures
 
 
-def _cached_task_paths(tasks: dict[str, ScanTask] | dict[str, WindTask]) -> dict[str, str]:
+def _cached_task_paths(tasks: dict[str, ScanTask] | dict[str, WeatherTask]) -> dict[str, str]:
     # Scan each cache directory once instead of issuing one metadata lookup per task
     directories = {Path(task.cache_path).parent for task in tasks.values()}
     inventories = {directory: cache_inventory(directory) for directory in directories}
@@ -241,21 +231,21 @@ def _run_tempo_regridding(
     return tempo_cache_paths, failures
 
 
-def _run_wind_alignment(
-    winds: dict[str, WindTask],
+def _run_weather_alignment(
+    weather: dict[str, WeatherTask],
     workers: int,
-    refresh_wind: bool,
+    refresh_weather: bool,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    # Reuse cached AOI-hour wind rasters unless refresh is explicit
-    cache_paths = {} if refresh_wind else _cached_task_paths(winds)
+    # Reuse cached AOI-hour weather rasters unless refresh is explicit
+    cache_paths = {} if refresh_weather else _cached_task_paths(weather)
     failures: dict[str, str] = {}
-    missing = [task for key, task in winds.items() if key not in cache_paths]
-    print(f"Wind cache: {len(cache_paths):,} hits; {len(missing):,} AOI-hours to align")
+    missing = [task for key, task in weather.items() if key not in cache_paths]
+    print(f"Weather cache: {len(cache_paths):,} hits; {len(missing):,} AOI-hours to align")
     if not missing:
         return cache_paths, failures
     completed = 0
-    batches = wind_batches(missing, reuse_existing=not refresh_wind)
-    for batch_results in bounded_parallel_map(process_wind_batch, batches, workers):
+    batches = weather_batches(missing, reuse_existing=not refresh_weather)
+    for batch_results in bounded_parallel_map(process_weather_batch, batches, workers):
         for result in batch_results:
             completed += 1
             if result.error is None:
@@ -263,7 +253,7 @@ def _run_wind_alignment(
             else:
                 failures[result.cache_key] = result.error
         if completed % PROGRESS_INTERVAL < len(batch_results) or completed == len(missing):
-            print(f"Aligned {completed:,}/{len(missing):,} cache-missing AOI-hour winds")
+            print(f"Aligned {completed:,}/{len(missing):,} cache-missing AOI-hour weather rasters")
     return cache_paths, failures
 
 
@@ -271,24 +261,22 @@ def _record_tasks(
     records: list[PreparedRecord],
     tempo_cache_paths: dict[str, str],
     tempo_failures: dict[str, str],
-    wind_cache_paths: dict[str, str],
-    wind_failures: dict[str, str],
+    weather_cache_paths: dict[str, str],
+    weather_failures: dict[str, str],
     failures: dict[str, list[dict[str, object]]],
 ) -> tuple[list[RecordTask], dict[tuple[str, int], PreparedRecord]]:
-    # Exclude records whose current or previous scan failed to regrid
+    # Exclude records when any timestep cache is unavailable
     tasks: list[RecordTask] = []
     records_by_id: dict[tuple[str, int], PreparedRecord] = {}
     for record in records:
-        missing_keys = [
-            key for key in (record.current_scan_key, record.previous_scan_key) if key not in tempo_cache_paths
-        ]
+        missing_keys = [key for key in record.scan_keys if key not in tempo_cache_paths]
         if missing_keys:
             reasons = [tempo_failures.get(key, "TEMPO cache unavailable") for key in missing_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
-        missing_wind_keys = [record.current_wind_cache_key] if record.current_wind_cache_key not in wind_cache_paths else []
-        if missing_wind_keys:
-            reasons = [wind_failures.get(key, "wind cache unavailable") for key in missing_wind_keys]
+        missing_weather_keys = [key for key in record.weather_cache_keys if key not in weather_cache_paths]
+        if missing_weather_keys:
+            reasons = [weather_failures.get(key, "weather cache unavailable") for key in missing_weather_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
         record_id = (record.split, record.record_index)
@@ -297,10 +285,9 @@ def _record_tasks(
             RecordTask(
                 split=record.split,
                 record_index=record.record_index,
-                current_cache_path=tempo_cache_paths[record.current_scan_key],
-                previous_cache_path=tempo_cache_paths[record.previous_scan_key],
-                current_wind_cache_path=wind_cache_paths[record.current_wind_cache_key],
-                output_path=record.delta_no2_path,
+                scan_cache_paths=tuple(tempo_cache_paths[key] for key in record.scan_keys),
+                weather_cache_paths=tuple(weather_cache_paths[key] for key in record.weather_cache_keys),
+                output_path=record.raster_bundle_path,
             )
         )
     return tasks, records_by_id
@@ -312,7 +299,7 @@ def _run_record_processing(
     failures: dict[str, list[dict[str, object]]],
     workers: int,
 ) -> dict[str, list[dict[str, object]]]:
-    # Derive delta rasters and scalar features in parallel
+    # Build temporal raster bundles and scalar diagnostics in parallel
     output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in failures}
     total = len(tasks)
     for completed, result in enumerate(bounded_parallel_map(process_record, tasks, workers), start=1):
@@ -323,12 +310,12 @@ def _run_record_processing(
             record = records_by_id[record_id]
             output_row: dict[str, object] = {
                 SOURCE_RECORD_INDEX_COL: result.record_index,
-                CANDIDATE_RASTER_PATH_COL: record.delta_no2_path,
+                CANDIDATE_RASTER_PATH_COL: record.raster_bundle_path,
             }
             output_row.update(result.features)
             output_rows[result.split].append(output_row)
         if completed % PROGRESS_INTERVAL == 0 or completed == total:
-            print(f"Processed {completed:,}/{total:,} paired records")
+            print(f"Processed {completed:,}/{total:,} temporal records")
     return output_rows
 
 
@@ -370,12 +357,16 @@ def _write_outputs(
         if selection_size["discarded_for_balance"]:
             print(f"[{split}] discarded {selection_size['discarded_for_balance']:,} records for class balance")
         print(
-            f"[{split}] full paired coverage: {selected_coverage['full_coverage_records']:,}/"
+            f"[{split}] full sequence coverage: {selected_coverage['full_coverage_records']:,}/"
             f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"
         )
         classification_report = {
             "split": split,
             "ema_delta_nox_threshold": EMA_DELTA_THRESHOLD,
+            "raster_contract": {
+                "sequence_timesteps": SEQUENCE_TIMESTEPS,
+                "minimum_no2_finite_fraction_per_timestep": MIN_TIMESTEP_NO2_FINITE_FRACTION,
+            },
             "selection_size": selection_size,
             "final_balance": classification_summary(candidates, output_frame),
             "coverage_selection": {
@@ -395,7 +386,7 @@ def _write_outputs(
             for candidate_path in output_frame[CANDIDATE_RASTER_PATH_COL].to_list()
         ]
         output_frame = output_frame.drop("_source_east_km", "_source_north_km", strict=False).with_columns(
-            pl.Series(DELTA_NO2_PATH_COL, relative_paths, dtype=pl.String)
+            pl.Series(RASTER_BUNDLE_PATH_COL, relative_paths, dtype=pl.String)
         )
         write_csv_atomic(
             output_frame.drop(SOURCE_RECORD_INDEX_COL, CANDIDATE_RASTER_PATH_COL),
@@ -417,28 +408,28 @@ def _run_shard(task: ShardTask, store: DatasetShardStore) -> None:
     started_at = time.perf_counter()
     shard_dir = store.create(task)
     tempo_cache_dir = Path(DATASET_TEMPO_CACHE_DIR)
-    wind_cache_dir = Path(DATASET_WIND_CACHE_DIR)
+    weather_cache_dir = Path(DATASET_WEATHER_CACHE_DIR)
     tempo_cache_dir.mkdir(parents=True, exist_ok=True)
-    wind_cache_dir.mkdir(parents=True, exist_ok=True)
+    weather_cache_dir.mkdir(parents=True, exist_ok=True)
     splits = _load_shard(task)
-    records, scans, winds, failures = _prepare_records(
+    records, scans, weather, failures = _prepare_records(
         splits,
         tempo_cache_dir,
-        wind_cache_dir,
+        weather_cache_dir,
         shard_dir,
     )
     print(
         f"Planned shard {task.task_id} with {len(records):,} records, "
-        f"{len(scans):,} TEMPO scans, and {len(winds):,} wind rasters"
+        f"{len(scans):,} TEMPO scans, and {len(weather):,} weather rasters"
     )
     tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, NUM_CORES, False)
-    wind_cache_paths, wind_failures = _run_wind_alignment(winds, NUM_CORES, False)
+    weather_cache_paths, weather_failures = _run_weather_alignment(weather, NUM_CORES, False)
     record_tasks, records_by_id = _record_tasks(
         records,
         tempo_cache_paths,
         tempo_failures,
-        wind_cache_paths,
-        wind_failures,
+        weather_cache_paths,
+        weather_failures,
         failures,
     )
     output_rows = _run_record_processing(record_tasks, records_by_id, failures, NUM_CORES)
@@ -509,9 +500,11 @@ def parse_args() -> argparse.Namespace:
         help="empty the TEMPO image cache before rebuilding entries for the selected split",
     )
     parser.add_argument(
+        "--refresh-weather",
         "--refresh-wind",
+        dest="refresh_weather",
         action="store_true",
-        help="empty the wind image cache before rebuilding entries for the selected split",
+        help="empty the weather raster cache before rebuilding entries for the selected split",
     )
     return parser.parse_args()
 
@@ -540,18 +533,18 @@ def _reset_cache_directory(cache_dir: Path) -> None:
     resolved_cache.mkdir(parents=True)
 
 
-def _reset_requested_caches(args: argparse.Namespace, tempo_cache_dir: Path, wind_cache_dir: Path) -> None:
+def _reset_requested_caches(args: argparse.Namespace, tempo_cache_dir: Path, weather_cache_dir: Path) -> None:
     # Clear shared caches only from a single non-array process
     refresh_tempo = args.refresh_cache or args.refresh_tempo
-    refresh_wind = args.refresh_cache or args.refresh_wind
-    if not refresh_tempo and not refresh_wind:
+    refresh_weather = args.refresh_cache or args.refresh_weather
+    if not refresh_tempo and not refresh_weather:
         return
     if os.getenv("SLURM_ARRAY_TASK_ID") is not None:
         raise ValueError("Cache refresh cannot run inside a Slurm array because its tasks share cache directories")
     if refresh_tempo:
         _reset_cache_directory(tempo_cache_dir)
-    if refresh_wind:
-        _reset_cache_directory(wind_cache_dir)
+    if refresh_weather:
+        _reset_cache_directory(weather_cache_dir)
 
 
 def _initialize_output_directories() -> tuple[Path, Path]:
@@ -560,10 +553,10 @@ def _initialize_output_directories() -> tuple[Path, Path]:
     Path(DATASET_DF).mkdir(parents=True, exist_ok=True)
     Path(DATASET_RASTER_DIR).mkdir(parents=True, exist_ok=True)
     tempo_cache_dir = Path(DATASET_TEMPO_CACHE_DIR)
-    wind_cache_dir = Path(DATASET_WIND_CACHE_DIR)
+    weather_cache_dir = Path(DATASET_WEATHER_CACHE_DIR)
     tempo_cache_dir.mkdir(parents=True, exist_ok=True)
-    wind_cache_dir.mkdir(parents=True, exist_ok=True)
-    return tempo_cache_dir, wind_cache_dir
+    weather_cache_dir.mkdir(parents=True, exist_ok=True)
+    return tempo_cache_dir, weather_cache_dir
 
 
 def _reset_generated_outputs() -> None:
@@ -578,26 +571,33 @@ def _run_monolithic(args: argparse.Namespace, split_paths: dict[str, str]) -> No
     # Preserve direct single-process generation with persistent raster paths
     _refuse_active_dataset_jobs()
     _reset_generated_outputs()
-    tempo_cache_dir, wind_cache_dir = _initialize_output_directories()
-    _reset_requested_caches(args, tempo_cache_dir, wind_cache_dir)
+    tempo_cache_dir, weather_cache_dir = _initialize_output_directories()
+    _reset_requested_caches(args, tempo_cache_dir, weather_cache_dir)
     splits = _load_splits(split_paths)
     refresh_tempo = args.refresh_cache or args.refresh_tempo
-    refresh_wind = args.refresh_cache or args.refresh_wind
-    records, scans, winds, failures = _prepare_records(
+    refresh_weather = args.refresh_cache or args.refresh_weather
+    records, scans, weather, failures = _prepare_records(
         splits,
         tempo_cache_dir,
-        wind_cache_dir,
+        weather_cache_dir,
         Path(DATASET_RASTER_DIR),
     )
-    print(f"Planned {len(records):,} records using {len(scans):,} TEMPO scans and {len(winds):,} wind rasters")
+    print(
+        f"Planned {len(records):,} records using {len(scans):,} TEMPO scans and "
+        f"{len(weather):,} weather rasters"
+    )
     tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, NUM_CORES, refresh_tempo)
-    wind_cache_paths, wind_failures = _run_wind_alignment(winds, NUM_CORES, refresh_wind)
+    weather_cache_paths, weather_failures = _run_weather_alignment(
+        weather,
+        NUM_CORES,
+        refresh_weather,
+    )
     tasks, records_by_id = _record_tasks(
         records,
         tempo_cache_paths,
         tempo_failures,
-        wind_cache_paths,
-        wind_failures,
+        weather_cache_paths,
+        weather_failures,
         failures,
     )
     output_rows = _run_record_processing(tasks, records_by_id, failures, NUM_CORES)
@@ -655,8 +655,8 @@ def _launch_sharded_run(args: argparse.Namespace, split_paths: dict[str, str], s
     _refuse_active_dataset_jobs()
 
     _reset_generated_outputs()
-    tempo_cache_dir, wind_cache_dir = _initialize_output_directories()
-    _reset_requested_caches(args, tempo_cache_dir, wind_cache_dir)
+    tempo_cache_dir, weather_cache_dir = _initialize_output_directories()
+    _reset_requested_caches(args, tempo_cache_dir, weather_cache_dir)
     tasks = build_shard_plan(split_paths, shard_size)
     task_ids = [task.task_id for task in tasks]
     array_spec = _slurm_array_spec(task_ids)
@@ -703,7 +703,7 @@ def _run_array_shard(split_paths: dict[str, str], shard_size: int) -> None:
 
 
 def main() -> None:
-    """Generate paired raster NPZ files and metadata CSVs for all splits."""
+    """Generate temporal raster NPZ files and metadata CSVs for all splits."""
     args = parse_args()
     stage = os.getenv("DATASET_GENERATION_STAGE", "generate")
     split_paths = SPLIT_PATHS if args.split == "all" else {args.split: SPLIT_PATHS[args.split]}

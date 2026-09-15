@@ -24,10 +24,8 @@ from scipy.ndimage import map_coordinates
 
 from config import (
     LABEL_COL,
-    MIN_CURRENT_NO2_FINITE_FRACTION,
-    MIN_DELTA_NO2_FINITE_FRACTION,
-    MODEL_IMAGE_KEYS,
-    MODEL_MASK_KEYS,
+    MIN_TIMESTEP_NO2_FINITE_FRACTION,
+    SEQUENCE_TIMESTEPS,
 )
 from preprocessing.regrid import (
     AoiGrid,
@@ -39,10 +37,15 @@ from preprocessing.regrid import (
 )
 from preprocessing.stratify_utils import AOI_ID_COL
 
-CURRENT_RASTER_NAME, DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
-CURRENT_MASK_NAME, DELTA_MASK_NAME = MODEL_MASK_KEYS
-CURRENT_FINITE_FRACTION_COL = "current_finite_fraction"
-PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
+NO2_RASTER_NAME = "no2"
+NO2_MASK_NAME = "no2_mask"
+TEMPERATURE_RASTER_NAME = "temperature_2m_k"
+WIND_U_RASTER_NAME = "wind_u_80m_mps"
+WIND_V_RASTER_NAME = "wind_v_80m_mps"
+NO2_FINITE_FRACTION_COLUMNS = tuple(
+    f"no2_finite_fraction_t{index}" for index in range(SEQUENCE_TIMESTEPS)
+)
+MIN_NO2_FINITE_FRACTION_COL = "min_no2_finite_fraction"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
@@ -51,20 +54,16 @@ SELECTION_HELPER_COLUMNS = (
     "_stratum_rank",
     "_aoi_round",
 )
-HRRR_FIELDS = {
-    "2t": "temperature_2m_k",
-}
 TABULAR_FEATURE_NAMES = (
-    CURRENT_FINITE_FRACTION_COL,
-    PAIRED_FINITE_FRACTION_COL,
+    *NO2_FINITE_FRACTION_COLUMNS,
+    MIN_NO2_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
-    *HRRR_FIELDS.values(),
 )
 SOURCE_RECORD_INDEX_COL = "_source_record_index"
 CANDIDATE_RASTER_PATH_COL = "_candidate_raster_path"
-DELTA_NO2_PATH_COL = "delta_no2_path"
+RASTER_BUNDLE_PATH_COL = "raster_bundle_path"
 CANDIDATE_FEATURE_SCHEMA = {
     SOURCE_RECORD_INDEX_COL: pl.UInt32,
     CANDIDATE_RASTER_PATH_COL: pl.String,
@@ -261,9 +260,9 @@ class DatasetShardStore:
 
 
 def _coverage_group_summary(frame: pl.DataFrame) -> dict[str, int | float]:
-    # Summarize retained count and paired coverage for one record group
+    # Summarize retained count and sequence coverage for one record group
     records = frame.height
-    full_coverage = frame.filter(pl.col(PAIRED_FINITE_FRACTION_COL) >= 1.0).height
+    full_coverage = frame.filter(pl.col(MIN_NO2_FINITE_FRACTION_COL) >= 1.0).height
     return {
         "records": records,
         "full_coverage_records": full_coverage,
@@ -273,10 +272,10 @@ def _coverage_group_summary(frame: pl.DataFrame) -> dict[str, int | float]:
 
 
 def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
-    """Report paired coverage and AOI representation overall and by class.
+    """Report sequence coverage and AOI representation overall and by class.
 
     Args:
-        frame: Records carrying paired coverage and class labels.
+        frame: Records carrying sequence coverage and class labels.
 
     Returns:
         Coverage counts and AOI representation for the frame and each class.
@@ -317,17 +316,17 @@ def _rank_final_records(frame: pl.DataFrame) -> pl.DataFrame:
             (pl.col("hour") // 4).alias("_selection_hour_bin"),
         )
         .sort(
-            [*strata, PAIRED_FINITE_FRACTION_COL, "date", "hour"],
+            [*strata, MIN_NO2_FINITE_FRACTION_COL, "date", "hour"],
             descending=[False, False, False, False, True, False, False],
         )
         .with_columns(pl.col(AOI_ID_COL).cum_count().over(strata).alias("_stratum_rank"))
         .sort(
-            [AOI_ID_COL, "_stratum_rank", PAIRED_FINITE_FRACTION_COL, "date", "hour"],
+            [AOI_ID_COL, "_stratum_rank", MIN_NO2_FINITE_FRACTION_COL, "date", "hour"],
             descending=[False, False, True, False, False],
         )
         .with_columns(pl.col(AOI_ID_COL).cum_count().over(AOI_ID_COL).alias("_aoi_round"))
         .sort(
-            ["_aoi_round", PAIRED_FINITE_FRACTION_COL, AOI_ID_COL, "date", "hour"],
+            ["_aoi_round", MIN_NO2_FINITE_FRACTION_COL, AOI_ID_COL, "date", "hour"],
             descending=[False, True, False, False, False],
         )
     )
@@ -365,19 +364,18 @@ class ScanBatchTask:
 
 @dataclass(frozen=True)
 class RecordTask:
-    """Inputs needed to derive one paired record."""
+    """Inputs needed to derive one temporal raster record."""
 
     split: str
     record_index: int
-    current_cache_path: str
-    previous_cache_path: str
-    current_wind_cache_path: str
+    scan_cache_paths: tuple[str, ...]
+    weather_cache_paths: tuple[str, ...]
     output_path: str
 
 
 @dataclass(frozen=True)
 class RecordResult:
-    """Tabular features or failure from one paired record."""
+    """Tabular features or failure from one temporal record."""
 
     split: str
     record_index: int
@@ -386,20 +384,21 @@ class RecordResult:
 
 
 @dataclass(frozen=True)
-class WindTask:
-    """One AOI-hour wind raster and scalar meteorology cache entry."""
+class WeatherTask:
+    """One AOI-hour wind and temperature raster cache entry."""
 
     cache_key: str
     aoi_id: int
     lon: float
     lat: float
-    hrrr_path: str
+    wind_hrrr_path: str
+    temperature_hrrr_path: str
     cache_path: str
 
 
 @dataclass(frozen=True)
-class WindResult:
-    """Outcome of one aligned wind-cache operation."""
+class WeatherResult:
+    """Outcome of one aligned weather-cache operation."""
 
     cache_key: str
     cache_path: str
@@ -407,11 +406,12 @@ class WindResult:
 
 
 @dataclass(frozen=True)
-class WindBatchTask:
-    """AOI wind rasters sharing one HRRR source file."""
+class WeatherBatchTask:
+    """AOI weather rasters sharing the same HRRR source files."""
 
-    hrrr_path: str
-    winds: tuple[WindTask, ...]
+    wind_hrrr_path: str
+    temperature_hrrr_path: str
+    weather: tuple[WeatherTask, ...]
     reuse_existing: bool = True
 
 
@@ -582,28 +582,50 @@ def process_scan(task: ScanTask) -> ScanResult:
     return process_scan_batch(ScanBatchTask(task.granule_paths, (task,)))[0]
 
 
-def make_wind_task(row: dict[str, object], hrrr_root: Path, cache_dir: Path) -> WindTask:
-    """Create one persistent aligned-wind cache task.
+def make_weather_task(
+    row: dict[str, object],
+    wind_path_column: str,
+    temperature_path_column: str,
+    hrrr_root: Path,
+    cache_dir: Path,
+) -> WeatherTask:
+    """Create one persistent aligned-weather cache task.
 
     Args:
-        row: Stratified record carrying its AOI and HRRR relative path.
+        row: Stratified record carrying its AOI and HRRR relative paths.
+        wind_path_column: Column holding the wind GRIB path.
+        temperature_path_column: Column holding the temperature GRIB path.
         hrrr_root: Root of the HRRR archive.
-        cache_dir: Persistent aligned-wind cache directory.
+        cache_dir: Persistent aligned-weather cache directory.
 
     Returns:
-        Deduplicatable AOI-hour wind task.
+        Deduplicatable AOI-hour weather task.
     """
     aoi_id = int(row["aoi_id"])
     lon = float(row["lon"])
     lat = float(row["lat"])
-    hrrr_path = str(hrrr_root / str(row["hrrr"]))
+    wind_hrrr_path = str(hrrr_root / str(row[wind_path_column]))
+    temperature_hrrr_path = str(hrrr_root / str(row[temperature_path_column]))
     identity = json.dumps(
-        {"aoi": [aoi_id, lon, lat], "hrrr": hrrr_path},
+        {
+            "aoi": [aoi_id, lon, lat],
+            "fields": [WIND_U_RASTER_NAME, WIND_V_RASTER_NAME, TEMPERATURE_RASTER_NAME],
+            "temperature_hrrr": temperature_hrrr_path,
+            "wind_hrrr": wind_hrrr_path,
+        },
         sort_keys=True,
         separators=(",", ":"),
     )
     cache_key = hashlib.sha256(identity.encode()).hexdigest()
-    return WindTask(cache_key, aoi_id, lon, lat, hrrr_path, str(cache_dir / f"{cache_key}.npz"))
+    return WeatherTask(
+        cache_key,
+        aoi_id,
+        lon,
+        lat,
+        wind_hrrr_path,
+        temperature_hrrr_path,
+        str(cache_dir / f"{cache_key}.npz"),
+    )
 
 
 def _longitude_180(longitude: float) -> float:
@@ -673,116 +695,125 @@ def _interpolate_hrrr(field: np.ndarray, coordinates: tuple[np.ndarray, np.ndarr
     return map_coordinates(field, coordinates, order=1, mode="nearest")
 
 
-def _align_wind(grid: _HrrrGrid, fields: dict[str, np.ndarray], task: WindTask) -> dict[str, np.ndarray]:
-    # Interpolate grid-relative wind then rotate it to geographic east and north
+def _align_weather(
+    wind_grid: _HrrrGrid,
+    wind_fields: dict[str, np.ndarray],
+    temperature_grid: _HrrrGrid,
+    temperature_fields: dict[str, np.ndarray],
+    task: WeatherTask,
+) -> dict[str, np.ndarray]:
+    # Interpolate weather and rotate grid-relative wind to geographic coordinates
     target_grid = AoiGrid.from_lon_lat(task.aoi_id, task.lon, task.lat)
     x_m, y_m = target_grid.cell_centres()
-    coordinates = _hrrr_coordinates(grid, x_m, y_m)
-    grid_u = _interpolate_hrrr(fields["u"], coordinates)
-    grid_v = _interpolate_hrrr(fields["v"], coordinates)
+    wind_coordinates = _hrrr_coordinates(wind_grid, x_m, y_m)
+    temperature_coordinates = _hrrr_coordinates(temperature_grid, x_m, y_m)
+    grid_u = _interpolate_hrrr(wind_fields["u"], wind_coordinates)
+    grid_v = _interpolate_hrrr(wind_fields["v"], wind_coordinates)
+    temperature = _interpolate_hrrr(temperature_fields["2t"], temperature_coordinates)
     longitudes, latitudes = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True).transform(x_m, y_m)
-    convergence = np.deg2rad(Proj(grid.crs).get_factors(longitudes, latitudes).meridian_convergence)
+    convergence = np.deg2rad(Proj(wind_grid.crs).get_factors(longitudes, latitudes).meridian_convergence)
     eastward = grid_u * np.cos(convergence) + grid_v * np.sin(convergence)
     northward = -grid_u * np.sin(convergence) + grid_v * np.cos(convergence)
     return {
         WIND_U_RASTER_NAME: eastward.astype(np.float32),
         WIND_V_RASTER_NAME: northward.astype(np.float32),
+        TEMPERATURE_RASTER_NAME: temperature.astype(np.float32),
     }
 
 
-def _centre_hrrr_features(grid: _HrrrGrid, fields: dict[str, np.ndarray], task: WindTask) -> dict[str, float]:
-    # Interpolate scalar weather fields at the AOI centre
-    target = AoiGrid.from_lon_lat(task.aoi_id, task.lon, task.lat)
-    coordinates = _hrrr_coordinates(
-        grid,
-        np.asarray([[target.x_m]]),
-        np.asarray([[target.y_m]]),
-    )
-    return {
-        output_name: float(_interpolate_hrrr(fields[short_name], coordinates).item())
-        for short_name, output_name in HRRR_FIELDS.items()
-    }
-
-
-def wind_batches(winds: Iterable[WindTask], reuse_existing: bool = True) -> list[WindBatchTask]:
-    """Group wind tasks so each HRRR field is read once.
+def weather_batches(
+    weather: Iterable[WeatherTask],
+    reuse_existing: bool = True,
+) -> list[WeatherBatchTask]:
+    """Group weather tasks so each HRRR field is read once.
 
     Args:
-        winds: Wind tasks awaiting alignment.
+        weather: Weather tasks awaiting alignment.
         reuse_existing: Recheck initial inventory misses inside each worker.
 
     Returns:
-        One batch per distinct HRRR file.
+        One batch per distinct pair of HRRR files.
     """
-    grouped: dict[str, list[WindTask]] = {}
-    for wind in winds:
-        grouped.setdefault(wind.hrrr_path, []).append(wind)
-    return [WindBatchTask(path, tuple(group), reuse_existing) for path, group in grouped.items()]
+    grouped: dict[tuple[str, str], list[WeatherTask]] = {}
+    for task in weather:
+        key = (task.wind_hrrr_path, task.temperature_hrrr_path)
+        grouped.setdefault(key, []).append(task)
+    return [
+        WeatherBatchTask(wind_path, temperature_path, tuple(group), reuse_existing)
+        for (wind_path, temperature_path), group in grouped.items()
+    ]
 
 
-def process_wind_batch(batch: WindBatchTask) -> list[WindResult]:
-    """Align all AOIs sharing one HRRR source file.
+def process_weather_batch(batch: WeatherBatchTask) -> list[WeatherResult]:
+    """Align all AOIs sharing the same HRRR source files.
 
     Args:
-        batch: Wind tasks sharing one HRRR analysis file.
+        batch: Weather tasks sharing the same HRRR source files.
 
     Returns:
         One cache result for each requested AOI-hour.
     """
     reusable = {
-        task.cache_key: WindResult(task.cache_key, task.cache_path, None)
-        for task in batch.winds
+        task.cache_key: WeatherResult(task.cache_key, task.cache_path, None)
+        for task in batch.weather
         if batch.reuse_existing and cache_exists(task.cache_path)
     }
-    pending = [task for task in batch.winds if task.cache_key not in reusable]
+    pending = [task for task in batch.weather if task.cache_key not in reusable]
     if not pending:
-        return [reusable[task.cache_key] for task in batch.winds]
+        return [reusable[task.cache_key] for task in batch.weather]
 
     try:
-        grid, fields = _read_hrrr_fields(batch.hrrr_path)
+        wind_grid, wind_fields = _read_hrrr_fields(batch.wind_hrrr_path)
+        if batch.temperature_hrrr_path == batch.wind_hrrr_path:
+            temperature_grid, temperature_fields = wind_grid, wind_fields
+        else:
+            temperature_grid, temperature_fields = _read_hrrr_fields(batch.temperature_hrrr_path)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = f"HRRR read failed: {error}"
         reusable.update(
-            (task.cache_key, WindResult(task.cache_key, task.cache_path, message)) for task in pending
+            (task.cache_key, WeatherResult(task.cache_key, task.cache_path, message)) for task in pending
         )
-        return [reusable[task.cache_key] for task in batch.winds]
+        return [reusable[task.cache_key] for task in batch.weather]
 
     for task in pending:
         try:
-            arrays = _align_wind(grid, fields, task)
-            arrays.update(_centre_hrrr_features(grid, fields, task))
+            arrays = _align_weather(
+                wind_grid,
+                wind_fields,
+                temperature_grid,
+                temperature_fields,
+                task,
+            )
             _write_npz_atomic(task.cache_path, **arrays)
-            reusable[task.cache_key] = WindResult(task.cache_key, task.cache_path, None)
+            reusable[task.cache_key] = WeatherResult(task.cache_key, task.cache_path, None)
         except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-            reusable[task.cache_key] = WindResult(
+            reusable[task.cache_key] = WeatherResult(
                 task.cache_key,
                 task.cache_path,
-                f"HRRR alignment failed: {error}",
+                f"HRRR weather alignment failed: {error}",
             )
-    return [reusable[task.cache_key] for task in batch.winds]
+    return [reusable[task.cache_key] for task in batch.weather]
 
 
-def extract_wind_cache(path: str) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    """Read aligned wind rasters and scalar weather from one cache entry.
+def extract_weather_cache(path: str) -> dict[str, np.ndarray]:
+    """Read aligned wind and temperature rasters from one cache entry.
 
     Args:
-        path: Persistent AOI-hour wind cache path.
+        path: Persistent AOI-hour weather cache path.
 
     Returns:
-        Eastward/northward rasters and scalar weather features.
+        Eastward wind, northward wind, and temperature rasters.
     """
     with np.load(path, allow_pickle=False) as cache:
-        rasters = {
-            WIND_U_RASTER_NAME: np.asarray(cache[WIND_U_RASTER_NAME], dtype=np.float32),
-            WIND_V_RASTER_NAME: np.asarray(cache[WIND_V_RASTER_NAME], dtype=np.float32),
+        return {
+            name: np.asarray(cache[name], dtype=np.float32)
+            for name in (WIND_U_RASTER_NAME, WIND_V_RASTER_NAME, TEMPERATURE_RASTER_NAME)
         }
-        features = {name: float(cache[name]) for name in HRRR_FIELDS.values()}
-    return rasters, features
 
 
-def _paired_mean(current: np.ndarray, previous: np.ndarray, valid: np.ndarray) -> float:
-    # Average both diagnostics over original paired NO2 support
-    values = np.concatenate([current[valid], previous[valid]])
+def _sequence_mean(values_by_timestep: list[np.ndarray], masks: list[np.ndarray]) -> float:
+    # Average one diagnostic over each timestep's independent NO2 support
+    values = np.concatenate([values[valid] for values, valid in zip(values_by_timestep, masks, strict=True)])
     finite = values[np.isfinite(values)]
     return float(np.mean(finite)) if finite.size else float("nan")
 
@@ -792,71 +823,65 @@ class _InsufficientRasterCoverageError(ValueError):
 
 
 def _require_coverage(valid: np.ndarray, threshold: float, raster_name: str) -> float:
-    # Return coverage after enforcing one strict raster eligibility gate
+    # Return coverage after enforcing one inclusive raster eligibility gate
     fraction = float(np.mean(valid))
-    if fraction <= threshold:
+    if fraction < threshold:
         raise _InsufficientRasterCoverageError(
-            f"{raster_name} coverage must exceed {threshold:.0%}; got {fraction:.2%}"
+            f"{raster_name} coverage must be at least {threshold:.0%}; got {fraction:.2%}"
         )
     return fraction
 
 
 def derive_raster_features(
-    current_path: str,
-    previous_path: str,
-    current_wind_path: str,
+    scan_paths: tuple[str, ...],
+    weather_paths: tuple[str, ...],
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    """Derive paired model rasters and scan-quality scalar features.
+    """Build time-major model rasters and scan-quality scalar features.
 
     Args:
-        current_path: Cached scan bundle for the current observation.
-        previous_path: Cached scan bundle for the prior observation.
-        current_wind_path: Aligned wind cache for the current observation.
+        scan_paths: Oldest-to-newest cached TEMPO scan bundles.
+        weather_paths: Matching oldest-to-newest weather cache bundles.
 
     Returns:
         Model raster arrays and their retrieval-quality diagnostics.
     """
-    current_wind, weather_features = extract_wind_cache(current_wind_path)
-    with np.load(current_path, allow_pickle=False) as current, np.load(previous_path, allow_pickle=False) as previous:
-        current_no2 = np.asarray(current["no2"], dtype=np.float64)
-        previous_no2 = np.asarray(previous["no2"], dtype=np.float64)
-        current_valid = np.isfinite(current_no2)
-        previous_valid = np.isfinite(previous_no2)
-        current_fraction = _require_coverage(
-            current_valid,
-            MIN_CURRENT_NO2_FINITE_FRACTION,
-            "Current NO2",
-        )
+    no2_values: list[np.ndarray] = []
+    no2_masks: list[np.ndarray] = []
+    cloud_values: list[np.ndarray] = []
+    quality_values: list[np.ndarray] = []
+    uncertainty_values: list[np.ndarray] = []
+    finite_fractions: list[float] = []
+    for index, path in enumerate(scan_paths):
+        with np.load(path, allow_pickle=False) as scan:
+            no2 = np.asarray(scan["no2"], dtype=np.float32)
+            valid = np.isfinite(no2)
+            finite_fractions.append(
+                _require_coverage(
+                    valid,
+                    MIN_TIMESTEP_NO2_FINITE_FRACTION,
+                    f"Timestep {index} NO2",
+                )
+            )
+            no2_values.append(no2)
+            no2_masks.append(valid)
+            cloud_values.append(np.asarray(scan["weighted_cloud_fraction"], dtype=np.float32))
+            quality_values.append(np.asarray(scan["good_quality_fraction"], dtype=np.float32))
+            uncertainty_values.append(np.asarray(scan["retrieval_uncertainty"], dtype=np.float32))
 
-        paired_valid = current_valid & previous_valid
-        paired_fraction = _require_coverage(
-            paired_valid,
-            MIN_DELTA_NO2_FINITE_FRACTION,
-            "One-hour delta",
-        )
-        delta_no2 = np.full_like(current_no2, np.nan)
-        np.subtract(current_no2, previous_no2, out=delta_no2, where=paired_valid)
-
-        features = {
-            CURRENT_FINITE_FRACTION_COL: current_fraction,
-            PAIRED_FINITE_FRACTION_COL: paired_fraction,
-            "mean_weighted_cloud_fraction": _paired_mean(
-                current["weighted_cloud_fraction"], previous["weighted_cloud_fraction"], paired_valid
-            ),
-            "mean_good_quality_fraction": _paired_mean(
-                current["good_quality_fraction"], previous["good_quality_fraction"], paired_valid
-            ),
-            MEAN_RETRIEVAL_UNCERTAINTY_COL: _paired_mean(
-                current["retrieval_uncertainty"], previous["retrieval_uncertainty"], paired_valid
-            ),
-            **weather_features,
-        }
+    weather = [extract_weather_cache(path) for path in weather_paths]
+    features = {
+        **dict(zip(NO2_FINITE_FRACTION_COLUMNS, finite_fractions, strict=True)),
+        MIN_NO2_FINITE_FRACTION_COL: min(finite_fractions),
+        "mean_weighted_cloud_fraction": _sequence_mean(cloud_values, no2_masks),
+        "mean_good_quality_fraction": _sequence_mean(quality_values, no2_masks),
+        MEAN_RETRIEVAL_UNCERTAINTY_COL: _sequence_mean(uncertainty_values, no2_masks),
+    }
     rasters = {
-        CURRENT_RASTER_NAME: current_no2.astype(np.float32),
-        DELTA_RASTER_NAME: delta_no2.astype(np.float32),
-        **current_wind,
-        CURRENT_MASK_NAME: current_valid.astype(np.uint8),
-        DELTA_MASK_NAME: paired_valid.astype(np.uint8),
+        NO2_RASTER_NAME: np.stack(no2_values),
+        NO2_MASK_NAME: np.stack(no2_masks).astype(np.uint8),
+        TEMPERATURE_RASTER_NAME: np.stack([item[TEMPERATURE_RASTER_NAME] for item in weather]),
+        WIND_U_RASTER_NAME: np.stack([item[WIND_U_RASTER_NAME] for item in weather]),
+        WIND_V_RASTER_NAME: np.stack([item[WIND_V_RASTER_NAME] for item in weather]),
     }
     return rasters, features
 
@@ -886,9 +911,8 @@ def _write_npz_atomic(destination: str, **arrays: np.ndarray | float) -> None:
 def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     # Build and validate one complete raster and scalar feature bundle
     rasters, features = derive_raster_features(
-        task.current_cache_path,
-        task.previous_cache_path,
-        task.current_wind_cache_path,
+        task.scan_cache_paths,
+        task.weather_cache_paths,
     )
     return rasters, features
 
