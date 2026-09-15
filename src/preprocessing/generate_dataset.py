@@ -18,7 +18,7 @@ from config import (
     DATASET_RASTER_DIR,
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WIND_CACHE_DIR,
-    DELTA_THRESHOLD,
+    EMA_DELTA_THRESHOLD,
     HRRR_DIR,
     LABEL_COL,
     NUM_CORES,
@@ -375,7 +375,7 @@ def _write_outputs(
         )
         classification_report = {
             "split": split,
-            "raw_delta_nox_threshold": DELTA_THRESHOLD,
+            "ema_delta_nox_threshold": EMA_DELTA_THRESHOLD,
             "selection_size": selection_size,
             "final_balance": classification_summary(candidates, output_frame),
             "coverage_selection": {

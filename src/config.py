@@ -83,10 +83,7 @@ MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan coverage floor
 MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor
 LABEL_COL = "delta_nox_class"
-DELTA_THRESHOLD = 100.0  # least raw delta-NOx magnitude kept as a labeled class
-MIN_PREV_QTR_REL_DELTA = 0.10  # least absolute change relative to prior-quarter mean NOx
-NOX_LOWER_PERCENTILE = 1.0  # lower aggregate AOI-hour NOx percentile retained during stratification
-NOX_UPPER_PERCENTILE = 99.0  # upper aggregate AOI-hour NOx percentile retained during stratification
+EMA_DELTA_THRESHOLD = 100.0  # least absolute current-minus-previous effective NOx retained
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
@@ -95,6 +92,8 @@ MIN_MAJOR_CITY_DISTANCE_KM = 50.0  # minimum eligible plant distance from a majo
 # Modeling data contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
+SEQUENCE_TIMESTEPS = 5  # shared hourly raster and EMA history length
+EMA_DECAY_TIMESCALE_HOURS = 2.0  # exponential e-folding time kept separate from the sequence length
 MODEL_IMAGE_KEYS = ("current_no2", "delta_no2", "wind_u_80m_mps", "wind_v_80m_mps")
 MODEL_MASK_KEYS = ("current_no2_mask", "delta_no2_mask")
 MODEL_ROBUST_IMAGE_KEYS = ("current_no2", "delta_no2")
@@ -108,7 +107,6 @@ MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular a
     "avg_heat_input",
     "avg_pwr_gen",
     "temperature_2m_k",
-    "boundary_layer_height_m",
 )
 MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to sine and cosine
 

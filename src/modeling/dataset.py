@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 from config import (
     DATASET_DF,
     DATASET_DIR,
-    DELTA_THRESHOLD,
+    EMA_DELTA_THRESHOLD,
     LABEL_COL,
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_ABS,
@@ -265,7 +265,7 @@ def compute_stats(
         feature_names=MODEL_FEATURE_NAMES,
         feature_mean=tuple(float(value) for value in features.mean(axis=0)),
         feature_std=tuple(float(value) for value in feature_std),
-        delta_threshold=DELTA_THRESHOLD,
+        delta_threshold=EMA_DELTA_THRESHOLD,
         training_records=len(frame),
     )
 
