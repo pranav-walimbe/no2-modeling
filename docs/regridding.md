@@ -104,9 +104,11 @@ pairs. Production uses:
 - no additional effective-sample floor.
 
 Dataset generation requires at least 90% finite NO2 coverage independently at
-every configured timestep. It retains missing cells and selects eligible records
-through temporal and AOI round-robin with minimum sequence coverage as the sole
-quality rank. Cloud, uncertainty, and quality
+every configured timestep. It also requires complete coverage in the 3 by 3
+window centred on the highest-unit source cell in every timestep. It retains
+missing cells elsewhere and selects eligible records through temporal and AOI
+round-robin with minimum sequence coverage as the sole quality rank. Hotspot,
+cloud, uncertainty, and quality
 summaries remain diagnostics and rank nothing.
 
 Measured tradeoffs:

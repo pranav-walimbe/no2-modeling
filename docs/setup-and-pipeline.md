@@ -200,14 +200,17 @@ array such as `0-31%14`.
   caches, grouping work so workers reuse each NetCDF or GRIB read;
 - preserves each directly regridded NO2 scan and its independent mask;
 - requires at least 90 percent finite NO2 coverage in every timestep;
+- requires all nine cells around the highest-unit source cell to be valid in
+  every timestep;
 - selects the largest exactly balanced successful subset through deterministic
   AOI and temporal round-robin, limited only by the smaller class;
 - uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
   allocation.
 
 Every successful split-CSV row carries its relative `raster_bundle_path`,
-per-timestep NO2 coverage, and sequence-level cloud, quality, and
-retrieval-uncertainty summaries. Temperature is stored only as a raster.
+selected hotspot cell, per-timestep full-raster and hotspot coverage, and
+sequence-level cloud, quality, and retrieval-uncertainty summaries. Temperature
+is stored only as a raster.
 
 Running the splits:
 

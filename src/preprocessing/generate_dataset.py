@@ -18,8 +18,10 @@ from config import (
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WEATHER_CACHE_DIR,
     EMA_DELTA_THRESHOLD,
+    HOTSPOT_WINDOW_SIZE,
     HRRR_DIR,
     LABEL_COL,
+    MIN_HOTSPOT_NO2_FINITE_FRACTION,
     MIN_TIMESTEP_NO2_FINITE_FRACTION,
     NUM_CORES,
     SEQUENCE_TIMESTEPS,
@@ -50,6 +52,7 @@ from preprocessing.generate_dataset_utils import (
     process_weather_batch,
     scan_batches,
     select_final_records,
+    select_hotspot_cell,
     weather_batches,
     write_csv_atomic,
     write_json_atomic,
@@ -60,6 +63,11 @@ SPLIT_PATHS = {
     "train": TRAIN_RECORDS_CSV,
     "val": VAL_RECORDS_CSV,
     "test": TEST_RECORDS_CSV,
+}
+SOURCE_METADATA_SCHEMA = {
+    "_source_east_km": pl.String,
+    "_source_north_km": pl.String,
+    "_source_unit_count": pl.String,
 }
 ARRAY_SPLITS = tuple(SPLIT_PATHS)
 PROGRESS_INTERVAL = 1_000
@@ -80,6 +88,8 @@ class PreparedRecord:
     record_index: int
     scan_keys: tuple[str, ...]
     weather_cache_keys: tuple[str, ...]
+    hotspot_row: int
+    hotspot_column: int
     raster_bundle_path: str
 
 
@@ -93,7 +103,15 @@ def _positive_int(value: str) -> int:
 
 def _scan_split(path: str) -> pl.LazyFrame:
     # Load split rows lazily for bounded orchestration memory
-    return pl.scan_csv(path, try_parse_dates=True)
+    return pl.scan_csv(path, try_parse_dates=True, schema_overrides=SOURCE_METADATA_SCHEMA)
+
+
+def _parse_source_values(value: object, value_type: type[float] | type[int]) -> tuple[float, ...] | tuple[int, ...]:
+    # Parse aligned comma-delimited source metadata from stratification
+    values = tuple(value_type(item) for item in str(value).split(",") if item)
+    if not values:
+        raise ValueError("Source metadata cannot be empty")
+    return values
 
 
 def _slurm_array_spec(task_ids: list[int]) -> str:
@@ -172,12 +190,19 @@ def _prepare_records(
                     for index in range(SEQUENCE_TIMESTEPS)
                 )
                 raster_bundle_path = output_dir / f"{record_index:06d}.npz"
+                hotspot_row, hotspot_column = select_hotspot_cell(
+                    _parse_source_values(row["_source_east_km"], float),
+                    _parse_source_values(row["_source_north_km"], float),
+                    _parse_source_values(row["_source_unit_count"], int),
+                )
                 records.append(
                     PreparedRecord(
                         split=split,
                         record_index=record_index,
                         scan_keys=tuple(scan.cache_key for scan in record_scans),
                         weather_cache_keys=tuple(item.cache_key for item in record_weather),
+                        hotspot_row=hotspot_row,
+                        hotspot_column=hotspot_column,
                         raster_bundle_path=str(raster_bundle_path),
                     )
                 )
@@ -287,6 +312,8 @@ def _record_tasks(
                 record_index=record.record_index,
                 scan_cache_paths=tuple(tempo_cache_paths[key] for key in record.scan_keys),
                 weather_cache_paths=tuple(weather_cache_paths[key] for key in record.weather_cache_keys),
+                hotspot_row=record.hotspot_row,
+                hotspot_column=record.hotspot_column,
                 output_path=record.raster_bundle_path,
             )
         )
@@ -366,6 +393,8 @@ def _write_outputs(
             "raster_contract": {
                 "sequence_timesteps": SEQUENCE_TIMESTEPS,
                 "minimum_no2_finite_fraction_per_timestep": MIN_TIMESTEP_NO2_FINITE_FRACTION,
+                "hotspot_window_size": HOTSPOT_WINDOW_SIZE,
+                "minimum_hotspot_no2_finite_fraction_per_timestep": MIN_HOTSPOT_NO2_FINITE_FRACTION,
             },
             "selection_size": selection_size,
             "final_balance": classification_summary(candidates, output_frame),
@@ -385,7 +414,12 @@ def _write_outputs(
             str(Path(candidate_path).relative_to(DATASET_DIR))
             for candidate_path in output_frame[CANDIDATE_RASTER_PATH_COL].to_list()
         ]
-        output_frame = output_frame.drop("_source_east_km", "_source_north_km", strict=False).with_columns(
+        output_frame = output_frame.drop(
+            "_source_east_km",
+            "_source_north_km",
+            "_source_unit_count",
+            strict=False,
+        ).with_columns(
             pl.Series(RASTER_BUNDLE_PATH_COL, relative_paths, dtype=pl.String)
         )
         write_csv_atomic(

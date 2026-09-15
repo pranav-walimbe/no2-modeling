@@ -118,12 +118,15 @@ The native regridder accepts an NO2 contributor only when:
 - a positive area of accepted support reaches an output cell.
 
 Missing cells are never interpolated. Every configured timestep must have at
-least 90% finite NO2 coverage. After that gate passes, each scan retains its
-directly regridded values and its own validity mask.
+least 90% finite NO2 coverage. It must also have complete coverage in a 3 by 3
+window around the raster cell containing the largest cluster of modeled units.
+Facilities in the same raster cell contribute their combined unit count. Equal
+counts are resolved by unit-weighted distance to the AOI centre. After both
+gates pass, each scan retains its directly regridded values and validity mask.
 
 Generated records use `min_no2_finite_fraction` across the sequence as the only
-ranking signal after the fixed gate. Central coverage and retrieval uncertainty
-do not filter or rank records. Generation summaries report retained counts,
+ranking signal after the fixed gates. Retrieval uncertainty does not filter or
+rank records. Generation summaries report retained counts,
 full-sequence coverage rates, and represented AOIs overall and by class. Coverage
 remains a dataset diagnostic and is not supplied to the model.
 
