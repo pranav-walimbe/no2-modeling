@@ -109,12 +109,12 @@ class ConvGRUCell(nn.Module):
 
 
 class NOxModel(nn.Module):
-    """Encode raster sequences and optionally fuse a frozen tabular embedding."""
+    """Encode raster sequences and fuse a frozen tabular embedding."""
 
     def __init__(
         self,
         *,
-        tabular_model: TabularMLP | None = None,
+        tabular_model: TabularMLP,
         head_dim: int = DEFAULT_HEAD_DIM,
         dropout: float = DEFAULT_DROPOUT,
     ) -> None:
@@ -146,10 +146,9 @@ class NOxModel(nn.Module):
         )
 
         self.tabular_model = tabular_model
-        if self.tabular_model is not None:
-            self.tabular_model.requires_grad_(False)
-            self.tabular_model.eval()
-        fusion_dim = VISION_EMBEDDING_DIM + (tabular_model.embedding_dim if tabular_model is not None else 0)
+        self.tabular_model.requires_grad_(False)
+        self.tabular_model.eval()
+        fusion_dim = VISION_EMBEDDING_DIM + tabular_model.embedding_dim
         self.head = nn.Sequential(
             nn.Linear(fusion_dim, head_dim),
             nn.LayerNorm(head_dim),
@@ -160,8 +159,7 @@ class NOxModel(nn.Module):
 
     def train(self, mode: bool = True) -> "NOxModel":
         super().train(mode)
-        if self.tabular_model is not None:
-            self.tabular_model.eval()
+        self.tabular_model.eval()
         return self
 
     def _encode_sequence(self, image: torch.Tensor) -> torch.Tensor:
@@ -188,11 +186,10 @@ class NOxModel(nn.Module):
         return self.vision_projection(torch.cat((average, peak), dim=1))
 
     def forward(self, image: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
-        features = [self._encode_sequence(image)]
-        if self.tabular_model is not None:
-            with torch.no_grad():
-                features.append(self.tabular_model.encode(tabular))
-        return self.head(torch.cat(features, dim=1)).squeeze(1)
+        vision_features = self._encode_sequence(image)
+        with torch.no_grad():
+            tabular_features = self.tabular_model.encode(tabular)
+        return self.head(torch.cat((vision_features, tabular_features), dim=1)).squeeze(1)
 
     def num_params(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)

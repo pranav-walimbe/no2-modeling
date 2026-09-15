@@ -290,7 +290,6 @@ Use these stage-specific allocations and commands:
 ```bash
 srun python -u -m modeling.train \
     --device cuda \
-    --inputs full \
     --batch-size 128 \
     --epochs 300 \
     --workers "$SLURM_CPUS_PER_TASK" \

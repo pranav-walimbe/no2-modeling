@@ -220,17 +220,14 @@ non-overlapping plant regions rather than memorization of known AOIs.
 |---|---|
 | Constant and prevalence classifiers | Does the model beat trivial predictions? |
 | Tabular-only MLP | Does image data add value to the neural model? |
-| Raster-only ConvGRU | Does scalar context add value? |
-| Full fused model | Does fusion improve validation loss? |
+| ConvGRU plus frozen MLP | Do raster sequences improve on the same selected MLP? |
 | With and without masks | Does explicit support information add value? |
 
 Report every comparison on the same frozen validation and test records. The full
 model earns its place only when image information improves held-out-AOI error
-and the gain extends past unusually clear or high-plume scenes. The trainer
-exposes these ablations through `--inputs tabular`, `--inputs image`, and the
-default `--inputs full`. The default run reports the fused model minus the exact
-validation-selected MLP checkpoint that is frozen for fusion, isolating the
-incremental value of the raster branch without changing tabular models.
+and the gain extends past unusually clear or high-plume scenes. Every run
+reports the fused model minus the exact validation-selected MLP checkpoint that
+is frozen for fusion. A standalone ConvGRU is not trained or reported.
 
 ## Run artifacts
 
@@ -240,7 +237,7 @@ Each UTC-stamped directory under `RUNS_DIR` contains:
 |---|---|
 | `normalization_stats.json` | Train-only preprocessing and deadband cutoff |
 | `run_config.json` | Features, settings, clipping rates, and parameter count |
-| `checkpoints/best_model.pt` | Selected ConvGRU-fusion or ablation checkpoint |
+| `checkpoints/best_model.pt` | Selected ConvGRU-plus-MLP checkpoint |
 | `checkpoints/best_tabular_mlp.pt` | Independently selected MLP used by the fused model |
 | `results.json` | Metrics, ConvGRU-plus-MLP minus MLP differences, and prevalence |
 | `*_predictions.csv` | Row-level predictions for each model and split |
@@ -255,8 +252,8 @@ python -u -m modeling.train
 
 Flags:
 
-- `--workers`, `--batch-size`, `--epochs` for allocation-specific overrides;
-- `--inputs` for the controlled branch ablations.
+- `--workers`, `--batch-size`, and `--epochs` for allocation-specific overrides;
+- `--tabular-epochs` for the initial MLP training phase.
 
 Every run recomputes normalization statistics from the training split and writes
 them to its own run directory. No flag reuses a saved file, so a stale statistics

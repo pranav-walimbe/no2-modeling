@@ -86,7 +86,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
-    parser.add_argument("--inputs", choices=("full", "image", "tabular"), default="full")
     return parser.parse_args()
 
 
@@ -344,102 +343,81 @@ def main() -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
 
     save_stats(stats, run_dir / "normalization_stats.json")
-    load_images = args.inputs != "tabular"
-    datasets = {split: NOxDataset(split, stats, load_images=load_images) for split in ("train", "val", "test")}
-    clipped_fractions = {split: clipped_pixel_fractions(split, stats) for split in datasets} if load_images else {}
+    datasets = {split: NOxDataset(split, stats) for split in ("train", "val", "test")}
+    tabular_datasets = {split: NOxDataset(split, stats, load_images=False) for split in datasets}
+    clipped_fractions = {split: clipped_pixel_fractions(split, stats) for split in datasets}
     target_label_mode = str(datasets["train"].frame[LABEL_MODE_COL].iloc[0])
     train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
     eval_loaders = {
         split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in datasets.items()
+    }
+    tabular_train_loader = _loader(tabular_datasets["train"], shuffle=True, args=args, device=device)
+    tabular_eval_loaders = {
+        split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in tabular_datasets.items()
     }
 
     checkpoint_metadata = {
         "normalization_stats": stats.to_dict(),
         "model_feature_names": MODEL_FEATURE_NAMES,
     }
-    tabular_model: TabularMLP | None = None
-    tabular_run: dict[str, object] | None = None
-    tabular_split_frames: dict[str, pd.DataFrame] | None = None
-    if args.inputs in ("full", "tabular"):
-        tabular_model = TabularMLP(len(MODEL_FEATURE_NAMES)).to(device)
-        if args.inputs == "full":
-            tabular_datasets = {
-                split: NOxDataset(split, stats, load_images=False) for split in ("train", "val", "test")
-            }
-            tabular_train_loader = _loader(tabular_datasets["train"], shuffle=True, args=args, device=device)
-            tabular_eval_loaders = {
-                split: _loader(dataset, shuffle=False, args=args, device=device)
-                for split, dataset in tabular_datasets.items()
-            }
-        else:
-            tabular_datasets = datasets
-            tabular_train_loader = train_loader
-            tabular_eval_loaders = eval_loaders
-        tabular_path = checkpoint_dir / ("best_model.pt" if args.inputs == "tabular" else "best_tabular_mlp.pt")
-        print(f"Pretraining {tabular_model.num_params():,}-parameter tabular MLP on {device}")
-        tabular_train_losses, tabular_val_losses, tabular_best_loss = fit_model(
-            tabular_model,
-            tabular_train_loader,
-            tabular_eval_loaders["val"],
-            device=device,
-            epochs=args.tabular_epochs,
-            learning_rate=args.tabular_learning_rate,
-            args=args,
-            checkpoint_path=tabular_path,
-            checkpoint_metadata=checkpoint_metadata,
-            phase_name="Tabular MLP",
-        )
-        plot_loss_curve(
-            tabular_train_losses,
-            tabular_val_losses,
-            run_dir,
-            plot_name="tabular_loss_curve",
-            title="Tabular MLP training and validation loss",
-        )
-        tabular_run = {
-            "maximum_epochs": args.tabular_epochs,
-            "learning_rate": args.tabular_learning_rate,
-            "parameters": tabular_model.num_params(),
-            "best_validation_loss": tabular_best_loss,
-            "frozen_during_fusion": args.inputs == "full",
-        }
-        tabular_split_frames = {}
-        for split, loader in tabular_eval_loaders.items():
-            logits, indices = run_inference(tabular_model, loader, device)
-            tabular_split_frames[split] = _prediction_frame(tabular_datasets[split], logits, indices)
-        if args.inputs == "full":
-            del tabular_train_loader, tabular_eval_loaders, tabular_datasets
+    tabular_model = TabularMLP(len(MODEL_FEATURE_NAMES)).to(device)
+    print(f"Pretraining {tabular_model.num_params():,}-parameter tabular MLP on {device}")
+    tabular_train_losses, tabular_val_losses, tabular_best_loss = fit_model(
+        tabular_model,
+        tabular_train_loader,
+        tabular_eval_loaders["val"],
+        device=device,
+        epochs=args.tabular_epochs,
+        learning_rate=args.tabular_learning_rate,
+        args=args,
+        checkpoint_path=checkpoint_dir / "best_tabular_mlp.pt",
+        checkpoint_metadata=checkpoint_metadata,
+        phase_name="Tabular MLP",
+    )
+    plot_loss_curve(
+        tabular_train_losses,
+        tabular_val_losses,
+        run_dir,
+        plot_name="tabular_loss_curve",
+        title="Tabular MLP training and validation loss",
+    )
+    tabular_run = {
+        "maximum_epochs": args.tabular_epochs,
+        "learning_rate": args.tabular_learning_rate,
+        "parameters": tabular_model.num_params(),
+        "best_validation_loss": tabular_best_loss,
+        "frozen_during_fusion": True,
+    }
+    tabular_split_frames = {}
+    for split, loader in tabular_eval_loaders.items():
+        logits, indices = run_inference(tabular_model, loader, device)
+        tabular_split_frames[split] = _prediction_frame(tabular_datasets[split], logits, indices)
+    del tabular_train_loader, tabular_eval_loaders, tabular_datasets
 
     best_path = checkpoint_dir / "best_model.pt"
-    if args.inputs == "tabular":
-        model = tabular_model
-        best_val_loss = tabular_best_loss
-    else:
-        model = NOxModel(
-            tabular_model=tabular_model if args.inputs == "full" else None,
-            head_dim=args.head_dim,
-            dropout=args.dropout,
-        ).to(device)
-        print(f"Training {model.num_params():,}-parameter ConvGRU model on {device}; outputs: {run_dir}")
-        train_losses, val_losses, best_val_loss = fit_model(
-            model,
-            train_loader,
-            eval_loaders["val"],
-            device=device,
-            epochs=args.epochs,
-            learning_rate=args.learning_rate,
-            args=args,
-            checkpoint_path=best_path,
-            checkpoint_metadata=checkpoint_metadata,
-            phase_name="ConvGRU",
-        )
-        plot_loss_curve(train_losses, val_losses, run_dir)
-
-    assert model is not None
+    model = NOxModel(
+        tabular_model=tabular_model,
+        head_dim=args.head_dim,
+        dropout=args.dropout,
+    ).to(device)
+    print(f"Training {model.num_params():,}-parameter ConvGRU + MLP model on {device}; outputs: {run_dir}")
+    train_losses, val_losses, best_val_loss = fit_model(
+        model,
+        train_loader,
+        eval_loaders["val"],
+        device=device,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        args=args,
+        checkpoint_path=best_path,
+        checkpoint_metadata=checkpoint_metadata,
+        phase_name="ConvGRU + MLP",
+    )
+    plot_loss_curve(train_losses, val_losses, run_dir)
 
     run_config = {
         "device": str(device),
-        "inputs": args.inputs,
+        "models": ["convgru_mlp", "mlp"],
         "batch_size": args.batch_size,
         "workers": args.workers,
         "maximum_epochs": args.epochs,
@@ -448,7 +426,7 @@ def main() -> None:
         "seed": args.seed,
         "head_dim": args.head_dim,
         "dropout": args.dropout,
-        "no2_stem_normalization": "group_norm" if load_images else None,
+        "no2_stem_normalization": "group_norm",
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip_norm": args.gradient_clip_norm,
@@ -470,31 +448,21 @@ def main() -> None:
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
-    if args.inputs == "tabular":
-        assert tabular_split_frames is not None
-        split_frames = tabular_split_frames
-    else:
-        split_frames = {}
-        for split, loader in eval_loaders.items():
-            logits, indices = run_inference(model, loader, device)
-            split_frames[split] = _prediction_frame(datasets[split], logits, indices)
+    split_frames = {}
+    for split, loader in eval_loaders.items():
+        logits, indices = run_inference(model, loader, device)
+        split_frames[split] = _prediction_frame(datasets[split], logits, indices)
 
     plot_class_probabilities(split_frames, run_dir)
     plot_spatial_accuracy(split_frames, run_dir)
-    primary_model_name = {"full": "convgru_mlp", "image": "convgru", "tabular": "mlp"}[args.inputs]
-    model_frames = {primary_model_name: split_frames}
-    comparison_model_name = None
-    if args.inputs == "full":
-        assert tabular_split_frames is not None
-        model_frames["mlp"] = tabular_split_frames
-        comparison_model_name = "mlp"
-        plot_model_comparison(model_frames, run_dir)
+    model_frames = {"convgru_mlp": split_frames, "mlp": tabular_split_frames}
+    plot_model_comparison(model_frames, run_dir)
     save_results(
         model_frames,
         classification_summaries,
         run_dir,
-        primary_model_name=primary_model_name,
-        comparison_model_name=comparison_model_name,
+        primary_model_name="convgru_mlp",
+        comparison_model_name="mlp",
     )
 
 
