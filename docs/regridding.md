@@ -64,8 +64,8 @@ Pass the matching flag after changing TEMPO processing or wind alignment.
 Each successful model record persists one compressed NPZ holding four aligned
 `float32` arrays and two `uint8` masks:
 
-- `current_no2`, smoothed and upwind-normalized current NO2 on native QA-passing support;
-- `delta_no2`, current minus previous smoothed and upwind-normalized NO2 on their support intersection;
+- `current_no2`, directly regridded current NO2 on native QA-passing support;
+- `delta_no2`, current minus previous directly regridded NO2 on their support intersection;
 - `wind_u_80m_mps`, geographic eastward wind;
 - `wind_v_80m_mps`, geographic northward wind;
 - `current_no2_mask` and `delta_no2_mask`, independent binary support for the
@@ -74,7 +74,6 @@ Each successful model record persists one compressed NPZ holding four aligned
 Every row in the companion split CSV carries its NPZ path in `delta_no2_path`
 plus these derived features:
 
-- `plume_score`, from finite delta pixels as `(p99 - p50) / (p50 - p10)`;
 - `mean_weighted_cloud_fraction` and `mean_good_quality_fraction`, each averaged
   over both scans at their original paired-valid cells;
 - `mean_retrieval_uncertainty`, averaged over both scans at their original
@@ -88,12 +87,8 @@ Wind alignment, on the 3 km HRRR grid NOAA describes:
 2. Bilinearly interpolate the wind components.
 3. Rotate the grid-relative values to geographic east and north before caching.
 
-Current and previous scans are smoothed independently with retrieval
-uncertainty and winds from each scan's nearest HRRR analysis hour. Coverage is
-validated before smoothing, and the kernel does not expand finite support. A
-scan-specific Huber location from the 24 to 36 km source-relative upwind
-corridor is then subtracted from each scan. Dataset generation rejects the
-record when either background has fewer than 12 paired-valid pixels.
+Current and previous scans retain their directly regridded values. Coverage is
+validated on those values before the delta is formed.
 
 See the [NOAA Global Systems Laboratory HRRR overview](https://rapidrefresh.noaa.gov/).
 

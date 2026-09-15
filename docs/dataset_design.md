@@ -88,8 +88,8 @@ Each sample stores four numeric arrays and two masks on a fixed grid:
 
 | Array | Notes |
 |---|---|
-| smoothed and upwind-normalized current regridded NO2 | finite where native QA-passing support exists; record coverage must exceed 95% |
-| current minus previous smoothed and upwind-normalized NO2 | finite on the current/previous mask intersection; coverage must exceed 80% |
+| directly regridded current NO2 | finite where native QA-passing support exists; record coverage must exceed 95% |
+| current minus previous directly regridded NO2 | finite on the current/previous mask intersection; coverage must exceed 80% |
 | eastward wind, northward wind | bilinearly aligned from the native HRRR grid and finite across the image |
 | two NO2 validity masks | separate binary support for current and hourly delta |
 
@@ -134,11 +134,8 @@ The native regridder accepts an NO2 contributor only when:
 
 Missing cells are never interpolated. Current coverage must be greater than
 95%. The current/previous intersection must cover more than 80% of the raster.
-After those gates pass, each scan is smoothed independently with its retrieval
-uncertainty and observation-time wind. Each scan then receives a source-relative
-upwind background subtraction using its own wind. The paired operation becomes
-eligible only when both scans have at least 12 paired-valid background pixels.
-Smoothing and normalization preserve the original masks.
+After those gates pass, each scan retains its directly regridded values. The
+paired delta uses the current/previous mask intersection.
 
 After pairing scans, generated records use `paired_finite_fraction` as the only
 ranking signal after the fixed gates. Central coverage and retrieval uncertainty
@@ -150,11 +147,7 @@ remains a dataset diagnostic and is not supplied to the model.
 
 | Quantity | Role | Why not a filter |
 |---|---|---|
-| `plume_score` | Diagnostic | Selecting visible plumes conditions the dataset on an easily observed response and biases evaluation toward easy cases. Its percentile-ratio definition also destabilizes as the lower spread approaches zero. |
 | Mean cloud and quality fractions | Diagnostics | Native cloud and quality filtering already decides whether NO2 is accepted. |
-
-`plume_score` remains in each output row for post-hoc stratification. It is not
-required to be finite and never affects eligibility, ranking, or class balance.
 
 ## Candidate selection
 

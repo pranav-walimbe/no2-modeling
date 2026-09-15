@@ -31,7 +31,6 @@ from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
     CANDIDATE_RASTER_PATH_COL,
     DELTA_NO2_PATH_COL,
-    PLUME_SCORE_COL,
     PROCESSING_FAILURE_SCHEMA,
     SOURCE_RECORD_INDEX_COL,
     DatasetShardStore,
@@ -61,10 +60,6 @@ SPLIT_PATHS = {
     "val": VAL_RECORDS_CSV,
     "test": TEST_RECORDS_CSV,
 }
-SOURCE_OFFSET_SCHEMA = {
-    "_source_east_km": pl.String,
-    "_source_north_km": pl.String,
-}
 ARRAY_SPLITS = tuple(SPLIT_PATHS)
 PROGRESS_INTERVAL = 1_000
 LEGACY_DATASET_JOB_NAME = "generate-dataset"
@@ -83,18 +78,7 @@ class PreparedRecord:
     current_scan_key: str
     previous_scan_key: str
     current_wind_cache_key: str
-    previous_wind_cache_key: str
     delta_no2_path: str
-    source_east_km: tuple[float, ...]
-    source_north_km: tuple[float, ...]
-
-
-def _parse_source_offsets(value: object) -> tuple[float, ...]:
-    # Parse compact source coordinates while accepting older stratified files
-    if value is None:
-        return (0.0,)
-    offsets = tuple(float(item) for item in str(value).split(",") if item)
-    return offsets or (0.0,)
 
 
 def _positive_int(value: str) -> int:
@@ -106,8 +90,8 @@ def _positive_int(value: str) -> int:
 
 
 def _scan_split(path: str) -> pl.LazyFrame:
-    # Keep comma-delimited source lists from being inferred as scalar floats
-    return pl.scan_csv(path, try_parse_dates=True, schema_overrides=SOURCE_OFFSET_SCHEMA)
+    # Load split rows lazily for bounded orchestration memory
+    return pl.scan_csv(path, try_parse_dates=True)
 
 
 def _slurm_array_spec(task_ids: list[int]) -> str:
@@ -197,12 +181,6 @@ def _prepare_records(
                     Path(HRRR_DIR),
                     wind_cache_dir,
                 )
-                previous_wind = _observation_wind_task(
-                    row,
-                    "prev_tempo_time",
-                    Path(HRRR_DIR),
-                    wind_cache_dir,
-                )
                 delta_no2_path = output_dir / f"{record_index:06d}.npz"
                 records.append(
                     PreparedRecord(
@@ -211,16 +189,12 @@ def _prepare_records(
                         current_scan_key=current.cache_key,
                         previous_scan_key=previous.cache_key,
                         current_wind_cache_key=current_wind.cache_key,
-                        previous_wind_cache_key=previous_wind.cache_key,
                         delta_no2_path=str(delta_no2_path),
-                        source_east_km=_parse_source_offsets(row.get("_source_east_km")),
-                        source_north_km=_parse_source_offsets(row.get("_source_north_km")),
                     )
                 )
                 scans.setdefault(current.cache_key, current)
                 scans.setdefault(previous.cache_key, previous)
                 winds.setdefault(current_wind.cache_key, current_wind)
-                winds.setdefault(previous_wind.cache_key, previous_wind)
             except (KeyError, TypeError, ValueError) as error:
                 failures[split].append({"record_index": record_index, "error": str(error)})
             if prepared_count % PROGRESS_INTERVAL == 0 or prepared_count == source_count:
@@ -312,11 +286,7 @@ def _record_tasks(
             reasons = [tempo_failures.get(key, "TEMPO cache unavailable") for key in missing_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
             continue
-        missing_wind_keys = [
-            key
-            for key in (record.current_wind_cache_key, record.previous_wind_cache_key)
-            if key not in wind_cache_paths
-        ]
+        missing_wind_keys = [record.current_wind_cache_key] if record.current_wind_cache_key not in wind_cache_paths else []
         if missing_wind_keys:
             reasons = [wind_failures.get(key, "wind cache unavailable") for key in missing_wind_keys]
             failures[record.split].append({"record_index": record.record_index, "error": "; ".join(reasons)})
@@ -330,10 +300,7 @@ def _record_tasks(
                 current_cache_path=tempo_cache_paths[record.current_scan_key],
                 previous_cache_path=tempo_cache_paths[record.previous_scan_key],
                 current_wind_cache_path=wind_cache_paths[record.current_wind_cache_key],
-                previous_wind_cache_path=wind_cache_paths[record.previous_wind_cache_key],
                 output_path=record.delta_no2_path,
-                source_east_km=record.source_east_km,
-                source_north_km=record.source_north_km,
             )
         )
     return tasks, records_by_id
@@ -391,7 +358,6 @@ def _write_outputs(
     for split, candidates in candidates_by_split.items():
         output_frame = select_final_records(candidates)
         selected_coverage = coverage_selection_summary(output_frame)
-        finite_plume_records = candidates.filter(pl.col(PLUME_SCORE_COL).is_finite().fill_null(False)).height
         eligible_by_class = {
             str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)
         }
@@ -410,11 +376,6 @@ def _write_outputs(
         classification_report = {
             "split": split,
             "raw_delta_nox_threshold": DELTA_THRESHOLD,
-            "plume_score_diagnostic": {
-                "selection_role": "diagnostic_only",
-                "finite_records": finite_plume_records,
-                "missing_records": candidates.height - finite_plume_records,
-            },
             "selection_size": selection_size,
             "final_balance": classification_summary(candidates, output_frame),
             "coverage_selection": {
