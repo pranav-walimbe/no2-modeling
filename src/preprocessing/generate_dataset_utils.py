@@ -37,7 +37,6 @@ from preprocessing.regrid import (
     regrid_aoi_raster,
     write_raster_npz,
 )
-from preprocessing.smoothing import normalize_smoothed_pair, regional_plume_score, smooth_no2
 from preprocessing.stratify_utils import AOI_ID_COL
 
 CURRENT_RASTER_NAME, DELTA_RASTER_NAME, WIND_U_RASTER_NAME, WIND_V_RASTER_NAME = MODEL_IMAGE_KEYS
@@ -45,7 +44,6 @@ CURRENT_MASK_NAME, DELTA_MASK_NAME = MODEL_MASK_KEYS
 CURRENT_FINITE_FRACTION_COL = "current_finite_fraction"
 PAIRED_FINITE_FRACTION_COL = "paired_finite_fraction"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
-PLUME_SCORE_COL = "plume_score"
 SELECTION_HELPER_COLUMNS = (
     "_selection_year",
     "_selection_quarter",
@@ -58,7 +56,6 @@ HRRR_FIELDS = {
     "blh": "boundary_layer_height_m",
 }
 TABULAR_FEATURE_NAMES = (
-    PLUME_SCORE_COL,
     CURRENT_FINITE_FRACTION_COL,
     PAIRED_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
@@ -376,10 +373,7 @@ class RecordTask:
     current_cache_path: str
     previous_cache_path: str
     current_wind_cache_path: str
-    previous_wind_cache_path: str
     output_path: str
-    source_east_km: tuple[float, ...] = (0.0,)
-    source_north_km: tuple[float, ...] = (0.0,)
 
 
 @dataclass(frozen=True)
@@ -812,9 +806,6 @@ def derive_raster_features(
     current_path: str,
     previous_path: str,
     current_wind_path: str,
-    previous_wind_path: str,
-    source_east_km: tuple[float, ...] = (0.0,),
-    source_north_km: tuple[float, ...] = (0.0,),
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Derive paired model rasters and scan-quality scalar features.
 
@@ -822,15 +813,11 @@ def derive_raster_features(
         current_path: Cached scan bundle for the current observation.
         previous_path: Cached scan bundle for the prior observation.
         current_wind_path: Aligned wind cache for the current observation.
-        previous_wind_path: Aligned wind cache for the prior observation.
-        source_east_km: Facility offsets east of the AOI centre.
-        source_north_km: Facility offsets north of the AOI centre.
 
     Returns:
-        Model raster arrays and their plume and retrieval-quality diagnostics.
+        Model raster arrays and their retrieval-quality diagnostics.
     """
     current_wind, weather_features = extract_wind_cache(current_wind_path)
-    previous_wind, _ = extract_wind_cache(previous_wind_path)
     with np.load(current_path, allow_pickle=False) as current, np.load(previous_path, allow_pickle=False) as previous:
         current_no2 = np.asarray(current["no2"], dtype=np.float64)
         previous_no2 = np.asarray(previous["no2"], dtype=np.float64)
@@ -848,47 +835,10 @@ def derive_raster_features(
             MIN_DELTA_NO2_FINITE_FRACTION,
             "One-hour delta",
         )
-        current_smoothed = smooth_no2(
-            current_no2,
-            np.asarray(current["retrieval_uncertainty"], dtype=np.float64),
-            current_wind[WIND_U_RASTER_NAME],
-            current_wind[WIND_V_RASTER_NAME],
-        )
-        previous_smoothed = smooth_no2(
-            previous_no2,
-            np.asarray(previous["retrieval_uncertainty"], dtype=np.float64),
-            previous_wind[WIND_U_RASTER_NAME],
-            previous_wind[WIND_V_RASTER_NAME],
-        )
-        current_plume_score, _, _ = regional_plume_score(
-            current_smoothed,
-            current_wind[WIND_U_RASTER_NAME],
-            current_wind[WIND_V_RASTER_NAME],
-            source_east_km,
-            source_north_km,
-        )
-        previous_plume_score, _, _ = regional_plume_score(
-            previous_smoothed,
-            previous_wind[WIND_U_RASTER_NAME],
-            previous_wind[WIND_V_RASTER_NAME],
-            source_east_km,
-            source_north_km,
-        )
-        current_smoothed, previous_smoothed = normalize_smoothed_pair(
-            current_smoothed,
-            previous_smoothed,
-            current_wind[WIND_U_RASTER_NAME],
-            current_wind[WIND_V_RASTER_NAME],
-            previous_wind[WIND_U_RASTER_NAME],
-            previous_wind[WIND_V_RASTER_NAME],
-            source_east_km,
-            source_north_km,
-        )
         delta_no2 = np.full_like(current_no2, np.nan)
-        np.subtract(current_smoothed, previous_smoothed, out=delta_no2, where=paired_valid)
+        np.subtract(current_no2, previous_no2, out=delta_no2, where=paired_valid)
 
         features = {
-            PLUME_SCORE_COL: max(current_plume_score, previous_plume_score),
             CURRENT_FINITE_FRACTION_COL: current_fraction,
             PAIRED_FINITE_FRACTION_COL: paired_fraction,
             "mean_weighted_cloud_fraction": _paired_mean(
@@ -903,7 +853,7 @@ def derive_raster_features(
             **weather_features,
         }
     rasters = {
-        CURRENT_RASTER_NAME: current_smoothed.astype(np.float32),
+        CURRENT_RASTER_NAME: current_no2.astype(np.float32),
         DELTA_RASTER_NAME: delta_no2.astype(np.float32),
         **current_wind,
         CURRENT_MASK_NAME: current_valid.astype(np.uint8),
@@ -940,9 +890,6 @@ def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[s
         task.current_cache_path,
         task.previous_cache_path,
         task.current_wind_cache_path,
-        task.previous_wind_cache_path,
-        task.source_east_km,
-        task.source_north_km,
     )
     return rasters, features
 

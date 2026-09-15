@@ -46,7 +46,6 @@ Leakage controls:
 | Current emissions | Direct target leakage |
 | Previous-quarter average NOx | Defines the relative-change filter and can identify plant operating regimes |
 | `prev_qtr_rel_delta` | Contains target magnitude and is used only for stratification |
-| Plume score, raster-quality scores | Diagnostics extracted from the response image |
 | Flux-model outputs | The standalone estimator remains experimental and is not run during dataset generation |
 
 Coverage stays available for sliced evaluation but is not a model input.
@@ -85,8 +84,8 @@ distortion, so the transform is gone.
 
 Four numeric channels and two masks reach the model:
 
-1. smoothed and source-relative upwind-normalized current NO2 on finite native support;
-2. current-minus-previous smoothed and upwind-normalized NO2 on paired support;
+1. directly regridded current NO2 on finite native support;
+2. current-minus-previous directly regridded NO2 on paired support;
 3. geographic eastward wind aligned from the native HRRR grid;
 4. geographic northward wind aligned from the native HRRR grid;
 5. independent binary validity masks for current and hourly-delta NO2.

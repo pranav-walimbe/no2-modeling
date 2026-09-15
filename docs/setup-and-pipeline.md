@@ -198,11 +198,7 @@ array such as `0-31%14`.
   record;
 - stores each unique AOI scan and aligned AOI-hour wind raster in persistent
   caches, grouping work so workers reuse each NetCDF or GRIB read;
-- smooths current and previous NO2 independently with retrieval uncertainty and
-  winds matched to each observation before forming the hourly delta;
-- subtracts scan-specific Huber backgrounds from source-relative 24 to 36 km
-  upwind corridors and rejects records unless both scans have at least 12
-  paired-valid background pixels;
+- preserves each directly regridded NO2 scan when forming the hourly delta;
 - estimates aggregate NOx flux from positive enhancement integrated over the
   union of 12 km by 9 km source-relative downwind plumes, using an upwind
   median background and 80 m wind;
@@ -215,12 +211,11 @@ array such as `0-31%14`.
 - uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
   allocation.
 
-Every successful split-CSV row carries its relative `delta_no2_path`, plume
-score, paired cloud, quality and retrieval-uncertainty means, and
-centre-interpolated HRRR temperature and boundary-layer height. The plume score
-is diagnostic only and does not filter or rank records. The standalone flux
-estimator and its analysis scripts remain available, but dataset generation
-does not run the estimator or publish flux-derived columns.
+Every successful split-CSV row carries its relative `delta_no2_path`, paired
+cloud, quality and retrieval-uncertainty means, and centre-interpolated HRRR
+temperature and boundary-layer height. The standalone flux estimator and its
+analysis scripts remain available, but dataset generation does not run the
+estimator or publish flux-derived columns.
 
 Running the splits:
 
