@@ -1,8 +1,8 @@
 # Regridding TEMPO Level 2 pixels onto AOI rasters
 
 TEMPO Level 2 reports one NO2 value per irregular ground footprint. The model
-needs a fixed 48 by 48 raster covering 72 km around each AOI, with the same
-1.5 km cells in both scans of every delta.
+needs a fixed 24 by 24 raster covering 72 km around each AOI, with the same
+3 km cells in both scans of every delta.
 
 The regridder:
 
@@ -25,15 +25,15 @@ geometrically valid overlapping footprints, which keeps rejected inputs visible.
 
 ## Save each AOI scan
 
-Each AOI scan is saved as one compressed `.npz` holding five aligned 48 by 48
+Each AOI scan is saved as one compressed `.npz` holding five aligned 24 by 24
 `float32` rasters:
 
 | Raster | What one output pixel displays | Missing value |
 |---|---|---|
-| `no2` | Overlap-area-weighted tropospheric NO2 from quality-0 footprints with cloud fraction at most 0.20, in molecules/cm2 | `NaN` when no accepted value reaches the cell or accepted overlap is below 0.25 km2 |
+| `no2` | Overlap-area-weighted tropospheric NO2 from quality-0 footprints with cloud fraction at most 0.20, in molecules/cm2 | `NaN` when no accepted footprint overlaps the cell |
 | `weighted_cloud_fraction` | Overlap-area-weighted cloud fraction from all valid native footprints, including footprints rejected from NO2 | `NaN` when no footprint with valid cloud information overlaps the cell |
 | `good_quality_fraction` | Share of total overlapping footprint area carrying quality flag 0, from 0 to 1 | `NaN` when no valid native footprint overlaps the cell |
-| `retrieval_uncertainty` | Overlap-area-weighted NO2 retrieval uncertainty from accepted footprints, in molecules/cm2 | `NaN` when no accepted footprint has finite uncertainty |
+| `retrieval_uncertainty` | Arithmetic overlap-area-weighted mean of NO2 retrieval uncertainty from accepted footprints, in molecules/cm2 | `NaN` when no accepted footprint has finite uncertainty |
 | `sum_weight` | Total area in km2 where accepted native footprints overlap the cell | `0.0` when no accepted footprint overlaps; zero marks a real absence of support, not a missing value |
 
 The ancillary rasters stay populated where `no2` is `NaN`, which preserves
@@ -84,7 +84,7 @@ plus these derived features:
 
 Wind alignment, on the 3 km HRRR grid NOAA describes:
 
-1. Project the 48 by 48 TEMPO cell centres onto the native Lambert grid.
+1. Project the 24 by 24 TEMPO cell centres onto the native Lambert grid.
 2. Bilinearly interpolate the wind components.
 3. Rotate the grid-relative values to geographic east and north before caching.
 
@@ -108,21 +108,20 @@ pairs. Production uses:
 
 - cloud fraction at most 0.20;
 - overlap area alone for the NO2 weights;
-- an accepted-overlap floor of 0.25 km2;
+- no positive accepted-overlap floor;
 - no additional effective-sample floor.
 
 Dataset generation requires greater than 95% current coverage and greater than
 80% support for the hourly delta. It retains missing cells and
 selects eligible records through temporal and AOI round-robin with hourly paired
-coverage as the sole quality rank. These rules do not change per-scan
-tessellation or its 0.25 km2 cell-support floor. Plume, cloud, uncertainty, and
-quality summaries remain diagnostics and rank nothing.
+coverage as the sole quality rank. Plume, cloud, uncertainty, and quality
+summaries remain diagnostics and rank nothing.
 
 Measured tradeoffs:
 
 | Choice | Effect |
 |---|---|
-| 0.25 km2 overlap floor | Paired-cell survival fell from 58.0 to 57.0 percent while removing very small edge overlaps. Kept. |
+| No overlap floor | Matches NASA-style area-weighted gridding by retaining every positive overlap. |
 | 1.25 effective-sample floor | Survival fell to 21.1 percent. Rejected. |
 | Area-only weighting | Lower median normalized RMS disagreement with Level 3 than linear or squared inverse-uncertainty weighting. Kept. |
 

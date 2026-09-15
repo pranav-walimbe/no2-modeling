@@ -130,7 +130,7 @@ The native regridder accepts an NO2 contributor only when:
 - its quality flag is zero;
 - cloud fraction is at most 0.20;
 - value and geometry are valid;
-- at least 0.25 km2 of accepted support reaches an output cell.
+- a positive area of accepted support reaches an output cell.
 
 Missing cells are never interpolated. Current coverage must be greater than
 95%. The current/previous intersection must cover more than 80% of the raster.

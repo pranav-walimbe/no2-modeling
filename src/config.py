@@ -40,9 +40,7 @@ TEMPO_AOI_MAPPING = os.path.join(TEMPO_MAPPING_DIR, "aoi_observations")
 TEMPO_START_DATE = "2023-08-02 00:00:00"  # beginning of the TEMPO science record
 TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
 
-TEMPO_GOOD_QUALITY_FLAG = 0  # V04 main_data_quality_flag value accepted into the NO2 mean
-TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.25  # removes edge slivers with about 1 percentage point finite-support loss
-TEMPO_EFFECTIVE_SAMPLE_FLOOR = 0.0  # ESS 1.25 cut paired-cell coverage from 58 percent to 21 percent
+TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.0  # retain every positive accepted footprint-cell overlap
 
 # ============================================================================
 # Stratification
@@ -80,7 +78,7 @@ DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # raster bundles for 
 DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
 DATASET_TEMPO_CACHE_DIR = os.path.join(DATASET_DIR, "tempo-cache")  # persistent AOI-scan regridding cache
 DATASET_WIND_CACHE_DIR = os.path.join(DATASET_DIR, "wind-cache")  # persistent aligned AOI-hour wind rasters
-IMG_SIZE = 48  # image size in pixels (48x48)
+IMG_SIZE = 24  # image size in pixels (24x24)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_CURRENT_NO2_FINITE_FRACTION = 0.95  # strict record-level current-scan coverage floor
 MIN_DELTA_NO2_FINITE_FRACTION = 0.80  # strict paired current/previous coverage floor

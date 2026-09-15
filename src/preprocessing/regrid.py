@@ -14,14 +14,13 @@ from config import (
     IMG_SIZE,
     MIN_PIXEL_CLOUD,
     TEMPO_CELL_OVERLAP_FLOOR_KM2,
-    TEMPO_EFFECTIVE_SAMPLE_FLOOR,
-    TEMPO_GOOD_QUALITY_FLAG,
 )
 from preprocessing.stratify_utils import CONUS_TO_WGS84, WGS84_TO_CONUS
 
 METRES_PER_KM = 1000.0
 CORNER_COUNT = 4
 QUALITY_FILL_VALUE = -1
+GOOD_QUALITY_FLAG = 0
 SAVED_RASTER_NAMES = (
     "no2",
     "weighted_cloud_fraction",
@@ -316,7 +315,7 @@ def tessellate(
     grid: AoiGrid,
     *,
     max_cloud_fraction: float = MIN_PIXEL_CLOUD,
-    good_quality_flag: int = TEMPO_GOOD_QUALITY_FLAG,
+    good_quality_flag: int = GOOD_QUALITY_FLAG,
 ) -> RegriddedRaster:
     """Area-weight native footprint intersections onto an AOI grid.
 
@@ -436,23 +435,19 @@ def tessellate(
 def apply_cell_mask(
     raster: RegriddedRaster,
     overlap_floor_km2: float = TEMPO_CELL_OVERLAP_FLOOR_KM2,
-    effective_sample_floor: float = TEMPO_EFFECTIVE_SAMPLE_FLOOR,
 ) -> RegriddedRaster:
-    """Mask NO2 below support floors while retaining every diagnostic raster.
+    """Mask NO2 below the overlap floor while retaining every diagnostic raster.
 
     Args:
         raster: Raster carrying raw cell diagnostics.
         overlap_floor_km2: Accepted overlap area required per output cell.
-        effective_sample_floor: Effective accepted sample count required per cell.
 
     Returns:
         Raster with only the NO2 values masked by the support rule.
     """
-    if overlap_floor_km2 <= 0 and effective_sample_floor <= 0:
+    if overlap_floor_km2 <= 0:
         return raster
     keep = raster.sum_weight >= overlap_floor_km2
-    if effective_sample_floor > 0:
-        keep &= raster.effective_sample_size >= effective_sample_floor
     return replace(raster, no2=np.where(keep, raster.no2, np.nan))
 
 
@@ -491,7 +486,6 @@ def regrid_aoi_raster(
     *,
     max_cloud_fraction: float = MIN_PIXEL_CLOUD,
     overlap_floor_km2: float = TEMPO_CELL_OVERLAP_FLOOR_KM2,
-    effective_sample_floor: float = TEMPO_EFFECTIVE_SAMPLE_FLOOR,
 ) -> RegriddedRaster:
     """Build and mask one fixed-grid AOI raster.
 
@@ -500,13 +494,12 @@ def regrid_aoi_raster(
         grid: Fixed output grid that paired scans must share.
         max_cloud_fraction: Largest cloud fraction accepted into the NO2 mean.
         overlap_floor_km2: Accepted overlap area required per output cell.
-        effective_sample_floor: Effective accepted samples required per cell.
 
     Returns:
         Tessellated NO2 and its unmasked diagnostic rasters.
     """
     raster = tessellate(pixels, grid, max_cloud_fraction=max_cloud_fraction)
-    return apply_cell_mask(raster, overlap_floor_km2, effective_sample_floor)
+    return apply_cell_mask(raster, overlap_floor_km2)
 
 
 def regrid_aoi_scan(
