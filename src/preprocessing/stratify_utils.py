@@ -325,7 +325,11 @@ def _scan_ema(
     # Integrate piecewise-constant hourly emissions over one causal scan window
     scan_time = pl.col(scan_time_column)
     contributions = (
-        indexed.select("_label_row", AOI_ID_COL, scan_time_column)
+        indexed.select(
+            "_label_row",
+            AOI_ID_COL,
+            pl.col(scan_time_column).dt.truncate("1s").alias(scan_time_column),
+        )
         .with_columns((scan_time - pl.duration(hours=timesteps)).alias("_window_start"))
         .with_columns(
             pl.datetime_ranges(
