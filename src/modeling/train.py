@@ -20,6 +20,12 @@ from config import (
     RUNS_DIR,
     STRAT_BASE_DIR,
 )
+from modeling.convgru import (
+    DEFAULT_DROPOUT,
+    DEFAULT_HEAD_DIM,
+    NOxModel,
+    TabularMLP,
+)
 from modeling.dataset import (
     LABEL_MODE_COL,
     MODEL_FEATURE_NAMES,
@@ -41,19 +47,16 @@ from modeling.plot_utils import (
     plot_model_comparison,
     plot_spatial_accuracy,
 )
-from modeling.resnet import (
-    DEFAULT_DROPOUT,
-    DEFAULT_HEAD_DIM,
-    NOxModel,
-)
 from modeling.xgboost import train_xgboost_baseline
 
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 300
+DEFAULT_TABULAR_EPOCHS = 150
 DEFAULT_WORKERS = 4
 DEFAULT_PREFETCH_FACTOR = 2
 DEFAULT_SEED = 42
 DEFAULT_LEARNING_RATE = 3e-4
+DEFAULT_TABULAR_LEARNING_RATE = 1e-3
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_GRADIENT_CLIP_NORM = 5.0
 DEFAULT_SCHEDULER_PATIENCE = 10
@@ -70,12 +73,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--tabular-epochs", type=int, default=DEFAULT_TABULAR_EPOCHS)
     parser.add_argument("--workers", type=int, default=min(DEFAULT_WORKERS, NUM_CORES))
     parser.add_argument("--prefetch-factor", type=int, default=DEFAULT_PREFETCH_FACTOR)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--head-dim", type=int, default=DEFAULT_HEAD_DIM)
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
+    parser.add_argument("--tabular-learning-rate", type=float, default=DEFAULT_TABULAR_LEARNING_RATE)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--gradient-clip-norm", type=float, default=DEFAULT_GRADIENT_CLIP_NORM)
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
@@ -117,7 +122,7 @@ def _move_batch(batch: tuple[torch.Tensor, ...], device: torch.device) -> tuple[
 
 
 def train_epoch(
-    model: NOxModel,
+    model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
@@ -153,6 +158,81 @@ def train_epoch(
         scaler.update()
         total_loss += loss.detach().item() * target.numel()
     return total_loss / len(loader.dataset)
+
+
+def fit_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    *,
+    device: torch.device,
+    epochs: int,
+    learning_rate: float,
+    args: argparse.Namespace,
+    checkpoint_path: Path,
+    checkpoint_metadata: dict[str, object],
+    phase_name: str,
+) -> tuple[list[float], list[float], float]:
+    """Fit one model phase and restore its lowest-validation-loss state."""
+    optimizer = torch.optim.AdamW(
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        lr=learning_rate,
+        weight_decay=args.weight_decay,
+    )
+    criterion = nn.BCEWithLogitsLoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        patience=args.scheduler_patience,
+        factor=args.scheduler_factor,
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    best_val_loss = float("inf")
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    epochs_without_improvement = 0
+
+    for epoch in range(1, epochs + 1):
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            scaler,
+            device,
+            args.gradient_clip_norm,
+        )
+        validation_loss = val_epoch(model, val_loader, criterion, device)
+        scheduler.step(validation_loss)
+        train_losses.append(train_loss)
+        val_losses.append(validation_loss)
+        current_learning_rate = optimizer.param_groups[0]["lr"]
+        print(
+            f"{phase_name} epoch {epoch:03d} | train {train_loss:.5f} | "
+            f"val {validation_loss:.5f} | lr {current_learning_rate:.2e}"
+        )
+
+        if validation_loss < best_val_loss:
+            best_val_loss = validation_loss
+            epochs_without_improvement = 0
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "validation_loss": validation_loss,
+                    **checkpoint_metadata,
+                },
+                checkpoint_path,
+            )
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= args.early_stop_patience:
+                print(f"Early stopping {phase_name} at epoch {epoch}")
+                break
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return train_losses, val_losses, best_val_loss
 
 
 def val_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device) -> float:
@@ -274,28 +354,78 @@ def main() -> None:
         split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in datasets.items()
     }
 
-    model = NOxModel(
-        n_tabular_features=len(MODEL_FEATURE_NAMES),
-        use_image=args.inputs in ("full", "image"),
-        use_tabular=args.inputs in ("full", "tabular"),
-        head_dim=args.head_dim,
-        dropout=args.dropout,
-    ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    train_criterion = nn.BCEWithLogitsLoss()
-    eval_criterion = nn.BCEWithLogitsLoss()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        patience=args.scheduler_patience,
-        factor=args.scheduler_factor,
-    )
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    checkpoint_metadata = {
+        "normalization_stats": stats.to_dict(),
+        "model_feature_names": MODEL_FEATURE_NAMES,
+    }
+    tabular_model: TabularMLP | None = None
+    tabular_run: dict[str, object] | None = None
+    if args.inputs in ("full", "tabular"):
+        tabular_model = TabularMLP(len(MODEL_FEATURE_NAMES)).to(device)
+        if args.inputs == "full":
+            tabular_datasets = {split: NOxDataset(split, stats, load_images=False) for split in ("train", "val")}
+            tabular_train_loader = _loader(tabular_datasets["train"], shuffle=True, args=args, device=device)
+            tabular_val_loader = _loader(tabular_datasets["val"], shuffle=False, args=args, device=device)
+        else:
+            tabular_train_loader = train_loader
+            tabular_val_loader = eval_loaders["val"]
+        tabular_path = checkpoint_dir / ("best_model.pt" if args.inputs == "tabular" else "best_tabular_mlp.pt")
+        print(f"Pretraining {tabular_model.num_params():,}-parameter tabular MLP on {device}")
+        tabular_train_losses, tabular_val_losses, tabular_best_loss = fit_model(
+            tabular_model,
+            tabular_train_loader,
+            tabular_val_loader,
+            device=device,
+            epochs=args.tabular_epochs,
+            learning_rate=args.tabular_learning_rate,
+            args=args,
+            checkpoint_path=tabular_path,
+            checkpoint_metadata=checkpoint_metadata,
+            phase_name="Tabular MLP",
+        )
+        plot_loss_curve(
+            tabular_train_losses,
+            tabular_val_losses,
+            run_dir,
+            plot_name="tabular_loss_curve",
+            title="Tabular MLP training and validation loss",
+        )
+        tabular_run = {
+            "maximum_epochs": args.tabular_epochs,
+            "learning_rate": args.tabular_learning_rate,
+            "parameters": tabular_model.num_params(),
+            "best_validation_loss": tabular_best_loss,
+            "frozen_during_fusion": args.inputs == "full",
+        }
+        if args.inputs == "full":
+            del tabular_train_loader, tabular_val_loader, tabular_datasets
+
     best_path = checkpoint_dir / "best_model.pt"
-    best_val_loss = float("inf")
-    train_losses: list[float] = []
-    val_losses: list[float] = []
-    epochs_without_improvement = 0
+    if args.inputs == "tabular":
+        model = tabular_model
+        best_val_loss = tabular_best_loss
+    else:
+        model = NOxModel(
+            tabular_model=tabular_model if args.inputs == "full" else None,
+            head_dim=args.head_dim,
+            dropout=args.dropout,
+        ).to(device)
+        print(f"Training {model.num_params():,}-parameter ConvGRU model on {device}; outputs: {run_dir}")
+        train_losses, val_losses, best_val_loss = fit_model(
+            model,
+            train_loader,
+            eval_loaders["val"],
+            device=device,
+            epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            args=args,
+            checkpoint_path=best_path,
+            checkpoint_metadata=checkpoint_metadata,
+            phase_name="ConvGRU",
+        )
+        plot_loss_curve(train_losses, val_losses, run_dir)
+
+    assert model is not None
 
     run_config = {
         "device": str(device),
@@ -303,6 +433,7 @@ def main() -> None:
         "batch_size": args.batch_size,
         "workers": args.workers,
         "maximum_epochs": args.epochs,
+        "tabular_pretraining": tabular_run,
         "prefetch_factor": args.prefetch_factor,
         "seed": args.seed,
         "head_dim": args.head_dim,
@@ -322,52 +453,13 @@ def main() -> None:
         "raw_delta_nox_threshold": stats.delta_threshold,
         "target_label_mode": target_label_mode,
         "tabular_features": list(MODEL_FEATURE_NAMES),
+        "prediction_family": "Bernoulli",
         "model_parameters": model.num_params(),
+        "total_model_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "best_validation_loss": best_val_loss,
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
-    print(f"Training {model.num_params():,} parameters on {device}; outputs: {run_dir}")
-
-    for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(
-            model,
-            train_loader,
-            optimizer,
-            train_criterion,
-            scaler,
-            device,
-            args.gradient_clip_norm,
-        )
-        validation_loss = val_epoch(model, eval_loaders["val"], eval_criterion, device)
-        scheduler.step(validation_loss)
-        train_losses.append(train_loss)
-        val_losses.append(validation_loss)
-        learning_rate = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch:03d} | train {train_loss:.5f} | val {validation_loss:.5f} | lr {learning_rate:.2e}")
-
-        if validation_loss < best_val_loss:
-            best_val_loss = validation_loss
-            epochs_without_improvement = 0
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "validation_loss": validation_loss,
-                    "normalization_stats": stats.to_dict(),
-                    "model_feature_names": MODEL_FEATURE_NAMES,
-                    "run_config": run_config,
-                },
-                best_path,
-            )
-        else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= args.early_stop_patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
-
-    plot_loss_curve(train_losses, val_losses, run_dir)
-    checkpoint = torch.load(best_path, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"])
     split_frames = {}
     for split, loader in eval_loaders.items():
         logits, indices = run_inference(model, loader, device)

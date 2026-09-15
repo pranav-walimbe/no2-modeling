@@ -29,24 +29,33 @@ def _save(figure: plt.Figure, run_dir: str | Path, plot_name: str) -> None:
     plt.close(figure)
 
 
-def plot_loss_curve(train_losses: list[float], val_losses: list[float], run_dir: str | Path) -> None:
+def plot_loss_curve(
+    train_losses: list[float],
+    val_losses: list[float],
+    run_dir: str | Path,
+    *,
+    plot_name: str = "loss_curve",
+    title: str = "Training and validation loss",
+) -> None:
     """Plot binary cross-entropy loss across epochs.
 
     Args:
         train_losses: Mean training loss for each epoch.
         val_losses: Mean validation loss for each epoch.
         run_dir: Model-run output directory.
+        plot_name: Output filename without an extension.
+        title: Plot title.
     """
     sns.set_theme(style="whitegrid", font_scale=1.2)
     figure, axis = plt.subplots(figsize=(8, 5))
     epochs = range(1, len(train_losses) + 1)
     axis.plot(epochs, train_losses, label="Train", linewidth=2)
     axis.plot(epochs, val_losses, label="Validation", linewidth=2)
-    axis.set(xlabel="Epoch", ylabel="Binary cross-entropy", title="Training and validation loss")
+    axis.set(xlabel="Epoch", ylabel="Binary cross-entropy", title=title)
     axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     axis.legend()
     figure.tight_layout()
-    _save(figure, run_dir, "loss_curve")
+    _save(figure, run_dir, plot_name)
 
 
 def plot_class_probabilities(split_frames: dict[str, pd.DataFrame], run_dir: str | Path) -> None:

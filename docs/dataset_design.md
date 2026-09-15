@@ -74,18 +74,17 @@ Stratification reports natural class prevalence. Final generation reports
 overall and per-AOI retention, natural pre-balancing prevalence, and selected
 class counts.
 
-Each sample stores four numeric arrays and two masks on a fixed grid:
+Each sample stores five time-major arrays on a fixed 24 by 24 grid:
 
 | Array | Notes |
 |---|---|
-| directly regridded current NO2 | finite where native QA-passing support exists; record coverage must exceed 95% |
-| current minus previous directly regridded NO2 | finite on the current/previous mask intersection; coverage must exceed 80% |
-| eastward wind, northward wind | bilinearly aligned from the native HRRR grid and finite across the image |
-| two NO2 validity masks | separate binary support for current and hourly delta |
+| directly regridded NO2 | one direct field per hour; finite where native QA-passing support exists |
+| NO2 validity mask | independent binary support for each hourly NO2 field |
+| 2 m temperature | sampled from HRRR at every AOI cell center and hour |
+| eastward wind, northward wind | sampled from HRRR at every AOI cell center and hour |
 
-HRRR temperature and boundary-layer height come from interpolation at the AOI
-centre. Prior-quarter heat input and power generation keep contemporaneous
-operational leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's
+Prior-quarter heat input and power generation keep contemporaneous operational
+leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's
 hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
 delta). Stratification uses it to calculate `prev_qtr_rel_delta`, but the model
 does not receive either field.

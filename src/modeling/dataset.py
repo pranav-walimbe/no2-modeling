@@ -26,7 +26,7 @@ from config import (
     MODEL_ROBUST_IMAGE_KEYS,
 )
 
-RASTER_PATH_COL = "delta_no2_path"
+RASTER_PATH_COL = "raster_bundle_path"
 LABEL_MODE_COL = "label_mode"
 MIN_SCALE = 1e-12
 ROBUST_STD_NORMALIZER = 1.349
@@ -127,10 +127,10 @@ def _raster_path(serialized_path: object, dataset_dir: Path) -> Path:
 
 
 def _load_raster_bundle(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    # Load numeric rasters and their independent NO2 masks
+    # Place channels after time so each item is [T, C, H, W]
     with np.load(path, allow_pickle=False) as bundle:
-        rasters = np.stack([bundle[name] for name in MODEL_IMAGE_KEYS], axis=0)
-        masks = np.stack([bundle[name] for name in MODEL_MASK_KEYS], axis=0).astype(np.float32)
+        rasters = np.stack([bundle[name] for name in MODEL_IMAGE_KEYS], axis=1)
+        masks = np.stack([bundle[name] for name in MODEL_MASK_KEYS], axis=1).astype(np.float32)
     return rasters, masks
 
 
@@ -141,12 +141,12 @@ def _safe_scale(values: np.ndarray) -> np.ndarray:
 
 def _channel_valid_mask(rasters: np.ndarray, channel: int) -> np.ndarray:
     # Identify valid pixels for one numeric image channel
-    return np.isfinite(rasters[channel])
+    return np.isfinite(rasters[:, channel])
 
 
 def _valid_channel_values(rasters: np.ndarray, channel: int) -> np.ndarray:
     # Select valid values for one numeric image channel
-    return rasters[channel, _channel_valid_mask(rasters, channel)]
+    return rasters[:, channel][_channel_valid_mask(rasters, channel)]
 
 
 def _update_moments(
@@ -369,12 +369,13 @@ class NOxDataset(Dataset):
             normalized = np.zeros_like(rasters, dtype=np.float32)
             for channel in range(len(MODEL_IMAGE_KEYS)):
                 channel_valid = _channel_valid_mask(rasters, channel)
-                channel_values = rasters[channel, channel_valid]
-                normalized[channel, channel_valid] = (
+                channel_values = rasters[:, channel][channel_valid]
+                normalized_channel = normalized[:, channel]
+                normalized_channel[channel_valid] = (
                     channel_values - self.stats.image_center[channel]
                 ) / self.stats.image_scale[channel]
             np.clip(normalized, -MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS, out=normalized)
-            image = torch.from_numpy(np.concatenate((normalized, masks), axis=0))
+            image = torch.from_numpy(np.concatenate((normalized, masks), axis=1))
         else:
             image = torch.empty(0, dtype=torch.float32)
         return (
