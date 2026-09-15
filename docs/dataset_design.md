@@ -118,7 +118,7 @@ The native regridder accepts an NO2 contributor only when:
 - a positive area of accepted support reaches an output cell.
 
 Missing cells are never interpolated. Every configured timestep must have at
-least 90% finite NO2 coverage. It must also have complete coverage in a 3 by 3
+least 95% finite NO2 coverage. It must also have complete coverage in a 3 by 3
 window around the raster cell containing the largest cluster of modeled units.
 Facilities in the same raster cell contribute their combined unit count. Equal
 counts are resolved by unit-weighted distance to the AOI centre. After both

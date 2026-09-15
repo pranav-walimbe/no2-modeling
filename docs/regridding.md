@@ -85,7 +85,7 @@ Wind alignment, on the 3 km HRRR grid NOAA describes:
 3. Rotate the grid-relative values to geographic east and north before caching.
 
 Every scan retains its directly regridded values. Every timestep must have at
-least 90 percent finite NO2 coverage or the complete record is rejected.
+least 95 percent finite NO2 coverage or the complete record is rejected.
 
 See the [NOAA Global Systems Laboratory HRRR overview](https://rapidrefresh.noaa.gov/).
 
@@ -103,7 +103,7 @@ pairs. Production uses:
 - no positive accepted-overlap floor;
 - no additional effective-sample floor.
 
-Dataset generation requires at least 90% finite NO2 coverage independently at
+Dataset generation requires at least 95% finite NO2 coverage independently at
 every configured timestep. It also requires complete coverage in the 3 by 3
 window centred on the highest-unit source cell in every timestep. It retains
 missing cells elsewhere and selects eligible records through temporal and AOI

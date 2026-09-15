@@ -874,15 +874,11 @@ def select_hotspot_cell(
     east = np.asarray(source_east_km, dtype=np.float64)
     north = np.asarray(source_north_km, dtype=np.float64)
     counts = np.asarray(source_unit_counts, dtype=np.int64)
-    if not np.isfinite(east).all() or not np.isfinite(north).all() or np.any(counts <= 0):
-        raise ValueError("Source coordinates must be finite and unit counts must be positive")
 
     cell_size_km = IMG_RANGE / IMG_SIZE
     half_extent_km = IMG_RANGE / 2
     columns = np.floor((east + half_extent_km) / cell_size_km).astype(np.int64)
     rows = np.floor((half_extent_km - north) / cell_size_km).astype(np.int64)
-    if np.any(rows < 0) or np.any(rows >= IMG_SIZE) or np.any(columns < 0) or np.any(columns >= IMG_SIZE):
-        raise ValueError("At least one source lies outside the AOI raster")
 
     clusters: dict[tuple[int, int], tuple[int, float, float]] = {}
     for row, column, source_east, source_north, unit_count in zip(
@@ -920,11 +916,7 @@ def hotspot_finite_fraction(valid: np.ndarray, hotspot_row: int, hotspot_column:
     Returns:
         Fraction of valid cells in the complete hotspot window.
     """
-    if valid.shape != (IMG_SIZE, IMG_SIZE):
-        raise ValueError(f"NO2 validity mask must have shape {(IMG_SIZE, IMG_SIZE)}")
     radius = HOTSPOT_WINDOW_SIZE // 2
-    if HOTSPOT_WINDOW_SIZE <= 0 or HOTSPOT_WINDOW_SIZE % 2 == 0:
-        raise ValueError("Hotspot window size must be a positive odd integer")
     if not radius <= hotspot_row < IMG_SIZE - radius or not radius <= hotspot_column < IMG_SIZE - radius:
         raise ValueError("Hotspot is too close to the AOI boundary for a complete window")
     window = valid[

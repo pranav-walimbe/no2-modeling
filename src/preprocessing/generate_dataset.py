@@ -108,10 +108,7 @@ def _scan_split(path: str) -> pl.LazyFrame:
 
 def _parse_source_values(value: object, value_type: type[float] | type[int]) -> tuple[float, ...] | tuple[int, ...]:
     # Parse aligned comma-delimited source metadata from stratification
-    values = tuple(value_type(item) for item in str(value).split(",") if item)
-    if not values:
-        raise ValueError("Source metadata cannot be empty")
-    return values
+    return tuple(value_type(item) for item in str(value).split(",") if item)
 
 
 def _slurm_array_spec(task_ids: list[int]) -> str:

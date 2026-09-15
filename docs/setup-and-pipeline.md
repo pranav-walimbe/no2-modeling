@@ -199,7 +199,7 @@ array such as `0-31%14`.
 - stores each unique AOI scan and aligned AOI-hour weather raster in persistent
   caches, grouping work so workers reuse each NetCDF or GRIB read;
 - preserves each directly regridded NO2 scan and its independent mask;
-- requires at least 90 percent finite NO2 coverage in every timestep;
+- requires at least 95 percent finite NO2 coverage in every timestep;
 - requires all nine cells around the highest-unit source cell to be valid in
   every timestep;
 - selects the largest exactly balanced successful subset through deterministic
