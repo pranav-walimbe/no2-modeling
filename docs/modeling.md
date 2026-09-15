@@ -46,7 +46,6 @@ Leakage controls:
 | Current emissions | Direct target leakage |
 | Previous-quarter average NOx | Defines the relative-change filter and can identify plant operating regimes |
 | `prev_qtr_rel_delta` | Contains target magnitude and is used only for stratification |
-| Flux-model outputs | The standalone estimator remains experimental and is not run during dataset generation |
 
 Coverage stays available for sliced evaluation but is not a model input.
 

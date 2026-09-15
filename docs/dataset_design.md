@@ -100,11 +100,6 @@ hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
 delta). Stratification uses it to calculate `prev_qtr_rel_delta`, but the model
 does not receive either field.
 
-The source-aware aggregate flux estimator remains available as a standalone
-analysis module. Dataset generation does not run it, store its outputs, or use
-a flux-derived model feature. This keeps the generated data contract independent
-of the experimental flux formulation.
-
 Nameplate capacity:
 
 - Collection parses each CAMPD generator-capacity pair and deduplicates
