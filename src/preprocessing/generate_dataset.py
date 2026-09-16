@@ -374,12 +374,12 @@ def _write_outputs(
         }
         selection_size = {
             "actual_size": output_frame.height,
-            "discarded_for_balance": candidates.height - output_frame.height,
+            "duplicated_for_balance": output_frame.height - candidates.height,
             "eligible_by_class": eligible_by_class,
         }
         print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
-        if selection_size["discarded_for_balance"]:
-            print(f"[{split}] discarded {selection_size['discarded_for_balance']:,} records for class balance")
+        if selection_size["duplicated_for_balance"]:
+            print(f"[{split}] duplicated {selection_size['duplicated_for_balance']:,} records for class balance")
         print(
             f"[{split}] full sequence coverage: {selected_coverage['full_coverage_records']:,}/"
             f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"
