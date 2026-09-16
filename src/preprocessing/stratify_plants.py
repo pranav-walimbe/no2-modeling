@@ -11,7 +11,6 @@ from config import (
     FULL_DATA_PARQUET,
     LABEL_COL,
     MIN_COVERAGE_PERCENT,
-    MIN_MAJOR_CITY_DISTANCE_KM,
     SEQUENCE_TIMESTEPS,
     STRAT_BASE_DIR,
     TEST_RECORDS_CSV,
@@ -192,7 +191,6 @@ def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     # Apply non-raster candidate quality requirements
     return frame.filter(
         (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT)
-        & (pl.col(MAJOR_CITY_DIST_COL) >= MIN_MAJOR_CITY_DISTANCE_KM)
         & pl.col("avg_pwr_gen").is_finite()
         & pl.col(MAJOR_CITY_DIST_COL).is_finite()
         & pl.col(PREVIOUS_QUARTER_POWER_COL).is_finite()

@@ -87,7 +87,8 @@ Prior-quarter heat input and power generation keep contemporaneous operational
 leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's
 hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
 delta). Stratification uses it to calculate `prev_qtr_rel_delta`, but the model
-does not receive either field.
+does not receive either field. The model does receive `major_city_dist`, which
+is normalized from the training split with the other scalar inputs.
 
 Nameplate capacity:
 
@@ -134,12 +135,13 @@ remains a dataset diagnostic and is not supplied to the model.
 | Quantity | Role | Why not a filter |
 |---|---|---|
 | Mean cloud and quality fractions | Diagnostics | Native cloud and quality filtering already decides whether NO2 is accepted. |
+| Distance to the nearest major city | Tabular feature | Urban context may be predictive, but centroid distance is not a reliable contamination boundary. |
 
 ## Candidate selection
 
 Before raster generation, apply these rules to every split:
 
-- Require each AOI to sit at least 50 km from a major city.
+- Preserve every finite major-city distance without imposing a minimum distance.
 - Average each unit's previous-quarter output, then sum the unit averages by AOI.
 - Retain only AOIs where coal units supply more than 50 percent of that total.
 - Keep every record that passes the eligibility rules.

@@ -89,7 +89,6 @@ EMA_DELTA_THRESHOLD = 100.0  # least absolute current-minus-previous effective N
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
-MIN_MAJOR_CITY_DISTANCE_KM = 50.0  # minimum eligible plant distance from a major city in kilometers
 # ============================================================================
 # Modeling data contract
 # ============================================================================
@@ -103,6 +102,7 @@ MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS)
 MODEL_INPUT_CHANNELS = MODEL_IMAGE_CHANNELS + len(MODEL_MASK_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
 MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular and fused models
+    "major_city_dist",
     "num_coal_units",
     "num_ng_units",
     "total_nameplate_capacity_mw",
