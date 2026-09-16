@@ -39,7 +39,7 @@ class. Reports record eligible counts, final size, and discarded imbalance.
 Before any image processing, a candidate needs:
 
 - usable CAMPD measurements and a finite previous-quarter NOx average;
-- current and previous TEMPO observations separated by 50 to 70 minutes;
+- current and previous TEMPO observations separated by 40 to 70 minutes;
 - at least 50 percent temporal overlap with the assigned emissions hour;
 - a mapped HRRR analysis path, with file existence checked during generation;
 - finite prior-quarter power generation and distance to a city of 500,000 or
@@ -78,10 +78,10 @@ Each sample stores five time-major arrays on a fixed 24 by 24 grid:
 
 | Array | Notes |
 |---|---|
-| directly regridded NO2 | one direct field per hour; finite where native QA-passing support exists |
-| NO2 validity mask | independent binary support for each hourly NO2 field |
-| 2 m temperature | sampled from HRRR at every AOI cell center and hour |
-| eastward wind, northward wind | sampled from HRRR at every AOI cell center and hour |
+| directly regridded NO2 | one direct field per scan; finite where native QA-passing support exists |
+| NO2 validity mask | independent binary support for each scan's NO2 field |
+| 2 m temperature | sampled from HRRR at every AOI cell center and scan-aligned hour |
+| eastward wind, northward wind | sampled from HRRR at every AOI cell center and scan-aligned hour |
 
 Prior-quarter heat input and power generation keep contemporaneous operational
 leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's

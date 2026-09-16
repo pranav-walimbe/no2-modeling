@@ -1,14 +1,14 @@
 # Modeling
 
-The binary baseline classifies power-plant NOx changes from causal hourly TEMPO
-and HRRR sequences.
+The binary baseline classifies power-plant NOx changes from causal consecutive
+TEMPO scans and aligned hourly HRRR fields.
 
 ## Baseline at a glance
 
 | Component | Choice |
 |---|---|
 | Target | Sign of hourly NOx change outside a 100 lb deadband |
-| Raster input | `T` hourly NO2, validity mask, 2 m temperature, and wind U/V fields |
+| Raster input | `T` consecutive NO2 scans, validity masks, and aligned 2 m temperature and wind U/V fields |
 | Context input | Plant attributes, prior-quarter activity, and time |
 | Split | Geographic AOI clusters, approximately 70/15/15 |
 | Raster encoder | Shared mask-aware spatial encoder followed by a ConvGRU |
@@ -104,7 +104,7 @@ normalized[channel] =
 - Reuse the frozen training statistics for validation, test, and inference.
 
 The mask remains binary and unscaled. A two-layer partial-convolution stem
-consumes each hourly NO2 value-mask pair. The resulting features join the dense
+consumes each scan's NO2 value-mask pair. The resulting features join the dense
 weather stem before the shared residual encoder.
 
 Before spatial encoding, a differentiable transport module fills missing NO2
