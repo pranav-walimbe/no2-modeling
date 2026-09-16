@@ -107,6 +107,16 @@ The mask remains binary and unscaled. A two-layer partial-convolution stem
 consumes each hourly NO2 value-mask pair. The resulting features join the dense
 weather stem before the shared residual encoder.
 
+Before spatial encoding, a differentiable transport module fills missing NO2
+in normalized space with mask-aware separable bilinear interpolation. It
+backtraces the previous field with the current eastward and northward wind
+rasters and the measured inter-scan duration, using batched bilinear sampling
+on the GPU. A single global lifetime, initialized to 4 hours and learned within
+0.5 to 12 hours, applies exponential decay. The model receives the clipped
+train-scale innovation `current - advected_and_decayed_previous`; the first
+timestep gets a zero innovation. The original NO2 values, masks, and weather
+fields remain unchanged.
+
 Two design notes:
 
 - Robust linear scaling limits outlier influence without compressing the whole
@@ -124,8 +134,9 @@ an in-memory pixel archive.
 
 The raster branch applies the same spatial encoder to every hour. A partial-
 convolution NO2 stem uses the validity mask to renormalize local support rather
-than treating missing cells as physical zeros. A conventional weather stem
-encodes temperature and wind. Their fused features pass through residual blocks
+than treating missing cells as physical zeros. A parallel convolution injects
+the transport innovation into that stem. A conventional weather stem encodes
+temperature and wind. Their fused features pass through residual blocks
 that reduce each 24 by 24 timestep to 6 by 6, then a 96-channel ConvGRU fuses the
 ordered sequence. Global average and maximum pooling produce a 128-value raster
 embedding.

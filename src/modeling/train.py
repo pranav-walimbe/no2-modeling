@@ -23,6 +23,10 @@ from config import (
 from modeling.convgru import (
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
+    GRID_CELL_SIZE_KM,
+    INITIAL_LIFETIME_HOURS,
+    MAX_LIFETIME_HOURS,
+    MIN_LIFETIME_HOURS,
     NOxModel,
 )
 from modeling.dataset import (
@@ -109,11 +113,12 @@ def _seed_everything(seed: int) -> None:
 
 def _move_batch(batch: tuple[torch.Tensor, ...], device: torch.device) -> tuple[torch.Tensor, ...]:
     # Move model inputs and targets onto the training device
-    image, tabular, target, index = batch
+    image, tabular, elapsed_hours, target, index = batch
     non_blocking = device.type == "cuda"
     return (
         image.to(device, non_blocking=non_blocking),
         tabular.to(device, non_blocking=non_blocking),
+        elapsed_hours.to(device, non_blocking=non_blocking),
         target.to(device, non_blocking=non_blocking),
         index,
     )
@@ -145,10 +150,10 @@ def train_epoch(
     total_loss = 0.0
     amp_enabled = device.type == "cuda"
     for batch in loader:
-        image, tabular, target, _ = _move_batch(batch, device)
+        image, tabular, elapsed_hours, target, _ = _move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
-            loss = criterion(model(image, tabular), target)
+            loss = criterion(model(image, tabular, elapsed_hours), target)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
@@ -250,9 +255,9 @@ def val_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, device
     amp_enabled = device.type == "cuda"
     with torch.inference_mode():
         for batch in loader:
-            image, tabular, target, _ = _move_batch(batch, device)
+            image, tabular, elapsed_hours, target, _ = _move_batch(batch, device)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                loss = criterion(model(image, tabular), target)
+                loss = criterion(model(image, tabular, elapsed_hours), target)
             total_loss += loss.item() * target.numel()
     return total_loss / len(loader.dataset)
 
@@ -274,9 +279,9 @@ def run_inference(model: nn.Module, loader: DataLoader, device: torch.device) ->
     amp_enabled = device.type == "cuda"
     with torch.inference_mode():
         for batch in loader:
-            image, tabular, _, index = _move_batch(batch, device)
+            image, tabular, elapsed_hours, _, index = _move_batch(batch, device)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                prediction = model(image, tabular)
+                prediction = model(image, tabular, elapsed_hours)
             predictions.append(prediction.float().cpu().numpy())
             indices.append(index.numpy())
     return np.concatenate(predictions), np.concatenate(indices)
@@ -397,6 +402,8 @@ def main() -> None:
     best_path = checkpoint_dir / "best_model.pt"
     model = NOxModel(
         tabular_model=tabular_model,
+        image_center=stats.image_center,
+        image_scale=stats.image_scale,
         head_dim=args.head_dim,
         dropout=args.dropout,
     ).to(device)
@@ -427,6 +434,15 @@ def main() -> None:
         "head_dim": args.head_dim,
         "dropout": args.dropout,
         "no2_stem_normalization": "group_norm",
+        "transport": {
+            "method": "backward_semi_lagrangian_bilinear",
+            "missing_no2_fill": "mask_aware_separable_bilinear",
+            "residual": "current_minus_advected_decayed_prior",
+            "lifetime_hours": float(model.advection_decay.lifetime_hours.detach().cpu()),
+            "initial_lifetime_hours": INITIAL_LIFETIME_HOURS,
+            "lifetime_bounds_hours": [MIN_LIFETIME_HOURS, MAX_LIFETIME_HOURS],
+            "grid_cell_size_km": GRID_CELL_SIZE_KM,
+        },
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip_norm": args.gradient_clip_norm,

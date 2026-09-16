@@ -32,9 +32,14 @@ class TabularMLP(nn.Module):
         """Produce the embedding used by the classifier and fused model."""
         return self.encoder(tabular)
 
-    def forward(self, image: torch.Tensor, tabular: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        image: torch.Tensor,
+        tabular: torch.Tensor,
+        elapsed_hours: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Predict one Bernoulli logit from tabular features."""
-        del image
+        del image, elapsed_hours
         return self.classifier(self.encode(tabular)).squeeze(1)
 
     def num_params(self) -> int:
