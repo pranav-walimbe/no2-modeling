@@ -252,7 +252,7 @@ class ConvGRUCell(nn.Module):
 
 
 class NOxModel(nn.Module):
-    """Encode raster sequences and fuse a frozen tabular embedding."""
+    """Add a learned raster correction to a frozen tabular logit."""
 
     def __init__(
         self,
@@ -294,14 +294,15 @@ class NOxModel(nn.Module):
         self.tabular_model = tabular_model
         self.tabular_model.requires_grad_(False)
         self.tabular_model.eval()
-        fusion_dim = VISION_EMBEDDING_DIM + tabular_model.embedding_dim
-        self.head = nn.Sequential(
-            nn.Linear(fusion_dim, head_dim),
+        self.correction_head = nn.Sequential(
+            nn.Linear(VISION_EMBEDDING_DIM, head_dim),
             nn.LayerNorm(head_dim),
             nn.SiLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(head_dim, 1),
         )
+        nn.init.zeros_(self.correction_head[-1].weight)
+        nn.init.zeros_(self.correction_head[-1].bias)
 
     def train(self, mode: bool = True) -> "NOxModel":
         super().train(mode)
@@ -349,8 +350,9 @@ class NOxModel(nn.Module):
     ) -> torch.Tensor:
         vision_features = self._encode_sequence(image, elapsed_hours)
         with torch.no_grad():
-            tabular_features = self.tabular_model.encode(tabular)
-        return self.head(torch.cat((vision_features, tabular_features), dim=1)).squeeze(1)
+            baseline_logit = self.tabular_model(image, tabular, elapsed_hours)
+        correction = self.correction_head(vision_features).squeeze(1)
+        return baseline_logit + correction
 
     def num_params(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
