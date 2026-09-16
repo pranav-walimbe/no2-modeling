@@ -24,6 +24,7 @@ from config import (
     MODEL_MASK_KEYS,
     MODEL_RAW_FEATURES,
     MODEL_ROBUST_IMAGE_KEYS,
+    SEQUENCE_TIMESTEPS,
 )
 
 RASTER_PATH_COL = "raster_bundle_path"
@@ -35,6 +36,7 @@ STANDARD_IMAGE_CHANNELS = tuple(
     channel for channel in range(len(MODEL_IMAGE_KEYS)) if channel not in ROBUST_IMAGE_CHANNELS
 )
 DEGREES_PER_SOLAR_HOUR = 15.0
+TIMESTEP_TIME_COLUMNS = tuple(f"timestep_time_t{index}" for index in range(SEQUENCE_TIMESTEPS))
 
 
 def _model_feature_names() -> tuple[str, ...]:
@@ -359,11 +361,15 @@ class NOxDataset(Dataset):
         labels = pd.to_numeric(self.frame[LABEL_COL], errors="raise").to_numpy(dtype=np.float64)
         self.labels = labels.astype(np.float32)
         self.raster_paths = self.frame[RASTER_PATH_COL].to_numpy(dtype=str)
+        timestep_times = np.column_stack(
+            [pd.to_datetime(self.frame[column], utc=True).to_numpy() for column in TIMESTEP_TIME_COLUMNS]
+        )
+        self.elapsed_hours = (np.diff(timestep_times, axis=1) / np.timedelta64(1, "h")).astype(np.float32)
 
     def __len__(self) -> int:
         return len(self.labels)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         if self.load_images:
             rasters, masks = _load_raster_bundle(_raster_path(self.raster_paths[index], self.dataset_dir))
             normalized = np.zeros_like(rasters, dtype=np.float32)
@@ -381,6 +387,7 @@ class NOxDataset(Dataset):
         return (
             image,
             torch.from_numpy(self.features[index]),
+            torch.from_numpy(self.elapsed_hours[index]),
             torch.tensor(self.labels[index]),
             index,
         )
