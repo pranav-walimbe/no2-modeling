@@ -143,9 +143,11 @@ embedding.
 
 The tabular branch is a 32-value hidden layer followed by a 16-value embedding
 and its own Bernoulli classifier. It is trained independently, selected on
-validation loss, and frozen. During fused training, the raster embedding and
-frozen tabular embedding feed a nonlinear head. The head returns one logit; its
-sigmoid is the predicted Bernoulli distribution over decrease and increase.
+validation loss, and frozen. During fused training, a vision-only head converts
+the raster embedding into an additive correction to the frozen tabular logit.
+The correction output layer is initialized to zero, so fused training starts
+with exactly the selected tabular prediction. The corrected logit's sigmoid is
+the predicted Bernoulli distribution over decrease and increase.
 This is preferable to emitting a hard class because training and evaluation
 retain confidence and calibration information without a redundant two-logit
 binary head.
@@ -231,14 +233,15 @@ non-overlapping plant regions rather than memorization of known AOIs.
 |---|---|
 | Constant and prevalence classifiers | Does the model beat trivial predictions? |
 | Tabular-only MLP | Does image data add value to the neural model? |
-| ConvGRU plus frozen MLP | Do raster sequences improve on the same selected MLP? |
+| ConvGRU residual plus frozen MLP | Do raster sequences improve on the same selected MLP? |
 | With and without masks | Does explicit support information add value? |
 
 Report every comparison on the same frozen validation and test records. The full
 model earns its place only when image information improves held-out-AOI error
 and the gain extends past unusually clear or high-plume scenes. Every run
 reports the fused model minus the exact validation-selected MLP checkpoint that
-is frozen for fusion. A standalone ConvGRU is not trained or reported.
+is frozen while the ConvGRU learns an additive logit correction. A standalone
+ConvGRU is not trained or reported.
 
 ## Run artifacts
 
@@ -248,7 +251,7 @@ Each UTC-stamped directory under `RUNS_DIR` contains:
 |---|---|
 | `normalization_stats.json` | Train-only preprocessing and deadband cutoff |
 | `run_config.json` | Features, settings, clipping rates, and parameter count |
-| `checkpoints/best_model.pt` | Selected ConvGRU-plus-MLP checkpoint |
+| `checkpoints/best_model.pt` | Selected ConvGRU-residual-plus-MLP checkpoint |
 | `checkpoints/best_tabular_mlp.pt` | Independently selected MLP used by the fused model |
 | `results.json` | Metrics, ConvGRU-plus-MLP minus MLP differences, and prevalence |
 | `*_predictions.csv` | Row-level predictions for each model and split |

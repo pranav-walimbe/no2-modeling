@@ -407,7 +407,7 @@ def main() -> None:
         head_dim=args.head_dim,
         dropout=args.dropout,
     ).to(device)
-    print(f"Training {model.num_params():,}-parameter ConvGRU + MLP model on {device}; outputs: {run_dir}")
+    print(f"Training {model.num_params():,}-parameter ConvGRU residual + MLP model on {device}; outputs: {run_dir}")
     train_losses, val_losses, best_val_loss = fit_model(
         model,
         train_loader,
@@ -418,7 +418,7 @@ def main() -> None:
         args=args,
         checkpoint_path=best_path,
         checkpoint_metadata=checkpoint_metadata,
-        phase_name="ConvGRU + MLP",
+        phase_name="ConvGRU residual + MLP",
     )
     plot_loss_curve(train_losses, val_losses, run_dir)
 
@@ -429,6 +429,11 @@ def main() -> None:
         "workers": args.workers,
         "maximum_epochs": args.epochs,
         "tabular_pretraining": tabular_run,
+        "fusion": {
+            "method": "additive_residual_logit",
+            "baseline_frozen": True,
+            "correction_output_initialization": "zero",
+        },
         "prefetch_factor": args.prefetch_factor,
         "seed": args.seed,
         "head_dim": args.head_dim,
