@@ -45,7 +45,7 @@ TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.0  # retain every positive accepted footprint-c
 # ============================================================================
 # Stratification
 # ============================================================================
-TEMPO_MIN_DELTA_MINUTES = 50
+TEMPO_MIN_DELTA_MINUTES = 40
 TEMPO_MAX_DELTA_MINUTES = 70
 IMG_RANGE = 72  # spatial extent of extracted image patch (km)
 STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # stratified split output directory

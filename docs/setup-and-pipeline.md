@@ -243,17 +243,17 @@ Running the splits:
 python -u -m modeling.train
 ```
 
-The trainer reads the hourly NO2, validity-mask, temperature, and geographic
-wind sequences from each selected NPZ on demand. It derives local mean solar
-hour from the stored UTC hour and AOI longitude. It fits memory-bounded
-normalization statistics on the training split alone and records clipped
-valid-pixel fractions by channel and split. A tabular MLP is trained first and
-then frozen while the mask-aware ConvGRU learns an additive correction to its
-logit. The zero-initialized correction makes the hybrid begin at the selected
-MLP prediction. The model returns a Bernoulli probability for the emissions-
-change class. The report compares that residual model directly with the
-selected MLP checkpoint on the same records. See `docs/modeling.md` for the
-full contract.
+The trainer reads the consecutive NO2 scans and aligned validity-mask,
+temperature, and geographic-wind sequences from each selected NPZ on demand.
+It derives local mean solar hour from the stored UTC hour and AOI longitude. It
+fits memory-bounded normalization statistics on the training split alone and
+records clipped valid-pixel fractions by channel and split. A tabular MLP is
+trained first and then frozen while the mask-aware ConvGRU learns an additive
+correction to its logit. The zero-initialized correction makes the hybrid begin
+at the selected MLP prediction. The model returns a Bernoulli probability for
+the emissions-change class. The report compares that residual model directly
+with the selected MLP checkpoint on the same records. See `docs/modeling.md`
+for the full contract.
 
 ### Regeneration
 

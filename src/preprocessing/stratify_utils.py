@@ -222,7 +222,7 @@ def add_tempo_sequences(
     Args:
         frame: AOI-hour rows eligible for observation matching.
         observations: AOI scans with timestamps and source path lists.
-        timesteps: Number of consecutive hourly scans per record.
+        timesteps: Number of consecutive scans per record.
 
     Returns:
         Rows carrying oldest-to-newest scan timestamps, ages, and paths.
