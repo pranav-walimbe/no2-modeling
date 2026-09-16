@@ -84,6 +84,7 @@ MIN_TIMESTEP_NO2_FINITE_FRACTION = 0.95  # inclusive coverage floor applied inde
 HOTSPOT_WINDOW_SIZE = 3  # odd source-centred square required to have complete NO2 support
 MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applied to every timestep
 LABEL_COL = "delta_nox_class"
+EFFECTIVE_DELTA_NOX_COL = "effective_delta_nox"
 EMA_DELTA_THRESHOLD = 100.0  # least absolute current-minus-previous effective NOx retained
 TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover

@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
+from config import EFFECTIVE_DELTA_NOX_COL
+
 TRUE_CLASS_COL = "y_true"
 PREDICTED_CLASS_COL = "y_pred"
 POSITIVE_PROBABILITY_COL = "probability_positive"
@@ -99,7 +101,7 @@ def _model_results(split_frames: dict[str, pd.DataFrame]) -> dict[str, object]:
         }
     }
     test = split_frames["test"]
-    magnitude = np.abs(test["delta_nox_mass"].to_numpy(dtype=np.float64))
+    magnitude = np.abs(test[EFFECTIVE_DELTA_NOX_COL].to_numpy(dtype=np.float64))
     ordered_indices = np.argsort(magnitude, kind="stable")
     slices = {
         name: test.iloc[indices]
