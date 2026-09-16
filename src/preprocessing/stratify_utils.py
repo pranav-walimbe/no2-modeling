@@ -10,6 +10,7 @@ from pycanopy import SpatialFrame, distance_to_point
 from pyproj import Transformer
 
 from config import (
+    EFFECTIVE_DELTA_NOX_COL,
     EMA_DECAY_TIMESCALE_HOURS,
     EMA_DELTA_THRESHOLD,
     IMG_RANGE,
@@ -29,7 +30,6 @@ PREVIOUS_QUARTER_POWER_COL = "_previous_quarter_power"
 PREV_QTR_AVG_NOX_COL = "prev_qtr_avg_nox"
 EFFECTIVE_CURRENT_NOX_COL = "effective_current_nox"
 EFFECTIVE_PREVIOUS_NOX_COL = "effective_previous_nox"
-EFFECTIVE_DELTA_NOX_COL = "effective_delta_nox"
 METERS_PER_KM = 1000.0
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_MINUTE = 60
