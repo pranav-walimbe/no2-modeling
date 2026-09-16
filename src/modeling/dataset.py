@@ -362,7 +362,10 @@ class NOxDataset(Dataset):
         self.labels = labels.astype(np.float32)
         self.raster_paths = self.frame[RASTER_PATH_COL].to_numpy(dtype=str)
         timestep_times = np.column_stack(
-            [pd.to_datetime(self.frame[column], utc=True).to_numpy() for column in TIMESTEP_TIME_COLUMNS]
+            [
+                pd.to_datetime(self.frame[column], utc=True).dt.tz_localize(None).to_numpy(dtype="datetime64[ns]")
+                for column in TIMESTEP_TIME_COLUMNS
+            ]
         )
         self.elapsed_hours = (np.diff(timestep_times, axis=1) / np.timedelta64(1, "h")).astype(np.float32)
 
