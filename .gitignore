@@ -212,8 +212,10 @@ CLAUDE.md
 !/.agents/skills/savio-slurm/
 /.claude/
 
-# Local analysis and batch scripts
-/scripts/
+# Local analysis scripts; keep Savio batch scripts under version control
+/scripts/*
+!/scripts/slurm/
+!/scripts/slurm/**
 /src/eda/
 /src/collection/map_plant_zones.py
 /src/collection/plant_zone_mapping.py
