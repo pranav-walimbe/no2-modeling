@@ -8,6 +8,9 @@ Last updated: 2026-09-17
   0.8267 test AUROC and 75.77% accuracy on the saved balanced test table.
 - The frozen tabular MLP already reaches 0.8107 AUROC and 75.25% accuracy. The
   raster branch adds 0.0160 AUROC and 0.51 percentage points of accuracy.
+- Day of year supplies most of the MLP's ranking signal. A season-only probe
+  reaches about 0.787 test AUROC, while disrupting season within AOI reduces the
+  trained MLP from 0.816 to about 0.553 AUROC.
 - Evaluation oversampling duplicates 31.6% of test rows. On the 15,562 unique
   test records, fusion raises AUROC from 0.8160 to 0.8322 but lowers accuracy
   from 79.10% to 78.43% and worsens log loss from 0.4986 to 0.5189.
@@ -32,7 +35,7 @@ Last updated: 2026-09-17
 | Target | Sign of causal effective NOx change outside a 100 lb deadband |
 | Raster sequence | Five 24 x 24 hourly frames, oldest to newest |
 | Raster inputs | NO2, validity mask, 2 m temperature, and 80 m winds |
-| Tabular inputs | Plant attributes, current activity, solar hour, and season |
+| Tabular inputs | Plant attributes, prior-quarter same-hour activity, solar hour, and season |
 | Baseline | Frozen 993-parameter tabular MLP |
 | Fused model | 700,545 trainable parameters, spatial encoder and ConvGRU |
 | Fusion | Additive correction to the frozen MLP logit |
@@ -154,9 +157,44 @@ to +0.014 across those groups.
 
 ## How much do the rasters inform the model?
 
-The tabular MLP explains most of the observed signal. It sees current average
-heat input and power generation, plant capacity and unit counts, plus time of
-day and season. Those operational features closely track emissions direction.
+The tabular MLP explains most of the observed signal, and season explains most
+of the MLP. It sees plant capacity and unit counts, prior-quarter same-hour
+average heat input and power generation, solar hour, and day of year. It does
+not receive AOI ID, raw coordinates, date, year, current emissions, or current
+power generation.
+
+The label distribution contains a strong annual pattern. Among unique test
+records, the positive share is 12.3% in January, reaches 87.8% to 90.0% from
+June through September, and falls to 27.5% in December. Training records follow
+the same shape. A smoothed day-of-year lookup fitted on unique training records
+reaches 0.787 test AUROC without plant or operations features.
+
+Post-hoc checks on the selected MLP give the same result:
+
+| Check on unique test records | AUROC |
+|---|---:|
+| Full MLP | 0.8160 |
+| Keep only day-of-year inputs; set other normalized inputs to zero | 0.7831 |
+| Keep all time inputs; set other normalized inputs to zero | 0.7899 |
+| Remove day-of-year inputs by setting them to zero | 0.5293 |
+| Remove prior-quarter activity inputs | 0.8086 |
+
+Conditional permutation within each AOI lowers AUROC by about 0.263 for day of
+year, 0.034 for solar hour, and 0.005 for prior-quarter activity. These effects
+are not additive because the MLP learns interactions, and zeroing inputs creates
+out-of-distribution combinations. The gap is large enough to identify a smooth
+seasonal shortcut as the main source of tabular skill. The geographic split
+prevents direct AOI memorization, but it does not prevent a calendar pattern
+shared across train and test AOIs.
+
+The current analysis does not establish why the label is so seasonal. The
+causal target compares two overlapping five-hour emissions averages, TEMPO
+restricts examples to daytime observation windows, and the 100 lb deadband
+keeps only large changes. Seasonal generation ramps, observation timing, and
+selection effects can all create the observed prevalence curve. The next data
+audit should report label prevalence by day of year and local solar hour before
+and after the deadband and raster-quality filters.
+
 The fused model can only add a correction to this strong frozen prediction.
 
 The raster branch adds a repeatable-looking 0.016 test AUROC for this seed, and
