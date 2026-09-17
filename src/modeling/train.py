@@ -45,7 +45,6 @@ from modeling.plot_utils import (
     plot_class_probabilities,
     plot_loss_curve,
     plot_model_comparison,
-    plot_spatial_accuracy,
 )
 
 DEFAULT_BATCH_SIZE = 128
@@ -462,7 +461,6 @@ def main() -> None:
         split_frames[split] = _prediction_frame(datasets[split], logits, indices)
 
     plot_class_probabilities(split_frames, run_dir)
-    plot_spatial_accuracy(split_frames, run_dir)
     model_frames = {"raster_convgru": split_frames, "mlp": tabular_split_frames}
     plot_model_comparison(model_frames, run_dir)
     save_results(

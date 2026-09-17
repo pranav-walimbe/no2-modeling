@@ -10,7 +10,6 @@ from modeling.eval_utils import (
     POSITIVE_PROBABILITY_COL,
     TRUE_CLASS_COL,
     classification_metrics,
-    plant_metrics,
 )
 
 SPLIT_ORDER = ("train", "val", "test")
@@ -80,35 +79,6 @@ def plot_class_probabilities(split_frames: dict[str, pd.DataFrame], run_dir: str
         axis.legend()
     figure.tight_layout()
     _save(figure, run_dir, "class_probabilities")
-
-
-def plot_spatial_accuracy(split_frames: dict[str, pd.DataFrame], run_dir: str | Path) -> None:
-    """Map held-out AOI accuracy without a runtime network dependency.
-
-    Args:
-        split_frames: Row-level predictions for each data split.
-        run_dir: Model-run output directory.
-    """
-    sns.set_theme(style="white", font_scale=1.0)
-    figure, axes = plt.subplots(1, 2, figsize=(15, 6), sharex=True, sharey=True)
-    for axis, split in zip(axes, ("val", "test"), strict=True):
-        metrics = plant_metrics(split_frames[split])
-        points = axis.scatter(
-            metrics["lon"],
-            metrics["lat"],
-            c=metrics["accuracy"],
-            cmap="viridis",
-            vmin=0,
-            vmax=1,
-            s=30,
-            alpha=0.85,
-            edgecolors="black",
-            linewidths=0.2,
-        )
-        figure.colorbar(points, ax=axis, label="Classification accuracy")
-        axis.set(xlabel="Longitude", ylabel="Latitude", title=f"{split} AOIs")
-    figure.tight_layout()
-    _save(figure, run_dir, "spatial_accuracy")
 
 
 def plot_model_comparison(model_frames: dict[str, dict[str, pd.DataFrame]], run_dir: str | Path) -> None:
