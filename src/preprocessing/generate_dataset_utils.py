@@ -300,30 +300,31 @@ def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
     }
 
 
-def select_final_records(frame: pl.DataFrame) -> pl.DataFrame:
-    """Balance classes by duplicating deterministically ranked minority rows.
+def select_final_records(frame: pl.DataFrame, split: str) -> pl.DataFrame:
+    """Balance classes using deterministically ranked records.
 
     Args:
         frame: Successfully generated candidate records with finite paired coverage.
+        split: Dataset split being finalized.
 
     Returns:
-        Every successful record plus repeated minority rows so both classes
-        match the original majority-class size.
+        Equal-sized classes selected for the requested split.
     """
     eligible_by_class = {label: frame.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
     if not all(eligible_by_class.values()):
         raise ValueError(f"Cannot balance a split without both classes: {eligible_by_class}")
 
-    class_size = max(eligible_by_class.values())
+    class_size = max(eligible_by_class.values()) if split == "train" else min(eligible_by_class.values())
+
     selected_classes = []
     for label in (0, 1):
         class_records = frame.filter(pl.col(LABEL_COL) == label)
-        selected_classes.append(_repeat_ranked_records(class_records, class_size))
+        selected_classes.append(_resize_ranked_records(class_records, class_size))
     return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
 
 
-def _repeat_ranked_records(frame: pl.DataFrame, target_size: int) -> pl.DataFrame:
-    # Cycle through ranked rows until the class reaches the target size
+def _resize_ranked_records(frame: pl.DataFrame, target_size: int) -> pl.DataFrame:
+    # Repeat or truncate ranked rows to the requested class size
     ranked = _rank_final_records(frame)
     complete_copies, remainder = divmod(target_size, ranked.height)
     copies = [ranked] * complete_copies

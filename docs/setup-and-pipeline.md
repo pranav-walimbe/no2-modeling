@@ -202,8 +202,10 @@ array such as `0-31%14`.
 - requires at least 95 percent finite NO2 coverage in every timestep;
 - requires all nine cells around the highest-unit source cell to be valid in
   every timestep;
-- keeps every successful record and duplicates minority rows through
+- keeps every successful training record and duplicates minority rows through
   deterministic AOI and temporal round-robin until the classes are equal;
+- balances validation and test by retaining every minority row and selecting
+  the same number of deterministically ranked majority rows;
 - uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
   allocation.
 
@@ -225,9 +227,10 @@ Running the splits:
   launch deletes the complete shard tree rather than resuming it.
 - The finalizer runs only after every array task succeeds. It validates all
   source outcomes and referenced rasters, applies exact class balance by
-  deterministic minority oversampling, then atomically publishes metadata whose
-  raster paths point directly into the shards. It does not install or remove
-  raster files, so selected and unselected successful rasters remain in place.
+  oversampling the training minority class and undersampling the validation and
+  test majority classes, then atomically publishes metadata whose raster paths
+  point directly into the shards. It does not install or remove raster files,
+  so selected and unselected successful rasters remain in place.
 - `--refresh-cache`, `--refresh-tempo`, and `--refresh-weather` explicitly clear
   the selected persistent caches once before fan-out. Otherwise caches survive
   fresh dataset runs and concurrent shards reuse their atomic entries.

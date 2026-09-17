@@ -367,19 +367,24 @@ def _write_outputs(
 
     prepared_outputs: dict[str, tuple[pl.DataFrame, dict[str, object], pl.DataFrame]] = {}
     for split, candidates in candidates_by_split.items():
-        output_frame = select_final_records(candidates)
+        output_frame = select_final_records(candidates, split)
         selected_coverage = coverage_selection_summary(output_frame)
         eligible_by_class = {
             str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)
         }
+        balance_size_change = output_frame.height - candidates.height
         selection_size = {
             "actual_size": output_frame.height,
-            "duplicated_for_balance": output_frame.height - candidates.height,
+            "balance_strategy": "oversample_minority" if split == "train" else "undersample_majority",
+            "duplicated_for_balance": max(balance_size_change, 0),
+            "dropped_for_balance": max(-balance_size_change, 0),
             "eligible_by_class": eligible_by_class,
         }
         print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
         if selection_size["duplicated_for_balance"]:
             print(f"[{split}] duplicated {selection_size['duplicated_for_balance']:,} records for class balance")
+        if selection_size["dropped_for_balance"]:
+            print(f"[{split}] dropped {selection_size['dropped_for_balance']:,} records for class balance")
         print(
             f"[{split}] full sequence coverage: {selected_coverage['full_coverage_records']:,}/"
             f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"
