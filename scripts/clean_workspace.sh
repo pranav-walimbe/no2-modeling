@@ -4,7 +4,6 @@ set -euo pipefail
 
 repository_dir="/global/home/users/pranavwalimbe/no2-modeling"
 user_home_dir="/global/home/users/pranavwalimbe"
-model_runs_dir="${user_home_dir}/model_runs"
 pip_cache_dir="${user_home_dir}/.cache/pip"
 uv_cache_dir="${user_home_dir}/.cache/uv"
 codex_cache_dirs=(
@@ -19,26 +18,6 @@ codex_cache_files=(
 if [[ ! -d "${repository_dir}/.git" ]]; then
     echo "Expected repository is missing: ${repository_dir}" >&2
     exit 1
-fi
-
-if [[ -d "${model_runs_dir}" ]]; then
-    newest_run_name=$(find "${model_runs_dir}" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %f\n' \
-        | sort -nr \
-        | sed -n '1s/^[^ ]* //p')
-    if [[ -n "${newest_run_name}" ]]; then
-        newest_run="${model_runs_dir}/${newest_run_name}"
-        if [[ ! -d "${newest_run}" ]]; then
-            echo "Could not resolve newest model run: ${newest_run}" >&2
-            exit 1
-        fi
-        echo "Keeping newest model run: ${newest_run}"
-        while IFS= read -r -d '' candidate_run; do
-            if [[ "${candidate_run}" != "${newest_run}" ]]; then
-                echo "Removing old model run: ${candidate_run}"
-                rm -rf -- "${candidate_run}"
-            fi
-        done < <(find "${model_runs_dir}" -mindepth 1 -maxdepth 1 -type d -print0)
-    fi
 fi
 
 for cache_dir in "${pip_cache_dir}" "${uv_cache_dir}"; do

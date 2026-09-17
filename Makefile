@@ -16,7 +16,7 @@ help:
 	@echo "Available targets:"
 	@echo "  setup    Sync the locked environment with uv"
 	@echo "  check    Run Ruff and compile Python sources"
-	@echo "  clean    Keep the newest model run and clear regenerable caches"
+	@echo "  clean    Clear regenerable caches without modifying model runs"
 	@echo "  fix-codex Move Codex SQLite state off NFS and clear stale locks"
 
 setup:
