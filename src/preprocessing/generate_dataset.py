@@ -36,7 +36,6 @@ from preprocessing.generate_dataset_utils import (
     PROCESSING_FAILURE_SCHEMA,
     RASTER_BUNDLE_PATH_COL,
     SOURCE_RECORD_INDEX_COL,
-    BalanceStrategy,
     DatasetShardStore,
     RecordTask,
     ScanTask,
@@ -368,8 +367,7 @@ def _write_outputs(
 
     prepared_outputs: dict[str, tuple[pl.DataFrame, dict[str, object], pl.DataFrame]] = {}
     for split, candidates in candidates_by_split.items():
-        balance_strategy: BalanceStrategy = "oversample_minority" if split == "train" else "undersample_majority"
-        output_frame = select_final_records(candidates, balance_strategy)
+        output_frame = select_final_records(candidates, split)
         selected_coverage = coverage_selection_summary(output_frame)
         eligible_by_class = {
             str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)
@@ -377,7 +375,7 @@ def _write_outputs(
         balance_size_change = output_frame.height - candidates.height
         selection_size = {
             "actual_size": output_frame.height,
-            "balance_strategy": balance_strategy,
+            "balance_strategy": "oversample_minority" if split == "train" else "undersample_majority",
             "duplicated_for_balance": max(balance_size_change, 0),
             "dropped_for_balance": max(-balance_size_change, 0),
             "eligible_by_class": eligible_by_class,

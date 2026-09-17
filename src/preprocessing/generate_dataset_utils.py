@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import TypeVar
 
 import numpy as np
 import polars as pl
@@ -300,29 +300,21 @@ def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
     }
 
 
-BalanceStrategy = Literal["oversample_minority", "undersample_majority"]
-
-
-def select_final_records(frame: pl.DataFrame, strategy: BalanceStrategy) -> pl.DataFrame:
+def select_final_records(frame: pl.DataFrame, split: str) -> pl.DataFrame:
     """Balance classes using deterministically ranked records.
 
     Args:
         frame: Successfully generated candidate records with finite paired coverage.
-        strategy: Whether to repeat minority rows or discard majority rows.
+        split: Dataset split being finalized.
 
     Returns:
-        Equal-sized classes selected using the requested strategy.
+        Equal-sized classes selected for the requested split.
     """
     eligible_by_class = {label: frame.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
     if not all(eligible_by_class.values()):
         raise ValueError(f"Cannot balance a split without both classes: {eligible_by_class}")
 
-    if strategy == "oversample_minority":
-        class_size = max(eligible_by_class.values())
-    elif strategy == "undersample_majority":
-        class_size = min(eligible_by_class.values())
-    else:
-        raise ValueError(f"Unsupported balance strategy: {strategy}")
+    class_size = max(eligible_by_class.values()) if split == "train" else min(eligible_by_class.values())
 
     selected_classes = []
     for label in (0, 1):
