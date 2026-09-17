@@ -35,7 +35,6 @@ export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
 srun python -u -m modeling.train \
     --device cuda \
-    --inputs full \
     --batch-size 128 \
     --epochs 300 \
     --workers "${SLURM_CPUS_PER_TASK}" \
