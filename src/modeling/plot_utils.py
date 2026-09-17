@@ -15,7 +15,7 @@ from modeling.eval_utils import (
 
 SPLIT_ORDER = ("train", "val", "test")
 MODEL_DISPLAY_NAMES = {
-    "convgru_mlp": "ConvGRU residual + MLP",
+    "convgru_mlp": "ConvGRU + MLP",
     "mlp": "MLP",
 }
 COMPARISON_METRIC_NAMES = {

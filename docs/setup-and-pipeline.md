@@ -251,9 +251,9 @@ records clipped valid-pixel fractions by channel and split. A tabular MLP is
 trained first and then frozen while the mask-aware ConvGRU learns an additive
 correction to its logit. The zero-initialized correction makes the hybrid begin
 at the selected MLP prediction. The model returns a Bernoulli probability for
-the emissions-change class. The report compares that residual model directly
-with the selected MLP checkpoint on the same records. See `docs/modeling.md`
-for the full contract.
+the emissions-change class. The report compares the fused model directly with
+the selected MLP checkpoint on the same records. See `docs/modeling.md` for the
+full contract.
 
 ### Regeneration
 
