@@ -23,10 +23,6 @@ from config import (
 from modeling.convgru import (
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
-    GRID_CELL_SIZE_KM,
-    INITIAL_LIFETIME_HOURS,
-    MAX_LIFETIME_HOURS,
-    MIN_LIFETIME_HOURS,
     NOxModel,
 )
 from modeling.dataset import (
@@ -402,12 +398,10 @@ def main() -> None:
     best_path = checkpoint_dir / "best_model.pt"
     model = NOxModel(
         tabular_model=tabular_model,
-        image_center=stats.image_center,
-        image_scale=stats.image_scale,
         head_dim=args.head_dim,
         dropout=args.dropout,
     ).to(device)
-    print(f"Training {model.num_params():,}-parameter ConvGRU residual + MLP model on {device}; outputs: {run_dir}")
+    print(f"Training {model.num_params():,}-parameter ConvGRU + MLP model on {device}; outputs: {run_dir}")
     train_losses, val_losses, best_val_loss = fit_model(
         model,
         train_loader,
@@ -418,7 +412,7 @@ def main() -> None:
         args=args,
         checkpoint_path=best_path,
         checkpoint_metadata=checkpoint_metadata,
-        phase_name="ConvGRU residual + MLP",
+        phase_name="ConvGRU + MLP",
     )
     plot_loss_curve(train_losses, val_losses, run_dir)
 
@@ -430,7 +424,7 @@ def main() -> None:
         "maximum_epochs": args.epochs,
         "tabular_pretraining": tabular_run,
         "fusion": {
-            "method": "additive_residual_logit",
+            "method": "additive_logit_correction",
             "baseline_frozen": True,
             "correction_output_initialization": "zero",
         },
@@ -439,15 +433,7 @@ def main() -> None:
         "head_dim": args.head_dim,
         "dropout": args.dropout,
         "no2_stem_normalization": "group_norm",
-        "transport": {
-            "method": "backward_semi_lagrangian_bilinear",
-            "missing_no2_fill": "mask_aware_separable_bilinear",
-            "residual": "current_minus_advected_decayed_prior",
-            "lifetime_hours": float(model.advection_decay.lifetime_hours.detach().cpu()),
-            "initial_lifetime_hours": INITIAL_LIFETIME_HOURS,
-            "lifetime_bounds_hours": [MIN_LIFETIME_HOURS, MAX_LIFETIME_HOURS],
-            "grid_cell_size_km": GRID_CELL_SIZE_KM,
-        },
+        "sequence_encoder": "mask_aware_spatial_encoder_then_convgru",
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip_norm": args.gradient_clip_norm,
