@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 import numpy as np
 import polars as pl
@@ -300,30 +300,39 @@ def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
     }
 
 
-def select_final_records(frame: pl.DataFrame) -> pl.DataFrame:
-    """Balance classes by duplicating deterministically ranked minority rows.
+BalanceStrategy = Literal["oversample_minority", "undersample_majority"]
+
+
+def select_final_records(frame: pl.DataFrame, strategy: BalanceStrategy) -> pl.DataFrame:
+    """Balance classes using deterministically ranked records.
 
     Args:
         frame: Successfully generated candidate records with finite paired coverage.
+        strategy: Whether to repeat minority rows or discard majority rows.
 
     Returns:
-        Every successful record plus repeated minority rows so both classes
-        match the original majority-class size.
+        Equal-sized classes selected using the requested strategy.
     """
     eligible_by_class = {label: frame.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
     if not all(eligible_by_class.values()):
         raise ValueError(f"Cannot balance a split without both classes: {eligible_by_class}")
 
-    class_size = max(eligible_by_class.values())
+    if strategy == "oversample_minority":
+        class_size = max(eligible_by_class.values())
+    elif strategy == "undersample_majority":
+        class_size = min(eligible_by_class.values())
+    else:
+        raise ValueError(f"Unsupported balance strategy: {strategy}")
+
     selected_classes = []
     for label in (0, 1):
         class_records = frame.filter(pl.col(LABEL_COL) == label)
-        selected_classes.append(_repeat_ranked_records(class_records, class_size))
+        selected_classes.append(_resize_ranked_records(class_records, class_size))
     return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
 
 
-def _repeat_ranked_records(frame: pl.DataFrame, target_size: int) -> pl.DataFrame:
-    # Cycle through ranked rows until the class reaches the target size
+def _resize_ranked_records(frame: pl.DataFrame, target_size: int) -> pl.DataFrame:
+    # Repeat or truncate ranked rows to the requested class size
     ranked = _rank_final_records(frame)
     complete_copies, remainder = divmod(target_size, ranked.height)
     copies = [ranked] * complete_copies

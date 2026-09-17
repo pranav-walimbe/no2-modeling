@@ -12,16 +12,17 @@ whether it has enough coverage.
 | Label | Sign of raw hourly NOx change outside a 100 lb deadband |
 | Metadata filters | Required source data, NOx percentile bounds, relative-change floor, and coal dominance |
 | Raster gates | More than 95% current coverage and 80% paired coverage |
-| Final selection | Exact class balance by deterministic minority-row duplication |
+| Final selection | Oversample the training minority class; undersample validation and test majority classes |
 | Model selection | Validation data only; freeze test data for final comparison |
 
 ## Output contract
 
 Stratification assigns intact geographic clusters toward a 70/15/15 split and
-keeps each eligible record. After raster failures, finalization keeps the
-complete majority class and duplicates deterministically ranked minority rows
-until both classes have equal size. Reports record eligible counts, final size,
-and the number of duplicated rows.
+keeps each eligible record. After raster failures, finalization duplicates
+deterministically ranked minority rows in training until both classes match the
+majority size. For validation and test, it keeps every minority row and retains
+the same number of ranked majority rows. Reports record eligible counts, final
+size, balance strategy, and the numbers of duplicated and dropped rows.
 
 ## Split independence
 
@@ -155,8 +156,10 @@ Successfully generated candidates are selected deterministically:
 2. Rank records within each stratum by paired raster coverage.
 3. Interleave temporal strata within each AOI.
 4. Round-robin globally across AOIs.
-5. Keep every generated record and repeat ranked minority rows until the class
-   counts match.
+5. For training, keep every generated record and repeat ranked minority rows
+   until the class counts match.
+6. For validation and test, keep every minority row and truncate the ranked
+   majority class to the same size.
 
 ## Performance and persistence
 
