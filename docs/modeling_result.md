@@ -1,301 +1,293 @@
-# Performance analysis and architecture change report
+# Modeling results and next experiments
 
-Last updated: 2026-09-16
+Last updated: 2026-09-17
 
-## Scope and decision status
+## Executive readout
 
-This report evaluates the latest completed run,
-`delta_nox_classification_20260916_073403` from Slurm job `38969986`.
-The run is a single-seed result on the first five-scan causal-EMA dataset. It is
-useful evidence for architecture planning, but it is not the new reference model.
+- The latest completed run, `delta_nox_classification_20260917_115919`, reaches
+  0.8267 test AUROC and 75.77% accuracy on the saved balanced test table.
+- The frozen tabular MLP already reaches 0.8107 AUROC and 75.25% accuracy. The
+  raster branch adds 0.0160 AUROC and 0.51 percentage points of accuracy.
+- Evaluation oversampling duplicates 31.6% of test rows. On the 15,562 unique
+  test records, fusion raises AUROC from 0.8160 to 0.8322 but lowers accuracy
+  from 79.10% to 78.43% and worsens log loss from 0.4986 to 0.5189.
+- Raster gains appear across emissions-change levels and most adequately sized
+  AOIs, but the model remains close to random ranking at several held-out AOIs.
+- The raster branch contains NO2, its validity mask, temperature, and wind.
+  These results show conditional value from the branch as a whole; they do not
+  isolate information from NO2 columns.
+- The fused model selected epoch 1, overfit after that, and produced NaN losses
+  at epoch 16. Architecture work should start with evaluation and optimization
+  fixes, followed by controlled raster ablations and physics-guided pretraining.
 
-The queued follow-up, Slurm job `38976295`, is still pending. It will evaluate
-the current fusion change with the regenerated, larger sample. The latest
-stratification produced 307,491 training, 65,420 validation, and 68,344 test
-candidates before raster generation and class handling. Final raster-qualified
-counts are not known yet. Decisions about fusion, sample-size effects, or a new
-headline score must wait for that run and repeated seeds.
-
-## Completed-run contract
+## Run contract
 
 | Item | Value |
 |---|---|
-| Train / validation / test records | 15,708 / 4,256 / 3,326 |
-| Train / validation / test AOIs | 330 / 69 / 66 |
-| Class handling | Exactly balanced within each final split |
-| Target | Sign of causal effective NOx change outside a 100 lb deadband |
-| Effective-emissions kernel | Five hourly steps, exponential decay with 2 h timescale |
-| Raster sequence | Five 24 x 24 hourly frames, oldest to newest |
-| Per-frame inputs | NO2, 2 m temperature, 80 m eastward wind, 80 m northward wind, NO2 validity mask |
-| Tabular inputs | Unit counts, capacity, prior-quarter activity, solar hour, and day of year |
-| Baseline | 961-parameter tabular MLP, selected first and frozen during fusion |
-| Raster model | 702,994 trainable parameters; mask-aware spatial encoder, ConvGRU, advection-decay residual |
-| Fusion used by artifact | Additive correction to the frozen MLP logit, initialized at zero |
+| Run | `delta_nox_classification_20260917_115919` |
 | Seed | 42 |
+| Train / validation / test rows | 83,764 / 21,244 / 22,746 |
+| Unique raster records | 58,860 / 15,940 / 15,562 |
+| Train / validation / test AOIs | 556 / 107 / 134 |
+| Target | Sign of causal effective NOx change outside a 100 lb deadband |
+| Raster sequence | Five 24 x 24 hourly frames, oldest to newest |
+| Raster inputs | NO2, validity mask, 2 m temperature, and 80 m winds |
+| Tabular inputs | Plant attributes, current activity, solar hour, and season |
+| Baseline | Frozen 993-parameter tabular MLP |
+| Fused model | 700,545 trainable parameters, spatial encoder and ConvGRU |
+| Fusion | Additive correction to the frozen MLP logit |
 
-The transport layer back-advects the previous NO2 raster with the current wind,
-applies one bounded global exponential lifetime, and supplies the innovation to
-the raster encoder. The learned lifetime ended at 3.94 h from a 4 h
-initialization within a 0.5 to 12 h range. That small movement is not evidence
-for a physical lifetime estimate; classification loss may provide too little
-identifying information.
+The split is geographic, so validation and test measure transfer to held-out
+AOIs. Exact class balancing oversampled the minority class inside every split.
+That choice created duplicate validation and test rows and changed their class
+prevalence from 66.6% and 73.1% positive to 50%. The two evaluation views below
+serve different purposes:
 
-## Performance
+- **Artifact view:** reproduces `results.json` and weights duplicated rows.
+- **Unique-record view:** removes repeated `raster_bundle_path` values and
+  retains the raster-qualified sample's observed prevalence.
 
-### Validation and test metrics
+Future reports should use unique records as the primary evaluation set.
+Balancing belongs in the training sampler or loss, not validation or test data.
 
-| Split and metric | ConvGRU residual + MLP | Frozen MLP | Difference |
-|---|---:|---:|---:|
-| Validation accuracy | 0.7131 | **0.7199** | -0.0068 |
-| Validation ROC AUC | **0.8028** | 0.7913 | +0.0115 |
-| Validation log loss | 0.5786 | **0.5754** | +0.0032 |
-| Validation Brier score | **0.19380** | 0.19386 | -0.00006 |
-| Validation ECE, 10 bins | 0.1003 | **0.0855** | +0.0148 |
-| Test accuracy | **0.7402** | 0.7162 | +0.0241 |
-| Test ROC AUC | **0.8124** | 0.7756 | +0.0367 |
-| Test log loss | **0.5487** | 0.5893 | -0.0406 |
-| Test Brier score | **0.1823** | 0.1989 | -0.0165 |
-| Test ECE, 10 bins | 0.0771 | 0.0773 | -0.0002 |
+## Performance across splits
 
-The raster correction helps on the test AOIs. An AOI-cluster bootstrap with
-1,000 resamples gives the following 95% intervals for ConvGRU minus MLP:
+### Artifact-reported balanced view
 
-| Metric difference | 95% interval |
+| Split | Model | Accuracy | AUROC | Log loss | Brier score |
+|---|---|---:|---:|---:|---:|
+| Train | ConvGRU + MLP | 0.8578 | 0.9265 | 0.3469 | 0.1056 |
+| Train | MLP | 0.8478 | 0.9180 | 0.3636 | 0.1119 |
+| Validation | ConvGRU + MLP | 0.7701 | 0.8491 | 0.5363 | 0.1690 |
+| Validation | MLP | 0.7643 | 0.8418 | **0.5186** | **0.1685** |
+| Test | ConvGRU + MLP | 0.7577 | 0.8267 | **0.5524** | **0.1778** |
+| Test | MLP | 0.7525 | 0.8107 | 0.5612 | 0.1824 |
+
+Fusion improves accuracy and AUROC on all three splits. The AUROC gain is
+smaller on validation (+0.0073) than test (+0.0160), and the train-to-test gap
+is 0.100 AUROC. Both patterns point to limited transfer across AOIs. Validation
+log loss selects the MLP, despite the fused model's higher validation AUROC.
+
+### Unique-record view
+
+| Split | Model | Accuracy | Balanced accuracy | AUROC | Log loss |
+|---|---|---:|---:|---:|---:|
+| Train | ConvGRU + MLP | 0.8635 | 0.8636 | 0.9308 | 0.3512 |
+| Train | MLP | 0.8596 | 0.8550 | 0.9231 | **0.3498** |
+| Validation | ConvGRU + MLP | 0.7527 | 0.7703 | 0.8493 | 0.5930 |
+| Validation | MLP | 0.7502 | 0.7644 | 0.8420 | **0.5550** |
+| Test | ConvGRU + MLP | 0.7843 | 0.7630 | 0.8322 | 0.5189 |
+| Test | MLP | **0.7910** | 0.7586 | 0.8160 | **0.4986** |
+
+The natural test view is 73.1% positive. Fusion shifts test logits downward by
+0.146 on average. This improves specificity from 0.6882 to 0.7169 but lowers
+recall from 0.8289 to 0.8091, so accuracy falls. The raster correction changes
+the predicted class correctly for 231 records and incorrectly for 336 records.
+It reduces per-record log loss for 63.1% of records, yet a smaller set of large
+errors raises mean log loss.
+
+An AOI-cluster bootstrap with 1,000 resamples gives these 95% intervals for
+ConvGRU plus MLP minus MLP on unique test records:
+
+| Difference | 95% interval |
 |---|---:|
-| Accuracy | +0.0158 to +0.0316 |
-| ROC AUC | +0.0282 to +0.0453 |
-| Log loss | -0.0586 to -0.0238 |
-| Brier score | -0.0229 to -0.0102 |
+| Accuracy | -0.0105 to -0.0022 |
+| AUROC | +0.0112 to +0.0210 |
+| Log loss | +0.0096 to +0.0309 |
+| Brier score | +0.0013 to +0.0070 |
 
-These intervals describe geographic sampling uncertainty for this trained seed.
-They do not include training-seed variance, dataset-regeneration variance, or
-the architecture choices made after inspecting earlier test results.
+The intervals cover geographic sampling for this trained seed. They omit
+training-seed variance and choices made after reviewing earlier test runs.
 
-### The validation result does not yet approve the architecture
+## Test performance by emissions-change magnitude
 
-The tabular MLP reached its best validation loss at epoch 9. The fused model
-reached its best value at epoch 4, but that value was 0.0032 worse than the
-frozen MLP. It raised validation AUC while lowering validation accuracy and
-worsening calibration error. Because the experiment selected checkpoints by
-validation loss, the test improvement cannot override that result.
+The following tertiles use unique records and absolute effective NOx change.
 
-Training after epoch 4 added no validation value. Fused training loss fell from
-0.427 at epoch 4 to 0.007 at epoch 29 while validation loss rose from 0.579 to
-1.541. Early stopping restored the epoch-4 checkpoint, but the trajectory shows
-that a 703K-parameter raster correction can memorize 15,708 records quickly.
-Reduce patience for future sweeps and spend the saved compute on seeds and
-ablations.
+| Absolute change | Range (lb) | N | Accuracy | AUROC | Accuracy gain vs MLP | AUROC gain vs MLP |
+|---|---:|---:|---:|---:|---:|---:|
+| Low | 100.0 to 133.3 | 5,188 | 0.7787 | 0.8316 | -0.0079 | +0.0138 |
+| Middle | 133.3 to 201.5 | 5,187 | 0.7872 | **0.8461** | -0.0069 | **+0.0179** |
+| High | 201.5 to 4,300.3 | 5,187 | 0.7870 | 0.8204 | -0.0054 | +0.0167 |
 
-## Exploratory error analysis
+Large changes are not easier. The high tertile has the weakest AUROC, although
+its labels should sit farthest from the deadband. Large facilities, shutdowns,
+startup periods, nonlinear chemistry, and plume motion outside the local crop
+could all contribute. The current outputs cannot separate those explanations.
 
-All findings in this section use the frozen validation or test predictions from
-the completed run. They diagnose the model; they do not establish new selection
-rules.
+The raster branch adds a similar AUROC increment in all three tertiles. Its
+accuracy penalty also appears in all three because the downward logit shift
+trades positive recall for negative specificity under positive-heavy natural
+prevalence.
 
-### Does the raster correction add information?
+## Test performance across AOIs
 
-The correction changed the MLP logit by a mean absolute 0.44 on test. It reduced
-per-record log loss for 67.8% of test records and 64.6% of validation records.
-The test accuracy gain was similar for both classes:
+Per-AOI metrics become unstable for small sites or sites with one observed
+class. Restricting the summary to 44 AOIs with at least 100 unique records and
+both classes leaves 13,030 of 15,562 test records.
 
-| Test class | ConvGRU + MLP | MLP | Difference |
-|---|---:|---:|---:|
-| Emissions decrease: specificity | 0.6837 | 0.6590 | +0.0247 |
-| Emissions increase: recall | 0.7968 | 0.7733 | +0.0235 |
+| Per-AOI statistic | Accuracy | AUROC | Accuracy gain vs MLP | AUROC gain vs MLP |
+|---|---:|---:|---:|---:|
+| Median | 0.8120 | 0.8453 | -0.0056 | +0.0085 |
+| 25th percentile | 0.7705 | 0.7889 | | |
+| 75th percentile | 0.8563 | 0.8929 | | |
+| AOIs with a positive gain | | | 15 of 44 | 30 of 44 |
 
-The gain also appears across absolute effective-change tertiles. Accuracy gains
-were +3.70, +1.17, and +2.35 percentage points from the lowest to highest
-tertile. The raster branch is therefore not helping only on the largest target
-changes.
+Performance varies more than the pooled score suggests. AOIs 55463 and 2951
+have AUROCs of 0.5215 and 0.5421 across 251 and 256 records. Their accuracies
+remain near 84% because about 90% of their labels are positive. At the other
+end, AOIs 634, 8049, 7238, and 54466 exceed 0.977 AUROC with 437 to 509 records.
+The model can rank changes at many plants, but it does not learn a transport or
+operations relationship that transfers to every held-out setting.
 
-Among the 42 test AOIs with at least 20 records and both classes present, the
-fused model improved accuracy at 26, lost accuracy at 5, and tied at 11. The
-median AOI accuracy gain was 1.96 points, but individual changes ranged from
--5.45 to +7.53 points. Model selection still needs several seeds and paired
-AOI-level intervals.
+Capacity strata show where the middle of the fleet falls short:
 
-Seasonal AUC gains were positive in all four exploratory groups, from +0.036 in
-spring to +0.100 in winter. The groups differ in geography and class mix, so
-this pattern does not prove a seasonal mechanism.
+| AOI capacity tertile | AOIs | Records | Accuracy | AUROC | Accuracy gain vs MLP | AUROC gain vs MLP |
+|---|---:|---:|---:|---:|---:|---:|
+| Low, 133 to 1,269 MW | 46 | 2,462 | 0.8034 | 0.8339 | 0.0000 | +0.0089 |
+| Middle, 1,305 to 2,354 MW | 43 | 5,041 | 0.7419 | 0.7667 | -0.0038 | **+0.0256** |
+| High, 2,367 to 9,539 MW | 45 | 8,059 | 0.8049 | **0.8790** | -0.0107 | +0.0074 |
 
-### Coverage still controls learnability
+The middle-capacity group has the lowest absolute performance and the largest
+raster AUROC gain. Fuel grouping changes little: gas-only, mixed, and coal-only
+AOIs reach 0.819, 0.846, and 0.819 AUROC. Raster AUROC gains range from +0.011
+to +0.014 across those groups.
 
-The fused-minus-MLP AUC gain was +0.0439 for test sequences with complete NO2
-coverage and +0.0175 for sequences whose minimum timestep coverage was between
-0.90 and 0.99. The weaker group still showed a positive gain, which supports
-keeping masks and testing more permissive coverage rather than treating every
-incomplete sequence as unusable.
+## How much do the rasters inform the model?
 
-Coverage gates and balancing remove much of the available supervision. The
-completed dataset began with 88,167 stratified training candidates, generated
-26,266 qualifying raster sequences, and retained 15,708 after balancing. Among
-the generated training sequences, 18,412 were increases and 7,854 were
-decreases, so exact balancing discarded 10,558 otherwise eligible increases.
-Earlier coverage EDA found that only 25.8% of a 1,000-sequence sample passed the
-combination of at least 95% coverage at every timestep and complete 3 x 3 source
-coverage.
+The tabular MLP explains most of the observed signal. It sees current average
+heat input and power generation, plant capacity and unit counts, plus time of
+day and season. Those operational features closely track emissions direction.
+The fused model can only add a correction to this strong frozen prediction.
 
-## Dataset changes that could improve performance
+The raster branch adds a repeatable-looking 0.016 test AUROC for this seed, and
+the gain spans magnitude and fuel groups. Its mean absolute logit correction is
+0.407 on unique test records. That is enough to change ranking, but it does not
+improve probability quality or natural-prevalence accuracy.
 
-1. **Train on every raster-qualified record.** Use class-weighted loss or a
-   balanced batch sampler instead of deleting the majority class. Keep a frozen
-   balanced test view for comparison, but also report log loss, precision-recall
-   AUC, calibration, and decision costs under natural prevalence.
+No current ablation identifies the source of the gain. The branch can use:
 
-2. **Separate scientific eligibility from observation quality.** Keep hard
-   requirements for valid targets, geographic independence, and source support.
-   Represent partial scan coverage with masks, coverage features, and a missing
-   timestep indicator. Evaluate 0.90 and 0.95 coverage floors on validation
-   AOIs. Do not choose the floor from test performance.
+- spatial and temporal NO2 structure;
+- weather fields without NO2;
+- mask patterns tied to clouds, season, or scan geometry;
+- AOI-specific backgrounds and artifacts.
 
-3. **Prevent sequence duplication from inflating sample size.** Consecutive
-   five-hour windows share four frames. Split by geographic cluster first,
-   report unique AOI-date sequences and unique scans, and sample windows by
-   AOI-date during training. A nominal 200K examples can contain far fewer than
-   200K independent atmospheric states.
+Calling the measured increment an NO2 benefit would overstate the evidence.
+NO2-only, weather-only, mask-only, and conditional-permutation controls should
+precede claims about satellite information.
 
-4. **Preserve the continuous target.** Predict continuous effective NOx change
-   with a robust or Student-t likelihood and retain direction as an auxiliary
-   head. Calculate class probabilities relative to the deadband after fitting.
-   This uses magnitude information and exposes uncertainty near the threshold.
+## Training failure modes
 
-5. **Audit target timescales.** Compare causal EMA timescales of 1, 2, 4, and 6
-   h on fixed geographic splits. Scan-time overlap and the causal emissions
-   window must remain explicit in every record. A TEMPO power-plant study found
-   that adding the NO2 column tendency term improved agreement with CEMS at 10
-   of 14 plants, which supports modeling atmospheric memory rather than pairing
-   each scan with one isolated emissions hour.[^tempo]
+The frozen MLP reached its best validation loss at epoch 2. The fused model
+selected epoch 1 at 0.5363, already worse than the MLP's 0.5186. Training loss
+then fell from 0.3521 to 0.0209 while validation loss rose to 1.424 by epoch 15.
+Both losses became NaN at epoch 16 and remained NaN until early stopping at
+epoch 26. Checkpoint restoration preserved usable predictions, but the run
+spent most of its budget fitting noise and then operating in an invalid state.
 
-6. **Keep selection independent of observed plume strength.** Use plume scores,
-   cloud, uncertainty, and coverage for subgroup reporting or validated
-   abstention curves. A raster-derived plume score should not decide whether a
-   sample enters the headline test set.
+Likely contributors include a 700K-parameter branch learning a small residual,
+the frozen baseline's in-sample training logits, repeated training records, and
+one optimization schedule for spatial and temporal components. Multimodal work
+has found that streams can overfit at different rates and that joint models can
+underlearn one modality.[^gradient-blending] The current trajectory matches
+that risk.
 
-## Architecture changes after the queued run
+## Next modeling phase
 
-### Establish the fusion result first
+### 1. Repair evaluation and establish attribution
 
-The queued fusion-plus-larger-sample run should answer the next question before
-more components are added. Compare the fused model with its exact frozen MLP on
-the same records across at least five seeds. Use validation log-loss improvement
-as the primary gate, then report AUC, Brier score, calibration, accuracy,
-recall, and specificity with paired AOI-cluster intervals.
+1. Oversample or reweight training only. Keep validation and test rows unique,
+   report natural prevalence, and add a separately reweighted balanced view.
+2. Repeat MLP, fused, raster-only, NO2-only, weather-only, and mask-only models
+   across at least five seeds. Use paired AOI-cluster intervals.
+3. Permute NO2 within AOI, season, solar-hour, and weather bins. Also shuffle
+   temporal order and rotate wind. These controls preserve easy nuisance cues
+   while breaking the relationships the raster encoder should learn.
+4. Choose the operating threshold and any calibration map on validation AOIs.
+   Keep AUROC, log loss, Brier score, recall, and specificity beside accuracy.
 
-Include raster-only, mask-only, and conditionally permuted-NO2 controls. Permute
-NO2 within AOI, season, solar-hour, and weather bins while leaving masks and
-weather aligned. A real spatial contribution should disappear under that
-control. Multimodal research documents that joint models can undertrain one
-modality when streams overfit at different rates, so a strong tabular baseline
-can hide a useful but noisy image signal.[^gradient-blending][^modality-laziness]
+### 2. Stabilize fusion before adding capacity
 
-If the residual fusion passes, make two changes:
+- Stop on non-finite loss and save diagnostics from the first bad batch. Lower
+  the raster learning rate, shorten patience, and test stronger weight decay.
+- Generate out-of-fold MLP logits for training the correction branch. This
+  prevents the raster encoder from fitting residuals against in-sample baseline
+  predictions that are cleaner than validation predictions.
+- Add a raster-only auxiliary direction head and track gradient cosine
+  similarity on the shared encoder. Decay the auxiliary weight during training.
+- Compare the additive correction with a small gated fusion layer. Keep the
+  parameter budget fixed and require validation log-loss improvement.
 
-- Build out-of-fold MLP logits for the training records. A frozen baseline fit
-  on the same rows can give the correction branch overconfident nuisance
-  residuals even when its validation checkpoint is sound.
-- Add a raster-only auxiliary head during supervised training. Tune its weight
-  on validation AOIs and remove the head at inference. This forces the encoder
-  to retain image information while the additive final logit still measures
-  conditional improvement over tabular context.
+### 3. Make next-raster prediction the first physics experiment
 
-### Keep the physics module auditable
+The next phase should follow the experiment order in `AGENTS.md`. Pretrain the
+spatial encoder and ConvGRU on four causal frames to predict the fifth:
 
-Run capacity-matched ablations for raw ConvGRU, advection only, advection plus
-decay, and advection-decay plus learned correction. Report the learned lifetime
-across seeds. The current 3.94 h value is too close to initialization to support
-interpretation.
+```text
+baseline = advect(previous_no2, wind_u, wind_v)
+predicted_next_no2 = baseline + bounded_correction
+```
 
-Add source-relative distance, along-wind and cross-wind coordinates, travel
-time, and a cheap Gaussian-plume footprint as input fields before increasing
-network depth. FootNet found surface winds and a Gaussian-plume first guess to
-be its most informative transport-emulator inputs.[^footnet] Hybrid models such
-as NowcastNet also pair an explicit advection evolution with a learned intensity
-residual, which matches the structure of this problem.[^nowcastnet]
+Use masked Huber loss on observed target pixels. Compare unconstrained
+next-raster prediction, advection plus correction, and random initialization
+under identical downstream splits and budgets. Retain a fifth-raster auxiliary
+head during classification and decay its loss weight.
 
-Do not add diffusion, a free learned motion field, or per-pixel chemical
-lifetimes until advection and one global lifetime show repeatable validation
-value. Those additions can absorb the emissions-change signal.
+Hourly TEMPO research found that adding the observed NO2 column tendency
+improved facility-level emission estimates, which supports learning temporal
+evolution rather than treating frames as unordered texture.[^tempo-tendency]
+NowcastNet offers a useful architectural precedent for differentiable advection
+plus a learned intensity residual, though precipitation and NO2 chemistry obey
+different source and loss processes.[^nowcastnet]
 
-## Masked-raster pretraining on 200K+ sequences
+Test one constrained positive global lifetime only after advection alone. Add
+diffusion, conditioned decay, a continuity residual, or bounded wind correction
+one at a time. Avoid per-pixel lifetimes and free motion fields that could absorb
+the emissions-change target.
 
-Separate self-supervised pretraining is worth testing. It directly addresses
-the present regime: millions of valid raster pixels and many unlabeled temporal
-windows, but only 15,708 balanced labeled training examples for a 703K-parameter
-model. Masked autoencoders learn by reconstructing deliberately hidden patches
-with an encoder and lightweight decoder; satellite-specific work extends the
-method with independent temporal masking and time embeddings.[^mae][^satmae]
+### 4. Add source-relative geometry
 
-The experiment should pretrain the same spatial encoder and ConvGRU that the
-classifier will use:
+Provide along-wind distance, cross-wind distance, travel time, source masks,
+and a Gaussian-plume footprint without observed NO2 magnitude. FootNet found
+surface wind and a Gaussian-plume first guess to be its most useful transport
+emulator inputs.[^footnet] These fields may help the model transfer plume
+geometry between AOIs and give it a useful prior when TEMPO retrievals are
+noisy.
 
-1. Draw at least 200K five-scan windows from training AOIs. Include windows
-   without deadband-eligible emissions labels. Deduplicate exact scans and cap
-   sampling per AOI-date so large plants do not dominate.
-2. Preserve the native validity mask. Add a second artificial mask over pixels
-   that were originally observed. Hide 50% to 75% of 3 x 3 or 4 x 4 patches,
-   mixing independent spatial masks with temporal tube masks.
-3. Feed visible NO2, weather, elapsed time, coordinates, and both mask types to
-   the encoder. Compute reconstruction loss only on deliberately hidden,
-   originally valid NO2 pixels. Never ask the model to reconstruct pixels with
-   no retrieval target.
-4. Use a small decoder to reconstruct robust-normalized NO2 and the
-   advection-decay innovation. Add next-scan prediction as a secondary objective
-   only after masked reconstruction works. Weather should condition the task;
-   reconstructing smooth weather fields can become an easy shortcut.
-5. Discard the decoder. Compare a frozen linear probe, full encoder fine-tuning,
-   and random initialization on identical downstream records and seeds. Plot
-   learning curves at 10K, 25K, 50K, and the full labeled set.
+Use a larger or downwind-elongated context only if advection diagnostics show
+that plume support often leaves the 72 km crop. Otherwise it adds compute and
+background sources without addressing the present attribution problem.
 
-MAE used a high mask ratio to prevent local pixel interpolation from making the
-task trivial, and SatMAE found value in treating temporal satellite observations
-explicitly.[^mae][^satmae] Our 24 x 24 rasters are much smaller than their input
-images, so patch size and mask ratio need validation rather than direct copying.
-A convolutional masked autoencoder is preferable for the first test because it
-can reuse the deployed encoder; a larger transformer would confound the value
-of pretraining with a capacity change.
+### 5. Preserve target magnitude
 
-Use these safeguards:
+Add a continuous effective-NOx-change head with a robust loss and keep direction
+as an auxiliary target. The high-magnitude tertile's weak AUROC suggests that a
+binary sign discards useful structure. Direct emissions supervision should
+precede coupling the scalar head to a transport decoder.
 
-- Exclude validation and test AOIs from pretraining for the strict geographic
-  generalization result. If a transductive experiment uses their unlabeled
-  rasters, label it separately.
-- Keep train-only normalization and never use CAMPD outcomes, deadband labels,
-  or future emissions during pretraining.
-- Compare random masks, block masks, and time-tube masks. Report reconstruction
-  error by coverage, season, AOI, and distance from the source.
-- Run a mask-only downstream control. Satellite missingness correlates with
-  clouds, season, and scan geometry, so a representation can appear useful
-  while learning acquisition patterns instead of NO2 structure.
-- Test temporal-order shuffling and wind rotation. Useful pretraining should
-  lose downstream skill when transport relationships are broken.
+Masked-patch reconstruction remains a cheaper pretraining baseline. MAE and
+SatMAE support hidden-patch reconstruction and independent temporal masking for
+satellite sequences.[^mae][^satmae] For this dataset, calculate loss only on
+artificially hidden pixels that TEMPO observed, and judge pretraining by held-out
+classification and calibration rather than reconstruction error.
 
-Pretraining earns a place if it improves validation log loss across seeds,
-reduces the labeled-data requirement, and strengthens raster-only skill. Low
-reconstruction error alone is insufficient. Spatial redundancy, overlapping
-windows, and the gap between reconstruction and emissions inference could
-otherwise produce a good autoencoder with no downstream gain.
+## Experiment order and gates
 
-## Recommended experiment order
-
-| Priority | Experiment | Decision it supports |
+| Priority | Experiment | Pass condition |
 |---:|---|---|
-| 0 | Finish queued fusion run on the larger generated sample | Whether the current architecture and data scale clear the validation gate |
-| 1 | Five-seed MLP, raster-only, fused, mask-only, and conditional-permutation comparison | Whether NO2 adds repeatable conditional information |
-| 2 | 200K+ masked-raster pretraining with random-init and linear-probe controls | Whether unlabeled sequences improve representation and label efficiency |
-| 3 | Continuous effective-change head plus auxiliary direction head | Whether hard labels discard useful target structure |
-| 4 | Raw ConvGRU versus advection versus decay ablations | Which physics component contributes skill |
-| 5 | Source-relative geometry and Gaussian-plume prior | Whether explicit source-receptor structure improves transfer |
+| 0 | Unique validation/test records and stable training | No duplicated evaluation rows or non-finite losses |
+| 1 | Five-seed modality and permutation suite | Raster gain survives nuisance-preserving controls |
+| 2 | Unconstrained next-raster pretraining | Better validation log loss than random initialization |
+| 3 | Advection plus bounded correction | Beats capacity-matched unconstrained pretraining |
+| 4 | Global lifetime, then source-relative plume prior | Incremental validation gain across seeds |
+| 5 | Continuous change plus direction heads | Better ranking, calibration, and magnitude error |
 
-The immediate success criterion is modest: repeatable validation-log-loss
-improvement over the same frozen tabular baseline, without relying on masks or
-test-set tuning. The completed run shows enough spatial signal to justify the
-next experiments, but the queued larger-sample result must determine whether
-that signal survives the current data and fusion changes.
+Promote an architecture only after it improves validation log loss across seeds
+and raises raster-only skill. Test AUROC should confirm the locked decision, not
+select it.
 
-[^tempo]: K. Sun et al., “[Hourly Nitrogen Oxides Emissions Estimated From TEMPO and Comparison With Facility-Level Monitoring Data](https://doi.org/10.1029/2025JD044565),” *Journal of Geophysical Research: Atmospheres*, 2025.
-[^gradient-blending]: W. Wang, D. Tran, and M. Feiszli, “[What Makes Training Multi-Modal Classification Networks Hard?](https://openaccess.thecvf.com/content_CVPR_2020/html/Wang_What_Makes_Training_Multi-Modal_Classification_Networks_Hard_CVPR_2020_paper.html),” *CVPR*, 2020.
-[^modality-laziness]: C. Du et al., “[On Uni-Modal Feature Learning in Supervised Multi-Modal Learning](https://proceedings.mlr.press/v202/du23e.html),” *ICML*, 2023.
+[^tempo-tendency]: K. Sun et al., “[Hourly Nitrogen Oxides Emissions Estimated From TEMPO and Comparison With Facility-Level Monitoring Data](https://doi.org/10.1029/2025JD044565),” *Journal of Geophysical Research: Atmospheres*, 2025.
 [^footnet]: T.-L. He et al., “[FootNet v1.0: development of a machine learning emulator of atmospheric transport](https://doi.org/10.5194/gmd-18-1661-2025),” *Geoscientific Model Development*, 2025.
 [^nowcastnet]: Y. Zhang et al., “[Skilful nowcasting of extreme precipitation with NowcastNet](https://doi.org/10.1038/s41586-023-06184-4),” *Nature*, 2023.
+[^gradient-blending]: W. Wang, D. Tran, and M. Feiszli, “[What Makes Training Multi-Modal Classification Networks Hard?](https://openaccess.thecvf.com/content_CVPR_2020/html/Wang_What_Makes_Training_Multi-Modal_Classification_Networks_Hard_CVPR_2020_paper.html),” *CVPR*, 2020.
 [^mae]: K. He et al., “[Masked Autoencoders Are Scalable Vision Learners](https://openaccess.thecvf.com/content/CVPR2022/html/He_Masked_Autoencoders_Are_Scalable_Vision_Learners_CVPR_2022_paper.html),” *CVPR*, 2022.
 [^satmae]: Y. Cong et al., “[SatMAE: Pre-training Transformers for Temporal and Multi-Spectral Satellite Imagery](https://proceedings.neurips.cc/paper_files/paper/2022/hash/01c561df365429f33fcd7a7faa44c985-Abstract-Conference.html),” *NeurIPS*, 2022.
