@@ -16,7 +16,7 @@ help:
 	@echo "Available targets:"
 	@echo "  setup    Sync the locked environment with uv"
 	@echo "  check    Run Ruff and compile Python sources"
-	@echo "  clean    Remove local Python caches and build artifacts"
+	@echo "  clean    Keep the newest model run and clear regenerable caches"
 	@echo "  fix-codex Move Codex SQLite state off NFS and clear stale locks"
 
 setup:
@@ -27,8 +27,7 @@ check:
 	$(UV_PROJECT) run --locked python -m compileall -q src
 
 clean:
-	find src -type d -name __pycache__ -prune -exec rm -rf {} +
-	rm -rf build dist src/*.egg-info .pytest_cache .ruff_cache
+	bash scripts/clean_workspace.sh
 
 fix-codex:
 	@set -e; \
