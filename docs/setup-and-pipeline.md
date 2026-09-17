@@ -250,13 +250,11 @@ The trainer reads the consecutive NO2 scans and aligned validity-mask,
 temperature, and geographic-wind sequences from each selected NPZ on demand.
 It derives local mean solar hour from the stored UTC hour and AOI longitude. It
 fits memory-bounded normalization statistics on the training split alone and
-records clipped valid-pixel fractions by channel and split. A tabular MLP is
-trained first and then frozen while the mask-aware ConvGRU learns an additive
-correction to its logit. The zero-initialized correction makes the hybrid begin
-at the selected MLP prediction. The model returns a Bernoulli probability for
-the emissions-change class. The report compares the fused model directly with
-the selected MLP checkpoint on the same records. See `docs/modeling.md` for the
-full contract.
+records clipped valid-pixel fractions by channel and split. The tabular MLP and
+mask-aware raster ConvGRU train independently, with separate BCE losses,
+optimizers, validation selection, and checkpoints. The ConvGRU receives no MLP
+outputs or tabular features. The report compares both models on the same
+records. See `docs/modeling.md` for the full contract.
 
 ### Regeneration
 

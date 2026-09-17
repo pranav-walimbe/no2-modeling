@@ -12,7 +12,7 @@ TEMPO scans and aligned hourly HRRR fields.
 | Context input | Plant attributes, prior-quarter activity, and time |
 | Split | Geographic AOI clusters, approximately 70/15/15 |
 | Raster encoder | Shared mask-aware spatial encoder followed by a ConvGRU |
-| Fusion | Frozen pretrained tabular embedding plus the raster-sequence embedding |
+| Models | Independent raster-only ConvGRU and tabular-only MLP |
 | Selection metric | Validation log loss |
 | Final metrics | ROC AUC and log loss across seeds, with subgroup results |
 
@@ -130,16 +130,13 @@ that reduce each 24 by 24 timestep to 6 by 6, then a 96-channel ConvGRU fuses
 the ordered sequence. Global average and maximum pooling produce a 128-value
 raster embedding.
 
-The tabular branch is a 32-value hidden layer followed by a 16-value embedding
-and its own Bernoulli classifier. It is trained independently, selected on
-validation loss, and frozen. During fused training, a vision-only head converts
-the raster embedding into an additive correction to the frozen tabular logit.
-The correction output layer is initialized to zero, so fused training starts
-with exactly the selected tabular prediction. The corrected logit's sigmoid is
-the predicted Bernoulli distribution over decrease and increase.
-This is preferable to emitting a hard class because training and evaluation
-retain confidence and calibration information without a redundant two-logit
-binary head.
+The raster embedding passes through its own multilayer classifier to produce a
+single Bernoulli logit. The raster model receives no tabular features or MLP
+outputs. The tabular model is a separate 32-value hidden layer followed by a
+16-value embedding and its own Bernoulli classifier. Each model has its own BCE
+loss, optimizer, validation selection, and checkpoint. Their sigmoid outputs
+are compared on the same records; they are not fused during training or
+inference.
 
 Normalization choices:
 
@@ -222,15 +219,12 @@ non-overlapping plant regions rather than memorization of known AOIs.
 |---|---|
 | Constant and prevalence classifiers | Does the model beat trivial predictions? |
 | Tabular-only MLP | Does image data add value to the neural model? |
-| ConvGRU plus frozen MLP | Do raster sequences improve on the same selected MLP? |
+| Raster-only ConvGRU | How much can the raster sequence predict without tabular features? |
 | With and without masks | Does explicit support information add value? |
 
-Report every comparison on the same frozen validation and test records. The full
-model earns its place only when image information improves held-out-AOI error
-and the gain extends past unusually clear or high-plume scenes. Every run
-reports the fused model minus the exact validation-selected MLP checkpoint that
-is frozen while the ConvGRU learns an additive logit correction. A standalone
-ConvGRU is not trained or reported.
+Report every comparison on the same frozen validation and test records. Each run
+reports the independently trained raster ConvGRU against the independently
+trained MLP.
 
 ## Run artifacts
 
@@ -240,9 +234,9 @@ Each UTC-stamped directory under `RUNS_DIR` contains:
 |---|---|
 | `normalization_stats.json` | Train-only preprocessing and deadband cutoff |
 | `run_config.json` | Features, settings, clipping rates, and parameter count |
-| `checkpoints/best_model.pt` | Selected ConvGRU-plus-MLP checkpoint |
-| `checkpoints/best_tabular_mlp.pt` | Independently selected MLP used by the fused model |
-| `results.json` | Metrics, ConvGRU-plus-MLP minus MLP differences, and prevalence |
+| `checkpoints/best_raster_convgru.pt` | Validation-selected raster-only ConvGRU checkpoint |
+| `checkpoints/best_tabular_mlp.pt` | Validation-selected tabular-only MLP checkpoint |
+| `results.json` | Metrics, raster ConvGRU minus MLP differences, and prevalence |
 | `*_predictions.csv` | Row-level predictions for each model and split |
 | `model_comparison.png` | Side-by-side split metrics |
 | Other plots | Loss, probability distributions, and spatial accuracy |
@@ -256,7 +250,7 @@ python -u -m modeling.train
 Flags:
 
 - `--workers`, `--batch-size`, and `--epochs` for allocation-specific overrides;
-- `--tabular-epochs` for the initial MLP training phase.
+- `--tabular-epochs` for the independent MLP training phase.
 
 Every run recomputes normalization statistics from the training split and writes
 them to its own run directory. No flag reuses a saved file, so a stale statistics

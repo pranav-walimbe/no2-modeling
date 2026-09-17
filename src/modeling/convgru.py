@@ -5,7 +5,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from config import MODEL_IMAGE_CHANNELS
-from modeling.mlp import TabularMLP
 
 DEFAULT_HEAD_DIM = 128
 DEFAULT_DROPOUT = 0.20
@@ -112,13 +111,12 @@ class ConvGRUCell(nn.Module):
         return (1.0 - update) * hidden + update * candidate
 
 
-class NOxModel(nn.Module):
-    """Add a learned raster correction to a frozen tabular logit."""
+class RasterConvGRU(nn.Module):
+    """Classify emissions changes from raster sequences alone."""
 
     def __init__(
         self,
         *,
-        tabular_model: TabularMLP,
         head_dim: int = DEFAULT_HEAD_DIM,
         dropout: float = DEFAULT_DROPOUT,
     ) -> None:
@@ -149,23 +147,13 @@ class NOxModel(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.tabular_model = tabular_model
-        self.tabular_model.requires_grad_(False)
-        self.tabular_model.eval()
-        self.correction_head = nn.Sequential(
+        self.classifier = nn.Sequential(
             nn.Linear(VISION_EMBEDDING_DIM, head_dim),
             nn.LayerNorm(head_dim),
             nn.SiLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(head_dim, 1),
         )
-        nn.init.zeros_(self.correction_head[-1].weight)
-        nn.init.zeros_(self.correction_head[-1].bias)
-
-    def train(self, mode: bool = True) -> "NOxModel":
-        super().train(mode)
-        self.tabular_model.eval()
-        return self
 
     def _encode_sequence(self, image: torch.Tensor) -> torch.Tensor:
         batch_size, timesteps, _, height, width = image.shape
@@ -196,11 +184,8 @@ class NOxModel(nn.Module):
         tabular: torch.Tensor,
         elapsed_hours: torch.Tensor,
     ) -> torch.Tensor:
-        vision_features = self._encode_sequence(image)
-        with torch.no_grad():
-            baseline_logit = self.tabular_model(image, tabular, elapsed_hours)
-        correction = self.correction_head(vision_features).squeeze(1)
-        return baseline_logit + correction
+        del tabular, elapsed_hours
+        return self.classifier(self._encode_sequence(image)).squeeze(1)
 
     def num_params(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)

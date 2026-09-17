@@ -8,7 +8,7 @@ TABULAR_EMBEDDING_DIM = 16
 
 
 class TabularMLP(nn.Module):
-    """Independently trainable tabular classifier with a reusable embedding."""
+    """Classify emissions changes from tabular features alone."""
 
     def __init__(
         self,
@@ -29,7 +29,7 @@ class TabularMLP(nn.Module):
         self.classifier = nn.Linear(embedding_dim, 1)
 
     def encode(self, tabular: torch.Tensor) -> torch.Tensor:
-        """Produce the embedding used by the classifier and fused model."""
+        """Produce the embedding used by the classifier."""
         return self.encoder(tabular)
 
     def forward(

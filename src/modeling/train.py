@@ -1,4 +1,4 @@
-"""Train a raster-and-tabular classifier for hourly NOx-mass changes."""
+"""Train independent raster and tabular classifiers for hourly NOx changes."""
 
 import argparse
 import json
@@ -23,7 +23,7 @@ from config import (
 from modeling.convgru import (
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
-    NOxModel,
+    RasterConvGRU,
 )
 from modeling.dataset import (
     LABEL_MODE_COL,
@@ -362,7 +362,7 @@ def main() -> None:
         "model_feature_names": MODEL_FEATURE_NAMES,
     }
     tabular_model = TabularMLP(len(MODEL_FEATURE_NAMES)).to(device)
-    print(f"Pretraining {tabular_model.num_params():,}-parameter tabular MLP on {device}")
+    print(f"Training {tabular_model.num_params():,}-parameter tabular MLP on {device}")
     tabular_train_losses, tabular_val_losses, tabular_best_loss = fit_model(
         tabular_model,
         tabular_train_loader,
@@ -387,47 +387,49 @@ def main() -> None:
         "learning_rate": args.tabular_learning_rate,
         "parameters": tabular_model.num_params(),
         "best_validation_loss": tabular_best_loss,
-        "frozen_during_fusion": True,
     }
     tabular_split_frames = {}
     for split, loader in tabular_eval_loaders.items():
         logits, indices = run_inference(tabular_model, loader, device)
         tabular_split_frames[split] = _prediction_frame(tabular_datasets[split], logits, indices)
-    del tabular_train_loader, tabular_eval_loaders, tabular_datasets
+    del tabular_model, tabular_train_loader, tabular_eval_loaders, tabular_datasets
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
-    best_path = checkpoint_dir / "best_model.pt"
-    model = NOxModel(
-        tabular_model=tabular_model,
+    raster_model = RasterConvGRU(
         head_dim=args.head_dim,
         dropout=args.dropout,
     ).to(device)
-    print(f"Training {model.num_params():,}-parameter ConvGRU + MLP model on {device}; outputs: {run_dir}")
+    print(
+        f"Training {raster_model.num_params():,}-parameter raster-only ConvGRU "
+        f"on {device}; outputs: {run_dir}"
+    )
     train_losses, val_losses, best_val_loss = fit_model(
-        model,
+        raster_model,
         train_loader,
         eval_loaders["val"],
         device=device,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         args=args,
-        checkpoint_path=best_path,
+        checkpoint_path=checkpoint_dir / "best_raster_convgru.pt",
         checkpoint_metadata=checkpoint_metadata,
-        phase_name="ConvGRU + MLP",
+        phase_name="Raster ConvGRU",
     )
-    plot_loss_curve(train_losses, val_losses, run_dir)
+    plot_loss_curve(
+        train_losses,
+        val_losses,
+        run_dir,
+        title="Raster ConvGRU training and validation loss",
+    )
 
     run_config = {
         "device": str(device),
-        "models": ["convgru_mlp", "mlp"],
+        "models": ["raster_convgru", "mlp"],
         "batch_size": args.batch_size,
         "workers": args.workers,
         "maximum_epochs": args.epochs,
-        "tabular_pretraining": tabular_run,
-        "fusion": {
-            "method": "additive_logit_correction",
-            "baseline_frozen": True,
-            "correction_output_initialization": "zero",
-        },
+        "tabular_training": tabular_run,
         "prefetch_factor": args.prefetch_factor,
         "seed": args.seed,
         "head_dim": args.head_dim,
@@ -449,26 +451,25 @@ def main() -> None:
         "target_label_mode": target_label_mode,
         "tabular_features": list(MODEL_FEATURE_NAMES),
         "prediction_family": "Bernoulli",
-        "model_parameters": model.num_params(),
-        "total_model_parameters": sum(parameter.numel() for parameter in model.parameters()),
-        "best_validation_loss": best_val_loss,
+        "raster_model_parameters": raster_model.num_params(),
+        "raster_best_validation_loss": best_val_loss,
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
     split_frames = {}
     for split, loader in eval_loaders.items():
-        logits, indices = run_inference(model, loader, device)
+        logits, indices = run_inference(raster_model, loader, device)
         split_frames[split] = _prediction_frame(datasets[split], logits, indices)
 
     plot_class_probabilities(split_frames, run_dir)
     plot_spatial_accuracy(split_frames, run_dir)
-    model_frames = {"convgru_mlp": split_frames, "mlp": tabular_split_frames}
+    model_frames = {"raster_convgru": split_frames, "mlp": tabular_split_frames}
     plot_model_comparison(model_frames, run_dir)
     save_results(
         model_frames,
         classification_summaries,
         run_dir,
-        primary_model_name="convgru_mlp",
+        primary_model_name="raster_convgru",
         comparison_model_name="mlp",
     )
 
