@@ -17,8 +17,10 @@ from config import (
     DATASET_RASTER_DIR,
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WEATHER_CACHE_DIR,
+    EMA_DELTA_THRESHOLD,
     HOTSPOT_WINDOW_SIZE,
     HRRR_DIR,
+    LABEL_COL,
     MIN_HOTSPOT_NO2_FINITE_FRACTION,
     MIN_TIMESTEP_NO2_FINITE_FRACTION,
     NUM_CORES,
@@ -28,7 +30,6 @@ from config import (
     TRAIN_RECORDS_CSV,
     VAL_RECORDS_CSV,
 )
-from data_contract import LABEL_COL
 from preprocessing.generate_dataset_utils import (
     CANDIDATE_FEATURE_SCHEMA,
     CANDIDATE_RASTER_PATH_COL,
@@ -390,6 +391,7 @@ def _write_outputs(
         )
         classification_report = {
             "split": split,
+            "ema_delta_nox_threshold": EMA_DELTA_THRESHOLD,
             "raster_contract": {
                 "sequence_timesteps": SEQUENCE_TIMESTEPS,
                 "minimum_no2_finite_fraction_per_timestep": MIN_TIMESTEP_NO2_FINITE_FRACTION,

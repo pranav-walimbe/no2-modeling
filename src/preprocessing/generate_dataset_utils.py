@@ -26,11 +26,11 @@ from config import (
     HOTSPOT_WINDOW_SIZE,
     IMG_RANGE,
     IMG_SIZE,
+    LABEL_COL,
     MIN_HOTSPOT_NO2_FINITE_FRACTION,
     MIN_TIMESTEP_NO2_FINITE_FRACTION,
     SEQUENCE_TIMESTEPS,
 )
-from data_contract import LABEL_COL
 from preprocessing.regrid import (
     AoiGrid,
     build_granule_spatial_index,

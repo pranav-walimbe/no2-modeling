@@ -13,13 +13,13 @@ from config import (
     EFFECTIVE_DELTA_NOX_COL,
     EMA_DECAY_TIMESCALE_HOURS,
     IMG_RANGE,
+    LABEL_COL,
     MIN_CITY_POPULATION,
     SEQUENCE_TIMESTEPS,
     TARGET_LABEL_MODE,
     TEMPO_MAX_DELTA_MINUTES,
     TEMPO_MIN_DELTA_MINUTES,
 )
-from data_contract import LABEL_COL
 
 AOI_ID_COL = "aoi_id"
 MAJOR_CITY_DIST_COL = "major_city_dist"
