@@ -165,6 +165,8 @@ not duplicate, rank, or drop successful records based on a target or label.
 - Metadata operations use Polars and project only the required columns.
 - Generation bounds the number of pending worker futures and caches each unique
   AOI scan for one run.
+- The Slurm array defaults to eight concurrent shards with eight process workers
+  per shard. Completed tasks release array slots for the remaining queued shards.
 - Candidate delta rasters and outcome CSVs are written directly into disposable
   shards. Every launch first removes the previous shard tree and published
   metadata while retaining the TEMPO and wind caches.

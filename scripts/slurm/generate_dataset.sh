@@ -5,9 +5,8 @@
 #SBATCH --qos=savio_normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --time=12:00:00
-#SBATCH --array=0-2%3
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=pranav.walimbe@berkeley.edu
 #SBATCH --output=/global/home/users/pranavwalimbe/no2-modeling/logs/%x-%A_%a.log
