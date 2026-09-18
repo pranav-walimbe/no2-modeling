@@ -12,7 +12,6 @@ from pyproj import Transformer
 from config import (
     EFFECTIVE_DELTA_NOX_COL,
     EMA_DECAY_TIMESCALE_HOURS,
-    EMA_DELTA_THRESHOLD,
     IMG_RANGE,
     LABEL_COL,
     MIN_CITY_POPULATION,
@@ -44,37 +43,6 @@ CONUS_TO_WGS84 = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True)
 POPULATED_PLACES_PATH = Path(
     "/global/scratch/projects/fc_nitrates/ddp/nox/reference/ne_10m_populated_places_simple.zip"
 )
-
-
-def apply_binary_target(
-    splits: dict[str, pl.DataFrame],
-    threshold: float = EMA_DELTA_THRESHOLD,
-    target_column: str = "delta_nox_mass",
-) -> dict[str, pl.DataFrame]:
-    """Apply one fixed symmetric deadband and sign label to every split.
-
-    Args:
-        splits: Geographic data partitions carrying raw delta-NOx values.
-        threshold: Least absolute target magnitude retained as a labeled class.
-        target_column: Continuous change column used for filtering and direction.
-
-    Returns:
-        Filtered labeled splits.
-    """
-    labeled: dict[str, pl.DataFrame] = {}
-    for name, split in splits.items():
-        finite = split.filter(pl.col(target_column).is_finite())
-        labeled[name] = finite.filter(pl.col(target_column).abs() > threshold).with_columns(
-            (pl.col(target_column) > 0).cast(pl.UInt8).alias(LABEL_COL),
-        )
-        negative = labeled[name].filter(pl.col(LABEL_COL) == 0).height
-        positive = labeled[name].filter(pl.col(LABEL_COL) == 1).height
-        print(
-            f"[{name}] deadband retained {labeled[name].height:,}/{finite.height:,} records; "
-            f"class 0: {negative:,}; class 1: {positive:,}"
-        )
-    print(f"{target_column} deadband: [-{threshold:.6g}, {threshold:.6g}]")
-    return labeled
 
 
 def classification_summary(source: pl.DataFrame, retained: pl.DataFrame) -> dict[str, object]:

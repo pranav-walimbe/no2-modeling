@@ -10,9 +10,7 @@ import polars as pl
 
 from config import (
     EMA_DECAY_TIMESCALE_HOURS,
-    EMA_DELTA_THRESHOLD,
     FULL_DATA_PARQUET,
-    LABEL_COL,
     MIN_COVERAGE_PERCENT,
     SEQUENCE_TIMESTEPS,
     STRAT_BASE_DIR,
@@ -21,7 +19,6 @@ from config import (
     VAL_RECORDS_CSV,
     VIS_DIR,
 )
-from preprocessing.generate_dataset_utils import write_json_atomic
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
     DELTA_EFFECTIVE_NOX_SCALED_COL,
@@ -41,11 +38,9 @@ from preprocessing.stratify_utils import (
     add_sequence_weather_paths,
     add_tempo_sequences,
     aggregate_aoi_hours,
-    apply_binary_target,
     build_aoi_membership,
     build_aoi_spatial_frame,
     build_aois,
-    classification_summary,
     cluster_aois,
     filter_usable_nox_measurements,
     usable_nox_measurement_expr,
@@ -126,26 +121,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
-    # Greedily assign large clusters against total and per-class record targets
+    # Greedily assign large clusters against total record targets
     cluster_counts = (
         frame.group_by("cluster")
-        .agg(
-            pl.len().alias("records"),
-            (pl.col(LABEL_COL) == 0).sum().alias("negative_records"),
-            (pl.col(LABEL_COL) == 1).sum().alias("positive_records"),
-        )
+        .agg(pl.len().alias("records"))
         .with_columns(pl.col("cluster").hash(seed=SPLIT_SEED).alias("_tie_breaker"))
         .sort(["records", "_tie_breaker"], descending=[True, False])
     )
     if cluster_counts.height < len(SPLIT_FRACTIONS):
         raise ValueError("At least three geographic clusters are required")
 
-    count_columns = ("records", "negative_records", "positive_records")
-    totals = {column: float(cluster_counts[column].sum()) for column in count_columns}
-    targets = {
-        split: {column: total * SPLIT_FRACTIONS[split] for column, total in totals.items()} for split in SPLIT_FRACTIONS
-    }
-    assigned = {split: {column: 0.0 for column in count_columns} for split in SPLIT_FRACTIONS}
+    total_records = float(cluster_counts["records"].sum())
+    targets = {split: total_records * fraction for split, fraction in SPLIT_FRACTIONS.items()}
+    assigned = {split: 0.0 for split in SPLIT_FRACTIONS}
     cluster_assignments: list[dict[str, object]] = []
     assigned_cluster_counts = {split: 0 for split in SPLIT_FRACTIONS}
     for index, cluster in enumerate(cluster_counts.iter_rows(named=True)):
@@ -156,22 +144,17 @@ def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
             destinations,
             key=lambda destination: sum(
                 (
-                    (
-                        assigned[split][column]
-                        + (float(cluster[column]) if split == destination else 0.0)
-                        - targets[split][column]
-                    )
-                    / max(totals[column], 1.0)
+                    assigned[split]
+                    + (float(cluster["records"]) if split == destination else 0.0)
+                    - targets[split]
                 )
                 ** 2
                 for split in SPLIT_FRACTIONS
-                for column in count_columns
             ),
         )
         cluster_assignments.append({"cluster": cluster["cluster"], "split": destination})
         assigned_cluster_counts[destination] += 1
-        for column in count_columns:
-            assigned[destination][column] += float(cluster[column])
+        assigned[destination] += float(cluster["records"])
 
     assignments = pl.DataFrame(
         cluster_assignments,
@@ -304,45 +287,13 @@ def main() -> None:
         frame.join(bounds, on=AOI_ID_COL, how="left"),
         SEQUENCE_TIMESTEPS,
     )
-    frame = _filter_metadata_eligibility(frame)
-    eligible = apply_binary_target(
-        {"all": frame},
-        threshold=EMA_DELTA_THRESHOLD,
-        target_column=EFFECTIVE_DELTA_NOX_COL,
-    )["all"]
-    splits = _split_by_cluster(eligible)
+    frame = _filter_metadata_eligibility(frame).filter(pl.col(EFFECTIVE_DELTA_NOX_COL).is_finite())
+    splits = _split_by_cluster(frame)
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
-    summary = {
-        "deadband": {
-            "ema_delta_nox_threshold": EMA_DELTA_THRESHOLD,
-            "retained_rule": f"abs({EFFECTIVE_DELTA_NOX_COL}) > threshold",
-        },
-        "temporal_contract": {
-            "sequence_timesteps": SEQUENCE_TIMESTEPS,
-            "ema_decay_timescale_hours": EMA_DECAY_TIMESCALE_HOURS,
-            "timestep_order": "oldest_to_newest",
-            "missing_timestep_policy": "reject",
-        },
-        "filter_retention": {
-            "deadband": classification_summary(frame, eligible),
-        },
-        "split_assignment": {
-            "target_fractions": SPLIT_FRACTIONS,
-            "achieved_fractions": {name: splits[name].height / eligible.height for name in splits},
-        },
-        "split_sizes": {name: split.height for name, split in splits.items()},
-        "splits": {
-            name: {
-                "natural_class_distribution": classification_summary(split, split),
-            }
-            for name, split in splits.items()
-        },
-    }
     _plot_scaled_label_histograms(splits, args.histogram_output)
     print(f"Saved scaled-label histograms to {args.histogram_output}")
-    del frame, eligible, hourly
-    write_json_atomic(summary, Path(STRAT_BASE_DIR) / "classification_summary.json")
+    del frame, hourly
     # Project and write one split at a time so the copies never coexist
     for name, destination in (("train", TRAIN_RECORDS_CSV), ("val", VAL_RECORDS_CSV), ("test", TEST_RECORDS_CSV)):
         split = splits.pop(name)
