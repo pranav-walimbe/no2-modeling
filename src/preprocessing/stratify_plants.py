@@ -55,9 +55,6 @@ SPLIT_RECORD_COUNTS = {"train": TRAIN_RECORDS, "val": VAL_RECORDS, "test": TEST_
 TOTAL_RECORDS = sum(SPLIT_RECORD_COUNTS.values())
 SPLIT_FRACTIONS = {split: count / TOTAL_RECORDS for split, count in SPLIT_RECORD_COUNTS.items()}
 SPLIT_SEED = 42
-TAIL_FRACTION = 0.025
-BALANCE_BIN_COUNT = 20
-BALANCE_EXPONENT = 0.5
 TIMESTEP_COLUMNS = [
     column
     for index in range(SEQUENCE_TIMESTEPS)
@@ -303,10 +300,6 @@ def main() -> None:
             split_frame,
             split,
             SPLIT_RECORD_COUNTS[split],
-            tail_fraction=TAIL_FRACTION,
-            balance_scaled_delta=split == "train",
-            balance_bin_count=BALANCE_BIN_COUNT,
-            balance_exponent=BALANCE_EXPONENT,
             seed=SPLIT_SEED,
         )
         for split, split_frame in splits.items()
