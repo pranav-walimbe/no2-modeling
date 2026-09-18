@@ -182,13 +182,14 @@ array such as `0-31%14`.
 - stores raw and effective NOx changes scaled by the prior-quarter level;
 - scores AOIs from full-history coal production share, NOx signal strength,
   event support, urban isolation, and complete-observation yield;
-- retains the top `AOI_SELECTION_COUNT` AOIs, currently 75;
+- retains the top `AOI_SELECTION_COUNT` AOIs, currently 100;
 - assigns overlapping AOI clusters intact toward 70/15/15 record targets;
 - removes records above each split's 95th percentile of aggregate AOI-hour NOx
   mass;
-- deterministically random-samples the retained pools to 300,000 training and
-  75,000 validation and test records;
-- saves and emails a bar chart of each AOI's percentage of final records by split.
+- deterministically random-samples up to 300,000 training and 75,000 validation
+  and test records, retaining the full post-pruning pool when it is smaller;
+- saves and emails a bar chart of each AOI's percentage of final records by
+  split plus scaled hourly and effective NOx-delta histograms.
 
 `preprocessing.generate_dataset`:
 
@@ -216,6 +217,9 @@ Running the splits:
 - Run `python -u -m preprocessing.generate_dataset --shard-size N` on a login
   node. The CLI assigns at most `N` consecutive source records to each array
   task across train, validation, and test, then submits a dependent finalizer.
+  By default, Slurm runs at most eight shard tasks concurrently and gives each
+  shard eight CPUs and process workers. Use `--max-parallel-shards` and
+  `--workers-per-shard` to override those limits.
 - A launch is refused while dataset-generation or `train-no2` jobs are active.
   It deletes the existing shards and published metadata before submitting every
   planned shard, so the dataset is unavailable until finalization succeeds.
@@ -282,7 +286,7 @@ Use these stage-specific allocations and commands:
 | TEMPO index | `savio4_htc`, `savio_normal`, 16 CPUs, 2 hours | Run `python -u -m preprocessing.tempo_mapping index`; require success before observation tasks start |
 | TEMPO observations | `savio4_htc`, `savio_normal`, 4 CPUs per task, 8 hours | Use a `0-31%14` array and run `preprocessing.tempo_mapping observations --task-id "$SLURM_ARRAY_TASK_ID" --task-count 32` |
 | Stratification | `savio4_htc`, `savio_normal`, `savio4_m512`, 16 CPUs, 2 hours | Run `python -u -m preprocessing.stratify_plants` |
-| Dataset generation | `savio4_htc`, `savio_normal`, 16 CPUs, 12 hours | Set BLAS threads to 1 and `POLARS_MAX_THREADS` to the CPU count, then run `python -u -m preprocessing.generate_dataset --shard-size 20000` |
+| Dataset generation | `savio4_htc`, `savio_normal`, 8 concurrent tasks with 8 CPUs each, 12 hours | Submit a throttled shard array from the login node with `python -u -m preprocessing.generate_dataset --shard-size 20000`; Slurm starts another queued shard whenever a slot opens |
 | Model training | `savio3_gpu`, `a40_gpu3_normal`, 8 CPUs, 1 A40, 2 hours | Run the training command below |
 
 ```bash

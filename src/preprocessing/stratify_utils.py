@@ -69,7 +69,7 @@ def select_split_records(
     Args:
         frame: Eligible records carrying aggregate NOx mass.
         split: Split name used in progress and error messages.
-        target_records: Exact number of records to return.
+        target_records: Maximum number of records to return.
         seed: Deterministic record-ordering seed.
 
     Returns:
@@ -83,12 +83,6 @@ def select_split_records(
         raise ValueError(f"[{split}] no records have finite NOx mass")
     upper_bound = finite.select(pl.col(NOX_COL).quantile(0.95, interpolation="linear")).item()
     pruned = finite.filter(pl.col(NOX_COL) <= upper_bound)
-    if pruned.height < target_records:
-        raise ValueError(
-            f"[{split}] requested {target_records:,} records but only {pruned.height:,} remain "
-            "after upper NOx-mass pruning"
-        )
-
     selected = (
         pruned.with_columns(pl.struct(AOI_ID_COL, "emissions_hour_utc").hash(seed=seed).alias("_selection_tie_breaker"))
         .sort("_selection_tie_breaker", AOI_ID_COL, "emissions_hour_utc")

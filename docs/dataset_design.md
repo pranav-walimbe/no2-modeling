@@ -20,7 +20,7 @@ whether it has enough coverage.
 Stratification scores every AOI with complete metadata, retains the configured
 top-ranked AOIs, assigns their intact geographic clusters toward a 70/15/15
 split, removes each split's upper 5% of NOx mass, and randomly samples
-300k/75k/75k records. Dataset generation keeps every sampled record that
+up to 300k/75k/75k records. Dataset generation keeps every sampled record that
 passes raster quality checks and reports failures without label-based
 resampling.
 
@@ -165,6 +165,8 @@ not duplicate, rank, or drop successful records based on a target or label.
 - Metadata operations use Polars and project only the required columns.
 - Generation bounds the number of pending worker futures and caches each unique
   AOI scan for one run.
+- The Slurm array defaults to eight concurrent shards with eight process workers
+  per shard. Completed tasks release array slots for the remaining queued shards.
 - Candidate delta rasters and outcome CSVs are written directly into disposable
   shards. Every launch first removes the previous shard tree and published
   metadata while retaining the TEMPO and wind caches.

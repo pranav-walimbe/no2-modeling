@@ -14,9 +14,11 @@ import polars as pl
 from config import (
     DATASET_DF,
     DATASET_DIR,
+    DATASET_MAX_PARALLEL_SHARDS,
     DATASET_RASTER_DIR,
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WEATHER_CACHE_DIR,
+    DATASET_WORKERS_PER_SHARD,
     HOTSPOT_WINDOW_SIZE,
     HRRR_DIR,
     MIN_HOTSPOT_NO2_FINITE_FRACTION,
@@ -519,6 +521,18 @@ def parse_args() -> argparse.Namespace:
         help="source records per Slurm task in a fresh disposable-shard run",
     )
     parser.add_argument(
+        "--max-parallel-shards",
+        type=_positive_int,
+        default=DATASET_MAX_PARALLEL_SHARDS,
+        help="maximum Slurm shard tasks allowed to run concurrently",
+    )
+    parser.add_argument(
+        "--workers-per-shard",
+        type=_positive_int,
+        default=DATASET_WORKERS_PER_SHARD,
+        help="worker processes and CPUs allocated to each Slurm shard task",
+    )
+    parser.add_argument(
         "--refresh-cache",
         action="store_true",
         help="empty both image caches before rebuilding entries for the selected split",
@@ -697,14 +711,18 @@ def _launch_sharded_run(args: argparse.Namespace, split_paths: dict[str, str], s
     if task_ids:
         worker_job_id = _submit_job(
             [
-                f"--array={array_spec}",
+                f"--array={array_spec}%{args.max_parallel_shards}",
+                f"--cpus-per-task={args.workers_per_shard}",
                 f"--job-name={SHARD_WORKER_JOB_NAME}",
                 f"--export=ALL,DATASET_GENERATION_STAGE=worker,{RUN_STARTED_ENV}={run_started_at}",
                 str(DATASET_BATCH_SCRIPT),
                 *shard_arguments,
             ]
         )
-        print(f"Dataset shard array: {worker_job_id}")
+        print(
+            f"Dataset shard array: {worker_job_id}; at most {args.max_parallel_shards} concurrent shards "
+            f"with {args.workers_per_shard} workers each"
+        )
     finalizer_options = [
         "--array=0",
         "--cpus-per-task=1",
