@@ -45,6 +45,152 @@ POPULATED_PLACES_PATH = Path(
 )
 
 
+def _tempered_bin_quotas(
+    bin_counts: dict[int, int],
+    target_records: int,
+    balance_exponent: float,
+) -> dict[int, int]:
+    # Allocate quotas in proportion to tempered bin populations
+    weights = {bin_id: count**balance_exponent for bin_id, count in bin_counts.items()}
+    lower = 0.0
+    upper = max(bin_counts[bin_id] / weights[bin_id] for bin_id in bin_counts)
+    for _ in range(64):
+        midpoint = (lower + upper) / 2
+        allocated = sum(min(bin_counts[bin_id], midpoint * weights[bin_id]) for bin_id in bin_counts)
+        if allocated <= target_records:
+            lower = midpoint
+        else:
+            upper = midpoint
+
+    fractional_quotas = {
+        bin_id: min(bin_counts[bin_id], lower * weights[bin_id]) for bin_id in bin_counts
+    }
+    quotas = {bin_id: int(np.floor(quota)) for bin_id, quota in fractional_quotas.items()}
+    remaining = target_records - sum(quotas.values())
+    candidates = sorted(
+        (bin_id for bin_id in bin_counts if quotas[bin_id] < bin_counts[bin_id]),
+        key=lambda bin_id: (-(fractional_quotas[bin_id] - quotas[bin_id]), bin_id),
+    )
+    for bin_id in candidates[:remaining]:
+        quotas[bin_id] += 1
+    if sum(quotas.values()) != target_records:
+        raise RuntimeError(f"Could not allocate {target_records:,} records across scaled-delta bins")
+    return quotas
+
+
+def select_split_records(
+    frame: pl.DataFrame,
+    split: str,
+    target_records: int,
+    *,
+    tail_fraction: float,
+    balance_scaled_delta: bool,
+    balance_bin_count: int,
+    balance_exponent: float,
+    seed: int,
+) -> pl.DataFrame:
+    """Trim raw-delta tails and select a deterministic split sample.
+
+    Args:
+        frame: Eligible records carrying raw and scaled effective NOx deltas.
+        split: Split name used in progress and error messages.
+        target_records: Exact number of records to return.
+        tail_fraction: Fraction removed from each raw-delta tail.
+        balance_scaled_delta: Whether to temper the scaled-delta distribution.
+        balance_bin_count: Equal-width bins used for tempered selection.
+        balance_exponent: Exponent applied to source bin populations.
+        seed: Deterministic record-ordering seed.
+
+    Returns:
+        Selected records in AOI and emissions-time order.
+    """
+    if target_records <= 0:
+        raise ValueError("target_records must be positive")
+    if not 0 <= tail_fraction < 0.5:
+        raise ValueError("tail_fraction must satisfy 0 <= tail_fraction < 0.5")
+    if balance_scaled_delta and balance_bin_count <= 0:
+        raise ValueError("balance_bin_count must be positive")
+    if balance_scaled_delta and balance_exponent <= 0:
+        raise ValueError("balance_exponent must be positive")
+
+    lower_percentile = tail_fraction * 100
+    upper_percentile = 100 - lower_percentile
+    finite = frame.filter(
+        pl.col(DELTA_NOX_COL).is_finite() & pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL).is_finite()
+    )
+    lower_bound, upper_bound = finite.select(
+        pl.col(DELTA_NOX_COL).quantile(tail_fraction, interpolation="linear").alias("lower"),
+        pl.col(DELTA_NOX_COL).quantile(1 - tail_fraction, interpolation="linear").alias("upper"),
+    ).row(0)
+    trimmed = finite.filter(pl.col(DELTA_NOX_COL).is_between(lower_bound, upper_bound, closed="both"))
+    if trimmed.height < target_records:
+        raise ValueError(
+            f"[{split}] requested {target_records:,} records but only {trimmed.height:,} remain after tail trimming"
+        )
+
+    randomized = trimmed.with_columns(
+        pl.struct(AOI_ID_COL, "emissions_hour_utc").hash(seed=seed).alias("_selection_tie_breaker")
+    )
+    if not balance_scaled_delta:
+        selected = (
+            randomized.sort("_selection_tie_breaker", AOI_ID_COL, "emissions_hour_utc")
+            .head(target_records)
+            .drop("_selection_tie_breaker")
+            .sort(AOI_ID_COL, "emissions_hour_utc")
+        )
+        print(
+            f"[{split}] raw delta P{lower_percentile:g}-P{upper_percentile:g} "
+            f"[{lower_bound:.6g}, {upper_bound:.6g}] retained "
+            f"{trimmed.height:,}/{finite.height:,}; randomly selected {selected.height:,} records"
+        )
+        return selected
+
+    scaled_min, scaled_max = trimmed.select(
+        pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL).min().alias("scaled_min"),
+        pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL).max().alias("scaled_max"),
+    ).row(0)
+    if scaled_min == scaled_max:
+        raise ValueError(f"[{split}] cannot balance a constant scaled effective-delta target")
+
+    binned = randomized.with_columns(
+        (
+            (pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL) - scaled_min)
+            / (scaled_max - scaled_min)
+            * balance_bin_count
+        )
+        .floor()
+        .cast(pl.Int32)
+        .clip(0, balance_bin_count - 1)
+        .alias("_selection_bin"),
+    )
+    bin_counts = dict(binned.group_by("_selection_bin").len().iter_rows())
+    quotas = _tempered_bin_quotas(bin_counts, target_records, balance_exponent)
+    quota_frame = pl.DataFrame(
+        {
+            "_selection_bin": list(quotas),
+            "_selection_quota": list(quotas.values()),
+        },
+        schema={"_selection_bin": pl.Int32, "_selection_quota": pl.UInt32},
+    )
+    selected = (
+        binned.sort("_selection_bin", "_selection_tie_breaker", AOI_ID_COL, "emissions_hour_utc")
+        .with_columns(pl.col("_selection_bin").cum_count().over("_selection_bin").alias("_selection_rank"))
+        .join(quota_frame, on="_selection_bin", how="left")
+        .filter(pl.col("_selection_rank") <= pl.col("_selection_quota"))
+        .drop("_selection_bin", "_selection_tie_breaker", "_selection_rank", "_selection_quota")
+        .sort(AOI_ID_COL, "emissions_hour_utc")
+    )
+    if selected.height != target_records:
+        raise RuntimeError(f"[{split}] selected {selected.height:,} records instead of {target_records:,}")
+    print(
+        f"[{split}] raw delta P{lower_percentile:g}-P{upper_percentile:g} "
+        f"[{lower_bound:.6g}, {upper_bound:.6g}] retained "
+        f"{trimmed.height:,}/{finite.height:,}; selected {selected.height:,} records with tempered balancing "
+        f"across {len(bin_counts):,} scaled-delta bins"
+    )
+    return selected
+
+
 def classification_summary(source: pl.DataFrame, retained: pl.DataFrame) -> dict[str, object]:
     """Summarize binary-label retention overall and by AOI.
 
