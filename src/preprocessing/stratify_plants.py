@@ -5,10 +5,10 @@ import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 import polars as pl
 
 from config import (
+    AOI_SELECTION_COUNT,
     EMA_DECAY_TIMESCALE_HOURS,
     FULL_DATA_PARQUET,
     MIN_COVERAGE_PERCENT,
@@ -24,6 +24,8 @@ from config import (
 )
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
+    AOI_SCORE_COL,
+    AOI_SCORE_COMPONENTS,
     DELTA_EFFECTIVE_NOX_SCALED_COL,
     DELTA_NOX_COL,
     DELTA_NOX_SCALED_COL,
@@ -43,6 +45,7 @@ from preprocessing.stratify_utils import (
     build_aoi_membership,
     build_aoi_spatial_frame,
     build_aois,
+    calculate_aoi_scores,
     cluster_aois,
     filter_usable_nox_measurements,
     select_split_records,
@@ -114,14 +117,13 @@ REQUIRED_COLUMNS = [
     "facility_nameplate_capacity_mw",
 ]
 
-DEFAULT_HISTOGRAM_OUTPUT = Path(VIS_DIR) / "stratification_scaled_label_histograms.png"
-HISTOGRAM_QUANTILES = (0.01, 0.99)
+DEFAULT_AOI_SCORE_OUTPUT = Path(VIS_DIR) / "stratification_aoi_scores.png"
 
 
 def parse_args() -> argparse.Namespace:
     """Parse stratification command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--histogram-output", type=Path, default=DEFAULT_HISTOGRAM_OUTPUT)
+    parser.add_argument("--aoi-score-output", type=Path, default=DEFAULT_AOI_SCORE_OUTPUT)
     return parser.parse_args()
 
 
@@ -192,43 +194,54 @@ def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _plot_scaled_label_histograms(splits: dict[str, pl.DataFrame], output_path: Path) -> None:
-    # Plot each target on a common robust x-axis across geographic splits
-    target_rows = (
-        (DELTA_NOX_SCALED_COL, "Scaled hourly NOx delta"),
-        (DELTA_EFFECTIVE_NOX_SCALED_COL, "Scaled effective NOx delta"),
-    )
+def _plot_selected_aoi_scores(
+    scores: pl.DataFrame,
+    splits: dict[str, pl.DataFrame],
+    output_path: Path,
+) -> None:
+    # Show every selected AOI and its weighted score components by split
     split_names = tuple(SPLIT_FRACTIONS)
-    figure, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
-    for row_index, (column, row_title) in enumerate(target_rows):
-        combined = np.concatenate([split[column].drop_nulls().to_numpy() for split in splits.values()])
-        finite = combined[np.isfinite(combined)]
-        lower, upper = np.quantile(finite, HISTOGRAM_QUANTILES)
-        limit = max(abs(lower), abs(upper))
-        if limit == 0:
-            limit = 1.0
-        for column_index, split_name in enumerate(split_names):
-            axis = axes[row_index, column_index]
-            values = splits[split_name][column].drop_nulls().to_numpy()
-            values = values[np.isfinite(values)]
-            visible = values[np.abs(values) <= limit]
-            axis.hist(visible, bins=50, range=(-limit, limit), edgecolor="white")
-            axis.axvline(0, color="black", linewidth=1)
-            axis.set_title(f"{split_name}: n={len(values):,}")
-            axis.set_xlabel("asinh(delta / prior-quarter median NOx)")
-            axis.set_ylabel("AOI-hour count")
-            if column_index == 0:
-                axis.text(-0.2, 0.5, row_title, rotation=90, va="center", transform=axis.transAxes)
-            axis.text(
-                0.98,
-                0.95,
-                f"shown: {len(visible):,}\nx range: ±{limit:.3g}",
-                ha="right",
-                va="top",
-                transform=axis.transAxes,
+    scores_by_split = {
+        name: scores.join(split.select(AOI_ID_COL).unique(), on=AOI_ID_COL, how="inner").sort(
+            AOI_SCORE_COL, AOI_ID_COL, descending=[True, False]
+        )
+        for name, split in splits.items()
+    }
+    max_aois = max(frame.height for frame in scores_by_split.values())
+    figure, axes = plt.subplots(
+        1,
+        len(split_names),
+        figsize=(24, max(10, max_aois * 0.32)),
+        constrained_layout=True,
+    )
+    colors = plt.get_cmap("tab10").colors
+    for axis, split_name in zip(axes, split_names, strict=True):
+        split_scores = scores_by_split[split_name]
+        positions = list(range(split_scores.height))
+        left = [0.0] * split_scores.height
+        for component_index, (column, weight, label) in enumerate(AOI_SCORE_COMPONENTS):
+            contribution = (split_scores[column] * weight * 100).to_numpy()
+            axis.barh(
+                positions,
+                contribution,
+                left=left,
+                label=label,
+                color=colors[component_index],
             )
-    split_counts = ", ".join(f"{name}={splits[name].height:,}" for name in split_names)
-    figure.suptitle(f"Scaled label distributions by split\nSplit counts: {split_counts}")
+            left = [current + float(value) for current, value in zip(left, contribution, strict=True)]
+        axis.set_yticks(positions, [str(aoi_id) for aoi_id in split_scores[AOI_ID_COL]])
+        axis.invert_yaxis()
+        axis.set_xlim(0, 105)
+        axis.grid(axis="x", alpha=0.25)
+        axis.set_axisbelow(True)
+        axis.set_xlabel("Weighted AOI score")
+        axis.set_ylabel("AOI ID")
+        axis.set_title(f"{split_name}: {split_scores.height} AOIs")
+        for position, score in zip(positions, split_scores[AOI_SCORE_COL], strict=True):
+            axis.text(float(score) + 0.5, position, f"{float(score):.1f}", va="center", fontsize=7)
+    handles, labels = axes[0].get_legend_handles_labels()
+    figure.legend(handles, labels, loc="outside lower center", ncols=len(AOI_SCORE_COMPONENTS))
+    figure.suptitle(f"Top {scores.height} AOIs by plume-modelability score")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
@@ -255,7 +268,7 @@ def main() -> None:
 
     facilities = raw_records.select("facilityId", "lat", "lon").drop_nulls().unique(subset="facilityId").collect()
     aois = build_aois(facilities)
-    bounded_aois = add_aoi_bounds(aois)
+    bounded_aois = add_major_city_distance(add_aoi_bounds(aois))
     observations = load_tempo_mapping()
     spatial_aois = build_aoi_spatial_frame(aois)
     membership = build_aoi_membership(aois, facilities, spatial_aois)
@@ -285,7 +298,7 @@ def main() -> None:
     frame = add_ema_targets(frame, hourly, SEQUENCE_TIMESTEPS, EMA_DECAY_TIMESCALE_HOURS)
     frame = add_scaled_nox_targets(frame)
     frame = frame.with_columns(pl.lit("causal_ema").alias(LABEL_MODE_COL))
-    bounds = add_major_city_distance(bounded_aois).select(
+    bounds = bounded_aois.select(
         AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
     )
     frame = add_sequence_weather_paths(
@@ -293,7 +306,17 @@ def main() -> None:
         SEQUENCE_TIMESTEPS,
     )
     frame = _filter_metadata_eligibility(frame).filter(pl.col("effective_delta_nox").is_finite())
+    aoi_scores = calculate_aoi_scores(raw_records, hourly, frame, bounded_aois, membership)
+    if aoi_scores.height < AOI_SELECTION_COUNT:
+        raise ValueError(
+            f"Requested {AOI_SELECTION_COUNT} AOIs but only {aoi_scores.height} have complete score inputs"
+        )
+    selected_aoi_scores = aoi_scores.head(AOI_SELECTION_COUNT)
+    frame = frame.join(selected_aoi_scores.select(AOI_ID_COL), on=AOI_ID_COL, how="inner")
+    print(f"Selected the top {selected_aoi_scores.height} of {aoi_scores.height} scoreable AOIs")
     splits = _split_by_cluster(frame)
+    _plot_selected_aoi_scores(selected_aoi_scores, splits, args.aoi_score_output)
+    print(f"Saved selected-AOI score chart to {args.aoi_score_output}")
     splits = {
         split: select_split_records(
             split_frame,
@@ -305,8 +328,6 @@ def main() -> None:
     }
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
-    _plot_scaled_label_histograms(splits, args.histogram_output)
-    print(f"Saved scaled-label histograms to {args.histogram_output}")
     del frame, hourly
     # Project and write one split at a time so the copies never coexist
     for name, destination in (("train", TRAIN_RECORDS_CSV), ("val", VAL_RECORDS_CSV), ("test", TEST_RECORDS_CSV)):
