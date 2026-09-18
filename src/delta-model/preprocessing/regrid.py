@@ -8,6 +8,7 @@ from pathlib import Path
 import netCDF4 as nc
 import numpy as np
 import shapely
+from preprocessing.stratify_utils import CONUS_TO_WGS84, WGS84_TO_CONUS
 
 from config import (
     IMG_RANGE,
@@ -15,7 +16,6 @@ from config import (
     MIN_PIXEL_CLOUD,
     TEMPO_CELL_OVERLAP_FLOOR_KM2,
 )
-from preprocessing.stratify_utils import CONUS_TO_WGS84, WGS84_TO_CONUS
 
 METRES_PER_KM = 1000.0
 CORNER_COUNT = 4

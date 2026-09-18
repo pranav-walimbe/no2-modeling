@@ -5,7 +5,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
-
 from modeling.eval_utils import (
     POSITIVE_PROBABILITY_COL,
     TRUE_CLASS_COL,

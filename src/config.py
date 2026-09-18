@@ -1,4 +1,4 @@
-"""Configuration values for collection, preprocessing, and modeling."""
+"""Shared configuration for collection, delta modeling, and pretraining."""
 
 import os
 from datetime import date, datetime, timezone
@@ -14,7 +14,7 @@ EARTHDATA_USERNAME = os.getenv("EARTHDATA_USERNAME")
 EARTHDATA_PASSWORD = os.getenv("EARTHDATA_PASSWORD")
 
 # ============================================================================
-# Emissions scraping
+# Emissions data scraping
 # ============================================================================
 EMISSIONS_START_DATE = date(2023, 8, 1)  # start of CAMPD hourly emissions pull
 EMISSIONS_END_DATE = date.today()  # request through the latest date available from CAMPD
@@ -43,7 +43,7 @@ TEMPO_END_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d 23:59:59")
 TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.0  # retain every positive accepted footprint-cell overlap
 
 # ============================================================================
-# Stratification
+# Delta-model stratification
 # ============================================================================
 TEMPO_MIN_DELTA_MINUTES = 40
 TEMPO_MAX_DELTA_MINUTES = 70
@@ -62,7 +62,7 @@ TEST_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "test_records.csv")  # test spli
 VIS_DIR = "/global/home/users/pranavwalimbe/vis"  # output directory for visualizations
 
 # ============================================================================
-# Wind data scraping
+# ERA5 wind data scraping
 # ============================================================================
 ERA5_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/era5"  # output directory for ERA5 wind reanalysis
 WIND_START_MONTH = 8  # ERA5 download start month
@@ -78,7 +78,7 @@ HRRR_START_DATE = EMISSIONS_START_DATE
 HRRR_END_DATE = EMISSIONS_END_DATE
 
 # ============================================================================
-# Dataset generation
+# Delta-model dataset generation
 # ============================================================================
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
 DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # raster bundles for direct monolithic generation
@@ -94,7 +94,7 @@ HOTSPOT_WINDOW_SIZE = 3  # odd source-centred square required to have complete N
 MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applied to every timestep
 
 # ============================================================================
-# Modeling data contract
+# Delta-model training contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
 SEQUENCE_TIMESTEPS = 5  # shared hourly raster and EMA history length
@@ -136,6 +136,6 @@ MASKED_PRETRAINING_SPLIT_SEED = 42
 # ============================================================================
 
 # ============================================================================
-# Other
+# Shared runtime
 # ============================================================================
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))  # number of cores for parallelized jobs
