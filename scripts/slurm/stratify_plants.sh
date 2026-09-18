@@ -25,6 +25,7 @@ recipient="pranav.walimbe@berkeley.edu"
 mail_host="${SLURM_SUBMIT_HOST:-ln002.brc}"
 mail_log="/var/log/maillog"
 aoi_record_shares="/global/home/users/pranavwalimbe/vis/stratification-aoi-record-shares-${SLURM_JOB_ID}.png"
+histogram="/global/home/users/pranavwalimbe/vis/stratification-scaled-label-histograms-${SLURM_JOB_ID}.png"
 
 cd "${repo_dir}"
 module load python/3.11.6-gcc-11.4.0
@@ -34,10 +35,17 @@ export PYTHONPATH="${repo_dir}/src"
 # Slurm 22.05 and later stopped propagating --cpus-per-task into srun
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
-srun python -u -m preprocessing.stratify_plants --aoi-record-share-output "${aoi_record_shares}" "$@"
+srun python -u -m preprocessing.stratify_plants \
+    --aoi-record-share-output "${aoi_record_shares}" \
+    --histogram-output "${histogram}" \
+    "$@"
 
 if [[ ! -s "${aoi_record_shares}" ]]; then
     echo "Expected AOI record-share chart was not created: ${aoi_record_shares}" >&2
+    exit 1
+fi
+if [[ ! -s "${histogram}" ]]; then
+    echo "Expected histogram was not created: ${histogram}" >&2
     exit 1
 fi
 
@@ -54,8 +62,9 @@ printf '%s\n' \
     "Test: ${test_records} records" \
     "Total: ${total_records} records" \
     "AOI record-share chart: ${aoi_record_shares}" \
+    "Scaled-label histogram: ${histogram}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
-        "mailx -s 'NO2 stratification AOI record shares (${SLURM_JOB_ID})' -a '${aoi_record_shares}' '${recipient}'"
+        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${aoi_record_shares}' -a '${histogram}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do

@@ -188,7 +188,8 @@ array such as `0-31%14`.
   mass;
 - deterministically random-samples up to 300,000 training and 75,000 validation
   and test records, retaining the full post-pruning pool when it is smaller;
-- saves and emails a bar chart of each AOI's percentage of final records by split.
+- saves and emails a bar chart of each AOI's percentage of final records by
+  split plus scaled hourly and effective NOx-delta histograms.
 
 `preprocessing.generate_dataset`:
 

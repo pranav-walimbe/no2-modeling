@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import polars as pl
 
 from config import (
@@ -116,6 +117,8 @@ REQUIRED_COLUMNS = [
 ]
 
 DEFAULT_AOI_RECORD_SHARE_OUTPUT = Path(VIS_DIR) / "stratification_aoi_record_shares.png"
+DEFAULT_HISTOGRAM_OUTPUT = Path(VIS_DIR) / "stratification_scaled_label_histograms.png"
+HISTOGRAM_QUANTILES = (0.01, 0.99)
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,6 +129,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_AOI_RECORD_SHARE_OUTPUT,
     )
+    parser.add_argument("--histogram-output", type=Path, default=DEFAULT_HISTOGRAM_OUTPUT)
     return parser.parse_args()
 
 
@@ -254,6 +258,48 @@ def _plot_aoi_record_shares(
     plt.close(figure)
 
 
+def _plot_scaled_label_histograms(splits: dict[str, pl.DataFrame], output_path: Path) -> None:
+    # Plot each target on a common robust x-axis across geographic splits
+    target_rows = (
+        (DELTA_NOX_SCALED_COL, "Scaled hourly NOx delta"),
+        (DELTA_EFFECTIVE_NOX_SCALED_COL, "Scaled effective NOx delta"),
+    )
+    split_names = tuple(SPLIT_FRACTIONS)
+    figure, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+    for row_index, (column, row_title) in enumerate(target_rows):
+        combined = np.concatenate([split[column].drop_nulls().to_numpy() for split in splits.values()])
+        finite = combined[np.isfinite(combined)]
+        lower, upper = np.quantile(finite, HISTOGRAM_QUANTILES)
+        limit = max(abs(lower), abs(upper))
+        if limit == 0:
+            limit = 1.0
+        for column_index, split_name in enumerate(split_names):
+            axis = axes[row_index, column_index]
+            values = splits[split_name][column].drop_nulls().to_numpy()
+            values = values[np.isfinite(values)]
+            visible = values[np.abs(values) <= limit]
+            axis.hist(visible, bins=50, range=(-limit, limit), edgecolor="white")
+            axis.axvline(0, color="black", linewidth=1)
+            axis.set_title(f"{split_name}: n={len(values):,}")
+            axis.set_xlabel("asinh(delta / prior-quarter median NOx)")
+            axis.set_ylabel("AOI-hour count")
+            if column_index == 0:
+                axis.text(-0.2, 0.5, row_title, rotation=90, va="center", transform=axis.transAxes)
+            axis.text(
+                0.98,
+                0.95,
+                f"shown: {len(visible):,}\nx range: +/-{limit:.3g}",
+                ha="right",
+                va="top",
+                transform=axis.transAxes,
+            )
+    split_counts = ", ".join(f"{name}={splits[name].height:,}" for name in split_names)
+    figure.suptitle(f"Scaled label distributions by split\nSplit counts: {split_counts}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180)
+    plt.close(figure)
+
+
 def _serialize_no2_paths(frame: pl.DataFrame) -> pl.DataFrame:
     # Encode every configured TEMPO granule list for CSV output
     return frame.with_columns(
@@ -333,6 +379,8 @@ def main() -> None:
     }
     _plot_aoi_record_shares(splits, args.aoi_record_share_output)
     print(f"Saved AOI record-share chart to {args.aoi_record_share_output}")
+    _plot_scaled_label_histograms(splits, args.histogram_output)
+    print(f"Saved scaled-label histograms to {args.histogram_output}")
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     del frame, hourly
