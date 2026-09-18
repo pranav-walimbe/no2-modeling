@@ -14,8 +14,11 @@ from config import (
     MIN_COVERAGE_PERCENT,
     SEQUENCE_TIMESTEPS,
     STRAT_BASE_DIR,
+    TEST_RECORDS,
     TEST_RECORDS_CSV,
+    TRAIN_RECORDS,
     TRAIN_RECORDS_CSV,
+    VAL_RECORDS,
     VAL_RECORDS_CSV,
     VIS_DIR,
 )
@@ -47,8 +50,13 @@ from preprocessing.stratify_utils import (
 )
 from preprocessing.tempo_mapping import load_tempo_mapping
 
-SPLIT_FRACTIONS = {"train": 0.70, "val": 0.15, "test": 0.15}
+SPLIT_RECORD_COUNTS = {"train": TRAIN_RECORDS, "val": VAL_RECORDS, "test": TEST_RECORDS}
+TOTAL_RECORDS = sum(SPLIT_RECORD_COUNTS.values())
+SPLIT_FRACTIONS = {split: count / TOTAL_RECORDS for split, count in SPLIT_RECORD_COUNTS.items()}
 SPLIT_SEED = 42
+TAIL_FRACTION = 0.025
+BALANCE_BIN_COUNT = 20
+BALANCE_EXPONENT = 0.5
 TIMESTEP_COLUMNS = [
     column
     for index in range(SEQUENCE_TIMESTEPS)
@@ -187,6 +195,111 @@ def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _tempered_bin_quotas(bin_counts: dict[int, int], target_records: int) -> dict[int, int]:
+    # Allocate quotas proportional to the square root of bin population
+    weights = {bin_id: count**BALANCE_EXPONENT for bin_id, count in bin_counts.items()}
+    lower = 0.0
+    upper = max(bin_counts[bin_id] / weights[bin_id] for bin_id in bin_counts)
+    for _ in range(64):
+        midpoint = (lower + upper) / 2
+        allocated = sum(min(bin_counts[bin_id], midpoint * weights[bin_id]) for bin_id in bin_counts)
+        if allocated <= target_records:
+            lower = midpoint
+        else:
+            upper = midpoint
+
+    fractional_quotas = {
+        bin_id: min(bin_counts[bin_id], lower * weights[bin_id]) for bin_id in bin_counts
+    }
+    quotas = {bin_id: int(np.floor(quota)) for bin_id, quota in fractional_quotas.items()}
+    remaining = target_records - sum(quotas.values())
+    candidates = sorted(
+        (bin_id for bin_id in bin_counts if quotas[bin_id] < bin_counts[bin_id]),
+        key=lambda bin_id: (-(fractional_quotas[bin_id] - quotas[bin_id]), bin_id),
+    )
+    for bin_id in candidates[:remaining]:
+        quotas[bin_id] += 1
+    if sum(quotas.values()) != target_records:
+        raise RuntimeError(f"Could not allocate {target_records:,} records across scaled-delta bins")
+    return quotas
+
+
+def _select_split_records(frame: pl.DataFrame, split: str, target_records: int) -> pl.DataFrame:
+    # Trim raw-delta tails then select the configured split sample
+    finite = frame.filter(
+        pl.col(DELTA_NOX_COL).is_finite() & pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL).is_finite()
+    )
+    lower_bound, upper_bound = finite.select(
+        pl.col(DELTA_NOX_COL).quantile(TAIL_FRACTION, interpolation="linear").alias("lower"),
+        pl.col(DELTA_NOX_COL).quantile(1 - TAIL_FRACTION, interpolation="linear").alias("upper"),
+    ).row(0)
+    trimmed = finite.filter(pl.col(DELTA_NOX_COL).is_between(lower_bound, upper_bound, closed="both"))
+    if trimmed.height < target_records:
+        raise ValueError(
+            f"[{split}] requested {target_records:,} records but only {trimmed.height:,} remain after tail trimming"
+        )
+
+    randomized = trimmed.with_columns(
+        pl.struct(AOI_ID_COL, "emissions_hour_utc").hash(seed=SPLIT_SEED).alias("_selection_tie_breaker")
+    )
+    if split != "train":
+        selected = (
+            randomized.sort("_selection_tie_breaker", AOI_ID_COL, "emissions_hour_utc")
+            .head(target_records)
+            .drop("_selection_tie_breaker")
+            .sort(AOI_ID_COL, "emissions_hour_utc")
+        )
+        print(
+            f"[{split}] raw delta P2.5-P97.5 [{lower_bound:.6g}, {upper_bound:.6g}] retained "
+            f"{trimmed.height:,}/{finite.height:,}; randomly selected {selected.height:,} records"
+        )
+        return selected
+
+    scaled_min, scaled_max = trimmed.select(
+        pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL).min().alias("scaled_min"),
+        pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL).max().alias("scaled_max"),
+    ).row(0)
+    if scaled_min == scaled_max:
+        raise ValueError(f"[{split}] cannot balance a constant scaled effective-delta target")
+
+    binned = randomized.with_columns(
+        (
+            (pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL) - scaled_min)
+            / (scaled_max - scaled_min)
+            * BALANCE_BIN_COUNT
+        )
+        .floor()
+        .cast(pl.Int32)
+        .clip(0, BALANCE_BIN_COUNT - 1)
+        .alias("_selection_bin"),
+    )
+    bin_counts = dict(binned.group_by("_selection_bin").len().iter_rows())
+    quotas = _tempered_bin_quotas(bin_counts, target_records)
+    quota_frame = pl.DataFrame(
+        {
+            "_selection_bin": list(quotas),
+            "_selection_quota": list(quotas.values()),
+        },
+        schema={"_selection_bin": pl.Int32, "_selection_quota": pl.UInt32},
+    )
+    selected = (
+        binned.sort("_selection_bin", "_selection_tie_breaker", AOI_ID_COL, "emissions_hour_utc")
+        .with_columns(pl.col("_selection_bin").cum_count().over("_selection_bin").alias("_selection_rank"))
+        .join(quota_frame, on="_selection_bin", how="left")
+        .filter(pl.col("_selection_rank") <= pl.col("_selection_quota"))
+        .drop("_selection_bin", "_selection_tie_breaker", "_selection_rank", "_selection_quota")
+        .sort(AOI_ID_COL, "emissions_hour_utc")
+    )
+    if selected.height != target_records:
+        raise RuntimeError(f"[{split}] selected {selected.height:,} records instead of {target_records:,}")
+    print(
+        f"[{split}] raw delta P2.5-P97.5 [{lower_bound:.6g}, {upper_bound:.6g}] retained "
+        f"{trimmed.height:,}/{finite.height:,}; selected {selected.height:,} records with square-root balancing "
+        f"across {len(bin_counts):,} scaled-delta bins"
+    )
+    return selected
+
+
 def _plot_scaled_label_histograms(splits: dict[str, pl.DataFrame], output_path: Path) -> None:
     # Plot each target on a common robust x-axis across geographic splits
     target_rows = (
@@ -289,6 +402,10 @@ def main() -> None:
     )
     frame = _filter_metadata_eligibility(frame).filter(pl.col(EFFECTIVE_DELTA_NOX_COL).is_finite())
     splits = _split_by_cluster(frame)
+    splits = {
+        split: _select_split_records(split_frame, split, SPLIT_RECORD_COUNTS[split])
+        for split, split_frame in splits.items()
+    }
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     _plot_scaled_label_histograms(splits, args.histogram_output)
