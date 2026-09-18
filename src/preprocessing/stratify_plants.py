@@ -1,8 +1,11 @@
 """Partition AOI-hour emission records into train, validation, and test splits."""
 
+import argparse
 import os
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
 import polars as pl
 
 from config import (
@@ -16,20 +19,25 @@ from config import (
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
     VAL_RECORDS_CSV,
+    VIS_DIR,
 )
 from preprocessing.generate_dataset_utils import write_json_atomic
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
+    DELTA_EFFECTIVE_NOX_SCALED_COL,
+    DELTA_NOX_COL,
+    DELTA_NOX_SCALED_COL,
     EFFECTIVE_CURRENT_NOX_COL,
     EFFECTIVE_DELTA_NOX_COL,
-    EFFECTIVE_PREVIOUS_NOX_COL,
     LABEL_MODE_COL,
     MAJOR_CITY_DIST_COL,
-    PREV_QTR_AVG_NOX_COL,
+    NOX_COL,
+    PREV_QTR_MED_NOX_COL,
     PREVIOUS_QUARTER_POWER_COL,
     add_aoi_bounds,
     add_ema_targets,
     add_major_city_distance,
+    add_scaled_nox_targets,
     add_sequence_weather_paths,
     add_tempo_sequences,
     aggregate_aoi_hours,
@@ -53,19 +61,7 @@ TIMESTEP_COLUMNS = [
         f"timestep_time_t{index}",
         f"timestep_age_hours_t{index}",
         f"no2_paths_t{index}",
-        f"wind_path_t{index}",
-        f"temperature_path_t{index}",
-    )
-]
-EMA_AUDIT_COLUMNS = [
-    f"{prefix}_{suffix}"
-    for prefix in ("current_ema", "previous_ema")
-    for suffix in (
-        "component_hours",
-        "component_nox_mass",
-        "overlap_seconds",
-        "age_hours",
-        "normalized_weights",
+        f"weather_path_t{index}",
     )
 ]
 OUTPUT_COLUMNS = [
@@ -92,13 +88,13 @@ OUTPUT_COLUMNS = [
     "coverage_percent",
     "avg_heat_input",
     "avg_pwr_gen",
-    "nox_mass",
-    PREV_QTR_AVG_NOX_COL,
+    NOX_COL,
+    PREV_QTR_MED_NOX_COL,
+    DELTA_NOX_COL,
+    DELTA_NOX_SCALED_COL,
     EFFECTIVE_CURRENT_NOX_COL,
-    EFFECTIVE_PREVIOUS_NOX_COL,
     EFFECTIVE_DELTA_NOX_COL,
-    *EMA_AUDIT_COLUMNS,
-    LABEL_COL,
+    DELTA_EFFECTIVE_NOX_SCALED_COL,
     LABEL_MODE_COL,
 ]
 REQUIRED_COLUMNS = [
@@ -117,6 +113,16 @@ REQUIRED_COLUMNS = [
     "attributePrimaryFuelInfo",
     "facility_nameplate_capacity_mw",
 ]
+
+DEFAULT_HISTOGRAM_OUTPUT = Path(VIS_DIR) / "stratification_scaled_label_histograms.png"
+HISTOGRAM_QUANTILES = (0.01, 0.99)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse stratification command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--histogram-output", type=Path, default=DEFAULT_HISTOGRAM_OUTPUT)
+    return parser.parse_args()
 
 
 def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
@@ -198,17 +204,46 @@ def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _serialize_audit_lists(frame: pl.DataFrame) -> pl.DataFrame:
-    # Preserve variable hourly overlap components as JSON-compatible CSV fields
-    expressions = []
-    for column in EMA_AUDIT_COLUMNS:
-        values = pl.col(column).list.eval(pl.element().cast(pl.String))
-        if column.endswith("component_hours"):
-            serialized = pl.concat_str(pl.lit('["'), values.list.join('","'), pl.lit('"]'))
-        else:
-            serialized = pl.concat_str(pl.lit("["), values.list.join(","), pl.lit("]"))
-        expressions.append(serialized.alias(column))
-    return frame.with_columns(expressions)
+def _plot_scaled_label_histograms(splits: dict[str, pl.DataFrame], output_path: Path) -> None:
+    # Plot each target on a common robust x-axis across geographic splits
+    target_rows = (
+        (DELTA_NOX_SCALED_COL, "Scaled hourly NOx delta"),
+        (DELTA_EFFECTIVE_NOX_SCALED_COL, "Scaled effective NOx delta"),
+    )
+    split_names = tuple(SPLIT_FRACTIONS)
+    figure, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+    for row_index, (column, row_title) in enumerate(target_rows):
+        combined = np.concatenate([split[column].drop_nulls().to_numpy() for split in splits.values()])
+        finite = combined[np.isfinite(combined)]
+        lower, upper = np.quantile(finite, HISTOGRAM_QUANTILES)
+        limit = max(abs(lower), abs(upper))
+        if limit == 0:
+            limit = 1.0
+        for column_index, split_name in enumerate(split_names):
+            axis = axes[row_index, column_index]
+            values = splits[split_name][column].drop_nulls().to_numpy()
+            values = values[np.isfinite(values)]
+            visible = values[np.abs(values) <= limit]
+            axis.hist(visible, bins=50, range=(-limit, limit), edgecolor="white")
+            axis.axvline(0, color="black", linewidth=1)
+            axis.set_title(f"{split_name}: n={len(values):,}")
+            axis.set_xlabel("asinh(delta / prior-quarter median NOx)")
+            axis.set_ylabel("AOI-hour count")
+            if column_index == 0:
+                axis.text(-0.2, 0.5, row_title, rotation=90, va="center", transform=axis.transAxes)
+            axis.text(
+                0.98,
+                0.95,
+                f"shown: {len(visible):,}\nx range: ±{limit:.3g}",
+                ha="right",
+                va="top",
+                transform=axis.transAxes,
+            )
+    split_counts = ", ".join(f"{name}={splits[name].height:,}" for name in split_names)
+    figure.suptitle(f"Scaled label distributions by split\nSplit counts: {split_counts}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180)
+    plt.close(figure)
 
 
 def _serialize_no2_paths(frame: pl.DataFrame) -> pl.DataFrame:
@@ -225,6 +260,7 @@ def _serialize_no2_paths(frame: pl.DataFrame) -> pl.DataFrame:
 
 def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
+    args = parse_args()
     source = pl.scan_parquet(FULL_DATA_PARQUET)
     raw_records = source.select(REQUIRED_COLUMNS).with_columns(pl.col("date").cast(pl.Date, strict=False))
     records = raw_records.pipe(filter_usable_nox_measurements).filter(pl.col("noxMass").is_finite())
@@ -251,13 +287,15 @@ def main() -> None:
         .filter(
             pl.col("avg_heat_input").is_not_null()
             & pl.col("avg_pwr_gen").is_not_null()
-            & pl.col(PREV_QTR_AVG_NOX_COL).is_finite()
+            & pl.col(PREV_QTR_MED_NOX_COL).is_finite()
+            & (pl.col(PREV_QTR_MED_NOX_COL) > 0)
         )
     )
     frame = hourly.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
     frame = add_tempo_sequences(frame, observations, SEQUENCE_TIMESTEPS)
     frame = frame.filter(pl.col(f"timestep_time_t{SEQUENCE_TIMESTEPS - 1}").is_not_null())
     frame = add_ema_targets(frame, hourly, SEQUENCE_TIMESTEPS, EMA_DECAY_TIMESCALE_HOURS)
+    frame = add_scaled_nox_targets(frame)
     frame = frame.with_columns(pl.lit("causal_ema").alias(LABEL_MODE_COL))
     bounds = add_major_city_distance(bounded_aois).select(
         AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
@@ -301,13 +339,14 @@ def main() -> None:
             for name, split in splits.items()
         },
     }
+    _plot_scaled_label_histograms(splits, args.histogram_output)
+    print(f"Saved scaled-label histograms to {args.histogram_output}")
     del frame, eligible, hourly
     write_json_atomic(summary, Path(STRAT_BASE_DIR) / "classification_summary.json")
     # Project and write one split at a time so the copies never coexist
     for name, destination in (("train", TRAIN_RECORDS_CSV), ("val", VAL_RECORDS_CSV), ("test", TEST_RECORDS_CSV)):
         split = splits.pop(name)
         serialized = _serialize_no2_paths(split)
-        serialized = _serialize_audit_lists(serialized)
         serialized.select(OUTPUT_COLUMNS).write_csv(destination)
 
 

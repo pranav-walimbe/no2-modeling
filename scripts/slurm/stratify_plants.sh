@@ -24,6 +24,7 @@ strat_dir="/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"
 recipient="pranav.walimbe@berkeley.edu"
 mail_host="${SLURM_SUBMIT_HOST:-ln002.brc}"
 mail_log="/var/log/maillog"
+histogram="/global/home/users/pranavwalimbe/vis/stratification-scaled-label-histograms-${SLURM_JOB_ID}.png"
 
 cd "${repo_dir}"
 module load python/3.11.6-gcc-11.4.0
@@ -33,7 +34,12 @@ export PYTHONPATH="${repo_dir}/src"
 # Slurm 22.05 and later stopped propagating --cpus-per-task into srun
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
-srun python -u -m preprocessing.stratify_plants "$@"
+srun python -u -m preprocessing.stratify_plants --histogram-output "${histogram}" "$@"
+
+if [[ ! -s "${histogram}" ]]; then
+    echo "Expected histogram was not created: ${histogram}" >&2
+    exit 1
+fi
 
 train_records=$(($(wc -l < "${strat_dir}/train_records.csv") - 1))
 val_records=$(($(wc -l < "${strat_dir}/val_records.csv") - 1))
@@ -47,8 +53,9 @@ printf '%s\n' \
     "Validation: ${val_records} records" \
     "Test: ${test_records} records" \
     "Total: ${total_records} records" \
+    "Histogram: ${histogram}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
-        "mailx -s 'NO2 stratification split sizes (${SLURM_JOB_ID})' '${recipient}'"
+        "mailx -s 'NO2 stratification scaled labels (${SLURM_JOB_ID})' -a '${histogram}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do
