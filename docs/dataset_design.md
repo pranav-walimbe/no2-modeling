@@ -9,28 +9,25 @@ whether it has enough coverage.
 |---|---|
 | Split unit | Geographic clusters of overlapping 72 km AOIs |
 | Split target | Approximately 70% train, 15% validation, 15% test |
-| Label | Sign of raw hourly NOx change outside a 100 lb deadband |
+| Targets | Raw and scaled hourly and effective NOx changes |
 | Metadata filters | Required source data and per-split upper 5% NOx-mass pruning |
 | Raster gates | More than 95% current coverage and 80% paired coverage |
-| Final selection | Oversample the training minority class; undersample validation and test majority classes |
+| Final selection | Keep every record that passes raster quality checks |
 | Model selection | Validation data only; freeze test data for final comparison |
 
 ## Output contract
 
 Stratification assigns intact geographic clusters toward a 70/15/15 split,
 removes each split's upper 5% of NOx mass, and randomly samples 300k/75k/75k
-records. After raster failures, finalization duplicates
-deterministically ranked minority rows in training until both classes match the
-majority size. For validation and test, it keeps every minority row and retains
-the same number of ranked majority rows. Reports record eligible counts, final
-size, balance strategy, and the numbers of duplicated and dropped rows.
+records. Dataset generation keeps every sampled record that passes raster
+quality checks and reports failures without label-based resampling.
 
 ## Split independence
 
 - Overlapping 72 km AOIs form geographic clusters.
 - Each cluster belongs to exactly one of train, validation, or test.
 - A deterministic largest-cluster-first assignment minimizes deviations from
-  70/15/15 targets for total, negative, and positive eligible record counts.
+  the 70/15/15 total-record targets.
 - No plant region leaks across splits, so evaluation measures generalization to
   unseen geographic regions instead of interpolation at known plants.
 - The split precedes NOx-mass pruning, record sampling, and train-only raster
@@ -51,7 +48,7 @@ Before any image processing, a candidate needs:
 Coal share is not an eligibility constraint, so gas and mixed-fuel AOIs remain
 candidates.
 
-## Label and tabular features
+## Targets and tabular features
 
 All joins use UTC:
 
@@ -64,18 +61,9 @@ All joins use UTC:
 - The enriched archive keeps the source local-standard fields, each facility's
   timezone, and its standard offset for auditability.
 
-The target uses the current-minus-previous effective EMA emissions difference:
-
-- Read the fixed 100 lb cutoff from the `EMA_DELTA_THRESHOLD` configuration
-  constant.
-- Remove records with absolute change at or below that cutoff in every split.
-- Assign class 0 to negative changes and class 1 to positive changes.
-- Select equal class counts only in the final generated splits.
-- Record the cutoff in each stratification and generation summary.
-
-Stratification reports natural class prevalence. Final generation reports
-overall and per-AOI retention, natural pre-balancing prevalence, and selected
-class counts.
+Stratification preserves the raw hourly NOx change, the effective EMA change,
+and their prior-quarter-scaled forms. It does not convert these continuous
+targets into classes or filter them using a classification deadband.
 
 Each sample stores five time-major arrays on a fixed 24 by 24 grid:
 
@@ -127,11 +115,9 @@ Facilities in the same raster cell contribute their combined unit count. Equal
 counts are resolved by unit-weighted distance to the AOI centre. After both
 gates pass, each scan retains its directly regridded values and validity mask.
 
-Generated records use `min_no2_finite_fraction` across the sequence as the only
-ranking signal after the fixed gates. Retrieval uncertainty does not filter or
-rank records. Generation summaries report retained counts,
-full-sequence coverage rates, and represented AOIs overall and by class. Coverage
-remains a dataset diagnostic and is not supplied to the model.
+Retrieval uncertainty does not filter or rank records. Generation summaries
+report retained counts, full-sequence coverage rates, and represented AOIs.
+Coverage remains a dataset diagnostic and is not supplied to the model.
 
 ## Quantities that do not select records
 
@@ -151,16 +137,8 @@ Before raster generation, apply these rules to every split:
 
 ## Final raster selection
 
-Successfully generated candidates are selected deterministically:
-
-1. Form strata by AOI, year, quarter, and four-hour UTC bin.
-2. Rank records within each stratum by paired raster coverage.
-3. Interleave temporal strata within each AOI.
-4. Round-robin globally across AOIs.
-5. For training, keep every generated record and repeat ranked minority rows
-   until the class counts match.
-6. For validation and test, keep every minority row and truncate the ranked
-   majority class to the same size.
+Keep every sampled record that passes raster quality checks. Finalization does
+not duplicate, rank, or drop successful records based on a target or label.
 
 ## Performance and persistence
 
@@ -186,8 +164,8 @@ For every generated dataset, record:
 - candidate, processing-success, and final counts;
 - AOIs and geographic clusters per split;
 - records per AOI, year, quarter, and observation hour;
-- distributions of label, fuel mix, plant size, and weather;
-- metrics overall and by AOI, label magnitude, season, and fuel;
+- distributions of target values, fuel mix, plant size, and weather;
+- metrics overall and by AOI, target magnitude, season, and fuel;
 - a trivial tabular-only baseline against image-plus-tabular models.
 
 Freeze the test set once these checks pass, then choose filter thresholds and

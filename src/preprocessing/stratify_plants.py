@@ -28,7 +28,6 @@ from preprocessing.stratify_utils import (
     DELTA_NOX_COL,
     DELTA_NOX_SCALED_COL,
     EFFECTIVE_CURRENT_NOX_COL,
-    EFFECTIVE_DELTA_NOX_COL,
     LABEL_MODE_COL,
     MAJOR_CITY_DIST_COL,
     NOX_COL,
@@ -94,7 +93,7 @@ OUTPUT_COLUMNS = [
     DELTA_NOX_COL,
     DELTA_NOX_SCALED_COL,
     EFFECTIVE_CURRENT_NOX_COL,
-    EFFECTIVE_DELTA_NOX_COL,
+    "effective_delta_nox",
     DELTA_EFFECTIVE_NOX_SCALED_COL,
     LABEL_MODE_COL,
 ]
@@ -293,7 +292,7 @@ def main() -> None:
         frame.join(bounds, on=AOI_ID_COL, how="left"),
         SEQUENCE_TIMESTEPS,
     )
-    frame = _filter_metadata_eligibility(frame).filter(pl.col(EFFECTIVE_DELTA_NOX_COL).is_finite())
+    frame = _filter_metadata_eligibility(frame).filter(pl.col("effective_delta_nox").is_finite())
     splits = _split_by_cluster(frame)
     splits = {
         split: select_split_records(

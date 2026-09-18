@@ -48,6 +48,9 @@ TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.0  # retain every positive accepted footprint-c
 TEMPO_MIN_DELTA_MINUTES = 40
 TEMPO_MAX_DELTA_MINUTES = 70
 IMG_RANGE = 72  # spatial extent of extracted image patch (km)
+TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
+MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
+MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # stratified split output directory
 TRAIN_RECORDS = 300_000  # records passed from stratification to training dataset generation
 VAL_RECORDS = 75_000  # records passed from stratification to validation dataset generation
@@ -78,7 +81,7 @@ HRRR_END_DATE = EMISSIONS_END_DATE
 # ============================================================================
 DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
 DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # raster bundles for direct monolithic generation
-DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and labels
+DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and targets
 DATASET_TEMPO_CACHE_DIR = os.path.join(DATASET_DIR, "tempo-cache")  # persistent AOI-scan regridding cache
 DATASET_WEATHER_CACHE_DIR = os.path.join(DATASET_DIR, "weather-cache")  # persistent aligned AOI-hour weather rasters
 IMG_SIZE = 24  # image size in pixels (24x24)
@@ -86,12 +89,7 @@ MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_TIMESTEP_NO2_FINITE_FRACTION = 0.95  # inclusive coverage floor applied independently to every timestep
 HOTSPOT_WINDOW_SIZE = 3  # odd source-centred square required to have complete NO2 support
 MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applied to every timestep
-LABEL_COL = "delta_nox_class"
-EFFECTIVE_DELTA_NOX_COL = "effective_delta_nox"
-EMA_DELTA_THRESHOLD = 100.0  # least absolute current-minus-previous effective NOx retained
-TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
-MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
-MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
+
 # ============================================================================
 # Modeling data contract
 # ============================================================================
