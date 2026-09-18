@@ -254,7 +254,7 @@ records clipped valid-pixel fractions by channel and split. The tabular MLP and
 mask-aware raster ConvGRU train independently, with separate BCE losses,
 optimizers, validation selection, and checkpoints. The ConvGRU receives no MLP
 outputs or tabular features. The report compares both models on the same
-records. See `docs/modeling.md` for the full contract.
+records. See [`modeling.md`](modeling.md) for the full contract.
 
 ### Regeneration
 
@@ -318,5 +318,5 @@ them against current Savio documentation before submitting long-running jobs.
 
 The separate single-timestep masked-pretraining dataset reuses the TEMPO and
 weather caches while maintaining its own positive/negative validity cache. See
-[`docs/masked-pretraining.md`](masked-pretraining.md) for its AOI splitting,
-sharding, cache-refresh, and finalization contract.
+[`../masked-pretraining/setup-and-pipeline.md`](../masked-pretraining/setup-and-pipeline.md)
+for its AOI splitting, sharding, cache-refresh, and finalization contract.

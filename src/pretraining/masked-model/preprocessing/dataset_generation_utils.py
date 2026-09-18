@@ -31,6 +31,9 @@ from config import IMG_SIZE
 VALID_STATUS = "valid"
 INVALID_STATUS = "invalid"
 RETRYABLE_STATUS = "retryable"
+MASKED_NO2_RASTER_NAME = "masked_no2"
+ARTIFICIAL_MASK_NAME = "artificial_mask"
+SHARD_RECORDS_FILE = "records.csv"
 
 CANDIDATE_SCHEMA = {
     "candidate_index": pl.UInt64,
@@ -53,24 +56,35 @@ VALID_RECORD_SCHEMA = {
     "scan_num": pl.Int32,
     "tempo_time": pl.Datetime(time_zone="UTC"),
     "cache_key": pl.String,
-    "original_raster_path": pl.String,
+    "validity_cache_path": pl.String,
 }
 
 FINAL_RECORD_SCHEMA = {
-    **VALID_RECORD_SCHEMA,
-    "masked_raster_path": pl.String,
+    "candidate_index": pl.UInt64,
+    "aoi_id": pl.Int64,
+    "scan_date": pl.Date,
+    "scan_num": pl.Int32,
+    "tempo_time": pl.Datetime(time_zone="UTC"),
+    "cache_key": pl.String,
+    "raster_bundle_path": pl.String,
 }
 
 
 @dataclass(frozen=True)
 class PretrainingShardTask:
-    """One array task assigned a deterministic subset of one split."""
+    """One deterministic output-record range assigned to an array task."""
 
     task_id: int
     split: str
     shard_index: int
-    shard_count: int
-    target_count: int
+    start: int
+    stop: int
+    split_target: int
+
+    @property
+    def size(self) -> int:
+        """Return the maximum number of output records in this shard."""
+        return self.stop - self.start
 
 
 @dataclass(frozen=True)
@@ -84,12 +98,79 @@ class CandidateResult:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class MaskedRecordTask:
+    """One selected validity-cache entry to materialize in a fresh shard."""
+
+    row: dict[str, object]
+    output_path: str
+    mask_seed: int
+
+
+@dataclass(frozen=True)
+class MaskedDatasetShardStore:
+    """Manage disposable masked-pretraining dataset shards."""
+
+    root: Path
+
+    def create(self, task: PretrainingShardTask) -> Path:
+        """Create one new shard directory after the run-wide reset."""
+        split_root = self.root / task.split
+        split_root.mkdir(parents=True, exist_ok=True)
+        shard_dir = split_root / f"{task.shard_index:06d}"
+        shard_dir.mkdir()
+        return shard_dir
+
+    def write(self, task: PretrainingShardTask, shard_dir: Path, rows: list[dict[str, object]]) -> None:
+        """Publish one shard manifest with paths relative to its directory."""
+        frame = pl.DataFrame(rows, schema=FINAL_RECORD_SCHEMA).sort("candidate_index")
+        relative_paths = [str(Path(path).relative_to(shard_dir)) for path in frame["raster_bundle_path"].to_list()]
+        frame = frame.with_columns(pl.Series("raster_bundle_path", relative_paths, dtype=pl.String))
+        write_csv_atomic(frame, shard_dir / SHARD_RECORDS_FILE)
+        print(f"[{task.split} shard {task.shard_index}] wrote {frame.height:,} masked records")
+
+    def load(self, task: PretrainingShardTask, *, resolve_paths: bool = False) -> pl.DataFrame:
+        """Load and validate one completed shard manifest and its bundles."""
+        shard_dir = self.root / task.split / f"{task.shard_index:06d}"
+        frame = pl.read_csv(shard_dir / SHARD_RECORDS_FILE, schema_overrides=FINAL_RECORD_SCHEMA)
+        if frame.height > task.size:
+            raise ValueError(f"Shard {task.task_id} contains more than {task.size:,} records")
+        raster_directory = Path("record-rasters") / task.split
+        relative_paths = [Path(str(path)) for path in frame["raster_bundle_path"].to_list()]
+        if any(path.is_absolute() or path.parent != raster_directory for path in relative_paths):
+            raise ValueError(f"Shard {task.task_id} contains a raster path outside {raster_directory}")
+        if len(set(relative_paths)) != len(relative_paths):
+            raise ValueError(f"Shard {task.task_id} contains duplicate raster paths")
+        if any(not (shard_dir / path).is_file() for path in relative_paths):
+            raise ValueError(f"Shard {task.task_id} references a missing raster bundle")
+        if resolve_paths:
+            frame = frame.with_columns(
+                pl.Series(
+                    "raster_bundle_path",
+                    [str(shard_dir / path) for path in relative_paths],
+                    dtype=pl.String,
+                )
+            )
+        return frame
+
+
 def write_parquet_atomic(frame: pl.DataFrame, destination: Path) -> None:
     """Atomically publish a Parquet file."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(f"{destination.suffix}.{os.getpid()}.tmp")
     try:
         frame.write_parquet(temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_csv_atomic(frame: pl.DataFrame, destination: Path) -> None:
+    """Atomically publish a CSV file."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(f"{destination.suffix}.{os.getpid()}.tmp")
+    try:
+        frame.write_csv(temporary)
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -132,31 +213,32 @@ def write_npz_atomic(destination: Path, **arrays: np.ndarray) -> None:
 
 def build_shard_tasks(
     targets: dict[str, int],
-    shards_per_split: int,
+    shard_size: int,
 ) -> list[PretrainingShardTask]:
-    """Build fixed array tasks with per-split cooperative targets."""
-    if shards_per_split <= 0:
-        raise ValueError("shards_per_split must be positive")
+    """Partition each requested split into fixed-size output shards."""
+    if shard_size <= 0:
+        raise ValueError("shard_size must be positive")
     tasks: list[PretrainingShardTask] = []
     for split, target_count in targets.items():
-        for shard_index in range(shards_per_split):
+        for shard_index, start in enumerate(range(0, target_count, shard_size)):
             tasks.append(
                 PretrainingShardTask(
                     task_id=len(tasks),
                     split=split,
                     shard_index=shard_index,
-                    shard_count=shards_per_split,
-                    target_count=target_count,
+                    start=start,
+                    stop=min(start + shard_size, target_count),
+                    split_target=target_count,
                 )
             )
     return tasks
 
 
-def load_shard_candidates(path: Path, task: PretrainingShardTask) -> pl.DataFrame:
+def load_shard_candidates(path: Path, task: PretrainingShardTask, split_shard_count: int) -> pl.DataFrame:
     """Load the candidates owned by one modulo-partitioned shard."""
     return (
         pl.scan_parquet(path)
-        .filter((pl.col("shard_key") % task.shard_count) == task.shard_index)
+        .filter((pl.col("shard_key") % split_shard_count) == task.shard_index)
         .sort("selection_key", "scan_date", "scan_num", "aoi_id")
         .collect(engine="streaming")
     )
@@ -210,19 +292,6 @@ def _mark_invalid(
         invalid_path,
     )
     return CandidateResult(INVALID_STATUS, row, scan_task.cache_key, reason=reason)
-
-
-def _record_row(result: CandidateResult) -> dict[str, object]:
-    row = result.row
-    return {
-        "candidate_index": int(row["candidate_index"]),
-        "aoi_id": int(row["aoi_id"]),
-        "scan_date": row["scan_date"],
-        "scan_num": int(row["scan_num"]),
-        "tempo_time": row["tempo_time"],
-        "cache_key": result.cache_key,
-        "original_raster_path": str(result.raster_path),
-    }
 
 
 def _make_tasks(
@@ -363,7 +432,19 @@ def process_candidate_batch(
 def valid_record_frame(results: list[CandidateResult]) -> pl.DataFrame:
     """Convert valid outcomes to the stable shard schema."""
     return pl.DataFrame(
-        [_record_row(result) for result in results if result.status == VALID_STATUS],
+        [
+            {
+                "candidate_index": int(result.row["candidate_index"]),
+                "aoi_id": int(result.row["aoi_id"]),
+                "scan_date": result.row["scan_date"],
+                "scan_num": int(result.row["scan_num"]),
+                "tempo_time": result.row["tempo_time"],
+                "cache_key": result.cache_key,
+                "validity_cache_path": str(result.raster_path),
+            }
+            for result in results
+            if result.status == VALID_STATUS
+        ],
         schema=VALID_RECORD_SCHEMA,
     )
 
@@ -373,3 +454,40 @@ def mask_no2_raster(no2: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarr
     del no2, rng
     # Intentionally unimplemented until missingness EDA fixes the masking contract.
     return None
+
+
+def materialize_masked_record(task: MaskedRecordTask) -> dict[str, object]:
+    """Combine one persistent clean bundle with a newly sampled mask."""
+    row = task.row
+    with np.load(str(row["validity_cache_path"]), allow_pickle=False) as cached:
+        arrays = {
+            name: np.asarray(cached[name])
+            for name in (
+                NO2_RASTER_NAME,
+                NO2_MASK_NAME,
+                TEMPERATURE_RASTER_NAME,
+                WIND_U_RASTER_NAME,
+                WIND_V_RASTER_NAME,
+            )
+        }
+    no2 = np.asarray(arrays[NO2_RASTER_NAME], dtype=np.float32)
+    masked = mask_no2_raster(no2, np.random.default_rng(task.mask_seed))
+    if masked is None:
+        raise NotImplementedError(
+            "mask_no2_raster is intentionally empty until missingness EDA defines the masking algorithm"
+        )
+    masked_no2, artificial_mask = masked
+    if masked_no2.shape != no2.shape or artificial_mask.shape != no2.shape:
+        raise ValueError("Masked NO2 and artificial mask must match the original NO2 shape")
+    write_npz_atomic(
+        Path(task.output_path),
+        **arrays,
+        **{
+            MASKED_NO2_RASTER_NAME: np.asarray(masked_no2, dtype=np.float32),
+            ARTIFICIAL_MASK_NAME: np.asarray(artificial_mask, dtype=np.uint8),
+        },
+    )
+    return {
+        **{name: row[name] for name in FINAL_RECORD_SCHEMA if name != "raster_bundle_path"},
+        "raster_bundle_path": task.output_path,
+    }

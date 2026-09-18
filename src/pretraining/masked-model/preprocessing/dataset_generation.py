@@ -7,24 +7,25 @@ import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
-import numpy as np
 import polars as pl
 from dataset_generation_utils import (
     CANDIDATE_SCHEMA,
     FINAL_RECORD_SCHEMA,
     VALID_RECORD_SCHEMA,
     VALID_STATUS,
+    MaskedDatasetShardStore,
+    MaskedRecordTask,
     PretrainingShardTask,
+    bounded_parallel_map,
     build_shard_tasks,
     load_shard_candidates,
-    mask_no2_raster,
+    materialize_masked_record,
     process_candidate_batch,
     valid_record_frame,
+    write_csv_atomic,
     write_json_atomic,
-    write_npz_atomic,
     write_parquet_atomic,
 )
-from preprocessing.generate_dataset_utils import NO2_RASTER_NAME
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
     add_projected_coordinates,
@@ -40,9 +41,9 @@ from config import (
     HRRR_DIR,
     MASKED_PRETRAINING_BASE_DIR,
     MASKED_PRETRAINING_DF_DIR,
-    MASKED_PRETRAINING_MASKED_RASTER_DIR,
     MASKED_PRETRAINING_MAX_PARALLEL_SHARDS,
-    MASKED_PRETRAINING_SHARDS_PER_SPLIT,
+    MASKED_PRETRAINING_SHARD_DIR,
+    MASKED_PRETRAINING_SHARD_SIZE,
     MASKED_PRETRAINING_SPLIT_SEED,
     MASKED_PRETRAINING_TEST_RECORDS,
     MASKED_PRETRAINING_TRAIN_RECORDS,
@@ -61,8 +62,6 @@ SPLIT_TARGETS = {
     "test": MASKED_PRETRAINING_TEST_RECORDS,
 }
 STAGE_ENV = "MASKED_PRETRAINING_STAGE"
-SHARD_COUNT_ENV = "MASKED_PRETRAINING_SHARD_COUNT"
-BATCH_SIZE_ENV = "MASKED_PRETRAINING_BATCH_SIZE"
 DEFAULT_BATCH_SIZE = 64
 PROGRESS_INTERVAL = 1_000
 
@@ -80,8 +79,19 @@ def _positive_int(value: str) -> int:
 def parse_args() -> argparse.Namespace:
     """Parse public launcher and internal worker options."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--refresh-cache", action="store_true")
-    parser.add_argument("--shards-per-split", type=_positive_int, default=MASKED_PRETRAINING_SHARDS_PER_SPLIT)
+    parser.add_argument(
+        "--clear-cache",
+        "--refresh-cache",
+        dest="clear_cache",
+        action="store_true",
+        help="clear persistent positive and negative validity-cache entries before this run",
+    )
+    parser.add_argument(
+        "--shard-size",
+        type=_positive_int,
+        default=MASKED_PRETRAINING_SHARD_SIZE,
+        help="maximum selected records stored in each disposable dataset shard",
+    )
     parser.add_argument("--max-parallel-shards", type=_positive_int, default=MASKED_PRETRAINING_MAX_PARALLEL_SHARDS)
     parser.add_argument("--workers-per-shard", type=_positive_int, default=MASKED_PRETRAINING_WORKERS_PER_SHARD)
     parser.add_argument("--batch-size", type=_positive_int, default=DEFAULT_BATCH_SIZE)
@@ -90,10 +100,6 @@ def parse_args() -> argparse.Namespace:
 
 def _candidate_manifest(split: str) -> Path:
     return Path(MASKED_PRETRAINING_WORK_DIR) / "candidates" / f"{split}.parquet"
-
-
-def _shard_result_path(task: PretrainingShardTask) -> Path:
-    return Path(MASKED_PRETRAINING_WORK_DIR) / "shards" / task.split / f"{task.shard_index:06d}.parquet"
 
 
 def _safe_reset(path: Path, base: Path) -> None:
@@ -161,12 +167,7 @@ def _assign_clusters(frame: pl.DataFrame) -> pl.DataFrame:
         destination = min(
             choices,
             key=lambda choice: sum(
-                (
-                    assigned[split]
-                    + (float(group["records"]) if split == choice else 0.0)
-                    - targets[split]
-                )
-                ** 2
+                (assigned[split] + (float(group["records"]) if split == choice else 0.0) - targets[split]) ** 2
                 for split in SPLIT_TARGETS
             ),
         )
@@ -191,12 +192,8 @@ def _write_candidate_manifests() -> None:
         frame = (
             assigned.filter(pl.col("split") == split)
             .with_columns(
-                pl.struct("scan_date", "scan_num")
-                .hash(seed=MASKED_PRETRAINING_SPLIT_SEED)
-                .alias("shard_key"),
-                pl.struct("scan_date", "scan_num")
-                .hash(seed=MASKED_PRETRAINING_SPLIT_SEED + 1)
-                .alias("selection_key")
+                pl.struct("scan_date", "scan_num").hash(seed=MASKED_PRETRAINING_SPLIT_SEED).alias("shard_key"),
+                pl.struct("scan_date", "scan_num").hash(seed=MASKED_PRETRAINING_SPLIT_SEED + 1).alias("selection_key"),
             )
             .sort("selection_key", AOI_ID_COL, "tempo_time")
             .with_row_index("candidate_index")
@@ -204,10 +201,6 @@ def _write_candidate_manifests() -> None:
         )
         write_parquet_atomic(frame.cast(CANDIDATE_SCHEMA), _candidate_manifest(split))
         print(f"[{split}] candidate pool: {frame.height:,} scenes across {frame[AOI_ID_COL].n_unique():,} AOIs")
-
-
-def _array_spec(tasks: list[PretrainingShardTask]) -> str:
-    return f"0-{len(tasks) - 1}"
 
 
 def _submit(options: list[str], script_arguments: list[str]) -> str:
@@ -229,19 +222,35 @@ def _launch(args: argparse.Namespace) -> None:
         raise ValueError("Launch masked-pretraining generation from a login node")
     if not BATCH_SCRIPT.is_file():
         raise FileNotFoundError(BATCH_SCRIPT)
+    active_jobs = subprocess.run(
+        [
+            "squeue",
+            "--noheader",
+            "--user",
+            str(os.environ["USER"]),
+            "--name=masked-data-prepare,masked-data-discover,masked-data-shard,masked-data-finalize",
+            "--format=%i",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.split()
+    if active_jobs:
+        raise RuntimeError(f"Masked-pretraining generation jobs are already active: {', '.join(active_jobs)}")
     (REPOSITORY_ROOT / "logs").mkdir(exist_ok=True)
-    tasks = build_shard_tasks(SPLIT_TARGETS, args.shards_per_split)
+    tasks = build_shard_tasks(SPLIT_TARGETS, args.shard_size)
+    array_spec = f"0-{len(tasks) - 1}"
     script_arguments = [
-        "--shards-per-split",
-        str(args.shards_per_split),
+        "--shard-size",
+        str(args.shard_size),
         "--workers-per-shard",
         str(args.workers_per_shard),
         "--batch-size",
         str(args.batch_size),
     ]
     prepare_arguments = [*script_arguments]
-    if args.refresh_cache:
-        prepare_arguments.append("--refresh-cache")
+    if args.clear_cache:
+        prepare_arguments.append("--clear-cache")
     prepare_job = _submit(
         [
             f"--cpus-per-task={args.workers_per_shard}",
@@ -251,17 +260,23 @@ def _launch(args: argparse.Namespace) -> None:
         ],
         prepare_arguments,
     )
-    exported = (
-        f"ALL,{STAGE_ENV}=worker,{SHARD_COUNT_ENV}={args.shards_per_split},"
-        f"{BATCH_SIZE_ENV}={args.batch_size}"
-    )
-    worker_job = _submit(
+    discovery_job = _submit(
         [
-            f"--array={_array_spec(tasks)}%{args.max_parallel_shards}",
+            f"--array={array_spec}%{args.max_parallel_shards}",
+            f"--cpus-per-task={args.workers_per_shard}",
+            "--job-name=masked-data-discover",
+            f"--dependency=afterok:{prepare_job}",
+            f"--export=ALL,{STAGE_ENV}=discover",
+        ],
+        script_arguments,
+    )
+    materialize_job = _submit(
+        [
+            f"--array={array_spec}%{args.max_parallel_shards}",
             f"--cpus-per-task={args.workers_per_shard}",
             "--job-name=masked-data-shard",
-            f"--dependency=afterok:{prepare_job}",
-            f"--export={exported}",
+            f"--dependency=afterok:{discovery_job}",
+            f"--export=ALL,{STAGE_ENV}=materialize",
         ],
         script_arguments,
     )
@@ -271,13 +286,14 @@ def _launch(args: argparse.Namespace) -> None:
             "--cpus-per-task=1",
             "--time=04:00:00",
             "--job-name=masked-data-finalize",
-            f"--dependency=afterok:{worker_job}",
-            f"--export=ALL,{STAGE_ENV}=finalize,{SHARD_COUNT_ENV}={args.shards_per_split}",
+            f"--dependency=afterok:{materialize_job}",
+            f"--export=ALL,{STAGE_ENV}=finalize",
         ],
         script_arguments,
     )
     print(f"Masked-pretraining preparation: {prepare_job}")
-    print(f"Masked-pretraining shard array: {worker_job}")
+    print(f"Masked-pretraining validity discovery: {discovery_job}")
+    print(f"Masked-pretraining shard materialization: {materialize_job}")
     print(f"Masked-pretraining finalizer: {finalizer_job}")
 
 
@@ -286,8 +302,9 @@ def _run_prepare(args: argparse.Namespace) -> None:
     base = Path(MASKED_PRETRAINING_BASE_DIR)
     base.mkdir(parents=True, exist_ok=True)
     _safe_reset(Path(MASKED_PRETRAINING_WORK_DIR), base)
-    _safe_reset(Path(MASKED_PRETRAINING_MASKED_RASTER_DIR), base)
-    if args.refresh_cache:
+    _safe_reset(Path(MASKED_PRETRAINING_SHARD_DIR), base)
+    _safe_reset(Path(MASKED_PRETRAINING_DF_DIR), base)
+    if args.clear_cache:
         _safe_reset(Path(MASKED_PRETRAINING_VALIDITY_CACHE_DIR), base)
     else:
         Path(MASKED_PRETRAINING_VALIDITY_CACHE_DIR).mkdir(parents=True, exist_ok=True)
@@ -295,7 +312,7 @@ def _run_prepare(args: argparse.Namespace) -> None:
 
 
 def _global_valid_count(split: str) -> int:
-    paths = sorted((Path(MASKED_PRETRAINING_WORK_DIR) / "shards" / split).glob("*.parquet"))
+    paths = sorted((Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split).glob("*.parquet"))
     if not paths:
         return 0
     return sum(pl.scan_parquet(path).select(pl.len()).collect(engine="streaming").item() for path in paths)
@@ -316,25 +333,31 @@ def _candidate_batches(candidates: pl.DataFrame, batch_size: int) -> Iterator[pl
         yield pl.concat(pending, how="vertical")
 
 
-def _run_worker(args: argparse.Namespace) -> None:
+def _resolve_array_task(shard_size: int) -> tuple[PretrainingShardTask, list[PretrainingShardTask]]:
     task_id_text = os.getenv("SLURM_ARRAY_TASK_ID")
     if task_id_text is None:
-        raise ValueError("Worker stage requires SLURM_ARRAY_TASK_ID")
-    shard_count = int(os.getenv(SHARD_COUNT_ENV, str(args.shards_per_split)))
-    tasks = build_shard_tasks(SPLIT_TARGETS, shard_count)
+        raise ValueError("Array stage requires SLURM_ARRAY_TASK_ID")
+    tasks = build_shard_tasks(SPLIT_TARGETS, shard_size)
     task_id = int(task_id_text)
     if task_id < 0 or task_id >= len(tasks):
         raise ValueError(f"Array task {task_id} is outside the {len(tasks)}-task plan")
-    task = tasks[task_id]
-    candidates = load_shard_candidates(_candidate_manifest(task.split), task)
-    result_path = _shard_result_path(task)
+    return tasks[task_id], tasks
+
+
+def _run_discovery(args: argparse.Namespace) -> None:
+    task, tasks = _resolve_array_task(args.shard_size)
+    split_shard_count = sum(candidate.split == task.split for candidate in tasks)
+    candidates = load_shard_candidates(_candidate_manifest(task.split), task, split_shard_count)
+    result_path = (
+        Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / task.split / f"{task.shard_index:06d}.parquet"
+    )
     valid_rows: list[dict[str, object]] = []
     write_parquet_atomic(pl.DataFrame(schema=VALID_RECORD_SCHEMA), result_path)
     invalid_count = 0
     retryable_count = 0
     completed = 0
     for batch_frame in _candidate_batches(candidates, args.batch_size):
-        if _global_valid_count(task.split) >= task.target_count:
+        if _global_valid_count(task.split) >= task.split_target:
             break
         results = process_candidate_batch(
             list(batch_frame.iter_rows(named=True)),
@@ -355,23 +378,14 @@ def _run_worker(args: argparse.Namespace) -> None:
                 f"[{task.split} shard {task.shard_index}] {completed:,}/{candidates.height:,} candidates; "
                 f"{len(valid_rows):,} valid, {invalid_count:,} invalid, {retryable_count:,} retryable"
             )
-    print(f"[{task.split} shard {task.shard_index}] finished with {len(valid_rows):,} valid scenes")
+    print(f"[{task.split} discovery {task.shard_index}] finished with {len(valid_rows):,} valid scenes")
 
 
-def _write_csv_atomic(frame: pl.DataFrame, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(f"{destination.suffix}.{os.getpid()}.tmp")
-    try:
-        frame.write_csv(temporary)
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _finalize_split(split: str, target_count: int) -> dict[str, object]:
-    paths = sorted((Path(MASKED_PRETRAINING_WORK_DIR) / "shards" / split).glob("*.parquet"))
+def _selected_valid_records(split: str, target_count: int) -> pl.DataFrame:
+    """Select the deterministic cache-backed records published by this run."""
+    paths = sorted((Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split).glob("*.parquet"))
     frames = [pl.read_parquet(path).cast(VALID_RECORD_SCHEMA) for path in paths]
-    valid = (
+    return (
         pl.concat(frames, how="vertical")
         .unique(subset="cache_key", keep="first")
         .sort("candidate_index")
@@ -379,35 +393,68 @@ def _finalize_split(split: str, target_count: int) -> dict[str, object]:
         if frames
         else pl.DataFrame(schema=VALID_RECORD_SCHEMA)
     )
-    final_rows: list[dict[str, object]] = []
-    masked_root = Path(MASKED_PRETRAINING_MASKED_RASTER_DIR) / split
-    for row in valid.iter_rows(named=True):
-        with np.load(str(row["original_raster_path"]), allow_pickle=False) as bundle:
-            no2 = np.asarray(bundle[NO2_RASTER_NAME], dtype=np.float32)
-        rng = np.random.default_rng(MASKED_PRETRAINING_SPLIT_SEED + int(row["candidate_index"]))
-        masked = mask_no2_raster(no2, rng)
-        if masked is None:
-            raise NotImplementedError(
-                "mask_no2_raster is intentionally empty until missingness EDA defines the masking algorithm"
-            )
-        masked_no2, artificial_mask = masked
-        masked_path = masked_root / f"{row['cache_key']}.npz"
-        write_npz_atomic(masked_path, masked_no2=masked_no2, artificial_mask=artificial_mask)
-        final_rows.append({**row, "masked_raster_path": str(masked_path)})
-    output = pl.DataFrame(final_rows, schema=FINAL_RECORD_SCHEMA)
-    _write_csv_atomic(output, Path(MASKED_PRETRAINING_DF_DIR) / f"{split}_df.csv")
-    return {
-        "split": split,
-        "target_records": target_count,
-        "available_valid_records": valid.height,
-        "published_records": output.height,
-        "target_met": output.height == target_count,
-    }
 
 
-def _run_finalizer() -> None:
-    summaries = [_finalize_split(split, target) for split, target in SPLIT_TARGETS.items()]
-    write_json_atomic({"splits": summaries}, Path(MASKED_PRETRAINING_DF_DIR) / "generation_summary.json")
+def _run_materialize(args: argparse.Namespace) -> None:
+    """Build one fresh fixed-size shard from persistent clean cache entries."""
+    task, _ = _resolve_array_task(args.shard_size)
+    selected = _selected_valid_records(task.split, task.split_target).slice(task.start, task.size)
+    store = MaskedDatasetShardStore(Path(MASKED_PRETRAINING_SHARD_DIR))
+    shard_dir = store.create(task)
+    raster_dir = shard_dir / "record-rasters" / task.split
+    raster_dir.mkdir(parents=True)
+    record_tasks = [
+        MaskedRecordTask(
+            row=row,
+            output_path=str(raster_dir / f"{row['cache_key']}.npz"),
+            mask_seed=MASKED_PRETRAINING_SPLIT_SEED + task.task_id * args.shard_size + offset,
+        )
+        for offset, row in enumerate(selected.iter_rows(named=True))
+    ]
+    output_rows = list(bounded_parallel_map(materialize_masked_record, record_tasks, args.workers_per_shard))
+    store.write(task, shard_dir, output_rows)
+
+
+def _run_finalizer(args: argparse.Namespace) -> None:
+    """Validate fresh shards and publish split manifests without copying rasters."""
+    tasks = build_shard_tasks(SPLIT_TARGETS, args.shard_size)
+    store = MaskedDatasetShardStore(Path(MASKED_PRETRAINING_SHARD_DIR))
+    output_by_split: dict[str, list[pl.DataFrame]] = {split: [] for split in SPLIT_TARGETS}
+    for task in tasks:
+        try:
+            output_by_split[task.split].append(store.load(task, resolve_paths=True))
+        except (OSError, TypeError, ValueError, pl.exceptions.PolarsError) as error:
+            raise ValueError(f"Cannot finalize incomplete shard {task.task_id}: {error}") from error
+
+    summaries: list[dict[str, object]] = []
+    base = Path(MASKED_PRETRAINING_BASE_DIR)
+    for split, target_count in SPLIT_TARGETS.items():
+        expected = _selected_valid_records(split, target_count)
+        frames = output_by_split[split]
+        output = (
+            pl.concat(frames, how="vertical").sort("candidate_index")
+            if frames
+            else pl.DataFrame(schema=FINAL_RECORD_SCHEMA)
+        )
+        if output["cache_key"].to_list() != expected["cache_key"].to_list():
+            raise ValueError(f"[{split}] shard records do not match the selected validity-cache records")
+        relative_paths = [str(Path(path).relative_to(base)) for path in output["raster_bundle_path"].to_list()]
+        output = output.with_columns(pl.Series("raster_bundle_path", relative_paths, dtype=pl.String))
+        write_csv_atomic(output, Path(MASKED_PRETRAINING_DF_DIR) / f"{split}_df.csv")
+        summaries.append(
+            {
+                "split": split,
+                "target_records": target_count,
+                "available_valid_records": expected.height,
+                "published_records": output.height,
+                "target_met": output.height == target_count,
+            }
+        )
+
+    write_json_atomic(
+        {"shard_size": args.shard_size, "splits": summaries},
+        Path(MASKED_PRETRAINING_DF_DIR) / "generation_summary.json",
+    )
     for summary in summaries:
         print(
             f"[{summary['split']}] published {summary['published_records']:,}/"
@@ -423,10 +470,12 @@ def main() -> None:
         _launch(args)
     elif stage == "prepare":
         _run_prepare(args)
-    elif stage == "worker":
-        _run_worker(args)
+    elif stage == "discover":
+        _run_discovery(args)
+    elif stage == "materialize":
+        _run_materialize(args)
     elif stage == "finalize":
-        _run_finalizer()
+        _run_finalizer(args)
     else:
         raise ValueError(f"Unsupported {STAGE_ENV}: {stage}")
 
