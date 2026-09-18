@@ -18,7 +18,7 @@ set -euo pipefail
 cd "/global/home/users/pranavwalimbe/no2-modeling"
 module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
-export PYTHONPATH="/global/home/users/pranavwalimbe/no2-modeling/src"
+export PYTHONPATH="/global/home/users/pranavwalimbe/no2-modeling/src:/global/home/users/pranavwalimbe/no2-modeling/src/delta-model"
 
 START_DATES=(2023-08-01 2024-05-09 2025-02-15 2025-11-24)
 END_DATES=(2024-05-08 2025-02-14 2025-11-23 2026-09-10)
@@ -29,7 +29,7 @@ end_date="${END_DATES[$SLURM_ARRAY_TASK_ID]}"
 # Slurm 22.05 and later stopped propagating --cpus-per-task into srun
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
-srun python -u -m collection.scrape_hrrr \
+srun python -u src/data-scraping/scrape_hrrr.py \
   --start-date "$start_date" \
   --end-date "$end_date" \
   --workers "$SLURM_CPUS_PER_TASK" \

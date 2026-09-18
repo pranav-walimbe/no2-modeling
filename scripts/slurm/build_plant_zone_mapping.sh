@@ -18,10 +18,10 @@ set -euo pipefail
 cd "/global/home/users/pranavwalimbe/no2-modeling"
 module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
-export PYTHONPATH="/global/home/users/pranavwalimbe/no2-modeling/src"
+export PYTHONPATH="/global/home/users/pranavwalimbe/no2-modeling/src:/global/home/users/pranavwalimbe/no2-modeling/src/delta-model"
 export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"
 
 # Slurm 22.05 and later stopped propagating --cpus-per-task into srun
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
-srun python -u -m collection.map_plant_zones --batch-size 100000
+srun python -u src/data-scraping/map_plant_zones.py --batch-size 100000

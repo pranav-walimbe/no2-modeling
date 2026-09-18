@@ -218,10 +218,10 @@ CLAUDE.md
 !/scripts/slurm/
 !/scripts/slurm/**
 /src/eda/
-/src/collection/map_plant_zones.py
-/src/collection/plant_zone_mapping.py
-/src/collection/power_price_sources.py
-/src/collection/scrape_power_prices.py
+/src/data-scraping/map_plant_zones.py
+/src/data-scraping/plant_zone_mapping.py
+/src/data-scraping/power_price_sources.py
+/src/data-scraping/scrape_power_prices.py
 
 # Marimo
 marimo/_static/

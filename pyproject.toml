@@ -37,12 +37,9 @@ dependencies = [
 dev = ["ruff>=0.12"]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "src", modeling = "src/delta-model/modeling", preprocessing = "src/delta-model/preprocessing"}
 py-modules = ["config", "prerequisites"]
-
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["collection*", "eda*", "modeling*", "preprocessing*"]
+packages = ["modeling", "preprocessing"]
 
 [tool.ruff]
 line-length = 120
