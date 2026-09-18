@@ -118,6 +118,18 @@ MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to s
 # ============================================================================
 # Masked pretraining
 # ============================================================================
+MASKED_PRETRAINING_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/masked_pretraining"
+MASKED_PRETRAINING_VALIDITY_CACHE_DIR = os.path.join(MASKED_PRETRAINING_BASE_DIR, "validity-cache")
+MASKED_PRETRAINING_WORK_DIR = os.path.join(MASKED_PRETRAINING_BASE_DIR, "work")
+MASKED_PRETRAINING_MASKED_RASTER_DIR = os.path.join(MASKED_PRETRAINING_BASE_DIR, "masked-rasters")
+MASKED_PRETRAINING_DF_DIR = os.path.join(MASKED_PRETRAINING_BASE_DIR, "dataframes")
+MASKED_PRETRAINING_TRAIN_RECORDS = 500_000
+MASKED_PRETRAINING_VAL_RECORDS = 50_000
+MASKED_PRETRAINING_TEST_RECORDS = 50_000
+MASKED_PRETRAINING_SHARDS_PER_SPLIT = 16
+MASKED_PRETRAINING_MAX_PARALLEL_SHARDS = 8
+MASKED_PRETRAINING_WORKERS_PER_SHARD = 8
+MASKED_PRETRAINING_SPLIT_SEED = 42
 
 # ============================================================================
 # Next-raster pretraining

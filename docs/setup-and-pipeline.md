@@ -313,3 +313,10 @@ environment. Adjust the activation path when the environment lives in scratch.
 
 Cluster partitions, QoS names, and account policies change over time. Verify
 them against current Savio documentation before submitting long-running jobs.
+
+## Masked pretraining dataset
+
+The separate single-timestep masked-pretraining dataset reuses the TEMPO and
+weather caches while maintaining its own positive/negative validity cache. See
+[`docs/masked-pretraining.md`](masked-pretraining.md) for its AOI splitting,
+sharding, cache-refresh, and finalization contract.
