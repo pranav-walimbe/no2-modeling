@@ -17,10 +17,12 @@ whether it has enough coverage.
 
 ## Output contract
 
-Stratification assigns intact geographic clusters toward a 70/15/15 split,
-removes each split's upper 5% of NOx mass, and randomly samples 300k/75k/75k
-records. Dataset generation keeps every sampled record that passes raster
-quality checks and reports failures without label-based resampling.
+Stratification scores every AOI with complete metadata, retains the configured
+top-ranked AOIs, assigns their intact geographic clusters toward a 70/15/15
+split, removes each split's upper 5% of NOx mass, and randomly samples
+300k/75k/75k records. Dataset generation keeps every sampled record that
+passes raster quality checks and reports failures without label-based
+resampling.
 
 ## Split independence
 
@@ -30,9 +32,9 @@ quality checks and reports failures without label-based resampling.
   the 70/15/15 total-record targets.
 - No plant region leaks across splits, so evaluation measures generalization to
   unseen geographic regions instead of interpolation at known plants.
-- The split precedes NOx-mass pruning, record sampling, and train-only raster
-  and tabular normalization. Each split therefore has its own 95th-percentile
-  NOx-mass cutoff.
+- AOI selection precedes the geographic split. The split then precedes NOx-mass
+  pruning, record sampling, and train-only raster and tabular normalization.
+  Each split therefore has its own 95th-percentile NOx-mass cutoff.
 
 ## Metadata eligibility and outliers
 
@@ -45,8 +47,26 @@ Before any image processing, a candidate needs:
 - finite prior-quarter power generation and distance to a city of 500,000 or
   more people for priority sampling.
 
-Coal share is not an eligibility constraint, so gas and mixed-fuel AOIs remain
-candidates.
+Coal share is not an eligibility constraint, so gas and mixed-fuel AOIs can
+enter the selected set when their other score components are strong.
+
+## AOI selection score
+
+`AOI_SELECTION_COUNT` controls how many AOIs survive before geographic
+splitting. The score is a weighted sum on a 0 to 100 scale:
+
+| Component | Weight | Definition |
+|---|---:|---|
+| Coal production share | 25% | Positive gross generation from coal units divided by positive gross generation from every unit in the AOI over the full archive |
+| Signal strength | 25% | Percentile rank of the log-transformed AOI hourly NOx P75 |
+| Event support | 20% | Percentile rank of meaningful hourly NOx-change counts with a modest reward for having both increase and decrease events |
+| Urban isolation | 15% | Linear score from zero at 25 km to one at 150 km from the nearest major city, clipped outside that range |
+| Observation yield | 15% | 75% complete-record count percentile and 25% complete-record-rate percentile |
+
+A meaningful event exceeds the larger of 100 lb and 25% of the AOI's
+previous-quarter median NOx. Ties in the total score are resolved by AOI ID.
+The batch-job PNG lists the represented AOIs by split and shows the percentage
+of final sampled records belonging to each AOI.
 
 ## Targets and tabular features
 
@@ -119,21 +139,21 @@ Retrieval uncertainty does not filter or rank records. Generation summaries
 report retained counts, full-sequence coverage rates, and represented AOIs.
 Coverage remains a dataset diagnostic and is not supplied to the model.
 
-## Quantities that do not select records
+## Additional record-level quantities
 
 | Quantity | Role | Why not a filter |
 |---|---|---|
 | Mean cloud and quality fractions | Diagnostics | Native cloud and quality filtering already decides whether NO2 is accepted. |
-| Distance to the nearest major city | Tabular feature | Urban context may be predictive, but centroid distance is not a reliable contamination boundary. |
+| Distance to the nearest major city | Tabular feature and AOI score input | The model receives the raw distance while AOI selection uses a bounded isolation score. |
 
 ## Candidate selection
 
 Before raster generation, apply these rules to every split:
 
 - Preserve every finite major-city distance without imposing a minimum distance.
-- Average each unit's previous-quarter output, then sum the unit averages by AOI.
-- Retain only AOIs where coal units supply more than 50 percent of that total.
-- Keep every record that passes the eligibility rules.
+- Score eligible AOIs across the complete emissions and observation-mapping archive.
+- Retain the top `AOI_SELECTION_COUNT` AOIs before assigning geographic splits.
+- Randomly sample eligible records within each split without seasonal or target-bin balancing.
 
 ## Final raster selection
 

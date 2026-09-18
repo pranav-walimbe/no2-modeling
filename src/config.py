@@ -52,6 +52,7 @@ TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # stratified split output directory
+AOI_SELECTION_COUNT = 75  # highest-scoring AOIs retained before geographic splitting
 TRAIN_RECORDS = 300_000  # records passed from stratification to training dataset generation
 VAL_RECORDS = 75_000  # records passed from stratification to validation dataset generation
 TEST_RECORDS = 75_000  # records passed from stratification to test dataset generation

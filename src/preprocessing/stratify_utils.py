@@ -20,6 +20,20 @@ from config import (
 )
 
 AOI_ID_COL = "aoi_id"
+AOI_SCORE_COL = "aoi_score"
+COAL_SHARE_COL = "coal_production_share"
+SIGNAL_STRENGTH_SCORE_COL = "signal_strength_score"
+EVENT_SUPPORT_SCORE_COL = "event_support_score"
+URBAN_ISOLATION_SCORE_COL = "urban_isolation_score"
+OBSERVATION_YIELD_SCORE_COL = "observation_yield_score"
+AOI_SCORE_COMPONENTS = (
+    (COAL_SHARE_COL, 0.25, "Coal production share"),
+    (SIGNAL_STRENGTH_SCORE_COL, 0.25, "Signal strength"),
+    (EVENT_SUPPORT_SCORE_COL, 0.20, "Event support"),
+    (URBAN_ISOLATION_SCORE_COL, 0.15, "Urban isolation"),
+    (OBSERVATION_YIELD_SCORE_COL, 0.15, "Observation yield"),
+)
+AOI_EVENT_ABSOLUTE_DELTA_THRESHOLD = 100.0
 MAJOR_CITY_DIST_COL = "major_city_dist"
 LABEL_MODE_COL = "label_mode"
 PREVIOUS_QUARTER_COAL_POWER_COL = "_previous_quarter_coal_power"
@@ -485,6 +499,133 @@ def _fuel_flags() -> tuple[pl.Expr, pl.Expr]:
     # Prefer hourly fuel metadata and fall back to facility attributes
     fuel = pl.coalesce("primaryFuelInfo", "attributePrimaryFuelInfo").fill_null("").str.to_lowercase()
     return fuel.str.contains("coal"), fuel.str.contains("natural gas")
+
+
+def calculate_aoi_scores(
+    records: pl.DataFrame | pl.LazyFrame,
+    hourly: pl.DataFrame,
+    eligible_records: pl.DataFrame,
+    aois: pl.DataFrame,
+    membership: pl.DataFrame,
+) -> pl.DataFrame:
+    """Score AOIs for source strength, events, isolation, and observation yield.
+
+    Args:
+        records: Full unit-hour emissions history with production and fuel fields.
+        hourly: Valid AOI-hour emissions aggregates over the full history.
+        eligible_records: AOI-hour rows with complete sequence metadata and targets.
+        aois: AOI centroids carrying distance to the nearest major city.
+        membership: Facility-to-AOI membership table.
+
+    Returns:
+        One row per scoreable AOI with raw diagnostics and component scores.
+    """
+    records_lazy = records.lazy() if isinstance(records, pl.DataFrame) else records
+    coal, _ = _fuel_flags()
+    production = (
+        records_lazy.filter(pl.col("grossLoad").is_finite() & (pl.col("grossLoad") > 0))
+        .with_columns(coal.alias("_is_coal"))
+        .join(membership.lazy(), on="facilityId", how="inner")
+        .group_by(AOI_ID_COL)
+        .agg(
+            pl.col("grossLoad").sum().alias("_total_production"),
+            pl.col("grossLoad").filter(pl.col("_is_coal")).sum().alias("_coal_production"),
+        )
+        .with_columns(
+            (pl.col("_coal_production") / pl.col("_total_production")).alias(COAL_SHARE_COL)
+        )
+        .collect(engine="streaming")
+    )
+
+    event_threshold = pl.max_horizontal(
+        pl.lit(AOI_EVENT_ABSOLUTE_DELTA_THRESHOLD),
+        pl.col(PREV_QTR_MED_NOX_COL) * 0.25,
+    )
+    emissions_metrics = (
+        hourly.group_by(AOI_ID_COL)
+        .agg(
+            pl.col(NOX_COL)
+            .filter(pl.col(NOX_COL).is_finite() & (pl.col(NOX_COL) >= 0))
+            .quantile(0.75, interpolation="linear")
+            .alias("signal_strength_p75"),
+            (pl.col("delta_nox_mass") >= event_threshold).sum().alias("up_event_count"),
+            (pl.col("delta_nox_mass") <= -event_threshold).sum().alias("down_event_count"),
+            pl.len().alias("candidate_hour_count"),
+        )
+        .with_columns(
+            (pl.col("up_event_count") + pl.col("down_event_count")).alias("event_count")
+        )
+        .with_columns(
+            (
+                2
+                * pl.min_horizontal("up_event_count", "down_event_count")
+                / pl.max_horizontal("event_count", pl.lit(1))
+            ).alias("event_direction_balance")
+        )
+        .with_columns(
+            (
+                pl.col("event_count").log1p()
+                * (0.75 + 0.25 * pl.col("event_direction_balance"))
+            ).alias("event_support_raw")
+        )
+    )
+    observation_metrics = eligible_records.group_by(AOI_ID_COL).agg(
+        pl.len().alias("observable_record_count")
+    )
+    scores = (
+        production.join(emissions_metrics, on=AOI_ID_COL, how="inner")
+        .join(observation_metrics, on=AOI_ID_COL, how="inner")
+        .join(aois.select(AOI_ID_COL, MAJOR_CITY_DIST_COL), on=AOI_ID_COL, how="inner")
+        .filter(
+            pl.col(COAL_SHARE_COL).is_finite()
+            & pl.col("signal_strength_p75").is_finite()
+            & pl.col(MAJOR_CITY_DIST_COL).is_finite()
+            & (pl.col("_total_production") > 0)
+            & (pl.col("candidate_hour_count") > 0)
+            & (pl.col("observable_record_count") > 0)
+        )
+        .with_columns(
+            (pl.col("observable_record_count") / pl.col("candidate_hour_count")).alias(
+                "observation_rate"
+            ),
+            pl.col("signal_strength_p75").log1p().alias("signal_strength_raw"),
+            ((pl.col(MAJOR_CITY_DIST_COL) - 25.0) / 125.0)
+            .clip(0.0, 1.0)
+            .alias(URBAN_ISOLATION_SCORE_COL),
+        )
+        .with_columns(
+            (pl.col("signal_strength_raw").rank(method="average") / pl.len()).alias(
+                SIGNAL_STRENGTH_SCORE_COL
+            ),
+            pl.when(pl.col("event_count") > 0)
+            .then(pl.col("event_support_raw").rank(method="average") / pl.len())
+            .otherwise(0.0)
+            .alias(EVENT_SUPPORT_SCORE_COL),
+            (pl.col("observable_record_count").log1p().rank(method="average") / pl.len()).alias(
+                "_observation_count_score"
+            ),
+            (pl.col("observation_rate").rank(method="average") / pl.len()).alias(
+                "_observation_rate_score"
+            ),
+        )
+        .with_columns(
+            (
+                0.75 * pl.col("_observation_count_score")
+                + 0.25 * pl.col("_observation_rate_score")
+            ).alias(OBSERVATION_YIELD_SCORE_COL)
+        )
+        .with_columns(
+            (
+                100
+                * pl.sum_horizontal(
+                    [pl.col(column) * weight for column, weight, _ in AOI_SCORE_COMPONENTS]
+                )
+            ).alias(AOI_SCORE_COL)
+        )
+        .drop("_coal_production", "_observation_count_score", "_observation_rate_score")
+        .sort(AOI_SCORE_COL, AOI_ID_COL, descending=[True, False])
+    )
+    return scores
 
 
 def previous_quarter_power_priorities(
