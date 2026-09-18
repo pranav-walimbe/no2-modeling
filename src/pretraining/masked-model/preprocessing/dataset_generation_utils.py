@@ -26,7 +26,16 @@ from preprocessing.generate_dataset_utils import (
     weather_batches,
 )
 
-from config import IMG_SIZE
+from config import (
+    IMG_SIZE,
+    MASKED_PRETRAINING_MASK_CLUMP_SIGMA_PIXELS,
+    MASKED_PRETRAINING_MASK_CLUMP_STRENGTH,
+    MASKED_PRETRAINING_MASK_EDGE_DECAY_PIXELS,
+    MASKED_PRETRAINING_MASK_EDGE_STRENGTH,
+    MASKED_PRETRAINING_MASK_MAX_CLUMP_MULTIPLIER,
+    MASKED_PRETRAINING_MAX_MASK_FRACTION,
+    MASKED_PRETRAINING_MIN_MASK_FRACTION,
+)
 
 VALID_STATUS = "valid"
 INVALID_STATUS = "invalid"
@@ -34,6 +43,17 @@ RETRYABLE_STATUS = "retryable"
 MASKED_NO2_RASTER_NAME = "masked_no2"
 ARTIFICIAL_MASK_NAME = "artificial_mask"
 SHARD_RECORDS_FILE = "records.csv"
+
+_MASK_ROWS, _MASK_COLUMNS = np.indices((IMG_SIZE, IMG_SIZE))
+_MASK_EDGE_DISTANCE = np.minimum.reduce(
+    (_MASK_ROWS, _MASK_COLUMNS, IMG_SIZE - 1 - _MASK_ROWS, IMG_SIZE - 1 - _MASK_COLUMNS)
+)
+_MASK_BASE_WEIGHTS = 1.0 + MASKED_PRETRAINING_MASK_EDGE_STRENGTH * np.exp(
+    -_MASK_EDGE_DISTANCE / MASKED_PRETRAINING_MASK_EDGE_DECAY_PIXELS
+)
+_MASK_COORDINATES = np.column_stack((_MASK_ROWS.ravel(), _MASK_COLUMNS.ravel()))
+_MASK_PAIRWISE_SQUARED_DISTANCE = ((_MASK_COORDINATES[:, None] - _MASK_COORDINATES[None, :]) ** 2).sum(axis=2)
+_MASK_CLUMP_KERNELS = np.exp(-_MASK_PAIRWISE_SQUARED_DISTANCE / (2.0 * MASKED_PRETRAINING_MASK_CLUMP_SIGMA_PIXELS**2))
 
 CANDIDATE_SCHEMA = {
     "candidate_index": pl.UInt64,
@@ -454,19 +474,40 @@ def process_candidate_batch(
     return [results[make_scan_task(row, "granule_paths", tempo_root, tempo_cache_dir).cache_key] for row in rows]
 
 
-def mask_no2_raster(no2: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray] | None:
-    """Create masked NO2 and the artificial mask.
+def mask_no2_raster(
+    no2: np.ndarray,
+    mask_fraction: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create masked NO2 and its observed-pixel mask.
 
     Args:
         no2: Complete NO2 raster.
+        mask_fraction: Fraction of raster pixels to mask.
         rng: Random generator for mask sampling.
 
     Returns:
-        Masked NO2 and its mask once EDA defines the algorithm.
+        Masked NO2 and a binary mask where one marks observed pixels.
     """
-    del no2, rng
-    # Missingness EDA will define the masking contract
-    return None
+    masked_pixels = np.zeros((IMG_SIZE, IMG_SIZE), dtype=bool)
+    clump_influence = np.zeros(IMG_SIZE * IMG_SIZE, dtype=np.float64)
+    masked_pixel_count = round(mask_fraction * masked_pixels.size)
+
+    for _ in range(masked_pixel_count):
+        clump_multiplier = np.minimum(
+            1.0 + MASKED_PRETRAINING_MASK_CLUMP_STRENGTH * clump_influence,
+            MASKED_PRETRAINING_MASK_MAX_CLUMP_MULTIPLIER,
+        )
+        weights = _MASK_BASE_WEIGHTS.ravel() * clump_multiplier
+        weights[masked_pixels.ravel()] = 0.0
+        selected_pixel = int(rng.choice(masked_pixels.size, p=weights / weights.sum()))
+        masked_pixels.ravel()[selected_pixel] = True
+        clump_influence += _MASK_CLUMP_KERNELS[selected_pixel]
+
+    masked_no2 = no2.copy()
+    masked_no2[masked_pixels] = 0.0
+    observed_mask = (~masked_pixels).astype(np.uint8)
+    return masked_no2, observed_mask
 
 
 def materialize_masked_record(task: MaskedRecordTask) -> dict[str, object]:
@@ -491,12 +532,9 @@ def materialize_masked_record(task: MaskedRecordTask) -> dict[str, object]:
             )
         }
     no2 = np.asarray(arrays[NO2_RASTER_NAME], dtype=np.float32)
-    masked = mask_no2_raster(no2, np.random.default_rng(task.mask_seed))
-    if masked is None:
-        raise NotImplementedError(
-            "mask_no2_raster is intentionally empty until missingness EDA defines the masking algorithm"
-        )
-    masked_no2, artificial_mask = masked
+    rng = np.random.default_rng(task.mask_seed)
+    mask_fraction = rng.uniform(MASKED_PRETRAINING_MIN_MASK_FRACTION, MASKED_PRETRAINING_MAX_MASK_FRACTION)
+    masked_no2, artificial_mask = mask_no2_raster(no2, mask_fraction, rng)
     if masked_no2.shape != no2.shape or artificial_mask.shape != no2.shape:
         raise ValueError("Masked NO2 and artificial mask must match the original NO2 shape")
     write_npz_atomic(
