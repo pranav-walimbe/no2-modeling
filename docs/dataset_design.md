@@ -65,8 +65,8 @@ splitting. The score is a weighted sum on a 0 to 100 scale:
 
 A meaningful event exceeds the larger of 100 lb and 25% of the AOI's
 previous-quarter median NOx. Ties in the total score are resolved by AOI ID.
-The batch-job PNG lists every selected AOI by split and shows these weighted
-components as stacked horizontal bars.
+The batch-job PNG lists the represented AOIs by split and shows the percentage
+of final sampled records belonging to each AOI.
 
 ## Targets and tabular features
 

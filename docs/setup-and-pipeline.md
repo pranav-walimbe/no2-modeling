@@ -188,7 +188,7 @@ array such as `0-31%14`.
   mass;
 - deterministically random-samples the retained pools to 300,000 training and
   75,000 validation and test records;
-- saves and emails a stacked bar chart listing every selected AOI by split.
+- saves and emails a bar chart of each AOI's percentage of final records by split.
 
 `preprocessing.generate_dataset`:
 

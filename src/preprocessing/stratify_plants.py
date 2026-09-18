@@ -24,8 +24,6 @@ from config import (
 )
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
-    AOI_SCORE_COL,
-    AOI_SCORE_COMPONENTS,
     DELTA_EFFECTIVE_NOX_SCALED_COL,
     DELTA_NOX_COL,
     DELTA_NOX_SCALED_COL,
@@ -117,13 +115,17 @@ REQUIRED_COLUMNS = [
     "facility_nameplate_capacity_mw",
 ]
 
-DEFAULT_AOI_SCORE_OUTPUT = Path(VIS_DIR) / "stratification_aoi_scores.png"
+DEFAULT_AOI_RECORD_SHARE_OUTPUT = Path(VIS_DIR) / "stratification_aoi_record_shares.png"
 
 
 def parse_args() -> argparse.Namespace:
     """Parse stratification command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--aoi-score-output", type=Path, default=DEFAULT_AOI_SCORE_OUTPUT)
+    parser.add_argument(
+        "--aoi-record-share-output",
+        type=Path,
+        default=DEFAULT_AOI_RECORD_SHARE_OUTPUT,
+    )
     return parser.parse_args()
 
 
@@ -194,54 +196,59 @@ def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _plot_selected_aoi_scores(
-    scores: pl.DataFrame,
+def _plot_aoi_record_shares(
     splits: dict[str, pl.DataFrame],
     output_path: Path,
 ) -> None:
-    # Show every selected AOI and its weighted score components by split
+    # Show each AOI's percentage of the final sampled records by split
     split_names = tuple(SPLIT_FRACTIONS)
-    scores_by_split = {
-        name: scores.join(split.select(AOI_ID_COL).unique(), on=AOI_ID_COL, how="inner").sort(
-            AOI_SCORE_COL, AOI_ID_COL, descending=[True, False]
-        )
+    shares_by_split = {
+        name: split.group_by(AOI_ID_COL)
+        .agg(pl.len().alias("record_count"))
+        .with_columns((100 * pl.col("record_count") / split.height).alias("record_share_percent"))
+        .sort("record_share_percent", AOI_ID_COL, descending=[True, False])
         for name, split in splits.items()
     }
-    max_aois = max(frame.height for frame in scores_by_split.values())
+    max_aois = max(frame.height for frame in shares_by_split.values())
+    max_share = max(
+        frame["record_share_percent"].max()
+        for frame in shares_by_split.values()
+        if not frame.is_empty()
+    )
     figure, axes = plt.subplots(
         1,
         len(split_names),
         figsize=(24, max(10, max_aois * 0.32)),
         constrained_layout=True,
+        sharex=True,
     )
     colors = plt.get_cmap("tab10").colors
-    for axis, split_name in zip(axes, split_names, strict=True):
-        split_scores = scores_by_split[split_name]
-        positions = list(range(split_scores.height))
-        left = [0.0] * split_scores.height
-        for component_index, (column, weight, label) in enumerate(AOI_SCORE_COMPONENTS):
-            contribution = (split_scores[column] * weight * 100).to_numpy()
-            axis.barh(
-                positions,
-                contribution,
-                left=left,
-                label=label,
-                color=colors[component_index],
-            )
-            left = [current + float(value) for current, value in zip(left, contribution, strict=True)]
-        axis.set_yticks(positions, [str(aoi_id) for aoi_id in split_scores[AOI_ID_COL]])
+    for split_index, (axis, split_name) in enumerate(zip(axes, split_names, strict=True)):
+        split_shares = shares_by_split[split_name]
+        positions = list(range(split_shares.height))
+        percentages = split_shares["record_share_percent"].to_numpy()
+        axis.barh(
+            positions,
+            percentages,
+            color=colors[split_index],
+        )
+        axis.set_yticks(positions, [str(aoi_id) for aoi_id in split_shares[AOI_ID_COL]])
         axis.invert_yaxis()
-        axis.set_xlim(0, 105)
+        axis.set_xlim(0, max_share * 1.15)
         axis.grid(axis="x", alpha=0.25)
         axis.set_axisbelow(True)
-        axis.set_xlabel("Weighted AOI score")
+        axis.set_xlabel("Share of split records (%)")
         axis.set_ylabel("AOI ID")
-        axis.set_title(f"{split_name}: {split_scores.height} AOIs")
-        for position, score in zip(positions, split_scores[AOI_SCORE_COL], strict=True):
-            axis.text(float(score) + 0.5, position, f"{float(score):.1f}", va="center", fontsize=7)
-    handles, labels = axes[0].get_legend_handles_labels()
-    figure.legend(handles, labels, loc="outside lower center", ncols=len(AOI_SCORE_COMPONENTS))
-    figure.suptitle(f"Top {scores.height} AOIs by plume-modelability score")
+        axis.set_title(f"{split_name}: {split_shares.height} AOIs, {splits[split_name].height:,} records")
+        for position, percentage in zip(positions, percentages, strict=True):
+            axis.text(
+                float(percentage) + max_share * 0.01,
+                position,
+                f"{float(percentage):.2f}%",
+                va="center",
+                fontsize=7,
+            )
+    figure.suptitle("AOI shares of final sampled records by split")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
@@ -315,8 +322,6 @@ def main() -> None:
     frame = frame.join(selected_aoi_scores.select(AOI_ID_COL), on=AOI_ID_COL, how="inner")
     print(f"Selected the top {selected_aoi_scores.height} of {aoi_scores.height} scoreable AOIs")
     splits = _split_by_cluster(frame)
-    _plot_selected_aoi_scores(selected_aoi_scores, splits, args.aoi_score_output)
-    print(f"Saved selected-AOI score chart to {args.aoi_score_output}")
     splits = {
         split: select_split_records(
             split_frame,
@@ -326,6 +331,8 @@ def main() -> None:
         )
         for split, split_frame in splits.items()
     }
+    _plot_aoi_record_shares(splits, args.aoi_record_share_output)
+    print(f"Saved AOI record-share chart to {args.aoi_record_share_output}")
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     del frame, hourly
