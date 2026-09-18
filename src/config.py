@@ -116,6 +116,14 @@ MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular a
 MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to sine and cosine
 
 # ============================================================================
+# Masked pretraining
+# ============================================================================
+
+# ============================================================================
+# Next-raster pretraining
+# ============================================================================
+
+# ============================================================================
 # Other
 # ============================================================================
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))  # number of cores for parallelized jobs

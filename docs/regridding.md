@@ -42,7 +42,7 @@ gaps and forms explicit masks instead of interpolating them.
 
 ## Build model records
 
-`preprocessing.generate_dataset` deduplicates AOI-scan work and writes the
+`src/delta-model/preprocessing/generate_dataset.py` deduplicates AOI-scan work and writes the
 five-raster bundles to the persistent TEMPO cache under `DATASET_DIR`.
 
 Caching behavior:

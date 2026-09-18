@@ -96,6 +96,7 @@ shell or job:
 ```bash
 module load python/3.11.6-gcc-11.4.0
 source .venv/bin/activate
+export PYTHONPATH="$PWD/src:$PWD/src/delta-model"
 ```
 
 ### 1. Choose the TEMPO collection
@@ -110,12 +111,12 @@ TEMPO/<version>/<level>/raw/<year>/<month>/
 ### 2. Download TEMPO and HRRR
 
 ```bash
-python -u -m collection.scrape_tempo
-python -u -m collection.scrape_hrrr
+python -u src/data-scraping/scrape_tempo.py
+python -u src/data-scraping/scrape_hrrr.py
 ```
 
 - The TEMPO scraper searches one month at a time, downloads in batches set by
-  `DOWNLOAD_BATCH_SIZE` in `collection/scrape_tempo.py`, and skips files already
+  `DOWNLOAD_BATCH_SIZE` in `src/data-scraping/scrape_tempo.py`, and skips files already
   present at their final path. Rerunning a range is idempotent for completed
   files.
 - The HRRR scraper saves one atomic GRIB2 subset per UTC hour under
@@ -128,8 +129,8 @@ python -u -m collection.scrape_hrrr
 ### 3. Download emissions and facility locations
 
 ```bash
-python -u -m collection.scrape_emissions
-python -u -m collection.scrape_locations
+python -u src/data-scraping/scrape_emissions.py
+python -u src/data-scraping/scrape_locations.py
 ```
 
 Facility attributes:
@@ -272,7 +273,7 @@ Each batch job should:
 2. Write stdout and stderr to `logs/%x-%j.log` and `logs/%x-%j.err`; use `%A_%a`
    for arrays. Request `BEGIN`, `END`, and `FAIL` email notifications.
 3. Change to the repository root, load `python/3.11.6-gcc-11.4.0`, activate
-   `.venv`, and add `src` to `PYTHONPATH`.
+   `.venv`, and add both `src` and `src/delta-model` to `PYTHONPATH`.
 4. Export `SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"`, then launch the stage
    command with `srun`.
 
@@ -280,9 +281,9 @@ Use these stage-specific allocations and commands:
 
 | Stage | Savio request | Command and scheduler logic |
 |---|---|---|
-| TEMPO download | `savio4_htc`, `savio_normal`, 4 CPUs, 72 hours | Confirm `TEMPO_LEVEL="L2"` and `TEMPO_VERSION="V04"`, then run `python -u -m collection.scrape_tempo` |
-| HRRR download | `savio4_htc`, `savio_normal`, 4 CPUs per task, 48 hours | Split the date range across an array; pass each range to `collection.scrape_hrrr` with `--workers "$SLURM_CPUS_PER_TASK" --overwrite` |
-| Facility metadata | `savio4_htc`, `savio_normal`, 4 CPUs, 8 hours | Run `python -u -m collection.scrape_locations` |
+| TEMPO download | `savio4_htc`, `savio_normal`, 4 CPUs, 72 hours | Confirm `TEMPO_LEVEL="L2"` and `TEMPO_VERSION="V04"`, then run `python -u src/data-scraping/scrape_tempo.py` |
+| HRRR download | `savio4_htc`, `savio_normal`, 4 CPUs per task, 48 hours | Split the date range across an array; pass each range to `src/data-scraping/scrape_hrrr.py` with `--workers "$SLURM_CPUS_PER_TASK" --overwrite` |
+| Facility metadata | `savio4_htc`, `savio_normal`, 4 CPUs, 8 hours | Run `python -u src/data-scraping/scrape_locations.py` |
 | TEMPO index | `savio4_htc`, `savio_normal`, 16 CPUs, 2 hours | Run `python -u -m preprocessing.tempo_mapping index`; require success before observation tasks start |
 | TEMPO observations | `savio4_htc`, `savio_normal`, 4 CPUs per task, 8 hours | Use a `0-31%14` array and run `preprocessing.tempo_mapping observations --task-id "$SLURM_ARRAY_TASK_ID" --task-count 32` |
 | Stratification | `savio4_htc`, `savio_normal`, `savio4_m512`, 16 CPUs, 2 hours | Run `python -u -m preprocessing.stratify_plants` |

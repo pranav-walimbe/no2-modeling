@@ -166,10 +166,10 @@ Where settings live:
 
 | File | Owns |
 |---|---|
-| `config.py` | Shared data contract: paths, raster keys and channels, image clipping, input-feature definitions |
-| `modeling/train.py` | Training defaults |
-| `modeling/convgru.py` | Mask-aware spatial and temporal raster model |
-| `modeling/mlp.py` | Compact tabular model and embedding dimensions |
+| `src/config.py` | Shared data contract: paths, raster keys and channels, image clipping, input-feature definitions |
+| `src/delta-model/modeling/train.py` | Training defaults |
+| `src/delta-model/modeling/convgru.py` | Mask-aware spatial and temporal raster model |
+| `src/delta-model/modeling/mlp.py` | Compact tabular model and embedding dimensions |
 
 Training CLI flags expose the last two, which keeps preprocessing and collection
 code independent of any single run while each run still records its resolved
