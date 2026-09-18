@@ -1,7 +1,7 @@
 # Dataset design
 
-Retain each scientifically eligible AOI-hour until raster generation determines
-whether it has enough coverage.
+The delta-model dataset keeps each eligible AOI-hour until raster generation
+applies its coverage checks.
 
 ## Design summary
 
@@ -10,185 +10,117 @@ whether it has enough coverage.
 | Split unit | Geographic clusters of overlapping 72 km AOIs |
 | Split target | Approximately 70% train, 15% validation, 15% test |
 | Targets | Raw and scaled hourly and effective NOx changes |
-| Metadata filters | Required source data and per-split upper 5% NOx-mass pruning |
-| Raster gates | More than 95% current coverage and 80% paired coverage |
-| Final selection | Keep every record that passes raster quality checks |
-| Model selection | Validation data only; freeze test data for final comparison |
+| Metadata filters | Required source data and each split's upper 5% NOx-mass cutoff |
+| Raster gates | At least 95% coverage per timestep and complete 3 by 3 hotspot coverage |
+| Final selection | Every record that passes raster checks |
+| Model selection | Validation only; test remains frozen |
 
-## Output contract
-
-Stratification scores every AOI with complete metadata, retains the configured
-top-ranked AOIs, assigns their intact geographic clusters toward a 70/15/15
-split, removes each split's upper 5% of NOx mass, and randomly samples
-up to 300k/75k/75k records. Dataset generation keeps every sampled record that
-passes raster quality checks and reports failures without label-based
-resampling.
+Stratification scores eligible AOIs, keeps the top `AOI_SELECTION_COUNT`, assigns
+intact overlap clusters to splits, applies each split's NOx-mass cutoff, and
+samples at most 300,000/75,000/75,000 records. Dataset generation keeps all
+sampled records that pass raster checks. It never resamples by label.
 
 ## Split independence
 
-- Overlapping 72 km AOIs form geographic clusters.
-- Each cluster belongs to exactly one of train, validation, or test.
-- A deterministic largest-cluster-first assignment minimizes deviations from
-  the 70/15/15 total-record targets.
-- No plant region leaks across splits, so evaluation measures generalization to
-  unseen geographic regions instead of interpolation at known plants.
-- AOI selection precedes the geographic split. The split then precedes NOx-mass
-  pruning, record sampling, and train-only raster and tabular normalization.
-  Each split therefore has its own 95th-percentile NOx-mass cutoff.
+- Each cluster of overlapping 72 km AOIs belongs to one split.
+- A deterministic largest-cluster-first assignment targets the 70/15/15 ratio.
+- AOI selection precedes splitting. Splitting precedes outlier pruning, record
+  sampling, and train-only normalization.
+- Each split computes its own 95th-percentile NOx-mass cutoff.
 
-## Metadata eligibility and outliers
+This order prevents a plant region from crossing split boundaries and tests
+transfer to unseen regions.
 
-Before any image processing, a candidate needs:
+## Metadata eligibility and AOI selection
+
+A candidate requires:
 
 - usable CAMPD measurements and a finite previous-quarter NOx average;
-- current and previous TEMPO observations separated by 40 to 70 minutes;
-- at least 50 percent temporal overlap with the assigned emissions hour;
-- a mapped HRRR analysis path, with file existence checked during generation;
-- finite prior-quarter power generation and distance to a city of 500,000 or
-  more people for priority sampling.
+- consecutive TEMPO observations 40 to 70 minutes apart;
+- at least 50% overlap with the assigned emissions hour;
+- a mapped HRRR analysis path, checked during generation;
+- finite prior-quarter power generation and major-city distance for scoring.
 
-Coal share is not an eligibility constraint, so gas and mixed-fuel AOIs can
-enter the selected set when their other score components are strong.
-
-## AOI selection score
-
-`AOI_SELECTION_COUNT` controls how many AOIs survive before geographic
-splitting. The score is a weighted sum on a 0 to 100 scale:
+Coal share does not determine eligibility. The AOI score is a weighted sum on a
+0 to 100 scale:
 
 | Component | Weight | Definition |
 |---|---:|---|
-| Coal production share | 25% | Positive gross generation from coal units divided by positive gross generation from every unit in the AOI over the full archive |
-| Signal strength | 25% | Percentile rank of the log-transformed AOI hourly NOx P75 |
-| Event support | 20% | Percentile rank of meaningful hourly NOx-change counts with a modest reward for having both increase and decrease events |
-| Urban isolation | 15% | Linear score from zero at 25 km to one at 150 km from the nearest major city, clipped outside that range |
-| Observation yield | 15% | 75% complete-record count percentile and 25% complete-record-rate percentile |
+| Coal production share | 25% | Positive coal generation divided by all positive generation in the AOI archive |
+| Signal strength | 25% | Percentile rank of log-transformed hourly NOx P75 |
+| Event support | 20% | Rank of meaningful-change counts, with a reward for both directions |
+| Urban isolation | 15% | Linear score from 25 km to 150 km from the nearest major city |
+| Observation yield | 15% | 75% complete-record count rank and 25% complete-record-rate rank |
 
-A meaningful event exceeds the larger of 100 lb and 25% of the AOI's
-previous-quarter median NOx. Ties in the total score are resolved by AOI ID.
-The batch-job PNG lists the represented AOIs by split and shows the percentage
-of final sampled records belonging to each AOI.
+A meaningful event exceeds 100 lb or 25% of the AOI's previous-quarter median
+NOx, whichever is larger. AOI ID breaks score ties. The split chart reports each
+AOI's share of final sampled records.
 
-## Targets and tabular features
+## Targets and features
 
-All joins use UTC:
+All joins use UTC. Facility enrichment converts CAMPD local standard time to
+UTC and retains the source fields, facility timezone, and standard offset for
+auditing. The model derives local mean solar hour from UTC and longitude.
 
-- Facility-location enrichment converts emission hours from CAMPD local standard
-  time to UTC.
-- AOI aggregation, TEMPO pairing, HRRR lookup, and the emitted `date` and `hour`
-  all share that clock.
-- The model converts UTC hour and AOI longitude to local mean solar hour at load
-  time. UTC remains the stored and joined clock.
-- The enriched archive keeps the source local-standard fields, each facility's
-  timezone, and its standard offset for auditability.
-
-Stratification preserves the raw hourly NOx change, the effective EMA change,
-and their prior-quarter-scaled forms. It does not convert these continuous
-targets into classes or filter them using a classification deadband.
-
-Each sample stores five time-major arrays on a fixed 24 by 24 grid:
-
-| Array | Notes |
-|---|---|
-| directly regridded NO2 | one direct field per scan; finite where native QA-passing support exists |
-| NO2 validity mask | independent binary support for each scan's NO2 field |
-| 2 m temperature | sampled from HRRR at every AOI cell center and scan-aligned hour |
-| eastward wind, northward wind | sampled from HRRR at every AOI cell center and scan-aligned hour |
-
-Prior-quarter heat input and power generation keep contemporaneous operational
-leakage out. `prev_qtr_avg_nox` is the mean level of the AOI's
-hourly `nox_mass` totals over the immediately preceding calendar quarter (not a
-delta). Stratification uses it to calculate `prev_qtr_rel_delta`, but the model
-does not receive either field. The model does receive `major_city_dist`, which
-is normalized from the training split with the other scalar inputs.
-
-Nameplate capacity:
-
-- Collection parses each CAMPD generator-capacity pair and deduplicates
-  generators within a facility and attribute year.
-- AOI aggregation sums each member facility once.
-- Conflicting values for one facility-generator pair contribute nothing.
-- Each prediction uses the latest attribute year at or before its own year.
-- Total capacity in MW enters the model as a numeric feature.
-
-`TARGET_LABEL_MODE` selects the target construction:
+Stratification preserves raw hourly NOx change, effective EMA change, and their
+prior-quarter-scaled forms. It does not create classes or apply a deadband.
+`TARGET_LABEL_MODE` controls label alignment:
 
 | Mode | Behavior |
 |---|---|
-| `hard_hour` | Keeps the change for the clock hour with the best scan overlap |
-| `overlap_weighted` | Averages every hourly change the scan interval touches, weighted by overlap seconds, and requires complete label coverage across that interval |
+| `hard_hour` | Uses the clock hour with the greatest scan overlap |
+| `overlap_weighted` | Averages touched hourly changes by overlap seconds and requires complete label coverage |
 
-Keep `hard_hour` as the default until both modes compete on frozen splits.
+`hard_hour` remains the default until both modes are compared on frozen splits.
 
-## Raster eligibility and masks
+Each record stores five time-major 24 by 24 arrays:
 
-The native regridder accepts an NO2 contributor only when:
+| Array | Contents |
+|---|---|
+| `no2` | Directly regridded NO2 on native QA-passing support |
+| `no2_mask` | Independent binary support mask |
+| `temperature_2m_k` | HRRR temperature at AOI cell centers |
+| `wind_u_80m_mps`, `wind_v_80m_mps` | Geographic eastward and northward HRRR wind |
 
-- its quality flag is zero;
-- cloud fraction is at most 0.20;
-- value and geometry are valid;
-- a positive area of accepted support reaches an output cell.
+Scalar model features use prior-quarter heat input and power generation to
+avoid contemporaneous leakage. `prev_qtr_avg_nox` is the preceding calendar
+quarter's mean AOI-hour NOx level. Stratification uses it for
+`prev_qtr_rel_delta`, but neither field enters the model. Major-city distance
+does enter the model.
 
-Missing cells are never interpolated. Every configured timestep must have at
-least 95% finite NO2 coverage. It must also have complete coverage in a 3 by 3
-window around the raster cell containing the largest cluster of modeled units.
-Facilities in the same raster cell contribute their combined unit count. Equal
-counts are resolved by unit-weighted distance to the AOI centre. After both
-gates pass, each scan retains its directly regridded values and validity mask.
+Generator capacity is deduplicated by facility, generator, and attribute year.
+Conflicting values contribute nothing. Each prediction uses the latest
+attribute year no later than its prediction year, then sums each facility once.
 
-Retrieval uncertainty does not filter or rank records. Generation summaries
-report retained counts, full-sequence coverage rates, and represented AOIs.
-Coverage remains a dataset diagnostic and is not supplied to the model.
+## Raster eligibility
 
-## Additional record-level quantities
+The regridder accepts an NO2 contributor when its quality flag is zero, cloud
+fraction is at most 0.20, its value and geometry are valid, and it has positive
+overlap with an output cell. Missing cells remain missing.
 
-| Quantity | Role | Why not a filter |
-|---|---|---|
-| Mean cloud and quality fractions | Diagnostics | Native cloud and quality filtering already decides whether NO2 is accepted. |
-| Distance to the nearest major city | Tabular feature and AOI score input | The model receives the raw distance while AOI selection uses a bounded isolation score. |
+Every timestep needs at least 95% finite NO2 coverage and complete coverage in
+a 3 by 3 window around the cell containing the largest modeled-unit cluster.
+Facilities in one cell contribute their combined unit count. Unit-weighted
+distance to the AOI center resolves ties.
 
-## Candidate selection
+Retrieval uncertainty, cloud, quality, and coverage summaries remain
+diagnostics. They do not filter, rank, or enter the model.
 
-Before raster generation, apply these rules to every split:
+## Generation and evaluation
 
-- Preserve every finite major-city distance without imposing a minimum distance.
-- Score eligible AOIs across the complete emissions and observation-mapping archive.
-- Retain the top `AOI_SELECTION_COUNT` AOIs before assigning geographic splits.
-- Randomly sample eligible records within each split without seasonal or target-bin balancing.
+Generation uses bounded worker queues and persistent TEMPO and weather caches.
+Each launch clears disposable shards and published metadata, then runs a
+throttled Slurm array. The finalizer validates every shard and publishes paths
+relative to the dataset root without copying raster files. A failed worker
+prevents publication; the next launch rebuilds all shards.
 
-## Final raster selection
+For each dataset, record:
 
-Keep every sampled record that passes raster quality checks. Finalization does
-not duplicate, rank, or drop successful records based on a target or label.
-
-## Performance and persistence
-
-- Metadata operations use Polars and project only the required columns.
-- Generation bounds the number of pending worker futures and caches each unique
-  AOI scan for one run.
-- The Slurm array defaults to eight concurrent shards with eight process workers
-  per shard. Completed tasks release array slots for the remaining queued shards.
-- Candidate delta rasters and outcome CSVs are written directly into disposable
-  shards. Every launch first removes the previous shard tree and published
-  metadata while retaining the TEMPO and wind caches.
-- Final dataframes reference selected rasters by paths relative to the dataset
-  root, such as `shards/train/000003/record-rasters/train/000012.npz`.
-- Finalization performs no per-raster link, copy, move, or deletion. Selected
-  and unselected successful rasters remain in the one current shard tree.
-- A failed worker prevents finalization and may leave partial shards. The next
-  launch starts with an empty shard tree rather than resuming them.
-
-For large archives, run stratification and raster generation through Slurm.
-
-## Evaluation checklist
-
-For every generated dataset, record:
-
-- candidate, processing-success, and final counts;
+- candidate, successful, and final counts;
 - AOIs and geographic clusters per split;
-- records per AOI, year, quarter, and observation hour;
-- distributions of target values, fuel mix, plant size, and weather;
-- metrics overall and by AOI, target magnitude, season, and fuel;
-- a trivial tabular-only baseline against image-plus-tabular models.
+- records by AOI, time, target magnitude, fuel mix, plant size, and weather;
+- overall and subgroup metrics;
+- a tabular-only baseline against raster models.
 
-Freeze the test set once these checks pass, then choose filter thresholds and
-feature definitions from training and validation alone.
+Freeze the test set after these checks. Choose thresholds, features, and models
+from training and validation only.

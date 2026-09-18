@@ -1,230 +1,136 @@
 # Modeling
 
-The binary baseline classifies power-plant NOx changes from causal consecutive
-TEMPO scans and aligned hourly HRRR fields.
+The delta-model baseline classifies hourly power-plant NOx changes from causal
+TEMPO sequences and aligned HRRR weather.
 
-## Baseline at a glance
+## Baseline
 
 | Component | Choice |
 |---|---|
-| Target | Sign of hourly NOx change outside a 100 lb deadband |
-| Raster input | `T` consecutive NO2 scans, validity masks, and aligned 2 m temperature and wind U/V fields |
-| Context input | Plant attributes, prior-quarter activity, and time |
+| Target | Sign of effective hourly NOx change outside a 100 lb deadband |
+| Raster input | `T` NO2 scans, validity masks, temperature, and geographic wind U/V |
+| Scalar input | Plant attributes, prior-quarter activity, and time |
 | Split | Geographic AOI clusters, approximately 70/15/15 |
-| Raster encoder | Shared mask-aware spatial encoder followed by a ConvGRU |
-| Models | Independent raster-only ConvGRU and tabular-only MLP |
-| Selection metric | Validation log loss |
-| Final metrics | ROC AUC and log loss across seeds, with subgroup results |
+| Raster model | Shared mask-aware encoder and ConvGRU |
+| Comparison | Independent tabular MLP |
+| Selection | Validation log loss |
 
-## Prediction target
+Apply the same symmetric 100 lb cutoff to every split and inference. Remove
+records inside the closed deadband, label decreases as 0 and increases as 1,
+then balance each split. Retain the continuous change for reporting only.
 
-- Apply the fixed symmetric 100 lb `EMA_DELTA_THRESHOLD` cutoff on the absolute
-  current-minus-previous effective EMA emissions difference.
-- Use the same cutoff for train, validation, test, and inference.
-- Remove records inside the closed deadband.
-- Label negative changes as 0 and positive changes as 1.
-- Balance each split to equal label counts after raster QC.
-- Preserve the continuous EMA difference for reporting, never as an input.
+## Inputs and leakage controls
 
-## Inputs and leakage policy
+Each sample contains `T` aligned 24 by 24 raster timesteps. Scalar inputs are
+coal and gas unit counts, total nameplate capacity, previous-quarter heat input
+and power generation, local solar hour, and day of year.
 
-Each sample carries `T` aligned 24 by 24 raster timesteps and scalar context.
-
-Scalar inputs:
-
-- coal and natural-gas unit counts;
-- total generator nameplate capacity;
-- previous-quarter average heat input and power generation;
-- sine/cosine encodings of local mean solar hour and day of year.
-
-Leakage controls:
-
-| Excluded | Reason |
+| Excluded input | Reason |
 |---|---|
-| Raw coordinates, AOI IDs | Prevent geographic memorization; longitude only converts UTC to local solar hour |
+| Coordinates and AOI IDs | Prevent geographic memorization; longitude only derives solar hour |
 | Current emissions | Direct target leakage |
-| Previous-quarter average NOx | Defines the relative-change filter and can identify plant operating regimes |
-| `prev_qtr_rel_delta` | Contains target magnitude and is used only for stratification |
+| Previous-quarter average NOx | Defines relative-change filtering and identifies operating regimes |
+| `prev_qtr_rel_delta` | Contains target magnitude and serves stratification only |
 
-Coverage stays available for sliced evaluation but is not a model input.
+Coverage supports sliced evaluation but does not enter the model.
 
-### Feature transformations
+All scalar features are standardized with training means and standard
+deviations. Local solar hour is `(UTC hour + longitude / 15) mod 24`; hour and
+day of year use sine and cosine encodings. Validation, test, and inference reuse
+the training statistics.
 
-Every scalar enters raw, then gets standardized with the training-split mean and
-standard deviation. Validation, test, and inference reuse those statistics.
+No feature uses `log1p`. On the first training split, it increased skew for all
+three tested features and changed logistic-probe validation AUC by less than
+0.005:
 
-| Transform | Features |
-|---|---|
-| None | all scalar inputs |
-| Sine and cosine | Local mean solar hour, day of year |
-
-Local mean solar hour is `(UTC hour + longitude / 15) mod 24`. This keeps solar
-time continuous across civil-time boundaries and daylight-saving changes. Sine
-and cosine keep hour 23 adjacent to hour 0.
-
-No feature carries a `log1p` transform. Measurements on the first generated
-training split rejected it, split by feature:
-
-| Feature | Raw skew | `log1p` skew | Tail share raw | Tail share `log1p` |
-|---|---|---|---|---|
+| Feature | Raw skew | `log1p` skew | Raw tail share | `log1p` tail share |
+|---|---:|---:|---:|---:|
 | `avg_heat_input` | 0.378 | -0.673 | 0.032 | 0.041 |
 | `total_nameplate_capacity_mw` | 0.789 | -0.643 | 0.038 | 0.044 |
 | `avg_pwr_gen` | 0.062 | -1.009 | 0.027 | 0.046 |
 
-Tail share is the fraction of total absolute deviation from the median held by
-the top 1 percent of records. A logistic probe on the retained tabular features
-moved validation AUC by less than 0.005 across every combination tested. Nothing
-justified the added distortion, so the transform is gone.
+Tail share is the fraction of absolute deviation from the median held by the top
+1% of records.
 
-## Raster representation and normalization
+## Raster normalization
 
-Four numeric channels and one mask reach the model at every timestep:
-
-1. directly regridded NO2 on finite native support;
-2. HRRR 2 m temperature sampled at AOI cell centers;
-3. geographic eastward wind sampled at AOI cell centers;
-4. geographic northward wind sampled at AOI cell centers;
-5. an independent binary NO2 validity mask.
-
-Every statistic comes from training pixels alone:
+Each timestep has NO2, 2 m temperature, eastward wind, northward wind, and a
+binary NO2 support mask. Fit statistics on finite training pixels only:
 
 | Channels | Center | Scale |
 |---|---|---|
-| NO2 | median of finite pixels | `IQR / 1.349` |
-| temperature, wind u, wind v | mean of finite pixels | population standard deviation |
+| NO2 | Median | `IQR / 1.349` |
+| Temperature and wind | Mean | Population standard deviation |
 
-```text
-normalized[channel] =
-    (raster[channel] - train_center[channel]) / train_scale[channel]
-```
+Clip numeric channels to `[-8, 8]`. Replace invalid normalized values with zero
+only at model loading, while keeping the binary mask unscaled. Reuse the frozen
+statistics for validation, test, and inference. Per-image normalization is not
+used because absolute enhancement magnitude carries signal.
 
-- Clip all four numeric channels to `[-8, 8]` and represent invalid normalized
-  values with zero only when loading the model input.
-- Fit every channel on its finite training pixels.
-- Reuse the frozen training statistics for validation, test, and inference.
-
-The mask remains binary and unscaled. A two-layer partial-convolution stem
-consumes each scan's NO2 value-mask pair. The resulting features join the dense
-weather stem before the shared residual encoder.
-
-Two design notes:
-
-- Robust linear scaling limits outlier influence without compressing the whole
-  NO2 distribution.
-- Per-image normalization stays unsuitable because absolute enhancement
-  magnitude carries part of the emissions signal.
-
-Run outputs store centers, scales, and valid counts in
-`normalization_stats.json`; `run_config.json` stores clipped-pixel fractions.
-
-Exact quartiles come from temporary node-local arrays, so the fit never builds
-an in-memory pixel archive.
+`normalization_stats.json` stores centers, scales, and valid counts.
+`run_config.json` stores clipped-pixel fractions. Exact quartiles use temporary
+node-local arrays instead of an in-memory pixel archive.
 
 ## Network
 
-The raster branch applies the same spatial encoder to every hour. A partial-
-convolution NO2 stem uses the validity mask to renormalize local support rather
-than treating missing cells as physical zeros. A conventional weather stem
-encodes temperature and wind. Their fused features pass through residual blocks
-that reduce each 24 by 24 timestep to 6 by 6, then a 96-channel ConvGRU fuses
-the ordered sequence. Global average and maximum pooling produce a 128-value
-raster embedding.
+The raster branch applies one spatial encoder to every timestep. A two-layer
+partial-convolution stem handles the NO2 value and mask. A dense stem handles
+weather. Residual blocks fuse the stems and reduce each 24 by 24 input to 6 by
+6. A 96-channel ConvGRU combines the ordered sequence, and global average and
+maximum pooling produce a 128-value embedding.
 
-The raster embedding passes through its own multilayer classifier to produce a
-single Bernoulli logit. The raster model receives no tabular features or MLP
-outputs. The tabular model is a separate 32-value hidden layer followed by a
-16-value embedding and its own Bernoulli classifier. Each model has its own BCE
-loss, optimizer, validation selection, and checkpoint. Their sigmoid outputs
-are compared on the same records; they are not fused during training or
-inference.
+The raster embedding feeds its own Bernoulli classifier. It receives no scalar
+features or MLP output. The tabular baseline uses a 32-value hidden layer, a
+16-value embedding, and a separate classifier. Each model has its own BCE loss,
+optimizer, validation selection, and checkpoint.
 
-Normalization choices:
+GroupNorm handles the raster stems and encoder; LayerNorm handles MLP
+projections. See the [Group Normalization paper](https://arxiv.org/abs/1803.08494).
+The baseline applies no rotations or flips. Any future spatial transform must
+also rotate wind vectors.
 
-- GroupNorm in the NO2 stem, weather stem, and shared spatial encoder avoids
-  batch-level statistics when memory pressure forces small batches. See the
-  [Group Normalization paper](https://arxiv.org/abs/1803.08494).
-- LayerNorm in the MLP projections.
+## Training and data loading
 
-The DenseNet alternative is gone. It duplicated an obsolete input signature and
-training never selected it.
-
-The baseline applies no rotation or flip. Alignment rotates HRRR grid-relative
-wind to geographic east and north, so any later spatial augmentation must
-transform the wind vector values along with the raster coordinates.
-
-## Optimization and I/O
-
-Training uses:
-
-- AdamW;
-- unweighted binary cross-entropy with logits;
-- gradient clipping and mixed precision on CUDA;
-- validation-loss scheduling;
-- early stopping.
-
-Where settings live:
+Training uses AdamW, unweighted binary cross-entropy with logits, gradient
+clipping, CUDA mixed precision, validation-loss scheduling, and early stopping.
 
 | File | Owns |
 |---|---|
-| `src/config.py` | Shared data contract: paths, raster keys and channels, image clipping, input-feature definitions |
-| `src/delta-model/modeling/train.py` | Training defaults |
-| `src/delta-model/modeling/convgru.py` | Mask-aware spatial and temporal raster model |
-| `src/delta-model/modeling/mlp.py` | Compact tabular model and embedding dimensions |
+| `src/config.py` | Shared paths and delta-model input contract |
+| `src/delta-model/modeling/train.py` | Training defaults and CLI |
+| `src/delta-model/modeling/convgru.py` | Raster model |
+| `src/delta-model/modeling/mlp.py` | Tabular model |
 
-Training CLI flags expose the last two, which keeps preprocessing and collection
-code independent of any single run while each run still records its resolved
-settings.
+The map-style dataset decompresses record NPZ files on demand. DataLoader
+workers overlap reads with GPU work and prefetch two batches. CUDA runs use
+pinned memory. Keep worker counts within the CPU allocation because excessive
+workers can hurt shared-filesystem throughput.
 
-CUDA runs use automatic mixed precision for convolutions and linear layers, with
-gradient scaling. AMP selects lower precision for eligible high-throughput
-operations and keeps float32 where the range matters; see the
-[PyTorch AMP documentation](https://docs.pytorch.org/docs/2.3/amp.html).
+Run on a compute node:
 
-Data loading:
+```bash
+python -u -m modeling.train
+```
 
-- The map-style dataset decompresses the selected per-record NPZ files on
-  demand.
-- DataLoader workers overlap that I/O with GPU computation, persist between
-  epochs, and prefetch two batches each.
-- Pinned memory stays on for CUDA alone.
-- The allocated CPUs cap the worker count. Raising it can hurt
-  shared-filesystem performance and multiply parent-process memory.
+Use `--workers`, `--batch-size`, `--epochs`, and `--tabular-epochs` for run-level
+overrides. Every run recomputes normalization statistics from its training split.
 
-The [PyTorch DataLoader documentation](https://docs.pytorch.org/docs/2.3/data.html)
-covers these controls and their memory implications.
+## Evaluation
 
-## Evaluation philosophy
+Select models on validation loss alone. Do not use test outputs for thresholds,
+normalization, architecture, or hyperparameters. Report accuracy, balanced
+accuracy, precision, recall, specificity, F1, ROC AUC, log loss, and confusion
+matrices. Also retain class prevalence, magnitude slices, per-AOI metrics,
+row-level predictions, probability plots, and held-out AOI maps.
 
-Report accuracy, balanced accuracy, precision, recall, specificity, F1, ROC AUC,
-and the full confusion matrix. Also record:
-
-- class counts and natural pre-balancing prevalence;
-- equal-count test slices by absolute raw delta-NOx magnitude;
-- per-AOI metrics;
-- row-level logits, probabilities, and predictions;
-- probability distributions and held-out AOI accuracy maps.
-
-Rules:
-
-- Select models on validation loss alone.
-- Keep test outputs out of decisions about normalization, architecture,
-  thresholds, and hyperparameters.
-
-The split is geographic, so validation and test measure transfer to
-non-overlapping plant regions rather than memorization of known AOIs.
-
-## Required comparisons
+Run all comparisons on the same frozen records:
 
 | Comparison | Question |
 |---|---|
-| Constant and prevalence classifiers | Does the model beat trivial predictions? |
-| Tabular-only MLP | Does image data add value to the neural model? |
-| Raster-only ConvGRU | How much can the raster sequence predict without tabular features? |
-| With and without masks | Does explicit support information add value? |
-
-Report every comparison on the same frozen validation and test records. Each run
-reports the independently trained raster ConvGRU against the independently
-trained MLP.
+| Constant and prevalence classifiers | Does either learned model beat trivial predictions? |
+| Tabular MLP | Does raster data add value? |
+| Raster ConvGRU | What can the raster sequence predict without scalar context? |
+| With and without masks | Does explicit support improve results? |
 
 ## Run artifacts
 
@@ -232,26 +138,10 @@ Each UTC-stamped directory under `RUNS_DIR` contains:
 
 | Artifact | Contents |
 |---|---|
-| `normalization_stats.json` | Train-only preprocessing and deadband cutoff |
+| `normalization_stats.json` | Train-only preprocessing and cutoff |
 | `run_config.json` | Features, settings, clipping rates, and parameter count |
-| `checkpoints/best_raster_convgru.pt` | Validation-selected raster-only ConvGRU checkpoint |
-| `checkpoints/best_tabular_mlp.pt` | Validation-selected tabular-only MLP checkpoint |
-| `results.json` | Metrics, raster ConvGRU minus MLP differences, and prevalence |
-| `*_predictions.csv` | Row-level predictions for each model and split |
-| `model_comparison.png` | Side-by-side split metrics |
-| Other plots | Loss, probability distributions, and spatial accuracy |
-
-Run training on a compute node:
-
-```bash
-python -u -m modeling.train
-```
-
-Flags:
-
-- `--workers`, `--batch-size`, and `--epochs` for allocation-specific overrides;
-- `--tabular-epochs` for the independent MLP training phase.
-
-Every run recomputes normalization statistics from the training split and writes
-them to its own run directory. No flag reuses a saved file, so a stale statistics
-JSON can never normalize a run against the wrong feature order.
+| `checkpoints/best_raster_convgru.pt` | Selected raster checkpoint |
+| `checkpoints/best_tabular_mlp.pt` | Selected tabular checkpoint |
+| `results.json` | Metrics, model differences, and prevalence |
+| `*_predictions.csv` | Row-level predictions by model and split |
+| Plots | Model comparison, loss, probabilities, and spatial accuracy |

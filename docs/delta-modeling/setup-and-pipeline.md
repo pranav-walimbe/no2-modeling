@@ -1,65 +1,33 @@
-# Setup and pipeline
+# Delta-model setup and pipeline
 
-This project predicts the direction of hourly power-plant NOx changes from
-TEMPO imagery, EPA CAMPD records, HRRR weather, and plant attributes. ERA5 is
-an optional weather benchmark.
+The delta model combines TEMPO imagery, EPA CAMPD records, HRRR weather, and
+plant attributes. ERA5 is an optional benchmark.
 
-## Quick path
+## Setup
 
-| Step | Action |
-|---|---|
-| 1 | Load Python 3.11 and run `make setup` |
-| 2 | Add CAMPD and Earthdata credentials to `.env` |
-| 3 | Review paths and thresholds in `src/config.py` |
-| 4 | Collect TEMPO, HRRR, emissions, and facility data |
-| 5 | Build mappings, split AOIs, and generate rasters |
-| 6 | Train with `python -m modeling.train` |
+Requirements:
 
-## Prerequisites
+- `uv` and Savio's `python/3.11.6-gcc-11.4.0` module;
+- an EPA CAMPD API key;
+- a NASA Earthdata account with TEMPO access;
+- a Copernicus CDS account only for ERA5;
+- access to the paths configured in `src/config.py`.
 
-- `uv`
-- The Savio `python/3.11.6-gcc-11.4.0` module
-- An EPA CAMPD API key
-- A NASA Earthdata account with access to TEMPO products
-- A Copernicus Climate Data Store account when collecting the ERA5 benchmark
-- Access to the configured Savio project paths, or matching path changes in
-  `src/config.py`
-
-## Initial Python environment setup
-
-Install `uv` once on a login node:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Create the locked environment from the repository root:
+Create the locked environment:
 
 ```bash
 module load python/3.11.6-gcc-11.4.0
 make setup
 ```
 
-`uv` creates `.venv`. To keep it in scratch, pass an explicit path and use that
-path in Slurm jobs:
+To place it in scratch:
 
 ```bash
 UV_CACHE_DIR=/global/scratch/users/$USER/uv-cache \
     make setup VENV=/global/scratch/users/$USER/no2-modeling-venv
 ```
 
-Rerun setup when the environment is missing or the dependency files change.
-Batch jobs activate the existing environment.
-
-Static and syntax checks:
-
-```bash
-make check
-```
-
-## Credentials
-
-Create `.env` in the repository root, and keep it out of commits:
+Create `.env` in the repository root:
 
 ```dotenv
 CAMPD_API_KEY=your_campd_api_key
@@ -67,31 +35,19 @@ EARTHDATA_USERNAME=your_nasa_earthdata_username
 EARTHDATA_PASSWORD=your_nasa_earthdata_password
 ```
 
-For ERA5 downloads, create `~/.cdsapirc` from the CDS account setup page:
+ERA5 also requires `~/.cdsapirc`:
 
 ```yaml
 url: https://cds.climate.copernicus.eu/api
 key: your-api-key
 ```
 
-## Configuration
+Review `src/config.py`, especially Savio paths, dates, thresholds, `VIS_DIR`,
+and `RUNS_DIR`. Run `make check` after setup.
 
-Review `src/config.py` before running the pipeline. It holds paths, date ranges,
-filters, image parameters, and model settings.
+## Shell environment
 
-The checked-in paths point at the `fc_nitrates` Savio project and one user's
-home directory, so update user-specific entries such as `VIS_DIR` and
-`RUNS_DIR`. Create the output directories before submitting jobs:
-
-```bash
-mkdir -p /global/home/users/<USERNAME>/no2-modeling/logs
-mkdir -p /global/home/users/<USERNAME>/vis
-```
-
-## Run the pipeline
-
-Run commands from the repository root. Load the module and environment once per
-shell or job:
+Run pipeline commands from the repository root:
 
 ```bash
 module load python/3.11.6-gcc-11.4.0
@@ -99,224 +55,107 @@ source .venv/bin/activate
 export PYTHONPATH="$PWD/src:$PWD/src/delta-model"
 ```
 
-### 1. Choose the TEMPO collection
+Set `TEMPO_VERSION` to `V03` or `V04`; `V04` is the default. The pipeline uses
+Level 2 data under `TEMPO/<version>/L2/raw/<year>/<month>/`.
 
-Set `TEMPO_VERSION` to `V03` or `V04` in `src/config.py`; `V04` is the default.
-Preprocessing uses `TEMPO_LEVEL = "L2"`. Files land under:
-
-```text
-TEMPO/<version>/<level>/raw/<year>/<month>/
-```
-
-### 2. Download TEMPO and HRRR
+## 1. Collect source data
 
 ```bash
 python -u src/data-scraping/scrape_tempo.py
 python -u src/data-scraping/scrape_hrrr.py
-```
-
-- The TEMPO scraper searches one month at a time, downloads in batches set by
-  `DOWNLOAD_BATCH_SIZE` in `src/data-scraping/scrape_tempo.py`, and skips files already
-  present at their final path. Rerunning a range is idempotent for completed
-  files.
-- The HRRR scraper saves one atomic GRIB2 subset per UTC hour under
-  `HRRR/raw/<year>/<month>/<day>`, each holding 80 m U/V wind, 2 m temperature,
-  and boundary-layer height from the hourly `f00` analysis.
-- The Slurm HRRR collector passes `--overwrite` for a full replacement. Wait
-  for every array task to succeed before using the archive, then regenerate
-  the dataset once with `--refresh-weather` to replace aligned weather cache entries.
-
-### 3. Download emissions and facility locations
-
-```bash
 python -u src/data-scraping/scrape_emissions.py
 python -u src/data-scraping/scrape_locations.py
 ```
 
-Facility attributes:
+The TEMPO collector skips completed files. HRRR output contains hourly `f00`
+analyses for 80 m wind, 2 m temperature, and boundary-layer height. After
+replacing HRRR files, regenerate the dataset with `--refresh-weather`.
 
-- Fetched in nationwide pages per prediction year, not one request per facility.
-- Each hourly record takes the latest facility and unit record whose attribute
-  year stays at or below the prediction year.
-- The location stage stops without replacing its output when CAMPD requests fail
-  or enrichment would drop any hourly rows.
-- Generator nameplate capacities are parsed, and conflicting facility-generator
-  values stay out of the sum.
-Time handling:
+Facility enrichment uses nationwide CAMPD pages and selects the latest
+attribute year no later than each prediction year. It preserves CAMPD local
+standard date and hour, resolves facility timezones, and writes
+`emissions_hour_utc`. Standard offsets apply year-round because the EPA clock
+does not use daylight-saving time. Failed or incomplete enrichment does not
+replace the prior output.
 
-- CAMPD source `date` and `hour` fields use local standard time.
-- Location enrichment resolves each facility's IANA timezone from its
-  coordinates, preserves the source fields as `local_standard_date` and
-  `local_standard_hour`, and writes an explicit `emissions_hour_utc`.
-- Downstream `date` and `hour` come from that UTC timestamp.
-- Standard offsets apply year-round, since the EPA reporting clock skips
-  daylight-saving time.
-
-### 4. Build mappings, partition plants, generate datasets
+## 2. Build mappings and splits
 
 ```bash
 python -u -m preprocessing.tempo_mapping index --overwrite
 python -u -m preprocessing.tempo_mapping observations \
     --task-id <TASK_ID> --task-count 32 --overwrite
 python -u -m preprocessing.stratify_plants
+```
+
+Run observation tasks from 0 through 31 after indexing succeeds. The mapping
+stage writes monthly granule indexes and daily AOI-observation shards.
+
+Stratification computes consecutive-hour changes and prior-quarter baselines,
+scores AOIs, keeps `AOI_SELECTION_COUNT`, assigns overlap clusters to
+70/15/15 splits, removes each split's upper 5% NOx-mass tail, and samples up to
+300,000/75,000/75,000 records. See [dataset_design.md](dataset_design.md).
+
+## 3. Generate raster datasets
+
+Launch the Slurm workflow from a login node:
+
+```bash
 python -u -m preprocessing.generate_dataset --shard-size 20000
 ```
 
-Run the observation command once for each `TASK_ID` from 0 through 31. Start
-those tasks after the index command succeeds. On Savio, use a dependent job
-array such as `0-31%14`.
+The launcher submits a throttled shard array and dependent finalizer. Defaults
+allow eight concurrent shards with eight CPUs and workers each. Override them
+with `--max-parallel-shards` and `--workers-per-shard`.
 
-`preprocessing.tempo_mapping`:
+Each launch clears old shards and published metadata but keeps persistent TEMPO
+and weather caches. Use `--refresh-cache`, `--refresh-tempo`, or
+`--refresh-weather` to clear selected caches before fan-out. Do not refresh or
+regenerate while dataset generation or training is active.
 
-- builds monthly granule-index Parquet files;
-- assigns disjoint months to a dependent job array;
-- writes daily AOI-observation shards;
-- skips populated month directories without `--overwrite`;
-- uses `NUM_CORES`, sourced from `SLURM_CPUS_PER_TASK`.
+Workers write five `T x 24 x 24` arrays per record: NO2, its mask, temperature,
+and geographic wind U/V. They require 95% NO2 coverage per timestep and complete
+3 by 3 source-hotspot coverage. The finalizer validates every source outcome
+and raster before publishing relative paths. A failed worker prevents
+publication; fix the cause and relaunch the complete workflow.
 
-`preprocessing.stratify_plants`:
+For a local monolithic run, call the module inside an allocation and use
+`--split` when needed. See [regridding.md](regridding.md) for cache and raster
+details.
 
-- reads the prebuilt TEMPO mapping;
-- computes raw consecutive-hour AOI NOx changes;
-- computes each AOI's absolute mean hourly NOx mass from the immediately
-  preceding quarter as `prev_qtr_avg_nox`;
-- stores raw and effective NOx changes scaled by the prior-quarter level;
-- scores AOIs from full-history coal production share, NOx signal strength,
-  event support, urban isolation, and complete-observation yield;
-- retains the top `AOI_SELECTION_COUNT` AOIs, currently 100;
-- assigns overlapping AOI clusters intact toward 70/15/15 record targets;
-- removes records above each split's 95th percentile of aggregate AOI-hour NOx
-  mass;
-- deterministically random-samples up to 300,000 training and 75,000 validation
-  and test records, retaining the full post-pruning pool when it is smaller;
-- saves and emails a bar chart of each AOI's percentage of final records by
-  split plus scaled hourly and effective NOx-delta histograms.
-
-`preprocessing.generate_dataset`:
-
-- resolves all configured TEMPO timesteps through one
-  deduplicated persistent image-cache plan;
-- writes NO2, NO2 validity, temperature, eastward wind, and northward wind as
-  `T x 24 x 24` arrays per retained record;
-- stores each unique AOI scan and aligned AOI-hour weather raster in persistent
-  caches, grouping work so workers reuse each NetCDF or GRIB read;
-- preserves each directly regridded NO2 scan and its independent mask;
-- requires at least 95 percent finite NO2 coverage in every timestep;
-- requires all nine cells around the highest-unit source cell to be valid in
-  every timestep;
-- keeps every successful record without label-based resampling;
-- uses `NUM_CORES` workers, sourced from `SLURM_CPUS_PER_TASK` inside an
-  allocation.
-
-Every successful split-CSV row carries its relative `raster_bundle_path`,
-selected hotspot cell, per-timestep full-raster and hotspot coverage, and
-sequence-level cloud, quality, and retrieval-uncertainty summaries. Temperature
-is stored only as a raster.
-
-Running the splits:
-
-- Run `python -u -m preprocessing.generate_dataset --shard-size N` on a login
-  node. The CLI assigns at most `N` consecutive source records to each array
-  task across train, validation, and test, then submits a dependent finalizer.
-  By default, Slurm runs at most eight shard tasks concurrently and gives each
-  shard eight CPUs and process workers. Use `--max-parallel-shards` and
-  `--workers-per-shard` to override those limits.
-- A launch is refused while dataset-generation or `train-no2` jobs are active.
-  It deletes the existing shards and published metadata before submitting every
-  planned shard, so the dataset is unavailable until finalization succeeds.
-- Workers write rasters and candidate/failure CSVs directly under
-  `shards/<split>/<shard>/`. Failed runs may leave partial shards; the next
-  launch deletes the complete shard tree rather than resuming it.
-- The finalizer runs only after every array task succeeds. It validates all
-  source outcomes and referenced rasters, then atomically publishes every
-  successful record with metadata whose raster paths point directly into the
-  shards. It does not install or remove raster files.
-- `--refresh-cache`, `--refresh-tempo`, and `--refresh-weather` explicitly clear
-  the selected persistent caches once before fan-out. Otherwise caches survive
-  fresh dataset runs and concurrent shards reuse their atomic entries.
-- Worker logs report elapsed time, peak memory, and TEMPO/weather cache hits. The
-  finalizer log reports finalizer time, peak memory, and launch-to-publication
-  wall time for warm-cache benchmark records.
-- Direct `python -u -m preprocessing.generate_dataset` remains available for a
-  fresh monolithic local run. Pass `--split` to limit that run to one split.
-
-### 5. Train and evaluate
+## 4. Train and evaluate
 
 ```bash
 python -u -m modeling.train
 ```
 
-The trainer reads the consecutive NO2 scans and aligned validity-mask,
-temperature, and geographic-wind sequences from each selected NPZ on demand.
-It derives local mean solar hour from the stored UTC hour and AOI longitude. It
-fits memory-bounded normalization statistics on the training split alone and
-records clipped valid-pixel fractions by channel and split. The tabular MLP and
-mask-aware raster ConvGRU train independently, with separate BCE losses,
-optimizers, validation selection, and checkpoints. The ConvGRU receives no MLP
-outputs or tabular features. The report compares both models on the same
-records. See [`modeling.md`](modeling.md) for the full contract.
+The trainer fits normalization on training pixels, loads NPZ files on demand,
+and trains independent raster ConvGRU and tabular MLP models. See
+[modeling.md](modeling.md) for inputs, leakage controls, architecture, and
+evaluation.
 
-### Regeneration
+## Savio allocations
 
-Dataset generation has no shard resume mode. Each launch discards the previous
-shards and published metadata but reuses valid TEMPO-cache and wind-cache
-entries. Do not regenerate or refresh caches while dataset generation or model
-training is active. A worker failure leaves no published dataframe; launch the
-complete run again after resolving the failure.
+Jobs should use `set -euo pipefail`, the `fc_nitrates` account, stage-specific
+logs, `BEGIN,END,FAIL` email, the Python module and environment above, and
+`srun`. Export `SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"`.
 
-## Savio jobs
-
-Each batch job should:
-
-1. Use Bash with `set -euo pipefail`. Request the `fc_nitrates` account, one
-   node, one task, and the stage resources listed below.
-2. Write stdout and stderr to `logs/%x-%j.log` and `logs/%x-%j.err`; use `%A_%a`
-   for arrays. Request `BEGIN`, `END`, and `FAIL` email notifications.
-3. Change to the repository root, load `python/3.11.6-gcc-11.4.0`, activate
-   `.venv`, and add both `src` and `src/delta-model` to `PYTHONPATH`.
-4. Export `SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"`, then launch the stage
-   command with `srun`.
-
-Use these stage-specific allocations and commands:
-
-| Stage | Savio request | Command and scheduler logic |
+| Stage | Savio request | Command |
 |---|---|---|
-| TEMPO download | `savio4_htc`, `savio_normal`, 4 CPUs, 72 hours | Confirm `TEMPO_LEVEL="L2"` and `TEMPO_VERSION="V04"`, then run `python -u src/data-scraping/scrape_tempo.py` |
-| HRRR download | `savio4_htc`, `savio_normal`, 4 CPUs per task, 48 hours | Split the date range across an array; pass each range to `src/data-scraping/scrape_hrrr.py` with `--workers "$SLURM_CPUS_PER_TASK" --overwrite` |
-| Facility metadata | `savio4_htc`, `savio_normal`, 4 CPUs, 8 hours | Run `python -u src/data-scraping/scrape_locations.py` |
-| TEMPO index | `savio4_htc`, `savio_normal`, 16 CPUs, 2 hours | Run `python -u -m preprocessing.tempo_mapping index`; require success before observation tasks start |
-| TEMPO observations | `savio4_htc`, `savio_normal`, 4 CPUs per task, 8 hours | Use a `0-31%14` array and run `preprocessing.tempo_mapping observations --task-id "$SLURM_ARRAY_TASK_ID" --task-count 32` |
-| Stratification | `savio4_htc`, `savio_normal`, `savio4_m512`, 16 CPUs, 2 hours | Run `python -u -m preprocessing.stratify_plants` |
-| Dataset generation | `savio4_htc`, `savio_normal`, 8 concurrent tasks with 8 CPUs each, 12 hours | Submit a throttled shard array from the login node with `python -u -m preprocessing.generate_dataset --shard-size 20000`; Slurm starts another queued shard whenever a slot opens |
-| Model training | `savio3_gpu`, `a40_gpu3_normal`, 8 CPUs, 1 A40, 2 hours | Run the training command below |
+| TEMPO download | `savio4_htc`, `savio_normal`, 4 CPUs, 72 hours | `python -u src/data-scraping/scrape_tempo.py` |
+| HRRR download | `savio4_htc`, `savio_normal`, 4 CPUs per task, 48 hours | Date-range array with `scrape_hrrr.py --workers "$SLURM_CPUS_PER_TASK" --overwrite` |
+| Facility metadata | `savio4_htc`, `savio_normal`, 4 CPUs, 8 hours | `python -u src/data-scraping/scrape_locations.py` |
+| TEMPO index | `savio4_htc`, `savio_normal`, 16 CPUs, 2 hours | `preprocessing.tempo_mapping index` |
+| TEMPO observations | `savio4_htc`, `savio_normal`, 4 CPUs per task, 8 hours | `0-31%14` array with the observations command |
+| Stratification | `savio4_htc`, `savio_normal`, `savio4_m512`, 16 CPUs, 2 hours | `python -u -m preprocessing.stratify_plants` |
+| Dataset generation | `savio4_htc`, `savio_normal`, 8 concurrent tasks with 8 CPUs, 12 hours | Launch `preprocessing.generate_dataset` from the login node |
+| Model training | `savio3_gpu`, `a40_gpu3_normal`, 8 CPUs, 1 A40, 2 hours | `python -u -m modeling.train --device cuda` |
 
-```bash
-srun python -u -m modeling.train \
-    --device cuda \
-    --batch-size 128 \
-    --epochs 300 \
-    --workers "$SLURM_CPUS_PER_TASK" \
-    --prefetch-factor 2 \
-    --seed 42 \
-    --head-dim 128 \
-    --dropout 0.30 \
-    --learning-rate 3e-4 \
-    --weight-decay 1e-4 \
-    --gradient-clip-norm 5.0 \
-    --scheduler-patience 10 \
-    --scheduler-factor 0.50 \
-    --early-stop-patience 25
-```
+Savio policies change. Verify partitions, QoS, and account limits before a long
+run.
 
-Create or update environments on a login node. Batch jobs activate the existing
-environment. Adjust the activation path when the environment lives in scratch.
+## Pretraining pipelines
 
-Cluster partitions, QoS names, and account policies change over time. Verify
-them against current Savio documentation before submitting long-running jobs.
-
-## Masked pretraining dataset
-
-The separate single-timestep masked-pretraining dataset reuses the TEMPO and
-weather caches while maintaining its own positive/negative validity cache. See
-[`../masked-pretraining/setup-and-pipeline.md`](../masked-pretraining/setup-and-pipeline.md)
-for its AOI splitting, sharding, cache-refresh, and finalization contract.
+Masked pretraining reuses delta-model TEMPO and weather caches but maintains its
+own validity cache and AOI-disjoint splits. See
+[`../masked-pretraining/setup-and-pipeline.md`](../masked-pretraining/setup-and-pipeline.md).
+The next-raster pipeline is not implemented yet.

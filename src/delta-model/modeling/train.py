@@ -9,17 +9,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch import nn
-from torch.utils.data import DataLoader
-
-from config import (
-    DATASET_DF,
-    LABEL_COL,
-    MODEL_IMAGE_CLIP_ABS,
-    NUM_CORES,
-    RUNS_DIR,
-    STRAT_BASE_DIR,
-)
 from modeling.convgru import (
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
@@ -45,6 +34,17 @@ from modeling.plot_utils import (
     plot_class_probabilities,
     plot_loss_curve,
     plot_model_comparison,
+)
+from torch import nn
+from torch.utils.data import DataLoader
+
+from config import (
+    DATASET_DF,
+    LABEL_COL,
+    MODEL_IMAGE_CLIP_ABS,
+    NUM_CORES,
+    RUNS_DIR,
+    STRAT_BASE_DIR,
 )
 
 DEFAULT_BATCH_SIZE = 128

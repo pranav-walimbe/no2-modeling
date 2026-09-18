@@ -83,7 +83,7 @@ class PretrainingShardTask:
 
     @property
     def size(self) -> int:
-        """Return the maximum number of output records in this shard."""
+        """Return the maximum record count for the shard."""
         return self.stop - self.start
 
 
@@ -114,7 +114,14 @@ class MaskedDatasetShardStore:
     root: Path
 
     def create(self, task: PretrainingShardTask) -> Path:
-        """Create one new shard directory after the run-wide reset."""
+        """Create a shard directory.
+
+        Args:
+            task: Shard coordinates.
+
+        Returns:
+            Path to the new shard directory.
+        """
         split_root = self.root / task.split
         split_root.mkdir(parents=True, exist_ok=True)
         shard_dir = split_root / f"{task.shard_index:06d}"
@@ -122,7 +129,13 @@ class MaskedDatasetShardStore:
         return shard_dir
 
     def write(self, task: PretrainingShardTask, shard_dir: Path, rows: list[dict[str, object]]) -> None:
-        """Publish one shard manifest with paths relative to its directory."""
+        """Publish a shard manifest.
+
+        Args:
+            task: Shard coordinates.
+            shard_dir: Shard directory.
+            rows: Final record rows.
+        """
         frame = pl.DataFrame(rows, schema=FINAL_RECORD_SCHEMA).sort("candidate_index")
         relative_paths = [str(Path(path).relative_to(shard_dir)) for path in frame["raster_bundle_path"].to_list()]
         frame = frame.with_columns(pl.Series("raster_bundle_path", relative_paths, dtype=pl.String))
@@ -130,7 +143,15 @@ class MaskedDatasetShardStore:
         print(f"[{task.split} shard {task.shard_index}] wrote {frame.height:,} masked records")
 
     def load(self, task: PretrainingShardTask, *, resolve_paths: bool = False) -> pl.DataFrame:
-        """Load and validate one completed shard manifest and its bundles."""
+        """Load and validate a shard.
+
+        Args:
+            task: Shard coordinates.
+            resolve_paths: Convert raster paths to absolute shard paths.
+
+        Returns:
+            Validated record manifest.
+        """
         shard_dir = self.root / task.split / f"{task.shard_index:06d}"
         frame = pl.read_csv(shard_dir / SHARD_RECORDS_FILE, schema_overrides=FINAL_RECORD_SCHEMA)
         if frame.height > task.size:
@@ -155,7 +176,12 @@ class MaskedDatasetShardStore:
 
 
 def write_parquet_atomic(frame: pl.DataFrame, destination: Path) -> None:
-    """Atomically publish a Parquet file."""
+    """Publish a Parquet file atomically.
+
+    Args:
+        frame: Data to write.
+        destination: Final file path.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(f"{destination.suffix}.{os.getpid()}.tmp")
     try:
@@ -166,7 +192,12 @@ def write_parquet_atomic(frame: pl.DataFrame, destination: Path) -> None:
 
 
 def write_csv_atomic(frame: pl.DataFrame, destination: Path) -> None:
-    """Atomically publish a CSV file."""
+    """Publish a CSV file atomically.
+
+    Args:
+        frame: Data to write.
+        destination: Final file path.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(f"{destination.suffix}.{os.getpid()}.tmp")
     try:
@@ -177,7 +208,12 @@ def write_csv_atomic(frame: pl.DataFrame, destination: Path) -> None:
 
 
 def write_json_atomic(values: dict[str, object], destination: Path) -> None:
-    """Atomically publish JSON metadata."""
+    """Publish JSON metadata atomically.
+
+    Args:
+        values: JSON-compatible metadata.
+        destination: Final file path.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(f"{destination.suffix}.{os.getpid()}.tmp")
     try:
@@ -191,7 +227,12 @@ def write_json_atomic(values: dict[str, object], destination: Path) -> None:
 
 
 def write_npz_atomic(destination: Path, **arrays: np.ndarray) -> None:
-    """Atomically publish a compressed raster bundle."""
+    """Publish a compressed raster bundle atomically.
+
+    Args:
+        destination: Final file path.
+        **arrays: Named arrays stored in the bundle.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
@@ -215,9 +256,15 @@ def build_shard_tasks(
     targets: dict[str, int],
     shard_size: int,
 ) -> list[PretrainingShardTask]:
-    """Partition each requested split into fixed-size output shards."""
-    if shard_size <= 0:
-        raise ValueError("shard_size must be positive")
+    """Partition split targets into fixed-size output shards.
+
+    Args:
+        targets: Requested record count for each split.
+        shard_size: Maximum records per shard.
+
+    Returns:
+        Ordered shard tasks for all splits.
+    """
     tasks: list[PretrainingShardTask] = []
     for split, target_count in targets.items():
         for shard_index, start in enumerate(range(0, target_count, shard_size)):
@@ -234,34 +281,25 @@ def build_shard_tasks(
     return tasks
 
 
-def load_shard_candidates(path: Path, task: PretrainingShardTask, split_shard_count: int) -> pl.DataFrame:
-    """Load the candidates owned by one modulo-partitioned shard."""
-    return (
-        pl.scan_parquet(path)
-        .filter((pl.col("shard_key") % split_shard_count) == task.shard_index)
-        .sort("selection_key", "scan_date", "scan_num", "aoi_id")
-        .collect(engine="streaming")
-    )
-
-
-def _valid_path(cache_dir: Path, cache_key: str) -> Path:
-    return cache_dir / "valid" / cache_key[:2] / f"{cache_key}.npz"
-
-
-def _invalid_path(cache_dir: Path, cache_key: str) -> Path:
-    return cache_dir / "invalid" / cache_key[:2] / f"{cache_key}.json"
-
-
 def cached_candidate_result(
     row: dict[str, object],
     scan_task: ScanTask,
     cache_dir: Path,
 ) -> CandidateResult | None:
-    """Return a terminal cached result, if one exists."""
-    valid_path = _valid_path(cache_dir, scan_task.cache_key)
+    """Return a cached terminal result for a candidate.
+
+    Args:
+        row: Candidate metadata.
+        scan_task: TEMPO scan task with the stable cache key.
+        cache_dir: Persistent validity-cache root.
+
+    Returns:
+        A valid or invalid result when cached, else ``None``.
+    """
+    valid_path = cache_dir / "valid" / scan_task.cache_key[:2] / f"{scan_task.cache_key}.npz"
     if valid_path.is_file():
         return CandidateResult(VALID_STATUS, row, scan_task.cache_key, str(valid_path))
-    invalid_path = _invalid_path(cache_dir, scan_task.cache_key)
+    invalid_path = cache_dir / "invalid" / scan_task.cache_key[:2] / f"{scan_task.cache_key}.json"
     if invalid_path.is_file():
         try:
             reason = str(json.loads(invalid_path.read_text()).get("reason", "cached invalid raster"))
@@ -278,7 +316,7 @@ def _mark_invalid(
     reason: str,
     valid_pixel_count: int,
 ) -> CandidateResult:
-    invalid_path = _invalid_path(cache_dir, scan_task.cache_key)
+    invalid_path = cache_dir / "invalid" / scan_task.cache_key[:2] / f"{scan_task.cache_key}.json"
     write_json_atomic(
         {
             "cache_key": scan_task.cache_key,
@@ -294,39 +332,6 @@ def _mark_invalid(
     return CandidateResult(INVALID_STATUS, row, scan_task.cache_key, reason=reason)
 
 
-def _make_tasks(
-    rows: list[dict[str, object]],
-    tempo_root: Path,
-    tempo_cache_dir: Path,
-    hrrr_root: Path,
-    weather_cache_dir: Path,
-) -> tuple[dict[str, ScanTask], dict[str, WeatherTask]]:
-    scans: dict[str, ScanTask] = {}
-    weather: dict[str, WeatherTask] = {}
-    for row in rows:
-        scan = make_scan_task(row, "granule_paths", tempo_root, tempo_cache_dir)
-        item = make_weather_task(row, "weather_path", hrrr_root, weather_cache_dir)
-        scans[scan.cache_key] = scan
-        weather[scan.cache_key] = item
-    return scans, weather
-
-
-def _run_scan_tasks(scans: list[ScanTask], workers: int) -> dict[str, str | None]:
-    outcomes: dict[str, str | None] = {}
-    batches = scan_batches(scans)
-    for results in bounded_parallel_map(process_scan_batch, batches, workers):
-        outcomes.update({result.cache_key: result.error for result in results})
-    return outcomes
-
-
-def _run_weather_tasks(weather: list[WeatherTask], workers: int) -> dict[str, str | None]:
-    outcomes: dict[str, str | None] = {}
-    batches = weather_batches(weather)
-    for results in bounded_parallel_map(process_weather_batch, batches, workers):
-        outcomes.update({result.cache_key: result.error for result in results})
-    return outcomes
-
-
 def process_candidate_batch(
     rows: list[dict[str, object]],
     *,
@@ -337,13 +342,29 @@ def process_candidate_batch(
     weather_cache_dir: Path,
     workers: int,
 ) -> list[CandidateResult]:
-    """Resolve cached outcomes, then generate uncached complete raster bundles."""
-    scans, weather = _make_tasks(rows, tempo_root, tempo_cache_dir, hrrr_root, weather_cache_dir)
+    """Build complete raster bundles for one candidate batch.
+
+    Args:
+        rows: Candidate metadata rows.
+        validity_cache_dir: Persistent validity-cache root.
+        tempo_root: TEMPO granule root.
+        tempo_cache_dir: Shared regridded TEMPO cache root.
+        hrrr_root: HRRR source root.
+        weather_cache_dir: Shared aligned-weather cache root.
+        workers: Maximum parallel processes.
+
+    Returns:
+        Candidate outcomes in input order.
+    """
     results: dict[str, CandidateResult] = {}
+    scans: dict[str, ScanTask] = {}
+    weather: dict[str, WeatherTask] = {}
     pending_scans: list[ScanTask] = []
     rows_by_key: dict[str, dict[str, object]] = {}
     for row in rows:
         scan = make_scan_task(row, "granule_paths", tempo_root, tempo_cache_dir)
+        scans[scan.cache_key] = scan
+        weather[scan.cache_key] = make_weather_task(row, "weather_path", hrrr_root, weather_cache_dir)
         rows_by_key[scan.cache_key] = row
         cached = cached_candidate_result(row, scan, validity_cache_dir)
         if cached is None:
@@ -351,7 +372,9 @@ def process_candidate_batch(
         else:
             results[scan.cache_key] = cached
 
-    scan_errors = _run_scan_tasks(pending_scans, workers) if pending_scans else {}
+    scan_errors: dict[str, str | None] = {}
+    for batch_results in bounded_parallel_map(process_scan_batch, scan_batches(pending_scans), workers):
+        scan_errors.update({result.cache_key: result.error for result in batch_results})
     full_coverage_keys: list[str] = []
     for scan in pending_scans:
         row = rows_by_key[scan.cache_key]
@@ -388,7 +411,9 @@ def process_candidate_batch(
         full_coverage_keys.append(scan.cache_key)
 
     pending_weather = [weather[key] for key in full_coverage_keys]
-    weather_errors = _run_weather_tasks(pending_weather, workers) if pending_weather else {}
+    weather_errors: dict[str, str | None] = {}
+    for batch_results in bounded_parallel_map(process_weather_batch, weather_batches(pending_weather), workers):
+        weather_errors.update({result.cache_key: result.error for result in batch_results})
     for key in full_coverage_keys:
         row = rows_by_key[key]
         scan = scans[key]
@@ -416,7 +441,7 @@ def process_candidate_batch(
                     reason="Weather or NO2 bundle is not completely finite",
                 )
                 continue
-            destination = _valid_path(validity_cache_dir, key)
+            destination = validity_cache_dir / "valid" / key[:2] / f"{key}.npz"
             write_npz_atomic(destination, **arrays)
             results[key] = CandidateResult(VALID_STATUS, row, key, str(destination))
         except (KeyError, OSError, TypeError, ValueError) as error:
@@ -429,35 +454,30 @@ def process_candidate_batch(
     return [results[make_scan_task(row, "granule_paths", tempo_root, tempo_cache_dir).cache_key] for row in rows]
 
 
-def valid_record_frame(results: list[CandidateResult]) -> pl.DataFrame:
-    """Convert valid outcomes to the stable shard schema."""
-    return pl.DataFrame(
-        [
-            {
-                "candidate_index": int(result.row["candidate_index"]),
-                "aoi_id": int(result.row["aoi_id"]),
-                "scan_date": result.row["scan_date"],
-                "scan_num": int(result.row["scan_num"]),
-                "tempo_time": result.row["tempo_time"],
-                "cache_key": result.cache_key,
-                "validity_cache_path": str(result.raster_path),
-            }
-            for result in results
-            if result.status == VALID_STATUS
-        ],
-        schema=VALID_RECORD_SCHEMA,
-    )
-
-
 def mask_no2_raster(no2: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray] | None:
-    """Return masked NO2 and its artificial mask once EDA defines the algorithm."""
+    """Create masked NO2 and the artificial mask.
+
+    Args:
+        no2: Complete NO2 raster.
+        rng: Random generator for mask sampling.
+
+    Returns:
+        Masked NO2 and its mask once EDA defines the algorithm.
+    """
     del no2, rng
-    # Intentionally unimplemented until missingness EDA fixes the masking contract.
+    # Missingness EDA will define the masking contract
     return None
 
 
 def materialize_masked_record(task: MaskedRecordTask) -> dict[str, object]:
-    """Combine one persistent clean bundle with a newly sampled mask."""
+    """Materialize a masked raster record.
+
+    Args:
+        task: Cached source record and output parameters.
+
+    Returns:
+        Final manifest row.
+    """
     row = task.row
     with np.load(str(row["validity_cache_path"]), allow_pickle=False) as cached:
         arrays = {

@@ -19,6 +19,15 @@ from eccodes import (
     codes_grib_new_from_file,
     codes_release,
 )
+from preprocessing.regrid import (
+    AoiGrid,
+    build_granule_spatial_index,
+    concatenate_pixels,
+    read_granule_pixels,
+    regrid_aoi_raster,
+    write_raster_npz,
+)
+from preprocessing.stratify_utils import AOI_ID_COL
 from pyproj import CRS, Proj, Transformer
 from scipy.ndimage import map_coordinates
 
@@ -30,15 +39,6 @@ from config import (
     MIN_TIMESTEP_NO2_FINITE_FRACTION,
     SEQUENCE_TIMESTEPS,
 )
-from preprocessing.regrid import (
-    AoiGrid,
-    build_granule_spatial_index,
-    concatenate_pixels,
-    read_granule_pixels,
-    regrid_aoi_raster,
-    write_raster_npz,
-)
-from preprocessing.stratify_utils import AOI_ID_COL
 
 NO2_RASTER_NAME = "no2"
 NO2_MASK_NAME = "no2_mask"

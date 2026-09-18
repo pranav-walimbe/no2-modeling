@@ -16,6 +16,7 @@ import netCDF4 as nc
 import numpy as np
 import polars as pl
 import shapely
+from preprocessing.stratify_utils import add_aoi_bounds, build_aois
 from pycanopy import SpatialFrame
 
 from config import (
@@ -27,7 +28,6 @@ from config import (
     TEMPO_MAX_DELTA_MINUTES,
     TEMPO_MIN_DELTA_MINUTES,
 )
-from preprocessing.stratify_utils import add_aoi_bounds, build_aois
 
 AOI_ID_COL = "aoi_id"
 GEOLOCATION_STRIDE = 4  # cross-track stride when sampling geolocation for AOI pixels
