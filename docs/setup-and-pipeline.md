@@ -184,11 +184,11 @@ array such as `0-31%14`.
   absolute deadband;
 - retains only AOIs whose coal units supplied more than 50 percent of summed
   previous-quarter average unit generation;
-- filters finite aggregate AOI-hour NOx to the configured inclusive 1st through
-  99th percentile bounds and records the fitted bounds in its summary;
-- assigns overlapping AOI clusters intact toward 70/15/15 record targets,
-  accounting for total and per-class counts;
-- emits every eligible record without class balancing or a row-count target.
+- assigns overlapping AOI clusters intact toward 70/15/15 record targets;
+- removes records above each split's 95th percentile of aggregate AOI-hour NOx
+  mass;
+- deterministically random-samples the retained pools to 300,000 training and
+  75,000 validation and test records.
 
 `preprocessing.generate_dataset`:
 

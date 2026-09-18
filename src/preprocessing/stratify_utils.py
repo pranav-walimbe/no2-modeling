@@ -12,7 +12,6 @@ from pyproj import Transformer
 from config import (
     EFFECTIVE_DELTA_NOX_COL,
     EMA_DECAY_TIMESCALE_HOURS,
-    EMA_DELTA_THRESHOLD,
     IMG_RANGE,
     LABEL_COL,
     MIN_CITY_POPULATION,
@@ -27,9 +26,13 @@ MAJOR_CITY_DIST_COL = "major_city_dist"
 LABEL_MODE_COL = "label_mode"
 PREVIOUS_QUARTER_COAL_POWER_COL = "_previous_quarter_coal_power"
 PREVIOUS_QUARTER_POWER_COL = "_previous_quarter_power"
-PREV_QTR_AVG_NOX_COL = "prev_qtr_avg_nox"
+PREV_QTR_MED_NOX_COL = "prev_qtr_med_nox"
 EFFECTIVE_CURRENT_NOX_COL = "effective_current_nox"
 EFFECTIVE_PREVIOUS_NOX_COL = "effective_previous_nox"
+NOX_COL = "nox"
+DELTA_NOX_COL = "delta_nox"
+DELTA_NOX_SCALED_COL = "delta_nox_scaled"
+DELTA_EFFECTIVE_NOX_SCALED_COL = "delta_effective_nox_scaled"
 METERS_PER_KM = 1000.0
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_MINUTE = 60
@@ -42,35 +45,50 @@ POPULATED_PLACES_PATH = Path(
 )
 
 
-def apply_binary_target(
-    splits: dict[str, pl.DataFrame],
-    threshold: float = EMA_DELTA_THRESHOLD,
-    target_column: str = "delta_nox_mass",
-) -> dict[str, pl.DataFrame]:
-    """Apply one fixed symmetric deadband and sign label to every split.
+def select_split_records(
+    frame: pl.DataFrame,
+    split: str,
+    target_records: int,
+    *,
+    seed: int,
+) -> pl.DataFrame:
+    """Prune the highest NOx masses and select a deterministic random sample.
 
     Args:
-        splits: Geographic data partitions carrying raw delta-NOx values.
-        threshold: Least absolute target magnitude retained as a labeled class.
-        target_column: Continuous change column used for filtering and direction.
+        frame: Eligible records carrying aggregate NOx mass.
+        split: Split name used in progress and error messages.
+        target_records: Exact number of records to return.
+        seed: Deterministic record-ordering seed.
 
     Returns:
-        Filtered labeled splits.
+        Selected records in AOI and emissions-time order.
     """
-    labeled: dict[str, pl.DataFrame] = {}
-    for name, split in splits.items():
-        finite = split.filter(pl.col(target_column).is_finite())
-        labeled[name] = finite.filter(pl.col(target_column).abs() > threshold).with_columns(
-            (pl.col(target_column) > 0).cast(pl.UInt8).alias(LABEL_COL),
+    if target_records <= 0:
+        raise ValueError("target_records must be positive")
+
+    finite = frame.filter(pl.col(NOX_COL).is_finite())
+    if finite.is_empty():
+        raise ValueError(f"[{split}] no records have finite NOx mass")
+    upper_bound = finite.select(pl.col(NOX_COL).quantile(0.95, interpolation="linear")).item()
+    pruned = finite.filter(pl.col(NOX_COL) <= upper_bound)
+    if pruned.height < target_records:
+        raise ValueError(
+            f"[{split}] requested {target_records:,} records but only {pruned.height:,} remain "
+            "after upper NOx-mass pruning"
         )
-        negative = labeled[name].filter(pl.col(LABEL_COL) == 0).height
-        positive = labeled[name].filter(pl.col(LABEL_COL) == 1).height
-        print(
-            f"[{name}] deadband retained {labeled[name].height:,}/{finite.height:,} records; "
-            f"class 0: {negative:,}; class 1: {positive:,}"
-        )
-    print(f"{target_column} deadband: [-{threshold:.6g}, {threshold:.6g}]")
-    return labeled
+
+    selected = (
+        pruned.with_columns(pl.struct(AOI_ID_COL, "emissions_hour_utc").hash(seed=seed).alias("_selection_tie_breaker"))
+        .sort("_selection_tie_breaker", AOI_ID_COL, "emissions_hour_utc")
+        .head(target_records)
+        .drop("_selection_tie_breaker")
+        .sort(AOI_ID_COL, "emissions_hour_utc")
+    )
+    print(
+        f"[{split}] NOx mass P95={upper_bound:.6g}; retained {pruned.height:,}/{finite.height:,} "
+        f"after pruning the upper 5%; randomly selected {selected.height:,} records"
+    )
+    return selected
 
 
 def classification_summary(source: pl.DataFrame, retained: pl.DataFrame) -> dict[str, object]:
@@ -186,14 +204,14 @@ def add_hrrr_files(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def add_sequence_weather_paths(frame: pl.DataFrame, timesteps: int = SEQUENCE_TIMESTEPS) -> pl.DataFrame:
-    """Add wind and temperature source paths for every sequence timestep.
+    """Add the weather source path for every sequence timestep.
 
     Args:
         frame: Records carrying oldest-to-newest timestep timestamps.
         timesteps: Configured sequence length.
 
     Returns:
-        Records with separate wind and temperature path columns per timestep.
+        Records with one weather path column per timestep.
     """
     expressions = []
     for index in range(timesteps):
@@ -203,12 +221,7 @@ def add_sequence_weather_paths(frame: pl.DataFrame, timesteps: int = SEQUENCE_TI
             matched_time.dt.strftime("%Y/%m/%d/hrrr_%Y%m%d_%H"),
             pl.lit(f"z_{HRRR_PRODUCT}_{HRRR_FIELD_SLUG}.grib2"),
         )
-        expressions.extend(
-            (
-                path.alias(f"wind_path_t{index}"),
-                path.alias(f"temperature_path_t{index}"),
-            )
-        )
+        expressions.append(path.alias(f"weather_path_t{index}"))
     return frame.with_columns(expressions)
 
 
@@ -439,6 +452,25 @@ def add_ema_targets(
     )
 
 
+def add_scaled_nox_targets(frame: pl.DataFrame) -> pl.DataFrame:
+    """Add canonical raw and effective delta targets scaled by prior-quarter median NOx.
+
+    Args:
+        frame: AOI-hour records with raw and effective NOx changes.
+
+    Returns:
+        Records with unscaled aliases and asinh-scaled delta targets.
+    """
+    return frame.with_columns(
+        pl.col("delta_nox_mass").alias(DELTA_NOX_COL),
+    ).with_columns(
+        (pl.col(DELTA_NOX_COL) / pl.col(PREV_QTR_MED_NOX_COL)).arcsinh().alias(DELTA_NOX_SCALED_COL),
+        (pl.col(EFFECTIVE_DELTA_NOX_COL) / pl.col(PREV_QTR_MED_NOX_COL))
+        .arcsinh()
+        .alias(DELTA_EFFECTIVE_NOX_SCALED_COL),
+    )
+
+
 def add_projected_coordinates(frame: pl.DataFrame) -> pl.DataFrame:
     """Add NAD83 Conus Albers coordinates to longitude-latitude points."""
     x_m, y_m = WGS84_TO_CONUS.transform(frame["lon"].to_numpy(), frame["lat"].to_numpy())
@@ -602,14 +634,14 @@ def add_previous_quarter_same_hour_averages(hourly: pl.LazyFrame) -> pl.LazyFram
     )
 
 
-def add_previous_quarter_nox_average(hourly: pl.LazyFrame) -> pl.LazyFrame:
-    """Add the AOI's mean hourly NOx mass level from the prior quarter.
+def add_previous_quarter_nox_median(hourly: pl.LazyFrame) -> pl.LazyFrame:
+    """Add the AOI's median hourly NOx mass from the prior quarter.
 
     Args:
         hourly: AOI-hour rows containing date and aggregate NOx mass.
 
     Returns:
-        Rows with a leakage-safe ``prev_qtr_avg_nox`` value when the immediately
+        Rows with a leakage-safe prior-quarter median when the immediately
         preceding quarter is available.
     """
     quarter_columns = hourly.with_columns(
@@ -618,7 +650,7 @@ def add_previous_quarter_nox_average(hourly: pl.LazyFrame) -> pl.LazyFrame:
     )
     previous_quarter = (
         quarter_columns.group_by(AOI_ID_COL, "_year", "_quarter")
-        .agg(pl.col("nox_mass").mean().alias(PREV_QTR_AVG_NOX_COL))
+        .agg(pl.col("nox_mass").median().alias(PREV_QTR_MED_NOX_COL))
         .with_columns(
             pl.when(pl.col("_quarter") == 4).then(pl.col("_year") + 1).otherwise(pl.col("_year")).alias("_year"),
             pl.when(pl.col("_quarter") == 4).then(1).otherwise(pl.col("_quarter") + 1).alias("_quarter"),
@@ -800,10 +832,11 @@ def aggregate_aoi_hours(
         .with_columns(
             pl.col("emissions_hour_utc").dt.date().alias("date"),
             pl.col("emissions_hour_utc").dt.hour().cast(pl.Int8).alias("hour"),
+            pl.col("nox_mass").alias(NOX_COL),
         )
     )
     return (
-        add_delta_nox_targets(add_previous_quarter_nox_average(add_previous_quarter_same_hour_averages(hourly)))
+        add_delta_nox_targets(add_previous_quarter_nox_median(add_previous_quarter_same_hour_averages(hourly)))
         .with_columns(
             pl.col("date").dt.year().alias("_priority_year"),
             pl.col("date").dt.quarter().alias("_priority_quarter"),

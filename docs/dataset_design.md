@@ -10,15 +10,16 @@ whether it has enough coverage.
 | Split unit | Geographic clusters of overlapping 72 km AOIs |
 | Split target | Approximately 70% train, 15% validation, 15% test |
 | Label | Sign of raw hourly NOx change outside a 100 lb deadband |
-| Metadata filters | Required source data, NOx percentile bounds, relative-change floor, and coal dominance |
+| Metadata filters | Required source data and per-split upper 5% NOx-mass pruning |
 | Raster gates | More than 95% current coverage and 80% paired coverage |
 | Final selection | Oversample the training minority class; undersample validation and test majority classes |
 | Model selection | Validation data only; freeze test data for final comparison |
 
 ## Output contract
 
-Stratification assigns intact geographic clusters toward a 70/15/15 split and
-keeps each eligible record. After raster failures, finalization duplicates
+Stratification assigns intact geographic clusters toward a 70/15/15 split,
+removes each split's upper 5% of NOx mass, and randomly samples 300k/75k/75k
+records. After raster failures, finalization duplicates
 deterministically ranked minority rows in training until both classes match the
 majority size. For validation and test, it keeps every minority row and retains
 the same number of ranked majority rows. Reports record eligible counts, final
@@ -32,9 +33,9 @@ size, balance strategy, and the numbers of duplicated and dropped rows.
   70/15/15 targets for total, negative, and positive eligible record counts.
 - No plant region leaks across splits, so evaluation measures generalization to
   unseen geographic regions instead of interpolation at known plants.
-- The split precedes train-only raster and tabular normalization. The aggregate
-  NOx eligibility percentiles are a global metadata gate applied before the
-  split and are recorded in the stratification summary.
+- The split precedes NOx-mass pruning, record sampling, and train-only raster
+  and tabular normalization. Each split therefore has its own 95th-percentile
+  NOx-mass cutoff.
 
 ## Metadata eligibility and outliers
 
