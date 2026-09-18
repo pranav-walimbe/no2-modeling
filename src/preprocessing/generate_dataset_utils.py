@@ -543,8 +543,7 @@ def process_scan(task: ScanTask) -> ScanResult:
 
 def make_weather_task(
     row: dict[str, object],
-    wind_path_column: str,
-    temperature_path_column: str,
+    weather_path_column: str,
     hrrr_root: Path,
     cache_dir: Path,
 ) -> WeatherTask:
@@ -552,8 +551,7 @@ def make_weather_task(
 
     Args:
         row: Stratified record carrying its AOI and HRRR relative paths.
-        wind_path_column: Column holding the wind GRIB path.
-        temperature_path_column: Column holding the temperature GRIB path.
+        weather_path_column: Column holding the combined wind and temperature GRIB path.
         hrrr_root: Root of the HRRR archive.
         cache_dir: Persistent aligned-weather cache directory.
 
@@ -563,14 +561,12 @@ def make_weather_task(
     aoi_id = int(row["aoi_id"])
     lon = float(row["lon"])
     lat = float(row["lat"])
-    wind_hrrr_path = str(hrrr_root / str(row[wind_path_column]))
-    temperature_hrrr_path = str(hrrr_root / str(row[temperature_path_column]))
+    hrrr_path = str(hrrr_root / str(row[weather_path_column]))
     identity = json.dumps(
         {
             "aoi": [aoi_id, lon, lat],
             "fields": [WIND_U_RASTER_NAME, WIND_V_RASTER_NAME, TEMPERATURE_RASTER_NAME],
-            "temperature_hrrr": temperature_hrrr_path,
-            "wind_hrrr": wind_hrrr_path,
+            "hrrr": hrrr_path,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -581,8 +577,8 @@ def make_weather_task(
         aoi_id,
         lon,
         lat,
-        wind_hrrr_path,
-        temperature_hrrr_path,
+        hrrr_path,
+        hrrr_path,
         str(cache_dir / f"{cache_key}.npz"),
     )
 

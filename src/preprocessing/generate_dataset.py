@@ -65,6 +65,16 @@ SOURCE_METADATA_SCHEMA = {
     "_source_north_km": pl.String,
     "_source_unit_count": pl.String,
 }
+REQUIRED_SOURCE_COLUMNS = frozenset(
+    {
+        "aoi_id",
+        "lat",
+        "lon",
+        *SOURCE_METADATA_SCHEMA,
+        *(f"no2_paths_t{index}" for index in range(SEQUENCE_TIMESTEPS)),
+        *(f"weather_path_t{index}" for index in range(SEQUENCE_TIMESTEPS)),
+    }
+)
 ARRAY_SPLITS = tuple(SPLIT_PATHS)
 PROGRESS_INTERVAL = 1_000
 LEGACY_DATASET_JOB_NAME = "generate-dataset"
@@ -99,7 +109,14 @@ def _positive_int(value: str) -> int:
 
 def _scan_split(path: str) -> pl.LazyFrame:
     # Load split rows lazily for bounded orchestration memory
-    return pl.scan_csv(path, try_parse_dates=True, schema_overrides=SOURCE_METADATA_SCHEMA)
+    frame = pl.scan_csv(path, try_parse_dates=True, schema_overrides=SOURCE_METADATA_SCHEMA)
+    missing_columns = sorted(REQUIRED_SOURCE_COLUMNS.difference(frame.collect_schema().names()))
+    if missing_columns:
+        raise ValueError(
+            f"Stratified split {path} is missing dataset-generation columns: "
+            f"{', '.join(missing_columns)}"
+        )
+    return frame
 
 
 def _parse_source_values(value: object, value_type: type[float] | type[int]) -> tuple[float, ...] | tuple[int, ...]:
@@ -175,8 +192,7 @@ def _prepare_records(
                 record_weather = tuple(
                     make_weather_task(
                         row,
-                        f"wind_path_t{index}",
-                        f"temperature_path_t{index}",
+                        f"weather_path_t{index}",
                         Path(HRRR_DIR),
                         weather_cache_dir,
                     )
@@ -460,7 +476,7 @@ def _finalize_shards(
     split_paths: dict[str, str],
     store: DatasetShardStore,
 ) -> None:
-    # Combine validated shard outputs before applying global split selection
+    # Combine validated shard outputs into the published split datasets
     started_at = time.perf_counter()
     output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in split_paths}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in split_paths}
