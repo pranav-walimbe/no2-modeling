@@ -182,12 +182,12 @@ array such as `0-31%14`.
 - stores raw and effective NOx changes scaled by the prior-quarter level;
 - scores AOIs from full-history coal production share, NOx signal strength,
   event support, urban isolation, and complete-observation yield;
-- retains the top `AOI_SELECTION_COUNT` AOIs, currently 75;
+- retains the top `AOI_SELECTION_COUNT` AOIs, currently 100;
 - assigns overlapping AOI clusters intact toward 70/15/15 record targets;
 - removes records above each split's 95th percentile of aggregate AOI-hour NOx
   mass;
-- deterministically random-samples the retained pools to 300,000 training and
-  75,000 validation and test records;
+- deterministically random-samples up to 300,000 training and 75,000 validation
+  and test records, retaining the full post-pruning pool when it is smaller;
 - saves and emails a bar chart of each AOI's percentage of final records by split.
 
 `preprocessing.generate_dataset`:

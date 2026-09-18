@@ -20,7 +20,7 @@ whether it has enough coverage.
 Stratification scores every AOI with complete metadata, retains the configured
 top-ranked AOIs, assigns their intact geographic clusters toward a 70/15/15
 split, removes each split's upper 5% of NOx mass, and randomly samples
-300k/75k/75k records. Dataset generation keeps every sampled record that
+up to 300k/75k/75k records. Dataset generation keeps every sampled record that
 passes raster quality checks and reports failures without label-based
 resampling.
 
