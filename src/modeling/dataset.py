@@ -16,8 +16,6 @@ from torch.utils.data import Dataset
 from config import (
     DATASET_DF,
     DATASET_DIR,
-    EMA_DELTA_THRESHOLD,
-    LABEL_COL,
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_ABS,
     MODEL_IMAGE_KEYS,
@@ -26,6 +24,7 @@ from config import (
     MODEL_ROBUST_IMAGE_KEYS,
     SEQUENCE_TIMESTEPS,
 )
+from data_contract import LABEL_COL
 
 RASTER_PATH_COL = "raster_bundle_path"
 LABEL_MODE_COL = "label_mode"
@@ -61,7 +60,6 @@ class NormalizationStats:
     feature_names: tuple[str, ...]
     feature_mean: tuple[float, ...]
     feature_std: tuple[float, ...]
-    delta_threshold: float
     training_records: int
 
     def to_dict(self) -> dict[str, object]:
@@ -90,7 +88,6 @@ class NormalizationStats:
             feature_names=tuple(str(name) for name in values["feature_names"]),
             feature_mean=tuple(float(value) for value in values["feature_mean"]),
             feature_std=tuple(float(value) for value in values["feature_std"]),
-            delta_threshold=float(values["delta_threshold"]),
             training_records=int(values["training_records"]),
         )
 
@@ -267,7 +264,6 @@ def compute_stats(
         feature_names=MODEL_FEATURE_NAMES,
         feature_mean=tuple(float(value) for value in features.mean(axis=0)),
         feature_std=tuple(float(value) for value in feature_std),
-        delta_threshold=EMA_DELTA_THRESHOLD,
         training_records=len(frame),
     )
 

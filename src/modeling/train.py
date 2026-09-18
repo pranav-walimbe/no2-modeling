@@ -14,12 +14,12 @@ from torch.utils.data import DataLoader
 
 from config import (
     DATASET_DF,
-    LABEL_COL,
     MODEL_IMAGE_CLIP_ABS,
     NUM_CORES,
     RUNS_DIR,
     STRAT_BASE_DIR,
 )
+from data_contract import LABEL_COL
 from modeling.convgru import (
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
@@ -446,7 +446,6 @@ def main() -> None:
         "image_scale": list(stats.image_scale),
         "image_clip_range": [-MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS],
         "clipped_valid_pixel_fraction": clipped_fractions,
-        "raw_delta_nox_threshold": stats.delta_threshold,
         "target_label_mode": target_label_mode,
         "tabular_features": list(MODEL_FEATURE_NAMES),
         "prediction_family": "Bernoulli",
