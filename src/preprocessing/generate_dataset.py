@@ -17,10 +17,8 @@ from config import (
     DATASET_RASTER_DIR,
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WEATHER_CACHE_DIR,
-    EMA_DELTA_THRESHOLD,
     HOTSPOT_WINDOW_SIZE,
     HRRR_DIR,
-    LABEL_COL,
     MIN_HOTSPOT_NO2_FINITE_FRACTION,
     MIN_TIMESTEP_NO2_FINITE_FRACTION,
     NUM_CORES,
@@ -51,13 +49,11 @@ from preprocessing.generate_dataset_utils import (
     process_scan_batch,
     process_weather_batch,
     scan_batches,
-    select_final_records,
     select_hotspot_cell,
     weather_batches,
     write_csv_atomic,
     write_json_atomic,
 )
-from preprocessing.stratify_utils import classification_summary
 
 SPLIT_PATHS = {
     "train": TRAIN_RECORDS_CSV,
@@ -69,6 +65,16 @@ SOURCE_METADATA_SCHEMA = {
     "_source_north_km": pl.String,
     "_source_unit_count": pl.String,
 }
+REQUIRED_SOURCE_COLUMNS = frozenset(
+    {
+        "aoi_id",
+        "lat",
+        "lon",
+        *SOURCE_METADATA_SCHEMA,
+        *(f"no2_paths_t{index}" for index in range(SEQUENCE_TIMESTEPS)),
+        *(f"weather_path_t{index}" for index in range(SEQUENCE_TIMESTEPS)),
+    }
+)
 ARRAY_SPLITS = tuple(SPLIT_PATHS)
 PROGRESS_INTERVAL = 1_000
 LEGACY_DATASET_JOB_NAME = "generate-dataset"
@@ -103,7 +109,14 @@ def _positive_int(value: str) -> int:
 
 def _scan_split(path: str) -> pl.LazyFrame:
     # Load split rows lazily for bounded orchestration memory
-    return pl.scan_csv(path, try_parse_dates=True, schema_overrides=SOURCE_METADATA_SCHEMA)
+    frame = pl.scan_csv(path, try_parse_dates=True, schema_overrides=SOURCE_METADATA_SCHEMA)
+    missing_columns = sorted(REQUIRED_SOURCE_COLUMNS.difference(frame.collect_schema().names()))
+    if missing_columns:
+        raise ValueError(
+            f"Stratified split {path} is missing dataset-generation columns: "
+            f"{', '.join(missing_columns)}"
+        )
+    return frame
 
 
 def _parse_source_values(value: object, value_type: type[float] | type[int]) -> tuple[float, ...] | tuple[int, ...]:
@@ -179,8 +192,7 @@ def _prepare_records(
                 record_weather = tuple(
                     make_weather_task(
                         row,
-                        f"wind_path_t{index}",
-                        f"temperature_path_t{index}",
+                        f"weather_path_t{index}",
                         Path(HRRR_DIR),
                         weather_cache_dir,
                     )
@@ -367,51 +379,32 @@ def _write_outputs(
 
     prepared_outputs: dict[str, tuple[pl.DataFrame, dict[str, object], pl.DataFrame]] = {}
     for split, candidates in candidates_by_split.items():
-        output_frame = select_final_records(candidates, split)
-        selected_coverage = coverage_selection_summary(output_frame)
-        eligible_by_class = {
-            str(label): candidates.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)
-        }
-        balance_size_change = output_frame.height - candidates.height
-        selection_size = {
-            "actual_size": output_frame.height,
-            "balance_strategy": "oversample_minority" if split == "train" else "undersample_majority",
-            "duplicated_for_balance": max(balance_size_change, 0),
-            "dropped_for_balance": max(-balance_size_change, 0),
-            "eligible_by_class": eligible_by_class,
-        }
-        print(f"[{split}] {candidates.height:,} generated; {output_frame.height:,} selected")
-        if selection_size["duplicated_for_balance"]:
-            print(f"[{split}] duplicated {selection_size['duplicated_for_balance']:,} records for class balance")
-        if selection_size["dropped_for_balance"]:
-            print(f"[{split}] dropped {selection_size['dropped_for_balance']:,} records for class balance")
+        coverage_summary = coverage_selection_summary(candidates)
+        print(f"[{split}] {candidates.height:,} records passed raster generation")
         print(
-            f"[{split}] full sequence coverage: {selected_coverage['full_coverage_records']:,}/"
-            f"{selected_coverage['records']:,} selected across {selected_coverage['aoi_count']:,} AOIs"
+            f"[{split}] full sequence coverage: {coverage_summary['full_coverage_records']:,}/"
+            f"{coverage_summary['records']:,} records across {coverage_summary['aoi_count']:,} AOIs"
         )
-        classification_report = {
+        generation_report = {
             "split": split,
-            "ema_delta_nox_threshold": EMA_DELTA_THRESHOLD,
             "raster_contract": {
                 "sequence_timesteps": SEQUENCE_TIMESTEPS,
                 "minimum_no2_finite_fraction_per_timestep": MIN_TIMESTEP_NO2_FINITE_FRACTION,
                 "hotspot_window_size": HOTSPOT_WINDOW_SIZE,
                 "minimum_hotspot_no2_finite_fraction_per_timestep": MIN_HOTSPOT_NO2_FINITE_FRACTION,
             },
-            "selection_size": selection_size,
-            "final_balance": classification_summary(candidates, output_frame),
-            "coverage_selection": {
-                "generated": coverage_selection_summary(candidates),
-                "selected": selected_coverage,
-            },
+            "source_records": source_splits[split].height,
+            "generated_records": candidates.height,
+            "processing_failures": failure_frames[split].height,
+            "coverage": coverage_summary,
         }
         prepared_outputs[split] = (
-            output_frame,
-            classification_report,
+            candidates,
+            generation_report,
             failure_frames[split],
         )
 
-    for split, (output_frame, classification_report, failure_frame) in prepared_outputs.items():
+    for split, (output_frame, generation_report, failure_frame) in prepared_outputs.items():
         relative_paths = [
             str(Path(candidate_path).relative_to(DATASET_DIR))
             for candidate_path in output_frame[CANDIDATE_RASTER_PATH_COL].to_list()
@@ -429,8 +422,8 @@ def _write_outputs(
             Path(DATASET_DF) / f"{split}_df.csv",
         )
         write_json_atomic(
-            classification_report,
-            Path(DATASET_DF) / f"{split}_classification_summary.json",
+            generation_report,
+            Path(DATASET_DF) / f"{split}_generation_summary.json",
         )
         write_csv_atomic(
             failure_frame,
@@ -483,7 +476,7 @@ def _finalize_shards(
     split_paths: dict[str, str],
     store: DatasetShardStore,
 ) -> None:
-    # Combine validated shard outputs before applying global split selection
+    # Combine validated shard outputs into the published split datasets
     started_at = time.perf_counter()
     output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in split_paths}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in split_paths}

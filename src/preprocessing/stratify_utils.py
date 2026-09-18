@@ -10,10 +10,8 @@ from pycanopy import SpatialFrame, distance_to_point
 from pyproj import Transformer
 
 from config import (
-    EFFECTIVE_DELTA_NOX_COL,
     EMA_DECAY_TIMESCALE_HOURS,
     IMG_RANGE,
-    LABEL_COL,
     MIN_CITY_POPULATION,
     SEQUENCE_TIMESTEPS,
     TARGET_LABEL_MODE,
@@ -89,53 +87,6 @@ def select_split_records(
         f"after pruning the upper 5%; randomly selected {selected.height:,} records"
     )
     return selected
-
-
-def classification_summary(source: pl.DataFrame, retained: pl.DataFrame) -> dict[str, object]:
-    """Summarize binary-label retention overall and by AOI.
-
-    Args:
-        source: Records before the reported filtering or balancing stage.
-        retained: Retained records carrying binary labels.
-
-    Returns:
-        JSON-safe overall and per-AOI counts.
-    """
-
-    def counts(frame: pl.DataFrame) -> dict[str, int | float | None]:
-        # Count each class without assuming both are present
-        negative = frame.filter(pl.col(LABEL_COL) == 0).height
-        positive = frame.filter(pl.col(LABEL_COL) == 1).height
-        total = negative + positive
-        return {
-            "retained_records": total,
-            "negative_records": negative,
-            "positive_records": positive,
-            "positive_fraction": positive / total if total else None,
-        }
-
-    source_by_aoi = dict(source.group_by(AOI_ID_COL).len().iter_rows())
-    retained_by_aoi = {int(group[AOI_ID_COL][0]): group for group in retained.partition_by(AOI_ID_COL)}
-    by_aoi = []
-    for aoi_id, source_records in sorted(source_by_aoi.items()):
-        aoi_counts = counts(retained_by_aoi.get(int(aoi_id), retained.head(0)))
-        by_aoi.append(
-            {
-                AOI_ID_COL: int(aoi_id),
-                "source_records": int(source_records),
-                "retained_fraction": aoi_counts["retained_records"] / source_records,
-                **aoi_counts,
-            }
-        )
-    overall = counts(retained)
-    return {
-        "overall": {
-            "source_records": source.height,
-            "retained_fraction": overall["retained_records"] / source.height if source.height else None,
-            **overall,
-        },
-        "by_aoi": by_aoi,
-    }
 
 
 def load_major_cities(path: Path = POPULATED_PLACES_PATH) -> pl.DataFrame:
@@ -446,7 +397,7 @@ def add_ema_targets(
             pl.col("previous_ema_nox").alias(EFFECTIVE_PREVIOUS_NOX_COL),
         )
         .with_columns(
-            (pl.col(EFFECTIVE_CURRENT_NOX_COL) - pl.col(EFFECTIVE_PREVIOUS_NOX_COL)).alias(EFFECTIVE_DELTA_NOX_COL)
+            (pl.col(EFFECTIVE_CURRENT_NOX_COL) - pl.col(EFFECTIVE_PREVIOUS_NOX_COL)).alias("effective_delta_nox")
         )
         .drop("_label_row", "current_ema_nox", "previous_ema_nox")
     )
@@ -465,7 +416,7 @@ def add_scaled_nox_targets(frame: pl.DataFrame) -> pl.DataFrame:
         pl.col("delta_nox_mass").alias(DELTA_NOX_COL),
     ).with_columns(
         (pl.col(DELTA_NOX_COL) / pl.col(PREV_QTR_MED_NOX_COL)).arcsinh().alias(DELTA_NOX_SCALED_COL),
-        (pl.col(EFFECTIVE_DELTA_NOX_COL) / pl.col(PREV_QTR_MED_NOX_COL))
+        (pl.col("effective_delta_nox") / pl.col(PREV_QTR_MED_NOX_COL))
         .arcsinh()
         .alias(DELTA_EFFECTIVE_NOX_SCALED_COL),
     )

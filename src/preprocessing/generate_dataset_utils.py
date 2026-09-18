@@ -26,7 +26,6 @@ from config import (
     HOTSPOT_WINDOW_SIZE,
     IMG_RANGE,
     IMG_SIZE,
-    LABEL_COL,
     MIN_HOTSPOT_NO2_FINITE_FRACTION,
     MIN_TIMESTEP_NO2_FINITE_FRACTION,
     SEQUENCE_TIMESTEPS,
@@ -57,13 +56,6 @@ MIN_HOTSPOT_FINITE_FRACTION_COL = "min_hotspot_no2_finite_fraction"
 HOTSPOT_ROW_COL = "hotspot_row"
 HOTSPOT_COLUMN_COL = "hotspot_column"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
-SELECTION_HELPER_COLUMNS = (
-    "_selection_year",
-    "_selection_quarter",
-    "_selection_hour_bin",
-    "_stratum_rank",
-    "_aoi_round",
-)
 TABULAR_FEATURE_NAMES = (
     *NO2_FINITE_FRACTION_COLUMNS,
     *HOTSPOT_FINITE_FRACTION_COLUMNS,
@@ -286,78 +278,15 @@ def _coverage_group_summary(frame: pl.DataFrame) -> dict[str, int | float]:
 
 
 def coverage_selection_summary(frame: pl.DataFrame) -> dict[str, object]:
-    """Report sequence coverage and AOI representation overall and by class.
+    """Report sequence coverage and AOI representation.
 
     Args:
-        frame: Records carrying sequence coverage and class labels.
+        frame: Successfully generated records carrying sequence coverage.
 
     Returns:
-        Coverage counts and AOI representation for the frame and each class.
+        Coverage counts and AOI representation for the frame.
     """
-    return {
-        **_coverage_group_summary(frame),
-        "by_class": {str(label): _coverage_group_summary(frame.filter(pl.col(LABEL_COL) == label)) for label in (0, 1)},
-    }
-
-
-def select_final_records(frame: pl.DataFrame, split: str) -> pl.DataFrame:
-    """Balance classes using deterministically ranked records.
-
-    Args:
-        frame: Successfully generated candidate records with finite paired coverage.
-        split: Dataset split being finalized.
-
-    Returns:
-        Equal-sized classes selected for the requested split.
-    """
-    eligible_by_class = {label: frame.filter(pl.col(LABEL_COL) == label).height for label in (0, 1)}
-    if not all(eligible_by_class.values()):
-        raise ValueError(f"Cannot balance a split without both classes: {eligible_by_class}")
-
-    class_size = max(eligible_by_class.values()) if split == "train" else min(eligible_by_class.values())
-
-    selected_classes = []
-    for label in (0, 1):
-        class_records = frame.filter(pl.col(LABEL_COL) == label)
-        selected_classes.append(_resize_ranked_records(class_records, class_size))
-    return pl.concat(selected_classes, how="vertical").sort(AOI_ID_COL, "date", "hour").drop(*SELECTION_HELPER_COLUMNS)
-
-
-def _resize_ranked_records(frame: pl.DataFrame, target_size: int) -> pl.DataFrame:
-    # Repeat or truncate ranked rows to the requested class size
-    ranked = _rank_final_records(frame)
-    complete_copies, remainder = divmod(target_size, ranked.height)
-    copies = [ranked] * complete_copies
-    if remainder:
-        copies.append(ranked.head(remainder))
-    return pl.concat(copies, how="vertical")
-
-
-def _rank_final_records(frame: pl.DataFrame) -> pl.DataFrame:
-    # Rank by coverage while retaining temporal and AOI round-robin ordering
-
-    strata = [AOI_ID_COL, "_selection_year", "_selection_quarter", "_selection_hour_bin"]
-    return (
-        frame.with_columns(
-            pl.col("date").dt.year().alias("_selection_year"),
-            pl.col("date").dt.quarter().alias("_selection_quarter"),
-            (pl.col("hour") // 4).alias("_selection_hour_bin"),
-        )
-        .sort(
-            [*strata, MIN_NO2_FINITE_FRACTION_COL, "date", "hour"],
-            descending=[False, False, False, False, True, False, False],
-        )
-        .with_columns(pl.col(AOI_ID_COL).cum_count().over(strata).alias("_stratum_rank"))
-        .sort(
-            [AOI_ID_COL, "_stratum_rank", MIN_NO2_FINITE_FRACTION_COL, "date", "hour"],
-            descending=[False, False, True, False, False],
-        )
-        .with_columns(pl.col(AOI_ID_COL).cum_count().over(AOI_ID_COL).alias("_aoi_round"))
-        .sort(
-            ["_aoi_round", MIN_NO2_FINITE_FRACTION_COL, AOI_ID_COL, "date", "hour"],
-            descending=[False, True, False, False, False],
-        )
-    )
+    return _coverage_group_summary(frame)
 
 
 @dataclass(frozen=True)
@@ -614,8 +543,7 @@ def process_scan(task: ScanTask) -> ScanResult:
 
 def make_weather_task(
     row: dict[str, object],
-    wind_path_column: str,
-    temperature_path_column: str,
+    weather_path_column: str,
     hrrr_root: Path,
     cache_dir: Path,
 ) -> WeatherTask:
@@ -623,8 +551,7 @@ def make_weather_task(
 
     Args:
         row: Stratified record carrying its AOI and HRRR relative paths.
-        wind_path_column: Column holding the wind GRIB path.
-        temperature_path_column: Column holding the temperature GRIB path.
+        weather_path_column: Column holding the combined wind and temperature GRIB path.
         hrrr_root: Root of the HRRR archive.
         cache_dir: Persistent aligned-weather cache directory.
 
@@ -634,14 +561,12 @@ def make_weather_task(
     aoi_id = int(row["aoi_id"])
     lon = float(row["lon"])
     lat = float(row["lat"])
-    wind_hrrr_path = str(hrrr_root / str(row[wind_path_column]))
-    temperature_hrrr_path = str(hrrr_root / str(row[temperature_path_column]))
+    hrrr_path = str(hrrr_root / str(row[weather_path_column]))
     identity = json.dumps(
         {
             "aoi": [aoi_id, lon, lat],
             "fields": [WIND_U_RASTER_NAME, WIND_V_RASTER_NAME, TEMPERATURE_RASTER_NAME],
-            "temperature_hrrr": temperature_hrrr_path,
-            "wind_hrrr": wind_hrrr_path,
+            "hrrr": hrrr_path,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -652,8 +577,8 @@ def make_weather_task(
         aoi_id,
         lon,
         lat,
-        wind_hrrr_path,
-        temperature_hrrr_path,
+        hrrr_path,
+        hrrr_path,
         str(cache_dir / f"{cache_key}.npz"),
     )
 
