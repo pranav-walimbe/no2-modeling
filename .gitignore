@@ -204,7 +204,6 @@ cython_debug/
 .cursorindexingignore
 
 # Local agent handoff state
-AGENTS.md
 CLAUDE.md
 /.agents/*
 !/.agents/skills/
