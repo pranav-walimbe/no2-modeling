@@ -249,7 +249,7 @@ def _launch(args: argparse.Namespace) -> None:
             "--noheader",
             "--user",
             str(os.environ["USER"]),
-            "--name=masked-data-prepare,masked-data-reuse,masked-data-discover,masked-data-validate,masked-data-shard,masked-data-finalize",
+            "--name=masked-data-prepare,masked-data-reuse,masked-data-discover,masked-data-shard,masked-data-finalize",
             "--format=%i",
         ],
         check=True,
@@ -307,24 +307,13 @@ def _launch(args: argparse.Namespace) -> None:
         ],
         script_arguments,
     )
-    validation_job = _submit(
-        [
-            "--cpus-per-task=1",
-            "--time=00:30:00",
-            "--job-name=masked-data-validate",
-            "--kill-on-invalid-dep=yes",
-            f"--dependency=afterok:{discovery_job}",
-            f"--export=ALL,{STAGE_ENV}=validate",
-        ],
-        script_arguments,
-    )
     materialize_job = _submit(
         [
             f"--array={shard_array_spec}",
             f"--cpus-per-task={args.workers_per_shard}",
             "--job-name=masked-data-shard",
             "--kill-on-invalid-dep=yes",
-            f"--dependency=afterok:{validation_job}",
+            f"--dependency=afterok:{discovery_job}",
             f"--export=ALL,{STAGE_ENV}=materialize",
         ],
         script_arguments,
@@ -344,7 +333,6 @@ def _launch(args: argparse.Namespace) -> None:
     print(f"Masked-pretraining preparation: {prepare_job}")
     print(f"Masked-pretraining cache reuse: {reuse_job}")
     print(f"Masked-pretraining validity discovery: {discovery_job}")
-    print(f"Masked-pretraining validity validation: {validation_job}")
     print(f"Masked-pretraining shard materialization: {materialize_job}")
     print(f"Masked-pretraining finalizer: {finalizer_job}")
 
@@ -510,20 +498,6 @@ def _run_discovery(args: argparse.Namespace) -> None:
         print(f"[{split} worker {worker_id}] finished with {len(valid_rows):,} newly valid scenes")
 
 
-def _run_validate() -> None:
-    incomplete = {
-        split: (valid_count, target_count)
-        for split, target_count in SPLIT_TARGETS.items()
-        if (valid_count := _count_valid_records(split)) < target_count
-    }
-    if incomplete:
-        details = ", ".join(
-            f"{split}={valid_count:,}/{target_count:,}" for split, (valid_count, target_count) in incomplete.items()
-        )
-        raise ValueError(f"Discovery exhausted its candidates before meeting targets: {details}")
-    print("Masked-pretraining discovery met every split target")
-
-
 def _selected_valid_records(split: str, target_count: int) -> pl.DataFrame:
     # Select deterministic cache-backed records from this run
     paths = sorted((Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split).glob("*.parquet"))
@@ -559,6 +533,20 @@ def _run_materialize(args: argparse.Namespace) -> None:
 
 def _run_finalizer(args: argparse.Namespace) -> None:
     tasks = build_shard_tasks(SPLIT_TARGETS, args.shard_size)
+    selected_by_split = {
+        split: _selected_valid_records(split, target_count) for split, target_count in SPLIT_TARGETS.items()
+    }
+    incomplete = {
+        split: (selected.height, SPLIT_TARGETS[split])
+        for split, selected in selected_by_split.items()
+        if selected.height < SPLIT_TARGETS[split]
+    }
+    if incomplete:
+        details = ", ".join(
+            f"{split}={valid_count:,}/{target_count:,}" for split, (valid_count, target_count) in incomplete.items()
+        )
+        raise ValueError(f"Cannot finalize incomplete discovery: {details}")
+
     store = MaskedDatasetShardStore(Path(MASKED_PRETRAINING_SHARD_DIR))
     output_by_split: dict[str, list[pl.DataFrame]] = {split: [] for split in SPLIT_TARGETS}
     for task in tasks:
@@ -570,7 +558,7 @@ def _run_finalizer(args: argparse.Namespace) -> None:
     summaries: list[dict[str, object]] = []
     base = Path(MASKED_PRETRAINING_BASE_DIR)
     for split, target_count in SPLIT_TARGETS.items():
-        expected = _selected_valid_records(split, target_count)
+        expected = selected_by_split[split]
         frames = output_by_split[split]
         output = (
             pl.concat(frames, how="vertical").sort("candidate_index")
@@ -615,8 +603,6 @@ def main() -> None:
         _run_reuse(args)
     elif stage == "discover":
         _run_discovery(args)
-    elif stage == "validate":
-        _run_validate()
     elif stage == "materialize":
         _run_materialize(args)
     elif stage == "finalize":
