@@ -45,13 +45,15 @@ The launcher submits four dependent stages:
 Discovery groups candidates by TEMPO scan to reuse granule reads. Materialized
 shards contain at most 20,000 records by default, with `records.csv` and NPZ
 bundles under `record-rasters/<split>/`. Each bundle copies the clean cache
-arrays and adds masked NO2 plus an artificial mask.
+arrays and adds masked NO2 plus an artificial mask. Each record draws a masking
+fraction uniformly from 1% through 10%. The sampler favors outer pixels and
+mildly boosts pixels near each previous selection, producing exact-size masks
+with small clusters. Masked NO2 uses a finite zero fill; the artificial mask
+uses one for observed pixels and zero for masked pixels.
 
 The finalizer publishes dataset-root-relative paths in `train_df.csv`,
 `val_df.csv`, and `test_df.csv`. It reports a shortfall when a candidate pool is
-exhausted and never duplicates records. `mask_no2_raster` remains unimplemented
-until missingness EDA defines the masking distribution, so materialization stops
-instead of publishing unchanged inputs.
+exhausted and never duplicates records.
 
 ## Launch
 
