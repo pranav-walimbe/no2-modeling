@@ -29,6 +29,9 @@ mkdir -p "${MPLCONFIGDIR}"
 
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
+training_output="${SLURM_TMPDIR:-/tmp}/train-masked-no2-${SLURM_JOB_ID}.log"
+recipient="pranav.walimbe@berkeley.edu"
+
 srun python -u -m modeling.train \
     --device cuda \
     --batch-size 128 \
@@ -41,4 +44,17 @@ srun python -u -m modeling.train \
     --gradient-clip-norm 5.0 \
     --scheduler-patience 10 \
     --scheduler-factor 0.50 \
-    --early-stop-patience 25
+    --early-stop-patience 25 \
+    | tee "${training_output}"
+echo "Training command completed; locating result artifacts"
+
+run_dir="$(sed -n 's/^Training .*; outputs: //p' "${training_output}" | tail -n 1)"
+if [[ -z "${run_dir}" ]]; then
+    echo "Could not determine the masked-model run directory from the training output." >&2
+    exit 1
+fi
+
+bash scripts/slurm/email_masked_model_results.sh \
+    "${run_dir}" \
+    "${SLURM_JOB_ID}" \
+    "${recipient}"

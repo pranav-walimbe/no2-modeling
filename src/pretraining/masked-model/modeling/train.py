@@ -24,7 +24,7 @@ from config import (
 from .dataset import MaskedNO2Dataset, compute_stats, save_stats
 from .eval_utils import evaluate_reconstruction, save_results
 from .model import ARCHITECTURE_NAME, MaskedNO2Autoencoder, masked_l1_loss
-from .plot_utils import plot_loss_curve
+from .plot_utils import plot_loss_curve, plot_results
 
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 300
@@ -269,6 +269,7 @@ def main() -> None:
         },
     }
     save_results(results, run_dir)
+    plot_results(train_losses, validation_losses, results, run_dir)
     run_config = {
         "device": str(device),
         "architecture": ARCHITECTURE_NAME,
