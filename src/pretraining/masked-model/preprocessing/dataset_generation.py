@@ -64,6 +64,7 @@ SPLIT_TARGETS = {
 STAGE_ENV = "MASKED_PRETRAINING_STAGE"
 DEFAULT_BATCH_SIZE = 64
 PROGRESS_INTERVAL = 1_000
+DISCOVERY_TIME_LIMIT = "24:00:00"
 CACHE_INVENTORY_SCHEMA = {"cache_key": pl.String, "status": pl.String}
 CACHE_INVENTORY_FILE = "validity-cache-inventory.parquet"
 
@@ -94,7 +95,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-parallel-shards", type=int, default=MASKED_PRETRAINING_MAX_PARALLEL_SHARDS)
     parser.add_argument("--workers-per-shard", type=int, default=MASKED_PRETRAINING_WORKERS_PER_SHARD)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_parallel_shards < 1:
+        parser.error("--max-parallel-shards must be positive")
+    return args
 
 
 def _safe_reset(path: Path, base: Path) -> None:
@@ -256,10 +260,13 @@ def _launch(args: argparse.Namespace) -> None:
         raise RuntimeError(f"Masked-pretraining generation jobs are already active: {', '.join(active_jobs)}")
     (REPOSITORY_ROOT / "logs").mkdir(exist_ok=True)
     tasks = build_shard_tasks(SPLIT_TARGETS, args.shard_size)
-    array_spec = f"0-{len(tasks) - 1}"
+    shard_array_spec = f"0-{len(tasks) - 1}%{args.max_parallel_shards}"
+    discovery_array_spec = f"0-{args.max_parallel_shards - 1}"
     script_arguments = [
         "--shard-size",
         str(args.shard_size),
+        "--max-parallel-shards",
+        str(args.max_parallel_shards),
         "--workers-per-shard",
         str(args.workers_per_shard),
         "--batch-size",
@@ -279,9 +286,10 @@ def _launch(args: argparse.Namespace) -> None:
     )
     reuse_job = _submit(
         [
-            f"--array={array_spec}%{args.max_parallel_shards}",
+            f"--array={discovery_array_spec}",
             "--cpus-per-task=1",
             "--job-name=masked-data-reuse",
+            "--kill-on-invalid-dep=yes",
             f"--dependency=afterok:{prepare_job}",
             f"--export=ALL,{STAGE_ENV}=reuse",
         ],
@@ -289,9 +297,11 @@ def _launch(args: argparse.Namespace) -> None:
     )
     discovery_job = _submit(
         [
-            f"--array={array_spec}%{args.max_parallel_shards}",
+            f"--array={discovery_array_spec}",
             f"--cpus-per-task={args.workers_per_shard}",
+            f"--time={DISCOVERY_TIME_LIMIT}",
             "--job-name=masked-data-discover",
+            "--kill-on-invalid-dep=yes",
             f"--dependency=afterok:{reuse_job}",
             f"--export=ALL,{STAGE_ENV}=discover",
         ],
@@ -299,9 +309,10 @@ def _launch(args: argparse.Namespace) -> None:
     )
     materialize_job = _submit(
         [
-            f"--array={array_spec}%{args.max_parallel_shards}",
+            f"--array={shard_array_spec}",
             f"--cpus-per-task={args.workers_per_shard}",
             "--job-name=masked-data-shard",
+            "--kill-on-invalid-dep=yes",
             f"--dependency=afterok:{discovery_job}",
             f"--export=ALL,{STAGE_ENV}=materialize",
         ],
@@ -313,6 +324,7 @@ def _launch(args: argparse.Namespace) -> None:
             "--cpus-per-task=1",
             "--time=04:00:00",
             "--job-name=masked-data-finalize",
+            "--kill-on-invalid-dep=yes",
             f"--dependency=afterok:{materialize_job}",
             f"--export=ALL,{STAGE_ENV}=finalize",
         ],
@@ -360,22 +372,31 @@ def _resolve_array_task(shard_size: int) -> tuple[PretrainingShardTask, list[Pre
     return tasks[task_id], tasks
 
 
-def _validity_result_path(task: PretrainingShardTask) -> Path:
-    return (
-        Path(MASKED_PRETRAINING_WORK_DIR)
-        / "validity-results"
-        / task.split
-        / f"{task.shard_index:06d}.parquet"
-    )
+def _reuse_result_path(split: str, worker_id: int) -> Path:
+    return Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split / f"cached-worker-{worker_id:06d}.parquet"
 
 
-def _remaining_candidates_path(task: PretrainingShardTask) -> Path:
-    return (
-        Path(MASKED_PRETRAINING_WORK_DIR)
-        / "remaining-candidates"
-        / task.split
-        / f"{task.shard_index:06d}.parquet"
-    )
+def _remaining_candidates_path(split: str, worker_id: int) -> Path:
+    return Path(MASKED_PRETRAINING_WORK_DIR) / "remaining-candidates" / split / f"worker-{worker_id:06d}.parquet"
+
+
+def _discovery_result_path(split: str, worker_id: int) -> Path:
+    return Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split / f"worker-{worker_id:06d}.parquet"
+
+
+def _count_valid_records(split: str) -> int:
+    result_paths = (Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split).glob("*.parquet")
+    return sum(pl.scan_parquet(path).select(pl.len()).collect(engine="streaming").item() for path in result_paths)
+
+
+def _load_discovery_candidates(split: str, worker_id: int, worker_count: int) -> pl.DataFrame:
+    candidate_path = _remaining_candidates_path(split, worker_id)
+    if not candidate_path.is_file():
+        return pl.DataFrame(schema=CANDIDATE_SCHEMA)
+    candidates = pl.read_parquet(candidate_path)
+    if candidates.filter((pl.col("shard_key") % worker_count) != worker_id).height:
+        raise ValueError(f"Discovery candidate partition does not belong to worker {worker_id}")
+    return candidates.sort("selection_key", "scan_date", "scan_num", AOI_ID_COL).cast(CANDIDATE_SCHEMA)
 
 
 def _partition_cached_candidates(
@@ -410,82 +431,71 @@ def _partition_cached_candidates(
 
 
 def _run_reuse(args: argparse.Namespace) -> None:
-    task, tasks = _resolve_array_task(args.shard_size)
-    split_shard_count = sum(candidate.split == task.split for candidate in tasks)
-    manifest = Path(MASKED_PRETRAINING_WORK_DIR) / "candidates" / f"{task.split}.parquet"
-    candidates = (
-        pl.scan_parquet(manifest)
-        .filter((pl.col("shard_key") % split_shard_count) == task.shard_index)
-        .sort("selection_key", "scan_date", "scan_num", AOI_ID_COL)
-        .collect(engine="streaming")
-    )
+    worker_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
     inventory = pl.read_parquet(Path(MASKED_PRETRAINING_WORK_DIR) / CACHE_INVENTORY_FILE)
     valid_keys = set(inventory.filter(pl.col("status") == VALID_STATUS)["cache_key"].to_list())
     invalid_keys = set(inventory.filter(pl.col("status") == INVALID_STATUS)["cache_key"].to_list())
-    cached_valid, remaining = _partition_cached_candidates(candidates, valid_keys, invalid_keys)
-    write_parquet_atomic(
-        cached_valid,
-        _validity_result_path(task),
-    )
-    write_parquet_atomic(
-        remaining,
-        _remaining_candidates_path(task),
-    )
-    print(
-        f"[{task.split} cache reuse {task.shard_index}] {cached_valid.height:,} valid reused; "
-        f"{remaining.height:,} uncached candidates remain"
-    )
+    for split in SPLIT_TARGETS:
+        manifest = Path(MASKED_PRETRAINING_WORK_DIR) / "candidates" / f"{split}.parquet"
+        candidates = (
+            pl.scan_parquet(manifest)
+            .filter((pl.col("shard_key") % args.max_parallel_shards) == worker_id)
+            .sort("selection_key", "scan_date", "scan_num", AOI_ID_COL)
+            .collect(engine="streaming")
+        )
+        cached_valid, remaining = _partition_cached_candidates(candidates, valid_keys, invalid_keys)
+        write_parquet_atomic(cached_valid, _reuse_result_path(split, worker_id))
+        write_parquet_atomic(remaining, _remaining_candidates_path(split, worker_id))
+        print(
+            f"[{split} cache reuse worker {worker_id}] {cached_valid.height:,} valid reused; "
+            f"{remaining.height:,} uncached candidates remain"
+        )
 
 
 def _run_discovery(args: argparse.Namespace) -> None:
-    task, _ = _resolve_array_task(args.shard_size)
-    candidates = pl.read_parquet(_remaining_candidates_path(task)).sort(
-        "selection_key", "scan_date", "scan_num", AOI_ID_COL
-    )
-    result_path = _validity_result_path(task)
-    valid_rows = list(pl.read_parquet(result_path).iter_rows(named=True))
-    invalid_count = 0
-    retryable_count = 0
-    completed = 0
-    for batch_frame in _candidate_batches(candidates, args.batch_size):
-        result_paths = (Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / task.split).glob("*.parquet")
-        valid_count = sum(
-            pl.scan_parquet(path).select(pl.len()).collect(engine="streaming").item() for path in result_paths
-        )
-        if valid_count >= task.split_target:
-            break
-        results = process_candidate_batch(
-            list(batch_frame.iter_rows(named=True)),
-            validity_cache_dir=Path(MASKED_PRETRAINING_VALIDITY_CACHE_DIR),
-            tempo_root=Path(TEMPO_DIR),
-            tempo_cache_dir=Path(DATASET_TEMPO_CACHE_DIR),
-            hrrr_root=Path(HRRR_DIR),
-            weather_cache_dir=Path(DATASET_WEATHER_CACHE_DIR),
-            workers=args.workers_per_shard,
-        )
-        valid_rows.extend(
-            {
-                "candidate_index": int(result.row["candidate_index"]),
-                "aoi_id": int(result.row["aoi_id"]),
-                "scan_date": result.row["scan_date"],
-                "scan_num": int(result.row["scan_num"]),
-                "tempo_time": result.row["tempo_time"],
-                "cache_key": result.cache_key,
-                "validity_cache_path": str(result.raster_path),
-            }
-            for result in results
-            if result.status == VALID_STATUS
-        )
-        invalid_count += sum(result.status != VALID_STATUS and result.status != "retryable" for result in results)
-        retryable_count += sum(result.status == "retryable" for result in results)
-        write_parquet_atomic(pl.DataFrame(valid_rows, schema=VALID_RECORD_SCHEMA), result_path)
-        completed += batch_frame.height
-        if completed % PROGRESS_INTERVAL == 0 or completed == candidates.height:
-            print(
-                f"[{task.split} shard {task.shard_index}] {completed:,}/{candidates.height:,} candidates; "
-                f"{len(valid_rows):,} valid, {invalid_count:,} invalid, {retryable_count:,} retryable"
+    worker_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
+    for split, target_count in SPLIT_TARGETS.items():
+        candidates = _load_discovery_candidates(split, worker_id, args.max_parallel_shards)
+        result_path = _discovery_result_path(split, worker_id)
+        valid_rows: list[dict[str, object]] = []
+        invalid_count = 0
+        retryable_count = 0
+        completed = 0
+        for batch_frame in _candidate_batches(candidates, args.batch_size):
+            if _count_valid_records(split) >= target_count:
+                break
+            results = process_candidate_batch(
+                list(batch_frame.iter_rows(named=True)),
+                validity_cache_dir=Path(MASKED_PRETRAINING_VALIDITY_CACHE_DIR),
+                tempo_root=Path(TEMPO_DIR),
+                tempo_cache_dir=Path(DATASET_TEMPO_CACHE_DIR),
+                hrrr_root=Path(HRRR_DIR),
+                weather_cache_dir=Path(DATASET_WEATHER_CACHE_DIR),
+                workers=args.workers_per_shard,
             )
-    print(f"[{task.split} discovery {task.shard_index}] finished with {len(valid_rows):,} valid scenes")
+            valid_rows.extend(
+                {
+                    "candidate_index": int(result.row["candidate_index"]),
+                    "aoi_id": int(result.row["aoi_id"]),
+                    "scan_date": result.row["scan_date"],
+                    "scan_num": int(result.row["scan_num"]),
+                    "tempo_time": result.row["tempo_time"],
+                    "cache_key": result.cache_key,
+                    "validity_cache_path": str(result.raster_path),
+                }
+                for result in results
+                if result.status == VALID_STATUS
+            )
+            invalid_count += sum(result.status != VALID_STATUS and result.status != "retryable" for result in results)
+            retryable_count += sum(result.status == "retryable" for result in results)
+            write_parquet_atomic(pl.DataFrame(valid_rows, schema=VALID_RECORD_SCHEMA), result_path)
+            completed += batch_frame.height
+            if completed % PROGRESS_INTERVAL == 0 or completed == candidates.height:
+                print(
+                    f"[{split} worker {worker_id}] {completed:,}/{candidates.height:,} candidates; "
+                    f"{len(valid_rows):,} valid, {invalid_count:,} invalid, {retryable_count:,} retryable"
+                )
+        print(f"[{split} worker {worker_id}] finished with {len(valid_rows):,} newly valid scenes")
 
 
 def _selected_valid_records(split: str, target_count: int) -> pl.DataFrame:
@@ -523,6 +533,20 @@ def _run_materialize(args: argparse.Namespace) -> None:
 
 def _run_finalizer(args: argparse.Namespace) -> None:
     tasks = build_shard_tasks(SPLIT_TARGETS, args.shard_size)
+    selected_by_split = {
+        split: _selected_valid_records(split, target_count) for split, target_count in SPLIT_TARGETS.items()
+    }
+    incomplete = {
+        split: (selected.height, SPLIT_TARGETS[split])
+        for split, selected in selected_by_split.items()
+        if selected.height < SPLIT_TARGETS[split]
+    }
+    if incomplete:
+        details = ", ".join(
+            f"{split}={valid_count:,}/{target_count:,}" for split, (valid_count, target_count) in incomplete.items()
+        )
+        raise ValueError(f"Cannot finalize incomplete discovery: {details}")
+
     store = MaskedDatasetShardStore(Path(MASKED_PRETRAINING_SHARD_DIR))
     output_by_split: dict[str, list[pl.DataFrame]] = {split: [] for split in SPLIT_TARGETS}
     for task in tasks:
@@ -534,7 +558,7 @@ def _run_finalizer(args: argparse.Namespace) -> None:
     summaries: list[dict[str, object]] = []
     base = Path(MASKED_PRETRAINING_BASE_DIR)
     for split, target_count in SPLIT_TARGETS.items():
-        expected = _selected_valid_records(split, target_count)
+        expected = selected_by_split[split]
         frames = output_by_split[split]
         output = (
             pl.concat(frames, how="vertical").sort("candidate_index")
