@@ -38,7 +38,7 @@ dev = ["ruff>=0.12"]
 
 [tool.setuptools]
 package-dir = {"" = "src", modeling = "src/delta-model/modeling", preprocessing = "src/delta-model/preprocessing"}
-py-modules = ["config", "prerequisites"]
+py-modules = ["config", "prerequisites", "raster_encoder"]
 packages = ["modeling", "preprocessing"]
 
 [tool.ruff]
