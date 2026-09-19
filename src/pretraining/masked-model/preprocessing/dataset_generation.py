@@ -42,7 +42,6 @@ from config import (
     HRRR_DIR,
     MASKED_PRETRAINING_BASE_DIR,
     MASKED_PRETRAINING_DF_DIR,
-    MASKED_PRETRAINING_DISCOVERY_WORKERS,
     MASKED_PRETRAINING_MAX_PARALLEL_SHARDS,
     MASKED_PRETRAINING_SHARD_DIR,
     MASKED_PRETRAINING_SHARD_SIZE,
@@ -93,18 +92,12 @@ def parse_args() -> argparse.Namespace:
         default=MASKED_PRETRAINING_SHARD_SIZE,
         help="maximum selected records stored in each disposable dataset shard",
     )
-    parser.add_argument(
-        "--discovery-workers",
-        type=int,
-        default=MASKED_PRETRAINING_DISCOVERY_WORKERS,
-        help="number of long-lived discovery array workers",
-    )
     parser.add_argument("--max-parallel-shards", type=int, default=MASKED_PRETRAINING_MAX_PARALLEL_SHARDS)
     parser.add_argument("--workers-per-shard", type=int, default=MASKED_PRETRAINING_WORKERS_PER_SHARD)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     args = parser.parse_args()
-    if args.discovery_workers < 1:
-        parser.error("--discovery-workers must be positive")
+    if args.max_parallel_shards < 1:
+        parser.error("--max-parallel-shards must be positive")
     return args
 
 
@@ -268,12 +261,12 @@ def _launch(args: argparse.Namespace) -> None:
     (REPOSITORY_ROOT / "logs").mkdir(exist_ok=True)
     tasks = build_shard_tasks(SPLIT_TARGETS, args.shard_size)
     shard_array_spec = f"0-{len(tasks) - 1}%{args.max_parallel_shards}"
-    discovery_array_spec = f"0-{args.discovery_workers - 1}"
+    discovery_array_spec = f"0-{args.max_parallel_shards - 1}"
     script_arguments = [
         "--shard-size",
         str(args.shard_size),
-        "--discovery-workers",
-        str(args.discovery_workers),
+        "--max-parallel-shards",
+        str(args.max_parallel_shards),
         "--workers-per-shard",
         str(args.workers_per_shard),
         "--batch-size",
@@ -458,7 +451,7 @@ def _run_reuse(args: argparse.Namespace) -> None:
         manifest = Path(MASKED_PRETRAINING_WORK_DIR) / "candidates" / f"{split}.parquet"
         candidates = (
             pl.scan_parquet(manifest)
-            .filter((pl.col("shard_key") % args.discovery_workers) == worker_id)
+            .filter((pl.col("shard_key") % args.max_parallel_shards) == worker_id)
             .sort("selection_key", "scan_date", "scan_num", AOI_ID_COL)
             .collect(engine="streaming")
         )
@@ -474,7 +467,7 @@ def _run_reuse(args: argparse.Namespace) -> None:
 def _run_discovery(args: argparse.Namespace) -> None:
     worker_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
     for split, target_count in SPLIT_TARGETS.items():
-        candidates = _load_discovery_candidates(split, worker_id, args.discovery_workers)
+        candidates = _load_discovery_candidates(split, worker_id, args.max_parallel_shards)
         result_path = _discovery_result_path(split, worker_id)
         valid_rows: list[dict[str, object]] = []
         invalid_count = 0
