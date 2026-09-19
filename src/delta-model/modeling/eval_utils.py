@@ -1,117 +1,181 @@
-"""Evaluation utilities for binary NOx-change classification."""
+"""Evaluation utilities for effective NOx-change regression."""
+
+from __future__ import annotations
 
 import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
+import torch
+from scipy.ndimage import gaussian_filter1d
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from torch import nn
+from torch.nn import functional as F
 
-from config import EFFECTIVE_DELTA_NOX_COL
-
-TRUE_CLASS_COL = "y_true"
-PREDICTED_CLASS_COL = "y_pred"
-POSITIVE_PROBABILITY_COL = "probability_positive"
-LOGIT_COL = "logit"
-MODEL_COMPARISON_METRICS = (
-    "accuracy",
-    "balanced_accuracy",
-    "precision",
-    "recall",
-    "specificity",
-    "f1",
-    "roc_auc",
-)
+TRUE_TARGET_COL = "y_true"
+PREDICTION_COL = "y_pred"
+RESIDUAL_COL = "residual"
+ABSOLUTE_ERROR_COL = "absolute_error"
+MODEL_COMPARISON_METRICS = ("mse", "mae", "rmse", "r2", "pearson_r", "spearman_r")
+DEFAULT_LDS_BINS = 101
+DEFAULT_LDS_SIGMA = 2.0
+DEFAULT_MAX_WEIGHT = 5.0
+DEFAULT_HUBER_DELTA = 0.1
 
 
-def classification_metrics(
-    y_true: np.ndarray,
-    positive_probability: np.ndarray,
-) -> dict[str, float | int | None]:
-    """Return thresholded and ranking metrics for a binary classifier.
+@dataclass(frozen=True)
+class LossWeightStats:
+    """Serializable description of training-label loss weights."""
+
+    weighting: str
+    bin_count: int
+    gaussian_sigma_bins: float
+    maximum_weight: float
+    huber_delta: float
+    target_minimum: float
+    target_maximum: float
+    sample_weight_minimum: float
+    sample_weight_median: float
+    sample_weight_mean: float
+    sample_weight_maximum: float
+
+    def to_dict(self) -> dict[str, object]:
+        """Return JSON-safe loss-weight metadata."""
+        return asdict(self)
+
+
+class WeightedHuberLoss(nn.Module):
+    """Huber loss with train-fitted label-distribution weights."""
+
+    def __init__(
+        self,
+        training_targets: np.ndarray,
+        *,
+        weighting: str = "lds_sqrt_inverse",
+        bin_count: int = DEFAULT_LDS_BINS,
+        gaussian_sigma_bins: float = DEFAULT_LDS_SIGMA,
+        maximum_weight: float = DEFAULT_MAX_WEIGHT,
+        huber_delta: float = DEFAULT_HUBER_DELTA,
+    ) -> None:
+        super().__init__()
+        targets = np.asarray(training_targets, dtype=np.float64)
+        if weighting == "none":
+            edges = np.array([-np.inf, np.inf], dtype=np.float64)
+            bin_weights = np.ones(1, dtype=np.float64)
+        else:
+            counts, edges = np.histogram(targets, bins=bin_count)
+            effective_counts = gaussian_filter1d(
+                counts.astype(np.float64),
+                sigma=gaussian_sigma_bins,
+                mode="nearest",
+            )
+            bin_weights = 1.0 / np.sqrt(np.maximum(effective_counts, 1.0))
+            target_bins = np.clip(np.digitize(targets, edges[1:-1]), 0, len(bin_weights) - 1)
+            bin_weights /= bin_weights[target_bins].mean()
+            bin_weights = np.minimum(bin_weights, maximum_weight)
+
+        sample_bins = np.clip(np.digitize(targets, edges[1:-1]), 0, len(bin_weights) - 1)
+        sample_weights = bin_weights[sample_bins]
+        self.weighting = weighting
+        self.huber_delta = huber_delta
+        self.register_buffer("internal_edges", torch.tensor(edges[1:-1], dtype=torch.float32))
+        self.register_buffer("bin_weights", torch.tensor(bin_weights, dtype=torch.float32))
+        self.stats = LossWeightStats(
+            weighting=weighting,
+            bin_count=len(bin_weights),
+            gaussian_sigma_bins=gaussian_sigma_bins,
+            maximum_weight=maximum_weight,
+            huber_delta=huber_delta,
+            target_minimum=float(targets.min()),
+            target_maximum=float(targets.max()),
+            sample_weight_minimum=float(sample_weights.min()),
+            sample_weight_median=float(np.median(sample_weights)),
+            sample_weight_mean=float(sample_weights.mean()),
+            sample_weight_maximum=float(sample_weights.max()),
+        )
+
+    def weights_for(self, targets: torch.Tensor) -> torch.Tensor:
+        """Return training-derived loss weights for continuous targets.
+
+        Args:
+            targets: Effective emissions-change targets.
+
+        Returns:
+            Per-example loss weights.
+        """
+        indices = torch.bucketize(targets.detach(), self.internal_edges)
+        return self.bin_weights[indices]
+
+    def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Return the normalized weighted Huber loss."""
+        weights = self.weights_for(targets)
+        losses = F.huber_loss(predictions, targets, reduction="none", delta=self.huber_delta)
+        return torch.sum(weights * losses) / torch.sum(weights)
+
+
+def regression_metrics(y_true: np.ndarray, prediction: np.ndarray) -> dict[str, float | int | None]:
+    """Calculate regression errors and associations.
 
     Args:
-        y_true: Ground-truth zero and one labels.
-        positive_probability: Predicted probability of class one.
+        y_true: Ground-truth continuous targets.
+        prediction: Continuous model predictions.
 
     Returns:
-        Counts, class metrics, and ROC AUC.
+        Sample count, error metrics, bias, and correlations.
     """
-    truth = np.asarray(y_true)
-    probability = np.asarray(positive_probability, dtype=np.float64)
-    prediction = (probability >= 0.5).astype(np.uint8)
-    true_negative = int(np.sum((truth == 0) & (prediction == 0)))
-    false_positive = int(np.sum((truth == 0) & (prediction == 1)))
-    false_negative = int(np.sum((truth == 1) & (prediction == 0)))
-    true_positive = int(np.sum((truth == 1) & (prediction == 1)))
-    positive_count = true_positive + false_negative
-    negative_count = true_negative + false_positive
-    precision_denominator = true_positive + false_positive
-    precision = true_positive / precision_denominator if precision_denominator else None
-    recall = true_positive / positive_count if positive_count else None
-    specificity = true_negative / negative_count if negative_count else None
-    f1_denominator = 2 * true_positive + false_positive + false_negative
-    balanced_accuracy = (recall + specificity) / 2 if recall is not None and specificity is not None else None
+    truth = np.asarray(y_true, dtype=np.float64)
+    predicted = np.asarray(prediction, dtype=np.float64)
+    residual = predicted - truth
+    mse = float(mean_squared_error(truth, predicted))
+    has_variation = truth.size > 1 and np.std(truth) > 0 and np.std(predicted) > 0
+    pearson = float(np.corrcoef(truth, predicted)[0, 1]) if has_variation else None
+    spearman = float(pd.Series(truth).corr(pd.Series(predicted), method="spearman")) if has_variation else None
     return {
         "n": int(truth.size),
-        "negative_count": negative_count,
-        "positive_count": positive_count,
-        "accuracy": float((true_positive + true_negative) / truth.size),
-        "balanced_accuracy": float(balanced_accuracy) if balanced_accuracy is not None else None,
-        "precision": float(precision) if precision is not None else None,
-        "recall": float(recall) if recall is not None else None,
-        "specificity": float(specificity) if specificity is not None else None,
-        "f1": float(2 * true_positive / f1_denominator) if f1_denominator else None,
-        "roc_auc": float(roc_auc_score(truth, probability)) if positive_count and negative_count else None,
-        "true_negative": true_negative,
-        "false_positive": false_positive,
-        "false_negative": false_negative,
-        "true_positive": true_positive,
+        "mse": mse,
+        "mae": float(mean_absolute_error(truth, predicted)),
+        "rmse": float(np.sqrt(mse)),
+        "r2": float(r2_score(truth, predicted)) if truth.size > 1 else None,
+        "pearson_r": pearson,
+        "spearman_r": spearman,
+        "mean_bias": float(residual.mean()),
     }
 
 
 def plant_metrics(frame: pd.DataFrame) -> pd.DataFrame:
-    """Compute classification metrics for each held-out AOI.
+    """Calculate regression metrics for each held-out AOI.
 
     Args:
-        frame: Row-level classifications with AOI coordinates.
+        frame: Row-level regression predictions with AOI coordinates.
 
     Returns:
-        One classification summary row per AOI.
+        One regression summary row per AOI.
     """
     rows = []
     for (aoi_id, lon, lat), group in frame.groupby(["aoi_id", "lon", "lat"], sort=True):
-        metrics = classification_metrics(
-            group[TRUE_CLASS_COL].to_numpy(),
-            group[POSITIVE_PROBABILITY_COL].to_numpy(),
-        )
+        metrics = regression_metrics(group[TRUE_TARGET_COL].to_numpy(), group[PREDICTION_COL].to_numpy())
         rows.append({"aoi_id": aoi_id, "lon": lon, "lat": lat, **metrics})
     return pd.DataFrame(rows)
 
 
 def _model_results(split_frames: dict[str, pd.DataFrame]) -> dict[str, object]:
-    # Summarize full splits and fixed equal-count test magnitude slices
+    # Summarize natural splits and fixed equal-count test magnitude slices
     results: dict[str, object] = {
         "splits": {
-            name: classification_metrics(
-                frame[TRUE_CLASS_COL].to_numpy(),
-                frame[POSITIVE_PROBABILITY_COL].to_numpy(),
-            )
+            name: regression_metrics(frame[TRUE_TARGET_COL].to_numpy(), frame[PREDICTION_COL].to_numpy())
             for name, frame in split_frames.items()
         }
     }
     test = split_frames["test"]
-    magnitude = np.abs(test[EFFECTIVE_DELTA_NOX_COL].to_numpy(dtype=np.float64))
-    ordered_indices = np.argsort(magnitude, kind="stable")
+    ordered_indices = np.argsort(np.abs(test[TRUE_TARGET_COL].to_numpy(dtype=np.float64)), kind="stable")
     slices = {
         name: test.iloc[indices]
         for name, indices in zip(("low", "mid", "high"), np.array_split(ordered_indices, 3), strict=True)
     }
-    results["test_absolute_delta_tertiles"] = {
-        name: classification_metrics(
-            subset[TRUE_CLASS_COL].to_numpy(),
-            subset[POSITIVE_PROBABILITY_COL].to_numpy(),
-        )
+    results["test_absolute_target_tertiles"] = {
+        name: regression_metrics(subset[TRUE_TARGET_COL].to_numpy(), subset[PREDICTION_COL].to_numpy())
         for name, subset in slices.items()
     }
     return results
@@ -122,7 +186,7 @@ def _model_comparison(
     primary_model_name: str,
     comparison_model_name: str,
 ) -> dict[str, object]:
-    # Place both scores and the primary model advantage beside each other
+    # Place both scores and signed primary-minus-comparison differences together
     primary = model_results[primary_model_name]["splits"]
     comparison = model_results[comparison_model_name]["splits"]
 
@@ -141,17 +205,15 @@ def _model_comparison(
 
 def save_results(
     model_frames: dict[str, dict[str, pd.DataFrame]],
-    classification_summaries: dict[str, object],
     run_dir: str | Path,
     *,
     primary_model_name: str,
     comparison_model_name: str | None = None,
 ) -> None:
-    """Save classification metrics and row-level predictions.
+    """Save regression metrics and row-level predictions.
 
     Args:
         model_frames: Row-level predictions by model and data split.
-        classification_summaries: Pre-balancing retention and prevalence data.
         run_dir: Model-run output directory.
         primary_model_name: Model copied into the top-level result summary.
         comparison_model_name: Baseline model used to calculate differences.
@@ -161,16 +223,11 @@ def save_results(
     results: dict[str, object] = {
         "primary_model": primary_model_name,
         "splits": primary_results["splits"],
-        "test_absolute_delta_tertiles": primary_results["test_absolute_delta_tertiles"],
+        "test_absolute_target_tertiles": primary_results["test_absolute_target_tertiles"],
         "models": model_results,
     }
     if comparison_model_name is not None:
-        results["comparison"] = _model_comparison(
-            model_results,
-            primary_model_name,
-            comparison_model_name,
-        )
-    results["dataset_classification_summaries"] = classification_summaries
+        results["comparison"] = _model_comparison(model_results, primary_model_name, comparison_model_name)
 
     output_dir = Path(run_dir)
     with (output_dir / "results.json").open("w") as destination:

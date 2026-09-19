@@ -1,27 +1,17 @@
-"""Plotting utilities for binary NOx-change classification."""
+"""Plotting utilities for effective NOx-change regression."""
 
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
-from modeling.eval_utils import (
-    POSITIVE_PROBABILITY_COL,
-    TRUE_CLASS_COL,
-    classification_metrics,
-)
+from modeling.eval_utils import PREDICTION_COL, TRUE_TARGET_COL, regression_metrics
 
 SPLIT_ORDER = ("train", "val", "test")
-MODEL_DISPLAY_NAMES = {
-    "raster_convgru": "Raster ConvGRU",
-    "mlp": "MLP",
-}
-COMPARISON_METRIC_NAMES = {
-    "accuracy": "Accuracy",
-    "balanced_accuracy": "Balanced accuracy",
-    "f1": "F1",
-    "roc_auc": "ROC AUC",
-}
+MODEL_DISPLAY_NAMES = {"raster_convgru": "Raster ConvGRU", "mlp": "MLP"}
+COMPARISON_METRIC_NAMES = {"mae": "MAE", "rmse": "RMSE", "r2": "R2", "pearson_r": "Pearson r"}
+ROBUST_AXIS_QUANTILES = (0.005, 0.995)
 
 
 def _save(figure: plt.Figure, run_dir: str | Path, plot_name: str) -> None:
@@ -38,7 +28,7 @@ def plot_loss_curve(
     plot_name: str = "loss_curve",
     title: str = "Training and validation loss",
 ) -> None:
-    """Plot binary cross-entropy loss across epochs.
+    """Plot weighted Huber loss across epochs.
 
     Args:
         train_losses: Mean training loss for each epoch.
@@ -52,36 +42,61 @@ def plot_loss_curve(
     epochs = range(1, len(train_losses) + 1)
     axis.plot(epochs, train_losses, label="Train", linewidth=2)
     axis.plot(epochs, val_losses, label="Validation", linewidth=2)
-    axis.set(xlabel="Epoch", ylabel="Binary cross-entropy", title=title)
+    axis.set(xlabel="Epoch", ylabel="Weighted Huber loss", title=title)
     axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
     axis.legend()
     figure.tight_layout()
     _save(figure, run_dir, plot_name)
 
 
-def plot_class_probabilities(split_frames: dict[str, pd.DataFrame], run_dir: str | Path) -> None:
-    """Plot positive-class probability by true class for every split.
+def plot_regression_predictions(
+    model_frames: dict[str, dict[str, pd.DataFrame]],
+    run_dir: str | Path,
+) -> None:
+    """Plot test predictions for both models with shared robust axes.
 
     Args:
-        split_frames: Row-level predictions for each data split.
+        model_frames: Row-level predictions by model and data split.
         run_dir: Model-run output directory.
     """
     sns.set_theme(style="whitegrid", font_scale=1.0)
-    figure, axes = plt.subplots(1, 3, figsize=(17, 5), sharex=True, sharey=True)
-    for axis, split in zip(axes, SPLIT_ORDER, strict=True):
-        frame = split_frames[split]
-        for label, color in ((0, "#4c72b0"), (1, "#dd8452")):
-            values = frame.loc[frame[TRUE_CLASS_COL] == label, POSITIVE_PROBABILITY_COL]
-            axis.hist(values, bins=20, range=(0, 1), alpha=0.55, color=color, label=f"Class {label}")
-        axis.axvline(0.5, color="#222222", linewidth=1.1, linestyle="--")
-        axis.set(xlabel="Predicted probability of class 1", ylabel="Records", title=split)
-        axis.legend()
+    figure, axes = plt.subplots(1, len(model_frames), figsize=(6.5 * len(model_frames), 6), sharex=True, sharey=True)
+    axes = np.atleast_1d(axes)
+    test_frames = [split_frames["test"] for split_frames in model_frames.values()]
+    plot_values = pd.concat(test_frames, ignore_index=True)[[TRUE_TARGET_COL, PREDICTION_COL]].to_numpy().ravel()
+    lower, upper = np.quantile(plot_values, ROBUST_AXIS_QUANTILES)
+    if lower == upper:
+        padding = max(abs(float(lower)) * 0.05, 1e-6)
+        lower -= padding
+        upper += padding
+
+    for axis, (model_name, split_frames) in zip(axes, model_frames.items(), strict=True):
+        frame = split_frames["test"]
+        metrics = regression_metrics(frame[TRUE_TARGET_COL].to_numpy(), frame[PREDICTION_COL].to_numpy())
+        axis.scatter(
+            frame[TRUE_TARGET_COL],
+            frame[PREDICTION_COL],
+            s=8,
+            alpha=0.25,
+            linewidths=0,
+            rasterized=True,
+        )
+        axis.plot((lower, upper), (lower, upper), color="#222222", linewidth=1.1, linestyle="--")
+        axis.set(
+            xlim=(lower, upper),
+            ylim=(lower, upper),
+            xlabel="Observed target",
+            ylabel="Predicted target",
+            title=f"{MODEL_DISPLAY_NAMES.get(model_name, model_name)}\nTest MSE = {metrics['mse']:.6g}",
+        )
+        axis.set_aspect("equal", adjustable="box")
+    figure.suptitle("Test predictions with pooled 0.5th-99.5th percentile axes")
     figure.tight_layout()
-    _save(figure, run_dir, "class_probabilities")
+    _save(figure, run_dir, "regression_predictions")
 
 
 def plot_model_comparison(model_frames: dict[str, dict[str, pd.DataFrame]], run_dir: str | Path) -> None:
-    """Compare model metrics on every frozen split.
+    """Compare regression metrics for each model and split.
 
     Args:
         model_frames: Row-level predictions by model and data split.
@@ -90,10 +105,7 @@ def plot_model_comparison(model_frames: dict[str, dict[str, pd.DataFrame]], run_
     rows = []
     for model_name, split_frames in model_frames.items():
         for split, frame in split_frames.items():
-            metrics = classification_metrics(
-                frame[TRUE_CLASS_COL].to_numpy(),
-                frame[POSITIVE_PROBABILITY_COL].to_numpy(),
-            )
+            metrics = regression_metrics(frame[TRUE_TARGET_COL].to_numpy(), frame[PREDICTION_COL].to_numpy())
             for metric, display_name in COMPARISON_METRIC_NAMES.items():
                 rows.append(
                     {
@@ -105,12 +117,14 @@ def plot_model_comparison(model_frames: dict[str, dict[str, pd.DataFrame]], run_
                 )
 
     sns.set_theme(style="whitegrid", font_scale=1.0)
-    figure, axes = plt.subplots(1, 3, figsize=(17, 5), sharey=True)
+    figure, axes = plt.subplots(1, 4, figsize=(20, 5))
     comparison = pd.DataFrame(rows)
-    for axis, split in zip(axes, SPLIT_ORDER, strict=True):
-        subset = comparison.loc[comparison["split"] == split]
-        sns.barplot(data=subset, x="metric", y="score", hue="model", ax=axis)
-        axis.set(xlabel="Metric", ylabel="Score", title=split, ylim=(0, 1))
-        axis.tick_params(axis="x", rotation=20)
+    for axis, (metric, display_name) in zip(axes, COMPARISON_METRIC_NAMES.items(), strict=True):
+        subset = comparison.loc[comparison["metric"] == display_name]
+        sns.barplot(data=subset, x="split", y="score", hue="model", ax=axis)
+        axis.set(xlabel="Split", ylabel=display_name, title=display_name)
+        if metric in {"r2", "pearson_r"}:
+            axis.axhline(0, color="#222222", linewidth=0.8)
+        axis.legend().set_visible(axis is axes[-1])
     figure.tight_layout()
     _save(figure, run_dir, "model_comparison")

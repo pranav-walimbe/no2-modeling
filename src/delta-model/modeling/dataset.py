@@ -16,14 +16,13 @@ from torch.utils.data import Dataset
 from config import (
     DATASET_DF,
     DATASET_DIR,
-    EMA_DELTA_THRESHOLD,
-    LABEL_COL,
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_ABS,
     MODEL_IMAGE_KEYS,
     MODEL_MASK_KEYS,
     MODEL_RAW_FEATURES,
     MODEL_ROBUST_IMAGE_KEYS,
+    MODEL_TARGET_COL,
     SEQUENCE_TIMESTEPS,
 )
 
@@ -61,7 +60,7 @@ class NormalizationStats:
     feature_names: tuple[str, ...]
     feature_mean: tuple[float, ...]
     feature_std: tuple[float, ...]
-    delta_threshold: float
+    target_name: str
     training_records: int
 
     def to_dict(self) -> dict[str, object]:
@@ -90,7 +89,7 @@ class NormalizationStats:
             feature_names=tuple(str(name) for name in values["feature_names"]),
             feature_mean=tuple(float(value) for value in values["feature_mean"]),
             feature_std=tuple(float(value) for value in values["feature_std"]),
-            delta_threshold=float(values["delta_threshold"]),
+            target_name=str(values.get("target_name", MODEL_TARGET_COL)),
             training_records=int(values["training_records"]),
         )
 
@@ -267,7 +266,7 @@ def compute_stats(
         feature_names=MODEL_FEATURE_NAMES,
         feature_mean=tuple(float(value) for value in features.mean(axis=0)),
         feature_std=tuple(float(value) for value in feature_std),
-        delta_threshold=EMA_DELTA_THRESHOLD,
+        target_name=MODEL_TARGET_COL,
         training_records=len(frame),
     )
 
@@ -358,7 +357,7 @@ class NOxDataset(Dataset):
         feature_mean = np.asarray(self.stats.feature_mean, dtype=np.float64)
         feature_std = np.asarray(self.stats.feature_std, dtype=np.float64)
         self.features = ((raw_features - feature_mean) / feature_std).astype(np.float32)
-        labels = pd.to_numeric(self.frame[LABEL_COL], errors="raise").to_numpy(dtype=np.float64)
+        labels = pd.to_numeric(self.frame[MODEL_TARGET_COL], errors="raise").to_numpy(dtype=np.float64)
         self.labels = labels.astype(np.float32)
         self.raster_paths = self.frame[RASTER_PATH_COL].to_numpy(dtype=str)
         timestep_times = np.column_stack(

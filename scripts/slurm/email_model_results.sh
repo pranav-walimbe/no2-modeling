@@ -13,25 +13,26 @@ recipient="$3"
 mail_host="${SLURM_SUBMIT_HOST:-ln002.brc}"
 mail_log="/var/log/maillog"
 comparison_plot="${run_dir}/model_comparison.png"
+prediction_plot="${run_dir}/regression_predictions.png"
 raster_loss_plot="${run_dir}/loss_curve.png"
 tabular_loss_plot="${run_dir}/tabular_loss_curve.png"
 
-for artifact in "${comparison_plot}" "${raster_loss_plot}" "${tabular_loss_plot}"; do
+for artifact in "${comparison_plot}" "${prediction_plot}" "${raster_loss_plot}" "${tabular_loss_plot}"; do
     if [[ ! -s "${artifact}" ]]; then
         echo "Expected result artifact is missing or empty: ${artifact}" >&2
         exit 1
     fi
 done
 
-echo "Emailing model comparison and both loss curves to ${recipient} via ${mail_host}"
+echo "Emailing regression plots and both loss curves to ${recipient} via ${mail_host}"
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 \
     "${mail_host}" stat -c %s "${mail_log}")
-printf 'NO2 model training completed successfully.\n\nRun: %s\nJob: %s\n' \
+printf 'NO2 regression training completed successfully.\n\nThe attached regression_predictions.png compares predicted and true test targets for both models, uses outlier-robust axes, and reports each model MSE.\n\nRun: %s\nJob: %s\n' \
     "${run_dir}" \
     "${job_id}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
-        "mailx -s 'NO2 modeling results (${job_id})' \
-            -a '${comparison_plot}' -a '${raster_loss_plot}' \
+        "mailx -s 'NO2 regression results (${job_id})' \
+            -a '${comparison_plot}' -a '${prediction_plot}' -a '${raster_loss_plot}' \
             -a '${tabular_loss_plot}' '${recipient}'"
 
 delivery_confirmed=false

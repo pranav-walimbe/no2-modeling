@@ -112,7 +112,7 @@ class ConvGRUCell(nn.Module):
 
 
 class RasterConvGRU(nn.Module):
-    """Classify emissions changes from raster sequences alone."""
+    """Regress effective emissions changes from raster sequences alone."""
 
     def __init__(
         self,
@@ -147,7 +147,7 @@ class RasterConvGRU(nn.Module):
             nn.Dropout(dropout),
         )
 
-        self.classifier = nn.Sequential(
+        self.regressor = nn.Sequential(
             nn.Linear(VISION_EMBEDDING_DIM, head_dim),
             nn.LayerNorm(head_dim),
             nn.SiLU(inplace=True),
@@ -185,7 +185,7 @@ class RasterConvGRU(nn.Module):
         elapsed_hours: torch.Tensor,
     ) -> torch.Tensor:
         del tabular, elapsed_hours
-        return self.classifier(self._encode_sequence(image)).squeeze(1)
+        return self.regressor(self._encode_sequence(image)).squeeze(1)
 
     def num_params(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
