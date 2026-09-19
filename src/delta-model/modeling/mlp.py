@@ -8,7 +8,7 @@ TABULAR_EMBEDDING_DIM = 16
 
 
 class TabularMLP(nn.Module):
-    """Classify emissions changes from tabular features alone."""
+    """Regress effective emissions changes from tabular features alone."""
 
     def __init__(
         self,
@@ -26,10 +26,10 @@ class TabularMLP(nn.Module):
             nn.LayerNorm(embedding_dim),
             nn.SiLU(inplace=True),
         )
-        self.classifier = nn.Linear(embedding_dim, 1)
+        self.regressor = nn.Linear(embedding_dim, 1)
 
     def encode(self, tabular: torch.Tensor) -> torch.Tensor:
-        """Produce the embedding used by the classifier."""
+        """Produce the embedding used by the regression head."""
         return self.encoder(tabular)
 
     def forward(
@@ -38,9 +38,9 @@ class TabularMLP(nn.Module):
         tabular: torch.Tensor,
         elapsed_hours: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict one Bernoulli logit from tabular features."""
+        """Predict one unrestricted continuous target from tabular features."""
         del image, elapsed_hours
-        return self.classifier(self.encode(tabular)).squeeze(1)
+        return self.regressor(self.encode(tabular)).squeeze(1)
 
     def num_params(self) -> int:
         """Count trainable model parameters."""
