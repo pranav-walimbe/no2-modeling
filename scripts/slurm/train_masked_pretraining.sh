@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:A5000:1
-#SBATCH --time=24:00:00
+#SBATCH --time=03:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=pranav.walimbe@berkeley.edu
 #SBATCH --output=/global/home/users/pranavwalimbe/no2-modeling/logs/%x-%j.log
@@ -45,6 +45,7 @@ srun python -u -m modeling.train \
     --scheduler-patience 10 \
     --scheduler-factor 0.50 \
     --early-stop-patience 25 \
+    --runs-dir /global/home/users/pranavwalimbe/masked_model_runs/ \
     | tee "${training_output}"
 echo "Training command completed; locating result artifacts"
 

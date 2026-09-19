@@ -14,14 +14,12 @@ from torch.utils.data import DataLoader
 
 from config import (
     MASKED_PRETRAINING_DF_DIR,
-    MASKED_PRETRAINING_IMAGE_KEYS,
-    MASKED_PRETRAINING_RUNS_DIR,
     MODEL_IMAGE_CLIP_ABS,
     MODEL_INPUT_CHANNELS,
     NUM_CORES,
 )
 
-from .dataset import MaskedNO2Dataset, compute_stats, save_stats
+from .dataset import MASKED_IMAGE_KEYS, MaskedNO2Dataset, compute_stats, save_stats
 from .eval_utils import evaluate_reconstruction, save_results
 from .model import ARCHITECTURE_NAME, MaskedNO2Autoencoder, masked_l1_loss
 from .plot_utils import plot_loss_curve, plot_results
@@ -53,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
     parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
+    parser.add_argument("--runs-dir", required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     return parser.parse_args()
 
@@ -229,7 +228,7 @@ def main() -> None:
     manifest_hash = _manifest_hash()
     stats = compute_stats()
     run_name = datetime.now(timezone.utc).strftime("masked_no2_%Y%m%d_%H%M%S")
-    run_dir = Path(MASKED_PRETRAINING_RUNS_DIR) / run_name
+    run_dir = Path(args.runs_dir) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
     save_stats(stats, run_dir / "normalization_stats.json")
@@ -246,7 +245,7 @@ def main() -> None:
     checkpoint_metadata = {
         "architecture": ARCHITECTURE_NAME,
         "input_channels": MODEL_INPUT_CHANNELS,
-        "image_keys": MASKED_PRETRAINING_IMAGE_KEYS,
+        "image_keys": MASKED_IMAGE_KEYS,
         "normalization_stats": stats.to_dict(),
         "training_data_manifest_sha256": manifest_hash,
     }

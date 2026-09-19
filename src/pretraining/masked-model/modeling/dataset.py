@@ -14,16 +14,17 @@ import torch
 from torch.utils.data import Dataset
 
 from config import (
-    MASKED_PRETRAINING_ARTIFICIAL_MASK_KEY,
     MASKED_PRETRAINING_BASE_DIR,
     MASKED_PRETRAINING_DF_DIR,
-    MASKED_PRETRAINING_IMAGE_KEYS,
-    MASKED_PRETRAINING_ORIGINAL_MASK_KEY,
     MODEL_IMAGE_CLIP_ABS,
+    MODEL_IMAGE_KEYS,
     MODEL_ROBUST_IMAGE_KEYS,
 )
 
 RASTER_PATH_COL = "raster_bundle_path"
+MASKED_IMAGE_KEYS = MODEL_IMAGE_KEYS
+ORIGINAL_MASK_KEY = "no2_mask"
+ARTIFICIAL_MASK_KEY = "artificial_mask"
 MIN_SCALE = 1e-12
 ROBUST_STD_NORMALIZER = 1.349
 
@@ -80,8 +81,8 @@ def compute_stats(
     frame = pd.read_csv(Path(dataframe_dir) / "train_df.csv")
     paths = frame[RASTER_PATH_COL].to_numpy(dtype=str)
     root = Path(dataset_dir)
-    channel_count = len(MASKED_PRETRAINING_IMAGE_KEYS)
-    robust_channels = tuple(MASKED_PRETRAINING_IMAGE_KEYS.index(name) for name in MODEL_ROBUST_IMAGE_KEYS)
+    channel_count = len(MASKED_IMAGE_KEYS)
+    robust_channels = tuple(MASKED_IMAGE_KEYS.index(name) for name in MODEL_ROBUST_IMAGE_KEYS)
     counts = np.zeros(channel_count, dtype=np.int64)
     sums = np.zeros(channel_count, dtype=np.float64)
     squared_sums = np.zeros(channel_count, dtype=np.float64)
@@ -90,7 +91,7 @@ def compute_stats(
         path = Path(serialized_path)
         path = path if path.is_absolute() else root / path
         with np.load(path, allow_pickle=False) as bundle:
-            for channel, name in enumerate(MASKED_PRETRAINING_IMAGE_KEYS):
+            for channel, name in enumerate(MASKED_IMAGE_KEYS):
                 values = np.asarray(bundle[name], dtype=np.float64)
                 valid = values[np.isfinite(values)]
                 counts[channel] += valid.size
@@ -116,7 +117,7 @@ def compute_stats(
                 path = Path(serialized_path)
                 path = path if path.is_absolute() else root / path
                 with np.load(path, allow_pickle=False) as bundle:
-                    raster = np.asarray(bundle[MASKED_PRETRAINING_IMAGE_KEYS[channel]], dtype=np.float32)
+                    raster = np.asarray(bundle[MASKED_IMAGE_KEYS[channel]], dtype=np.float32)
                 valid = raster[np.isfinite(raster)]
                 values[offset : offset + valid.size] = valid
                 offset += valid.size
@@ -127,7 +128,7 @@ def compute_stats(
 
     scale = np.where(np.isfinite(scale) & (scale > MIN_SCALE), scale, 1.0)
     return MaskedNormalizationStats(
-        image_keys=MASKED_PRETRAINING_IMAGE_KEYS,
+        image_keys=MASKED_IMAGE_KEYS,
         image_center=tuple(float(value) for value in center),
         image_scale=tuple(float(value) for value in scale),
         image_valid_pixels=tuple(int(value) for value in counts),
@@ -186,9 +187,9 @@ class MaskedNO2Dataset(Dataset):
         path = Path(self.raster_paths[index])
         path = path if path.is_absolute() else self.dataset_dir / path
         with np.load(path, allow_pickle=False) as bundle:
-            rasters = np.stack([np.asarray(bundle[name], dtype=np.float32) for name in MASKED_PRETRAINING_IMAGE_KEYS])
-            original_valid = np.asarray(bundle[MASKED_PRETRAINING_ORIGINAL_MASK_KEY], dtype=bool)
-            artificial_visible = np.asarray(bundle[MASKED_PRETRAINING_ARTIFICIAL_MASK_KEY], dtype=bool)
+            rasters = np.stack([np.asarray(bundle[name], dtype=np.float32) for name in MASKED_IMAGE_KEYS])
+            original_valid = np.asarray(bundle[ORIGINAL_MASK_KEY], dtype=bool)
+            artificial_visible = np.asarray(bundle[ARTIFICIAL_MASK_KEY], dtype=bool)
 
         center = np.asarray(self.stats.image_center, dtype=np.float32)[:, None, None]
         scale = np.asarray(self.stats.image_scale, dtype=np.float32)[:, None, None]
