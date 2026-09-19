@@ -27,7 +27,7 @@ done
 echo "Emailing regression plots and both loss curves to ${recipient} via ${mail_host}"
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 \
     "${mail_host}" stat -c %s "${mail_log}")
-printf 'NO2 regression training completed successfully.\n\nRun: %s\nJob: %s\n' \
+printf 'NO2 regression training completed successfully.\n\nThe attached regression_predictions.png compares predicted and true test targets for both models, uses outlier-robust axes, and reports each model MSE.\n\nRun: %s\nJob: %s\n' \
     "${run_dir}" \
     "${job_id}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \

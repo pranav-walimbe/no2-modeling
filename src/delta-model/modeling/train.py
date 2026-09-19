@@ -24,17 +24,15 @@ from modeling.dataset import (
 )
 from modeling.eval_utils import (
     ABSOLUTE_ERROR_COL,
-    PREDICTION_COL,
-    RESIDUAL_COL,
-    TRUE_TARGET_COL,
-    save_results,
-)
-from modeling.loss import (
     DEFAULT_HUBER_DELTA,
     DEFAULT_LDS_BINS,
     DEFAULT_LDS_SIGMA,
     DEFAULT_MAX_WEIGHT,
+    PREDICTION_COL,
+    RESIDUAL_COL,
+    TRUE_TARGET_COL,
     WeightedHuberLoss,
+    save_results,
 )
 from modeling.mlp import TabularMLP
 from modeling.plot_utils import (
@@ -470,8 +468,8 @@ def main() -> None:
         predictions, indices = run_inference(raster_model, loader, device)
         split_frames[split] = _prediction_frame(datasets[split], predictions, indices)
 
-    plot_regression_predictions(split_frames, run_dir)
     model_frames = {"raster_convgru": split_frames, "mlp": tabular_split_frames}
+    plot_regression_predictions(model_frames, run_dir)
     plot_model_comparison(model_frames, run_dir)
     save_results(
         model_frames,

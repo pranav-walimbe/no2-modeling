@@ -131,7 +131,7 @@ python -u -m modeling.train
 
 Each split reports:
 
-- mean absolute error and root mean squared error;
+- mean squared error, mean absolute error, and root mean squared error;
 - R-squared, Pearson correlation, and Spearman correlation;
 - mean prediction bias.
 
@@ -142,3 +142,7 @@ target, prediction, signed residual, and absolute error.
 
 The raster and MLP models use the same splits. Model selection uses validation
 loss only. Test metrics remain reporting outputs.
+
+The emailed prediction artifact shows test-set predicted-versus-observed
+scatterplots for both models. Both panels use shared limits from the pooled
+0.5th and 99.5th percentiles, and each panel reports its model's test MSE.

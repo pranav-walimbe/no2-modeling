@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
 from modeling.eval_utils import PREDICTION_COL, TRUE_TARGET_COL, regression_metrics
@@ -10,6 +11,7 @@ from modeling.eval_utils import PREDICTION_COL, TRUE_TARGET_COL, regression_metr
 SPLIT_ORDER = ("train", "val", "test")
 MODEL_DISPLAY_NAMES = {"raster_convgru": "Raster ConvGRU", "mlp": "MLP"}
 COMPARISON_METRIC_NAMES = {"mae": "MAE", "rmse": "RMSE", "r2": "R2", "pearson_r": "Pearson r"}
+ROBUST_AXIS_QUANTILES = (0.005, 0.995)
 
 
 def _save(figure: plt.Figure, run_dir: str | Path, plot_name: str) -> None:
@@ -47,28 +49,48 @@ def plot_loss_curve(
     _save(figure, run_dir, plot_name)
 
 
-def plot_regression_predictions(split_frames: dict[str, pd.DataFrame], run_dir: str | Path) -> None:
-    """Plot predicted against observed targets for every split.
+def plot_regression_predictions(
+    model_frames: dict[str, dict[str, pd.DataFrame]],
+    run_dir: str | Path,
+) -> None:
+    """Plot test predictions for both models with shared robust axes.
 
     Args:
-        split_frames: Row-level predictions for each data split.
+        model_frames: Row-level predictions by model and data split.
         run_dir: Model-run output directory.
     """
     sns.set_theme(style="whitegrid", font_scale=1.0)
-    figure, axes = plt.subplots(1, 3, figsize=(17, 5), sharex=True, sharey=True)
-    combined = pd.concat(split_frames.values(), ignore_index=True)
-    limit = float(combined[[TRUE_TARGET_COL, PREDICTION_COL]].abs().quantile(0.995).max())
-    for axis, split in zip(axes, SPLIT_ORDER, strict=True):
-        frame = split_frames[split]
-        axis.hexbin(frame[TRUE_TARGET_COL], frame[PREDICTION_COL], gridsize=35, mincnt=1, cmap="viridis")
-        axis.plot((-limit, limit), (-limit, limit), color="#222222", linewidth=1.1, linestyle="--")
+    figure, axes = plt.subplots(1, len(model_frames), figsize=(6.5 * len(model_frames), 6), sharex=True, sharey=True)
+    axes = np.atleast_1d(axes)
+    test_frames = [split_frames["test"] for split_frames in model_frames.values()]
+    plot_values = pd.concat(test_frames, ignore_index=True)[[TRUE_TARGET_COL, PREDICTION_COL]].to_numpy().ravel()
+    lower, upper = np.quantile(plot_values, ROBUST_AXIS_QUANTILES)
+    if lower == upper:
+        padding = max(abs(float(lower)) * 0.05, 1e-6)
+        lower -= padding
+        upper += padding
+
+    for axis, (model_name, split_frames) in zip(axes, model_frames.items(), strict=True):
+        frame = split_frames["test"]
+        metrics = regression_metrics(frame[TRUE_TARGET_COL].to_numpy(), frame[PREDICTION_COL].to_numpy())
+        axis.scatter(
+            frame[TRUE_TARGET_COL],
+            frame[PREDICTION_COL],
+            s=8,
+            alpha=0.25,
+            linewidths=0,
+            rasterized=True,
+        )
+        axis.plot((lower, upper), (lower, upper), color="#222222", linewidth=1.1, linestyle="--")
         axis.set(
-            xlim=(-limit, limit),
-            ylim=(-limit, limit),
+            xlim=(lower, upper),
+            ylim=(lower, upper),
             xlabel="Observed target",
             ylabel="Predicted target",
-            title=split,
+            title=f"{MODEL_DISPLAY_NAMES.get(model_name, model_name)}\nTest MSE = {metrics['mse']:.6g}",
         )
+        axis.set_aspect("equal", adjustable="box")
+    figure.suptitle("Test predictions with pooled 0.5th-99.5th percentile axes")
     figure.tight_layout()
     _save(figure, run_dir, "regression_predictions")
 

@@ -65,6 +65,7 @@ if [[ -z "${run_dir}" ]]; then
     exit 1
 fi
 
+echo "Emailing the two-model prediction scatterplot and training plots"
 bash scripts/slurm/email_model_results.sh \
     "${run_dir}" \
     "${SLURM_JOB_ID}" \
