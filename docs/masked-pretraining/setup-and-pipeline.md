@@ -11,10 +11,10 @@ weather. Emissions values are neither labels nor inputs.
 | Validation | 50,000 |
 | Test | 50,000 |
 
-Only delta-model training AOIs are eligible, which keeps downstream validation
-and test geography unseen. Overlapping 72 km AOIs remain in the same
-pretraining split. Preparation assigns AOI groups and writes fixed candidate
-manifests before shard work begins.
+Every AOI represented in the global emissions inventory and TEMPO mapping is
+eligible. Overlapping 72 km AOIs remain in the same pretraining split.
+Preparation assigns those AOI groups before randomly ordering the scenes within
+each split and writing fixed candidate manifests.
 
 ## Validity cache
 
@@ -35,12 +35,14 @@ rebuilds candidate results, shards, and published dataframes.
 
 ## Shards and finalization
 
-The launcher submits four dependent stages:
+The launcher submits five dependent stages:
 
 1. Clear disposable outputs and write candidate manifests.
-2. Discover valid scenes until each split reaches its target or runs out.
-3. Select records deterministically and materialize fresh shards.
-4. Validate shards and publish split CSVs.
+2. Exhaust cached valid scenes within each AOI-disjoint split, discard cached
+   invalid scenes, and publish randomized manifests containing only cache misses.
+3. Process those remaining scenes until each split reaches its target or runs out.
+4. Select records deterministically and materialize fresh shards.
+5. Validate shards and publish split CSVs.
 
 Discovery groups candidates by TEMPO scan to reuse granule reads. Materialized
 shards contain at most 20,000 records by default, with `records.csv` and NPZ
