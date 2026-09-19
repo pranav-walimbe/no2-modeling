@@ -12,7 +12,7 @@ import torch
 from modeling.convgru import (
     DEFAULT_DROPOUT,
     DEFAULT_HEAD_DIM,
-    RasterConvGRU,
+    RasterHurdleConvGRU,
 )
 from modeling.dataset import (
     LABEL_MODE_COL,
@@ -24,18 +24,28 @@ from modeling.dataset import (
 )
 from modeling.eval_utils import (
     ABSOLUTE_ERROR_COL,
+    DECREASE_MAGNITUDE_COL,
+    DECREASE_PROBABILITY_COL,
     DEFAULT_HUBER_DELTA,
     DEFAULT_LDS_BINS,
     DEFAULT_LDS_SIGMA,
     DEFAULT_MAX_WEIGHT,
+    INCREASE_MAGNITUDE_COL,
+    INCREASE_PROBABILITY_COL,
+    PREDICTED_CLASS_COL,
     PREDICTION_COL,
     RESIDUAL_COL,
+    STEADY_PROBABILITY_COL,
+    TRUE_CLASS_COL,
     TRUE_TARGET_COL,
+    HurdleLoss,
     WeightedHuberLoss,
+    hurdle_classes,
     save_results,
 )
 from modeling.mlp import TabularMLP
 from modeling.plot_utils import (
+    plot_hurdle_diagnostics,
     plot_loss_curve,
     plot_model_comparison,
     plot_regression_predictions,
@@ -63,6 +73,11 @@ DEFAULT_GRADIENT_CLIP_NORM = 5.0
 DEFAULT_SCHEDULER_PATIENCE = 10
 DEFAULT_SCHEDULER_FACTOR = 0.50
 DEFAULT_EARLY_STOP_PATIENCE = 12
+DEFAULT_STEADY_THRESHOLD = 0.05
+DEFAULT_CLASSIFICATION_LOSS_WEIGHT = 1.0
+DEFAULT_REGRESSION_LOSS_WEIGHT = 1.0
+
+TrainingLoss = WeightedHuberLoss | HurdleLoss
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,6 +107,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lds-sigma", type=float, default=DEFAULT_LDS_SIGMA)
     parser.add_argument("--maximum-loss-weight", type=float, default=DEFAULT_MAX_WEIGHT)
     parser.add_argument("--huber-delta", type=float, default=DEFAULT_HUBER_DELTA)
+    parser.add_argument("--steady-threshold", type=float, default=DEFAULT_STEADY_THRESHOLD)
+    parser.add_argument(
+        "--classification-loss-weight",
+        type=float,
+        default=DEFAULT_CLASSIFICATION_LOSS_WEIGHT,
+    )
+    parser.add_argument("--regression-loss-weight", type=float, default=DEFAULT_REGRESSION_LOSS_WEIGHT)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     return parser.parse_args()
 
@@ -131,7 +153,7 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    criterion: WeightedHuberLoss,
+    criterion: TrainingLoss,
     scaler: torch.cuda.amp.GradScaler,
     device: torch.device,
     gradient_clip_norm: float,
@@ -173,7 +195,7 @@ def fit_model(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    criterion: WeightedHuberLoss,
+    criterion: TrainingLoss,
     *,
     device: torch.device,
     epochs: int,
@@ -244,7 +266,7 @@ def fit_model(
     return train_losses, val_losses, best_val_loss
 
 
-def val_epoch(model: nn.Module, loader: DataLoader, criterion: WeightedHuberLoss, device: torch.device) -> float:
+def val_epoch(model: nn.Module, loader: DataLoader, criterion: TrainingLoss, device: torch.device) -> float:
     """Calculate validation loss for one epoch.
 
     Args:
@@ -296,6 +318,44 @@ def run_inference(model: nn.Module, loader: DataLoader, device: torch.device) ->
     return np.concatenate(predictions), np.concatenate(indices)
 
 
+def run_hurdle_inference(
+    model: RasterHurdleConvGRU,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Generate hurdle predictions for one dataset split.
+
+    Args:
+        model: Trained hurdle model.
+        loader: Evaluation batches.
+        device: Inference device.
+
+    Returns:
+        Expected values, class probabilities, magnitudes, and dataset indices.
+    """
+    model.eval()
+    predictions: list[np.ndarray] = []
+    probabilities: list[np.ndarray] = []
+    magnitudes: list[np.ndarray] = []
+    indices: list[np.ndarray] = []
+    amp_enabled = device.type == "cuda"
+    with torch.inference_mode():
+        for batch in loader:
+            image, tabular, elapsed_hours, _, index = _move_batch(batch, device)
+            with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                output = model(image, tabular, elapsed_hours)
+            predictions.append(output.expected_value.float().cpu().numpy())
+            probabilities.append(output.class_probabilities.float().cpu().numpy())
+            magnitudes.append(output.magnitudes.float().cpu().numpy())
+            indices.append(index.numpy())
+    return (
+        np.concatenate(predictions),
+        np.concatenate(probabilities),
+        np.concatenate(magnitudes),
+        np.concatenate(indices),
+    )
+
+
 def _loader(dataset: NOxDataset, *, shuffle: bool, args: argparse.Namespace, device: torch.device) -> DataLoader:
     # Configure one deterministic data loader
     options: dict[str, object] = {
@@ -325,6 +385,26 @@ def _prediction_frame(
     return frame
 
 
+def _hurdle_prediction_frame(
+    dataset: NOxDataset,
+    predictions: np.ndarray,
+    probabilities: np.ndarray,
+    magnitudes: np.ndarray,
+    indices: np.ndarray,
+    steady_threshold: float,
+) -> pd.DataFrame:
+    # Attach both gate and conditional-regression outputs
+    frame = _prediction_frame(dataset, predictions, indices)
+    frame[TRUE_CLASS_COL] = hurdle_classes(frame[TRUE_TARGET_COL].to_numpy(), steady_threshold)
+    frame[PREDICTED_CLASS_COL] = probabilities.argmax(axis=1)
+    frame[DECREASE_PROBABILITY_COL] = probabilities[:, 0]
+    frame[STEADY_PROBABILITY_COL] = probabilities[:, 1]
+    frame[INCREASE_PROBABILITY_COL] = probabilities[:, 2]
+    frame[DECREASE_MAGNITUDE_COL] = magnitudes[:, 0]
+    frame[INCREASE_MAGNITUDE_COL] = magnitudes[:, 1]
+    return frame
+
+
 def main() -> None:
     """Train and evaluate one continuous-regression run."""
     args = parse_args()
@@ -332,7 +412,7 @@ def main() -> None:
     device = _device(args.device)
 
     stats = compute_stats("train")
-    run_name = datetime.now(timezone.utc).strftime("delta_effective_nox_regression_%Y%m%d_%H%M%S")
+    run_name = datetime.now(timezone.utc).strftime("delta_effective_nox_hurdle_%Y%m%d_%H%M%S")
     run_dir = Path(RUNS_DIR) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
@@ -342,7 +422,7 @@ def main() -> None:
     tabular_datasets = {split: NOxDataset(split, stats, load_images=False) for split in datasets}
     clipped_fractions = {split: clipped_pixel_fractions(split, stats) for split in datasets}
     target_label_mode = str(datasets["train"].frame[LABEL_MODE_COL].iloc[0])
-    criterion = WeightedHuberLoss(
+    regression_criterion = WeightedHuberLoss(
         datasets["train"].labels,
         weighting=args.loss_weighting,
         bin_count=args.lds_bins,
@@ -359,11 +439,10 @@ def main() -> None:
         split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in tabular_datasets.items()
     }
 
-    checkpoint_metadata = {
+    common_checkpoint_metadata = {
         "normalization_stats": stats.to_dict(),
         "model_feature_names": MODEL_FEATURE_NAMES,
         "target_name": MODEL_TARGET_COL,
-        "loss_weighting": criterion.stats.to_dict(),
     }
     tabular_model = TabularMLP(len(MODEL_FEATURE_NAMES)).to(device)
     print(f"Training {tabular_model.num_params():,}-parameter tabular MLP on {device}")
@@ -371,13 +450,16 @@ def main() -> None:
         tabular_model,
         tabular_train_loader,
         tabular_eval_loaders["val"],
-        criterion,
+        regression_criterion,
         device=device,
         epochs=args.tabular_epochs,
         learning_rate=args.tabular_learning_rate,
         args=args,
         checkpoint_path=checkpoint_dir / "best_tabular_mlp.pt",
-        checkpoint_metadata=checkpoint_metadata,
+        checkpoint_metadata={
+            **common_checkpoint_metadata,
+            "loss": regression_criterion.stats.to_dict(),
+        },
         phase_name="Tabular MLP",
     )
     plot_loss_curve(
@@ -401,37 +483,50 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    raster_model = RasterConvGRU(
+    hurdle_criterion = HurdleLoss(
+        datasets["train"].labels,
+        steady_threshold=args.steady_threshold,
+        classification_weight=args.classification_loss_weight,
+        regression_weight=args.regression_loss_weight,
+        weighting=args.loss_weighting,
+        bin_count=args.lds_bins,
+        gaussian_sigma_bins=args.lds_sigma,
+        maximum_weight=args.maximum_loss_weight,
+        huber_delta=args.huber_delta,
+    ).to(device)
+    raster_model = RasterHurdleConvGRU(
+        steady_threshold=args.steady_threshold,
+        class_weights=hurdle_criterion.class_weights,
         head_dim=args.head_dim,
         dropout=args.dropout,
     ).to(device)
-    print(
-        f"Training {raster_model.num_params():,}-parameter raster-only ConvGRU "
-        f"on {device}; outputs: {run_dir}"
-    )
+    print(f"Training {raster_model.num_params():,}-parameter raster hurdle ConvGRU on {device}; outputs: {run_dir}")
     train_losses, val_losses, best_val_loss = fit_model(
         raster_model,
         train_loader,
         eval_loaders["val"],
-        criterion,
+        hurdle_criterion,
         device=device,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         args=args,
-        checkpoint_path=checkpoint_dir / "best_raster_convgru.pt",
-        checkpoint_metadata=checkpoint_metadata,
-        phase_name="Raster ConvGRU",
+        checkpoint_path=checkpoint_dir / "best_raster_hurdle.pt",
+        checkpoint_metadata={
+            **common_checkpoint_metadata,
+            "loss": hurdle_criterion.stats,
+        },
+        phase_name="Raster hurdle ConvGRU",
     )
     plot_loss_curve(
         train_losses,
         val_losses,
         run_dir,
-        title="Raster ConvGRU training and validation loss",
+        title="Raster hurdle ConvGRU training and validation loss",
     )
 
     run_config = {
         "device": str(device),
-        "models": ["raster_convgru", "mlp"],
+        "models": ["raster_hurdle", "mlp"],
         "batch_size": args.batch_size,
         "workers": args.workers,
         "maximum_epochs": args.epochs,
@@ -455,26 +550,38 @@ def main() -> None:
         "clipped_valid_pixel_fraction": clipped_fractions,
         "target_name": MODEL_TARGET_COL,
         "target_label_mode": target_label_mode,
-        "loss": criterion.stats.to_dict(),
+        "loss": {
+            "mlp": regression_criterion.stats.to_dict(),
+            "raster_hurdle": hurdle_criterion.stats,
+        },
         "tabular_features": list(MODEL_FEATURE_NAMES),
-        "prediction_family": "continuous_regression",
-        "raster_model_parameters": raster_model.num_params(),
-        "raster_best_validation_loss": best_val_loss,
+        "prediction_family": "directional_deep_hurdle",
+        "steady_threshold": args.steady_threshold,
+        "raster_hurdle_parameters": raster_model.num_params(),
+        "raster_hurdle_best_validation_loss": best_val_loss,
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
     split_frames = {}
     for split, loader in eval_loaders.items():
-        predictions, indices = run_inference(raster_model, loader, device)
-        split_frames[split] = _prediction_frame(datasets[split], predictions, indices)
+        predictions, probabilities, magnitudes, indices = run_hurdle_inference(raster_model, loader, device)
+        split_frames[split] = _hurdle_prediction_frame(
+            datasets[split],
+            predictions,
+            probabilities,
+            magnitudes,
+            indices,
+            args.steady_threshold,
+        )
 
-    model_frames = {"raster_convgru": split_frames, "mlp": tabular_split_frames}
+    model_frames = {"raster_hurdle": split_frames, "mlp": tabular_split_frames}
     plot_regression_predictions(model_frames, run_dir)
     plot_model_comparison(model_frames, run_dir)
+    plot_hurdle_diagnostics(split_frames["test"], run_dir)
     save_results(
         model_frames,
         run_dir,
-        primary_model_name="raster_convgru",
+        primary_model_name="raster_hurdle",
         comparison_model_name="mlp",
     )
 

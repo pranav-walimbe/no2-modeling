@@ -6,10 +6,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from modeling.eval_utils import PREDICTION_COL, TRUE_TARGET_COL, regression_metrics
+from modeling.eval_utils import (
+    DECREASE_MAGNITUDE_COL,
+    HURDLE_CLASS_NAMES,
+    INCREASE_MAGNITUDE_COL,
+    PREDICTION_COL,
+    TRUE_CLASS_COL,
+    TRUE_TARGET_COL,
+    hurdle_metrics,
+    regression_metrics,
+)
 
 SPLIT_ORDER = ("train", "val", "test")
-MODEL_DISPLAY_NAMES = {"raster_convgru": "Raster ConvGRU", "mlp": "MLP"}
+MODEL_DISPLAY_NAMES = {
+    "raster_convgru": "Raster ConvGRU",
+    "raster_hurdle": "Raster hurdle ConvGRU",
+    "mlp": "MLP",
+}
 COMPARISON_METRIC_NAMES = {"mae": "MAE", "rmse": "RMSE", "r2": "R2", "pearson_r": "Pearson r"}
 ROBUST_AXIS_QUANTILES = (0.005, 0.995)
 
@@ -128,3 +141,60 @@ def plot_model_comparison(model_frames: dict[str, dict[str, pd.DataFrame]], run_
         axis.legend().set_visible(axis is axes[-1])
     figure.tight_layout()
     _save(figure, run_dir, "model_comparison")
+
+
+def plot_hurdle_diagnostics(test_frame: pd.DataFrame, run_dir: str | Path) -> None:
+    """Plot test gate confusion and oracle-routed magnitude predictions.
+
+    Args:
+        test_frame: Row-level hurdle predictions for the test split.
+        run_dir: Model-run output directory.
+    """
+    sns.set_theme(style="whitegrid", font_scale=1.0)
+    figure, axes = plt.subplots(1, 2, figsize=(13, 5.5))
+    metrics = hurdle_metrics(test_frame)
+    confusion = np.asarray(metrics["confusion_matrix"], dtype=np.float64)
+    normalized = np.divide(
+        confusion,
+        confusion.sum(axis=1, keepdims=True),
+        out=np.zeros_like(confusion),
+        where=confusion.sum(axis=1, keepdims=True) > 0,
+    )
+    sns.heatmap(
+        normalized,
+        annot=True,
+        fmt=".1%",
+        cmap="Blues",
+        vmin=0,
+        vmax=1,
+        xticklabels=HURDLE_CLASS_NAMES,
+        yticklabels=HURDLE_CLASS_NAMES,
+        ax=axes[0],
+    )
+    axes[0].set(
+        xlabel="Predicted class",
+        ylabel="True class",
+        title=(f"Test gate\nBalanced accuracy {metrics['balanced_accuracy']:.3f}, macro F1 {metrics['macro_f1']:.3f}"),
+    )
+
+    changed = test_frame[TRUE_CLASS_COL] != 1
+    truth = test_frame.loc[changed, TRUE_TARGET_COL].abs().to_numpy()
+    true_classes = test_frame.loc[changed, TRUE_CLASS_COL].to_numpy(dtype=np.int64)
+    predicted = np.where(
+        true_classes == 0,
+        test_frame.loc[changed, DECREASE_MAGNITUDE_COL],
+        test_frame.loc[changed, INCREASE_MAGNITUDE_COL],
+    )
+    lower, upper = np.quantile(np.concatenate((truth, predicted)), ROBUST_AXIS_QUANTILES)
+    axes[1].scatter(truth, predicted, s=8, alpha=0.25, linewidths=0, rasterized=True)
+    axes[1].plot((lower, upper), (lower, upper), color="#222222", linewidth=1.1, linestyle="--")
+    axes[1].set(
+        xlim=(lower, upper),
+        ylim=(lower, upper),
+        xlabel="Observed magnitude",
+        ylabel="Predicted magnitude",
+        title="Conditional magnitude with oracle direction",
+    )
+    axes[1].set_aspect("equal", adjustable="box")
+    figure.tight_layout()
+    _save(figure, run_dir, "hurdle_diagnostics")
