@@ -16,8 +16,14 @@ comparison_plot="${run_dir}/model_comparison.png"
 prediction_plot="${run_dir}/regression_predictions.png"
 raster_loss_plot="${run_dir}/loss_curve.png"
 tabular_loss_plot="${run_dir}/tabular_loss_curve.png"
+hurdle_diagnostics_plot="${run_dir}/hurdle_diagnostics.png"
 
-for artifact in "${comparison_plot}" "${prediction_plot}" "${raster_loss_plot}" "${tabular_loss_plot}"; do
+for artifact in \
+    "${comparison_plot}" \
+    "${prediction_plot}" \
+    "${raster_loss_plot}" \
+    "${tabular_loss_plot}" \
+    "${hurdle_diagnostics_plot}"; do
     if [[ ! -s "${artifact}" ]]; then
         echo "Expected result artifact is missing or empty: ${artifact}" >&2
         exit 1
@@ -27,13 +33,13 @@ done
 echo "Emailing regression plots and both loss curves to ${recipient} via ${mail_host}"
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 \
     "${mail_host}" stat -c %s "${mail_log}")
-printf 'NO2 regression training completed successfully.\n\nThe attached regression_predictions.png compares predicted and true test targets for both models, uses outlier-robust axes, and reports each model MSE.\n\nRun: %s\nJob: %s\n' \
+printf 'NO2 hurdle training completed successfully.\n\nThe attachments compare the raster hurdle model with the LDS-weighted MLP and report gate and conditional-magnitude diagnostics.\n\nRun: %s\nJob: %s\n' \
     "${run_dir}" \
     "${job_id}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
         "mailx -s 'NO2 regression results (${job_id})' \
             -a '${comparison_plot}' -a '${prediction_plot}' -a '${raster_loss_plot}' \
-            -a '${tabular_loss_plot}' '${recipient}'"
+            -a '${tabular_loss_plot}' -a '${hurdle_diagnostics_plot}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do

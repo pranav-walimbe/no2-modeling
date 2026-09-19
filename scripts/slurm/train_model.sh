@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=train-no2-regression
+#SBATCH --job-name=train-no2-hurdle
 #SBATCH --account=fc_nitrates
 #SBATCH --partition=savio4_gpu
 #SBATCH --qos=a5k_gpu4_normal
@@ -56,6 +56,9 @@ srun python -u -m modeling.train \
     --lds-sigma 2.0 \
     --maximum-loss-weight 5.0 \
     --huber-delta 0.1 \
+    --steady-threshold 0.05 \
+    --classification-loss-weight 1.0 \
+    --regression-loss-weight 1.0 \
     | tee "${training_output}"
 echo "Training command completed; locating result artifacts"
 
@@ -65,7 +68,7 @@ if [[ -z "${run_dir}" ]]; then
     exit 1
 fi
 
-echo "Emailing the two-model prediction scatterplot and training plots"
+echo "Emailing hurdle diagnostics, model comparison, and training plots"
 bash scripts/slurm/email_model_results.sh \
     "${run_dir}" \
     "${SLURM_JOB_ID}" \

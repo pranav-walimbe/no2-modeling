@@ -1,5 +1,8 @@
 """Mask-aware ConvGRU for emissions-change prediction."""
 
+import math
+from typing import NamedTuple
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -10,6 +13,17 @@ DEFAULT_HEAD_DIM = 128
 DEFAULT_DROPOUT = 0.20
 VISION_EMBEDDING_DIM = 128
 CONVGRU_HIDDEN_CHANNELS = 96
+HURDLE_CLASS_COUNT = 3
+HURDLE_MAGNITUDE_COUNT = 2
+
+
+class HurdleOutput(NamedTuple):
+    """Outputs from the directional hurdle heads."""
+
+    class_logits: torch.Tensor
+    class_probabilities: torch.Tensor
+    magnitudes: torch.Tensor
+    expected_value: torch.Tensor
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -189,3 +203,48 @@ class RasterConvGRU(nn.Module):
 
     def num_params(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
+
+
+class RasterHurdleConvGRU(RasterConvGRU):
+    """Predict change occurrence and conditional directional magnitudes."""
+
+    def __init__(
+        self,
+        *,
+        steady_threshold: float,
+        class_weights: torch.Tensor | None = None,
+        head_dim: int = DEFAULT_HEAD_DIM,
+        dropout: float = DEFAULT_DROPOUT,
+    ) -> None:
+        super().__init__(head_dim=head_dim, dropout=dropout)
+        self.steady_threshold = steady_threshold
+        self.regressor = nn.Identity()
+        self.head = nn.Sequential(
+            nn.Linear(VISION_EMBEDDING_DIM, head_dim),
+            nn.LayerNorm(head_dim),
+            nn.SiLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        self.classifier = nn.Linear(head_dim, HURDLE_CLASS_COUNT)
+        self.magnitude_regressor = nn.Linear(head_dim, HURDLE_MAGNITUDE_COUNT)
+        probability_adjustment = (
+            torch.zeros(HURDLE_CLASS_COUNT) if class_weights is None else class_weights.detach().float().log()
+        )
+        self.register_buffer("probability_logit_adjustment", probability_adjustment)
+        initial_magnitude_bias = math.log(math.expm1(steady_threshold))
+        nn.init.constant_(self.magnitude_regressor.bias, initial_magnitude_bias)
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        tabular: torch.Tensor,
+        elapsed_hours: torch.Tensor,
+    ) -> HurdleOutput:
+        """Predict class probabilities and positive conditional magnitudes."""
+        del tabular, elapsed_hours
+        features = self.head(self._encode_sequence(image))
+        class_logits = self.classifier(features)
+        magnitudes = self.steady_threshold + F.softplus(self.magnitude_regressor(features))
+        probabilities = (class_logits - self.probability_logit_adjustment).softmax(dim=1)
+        expected_value = probabilities[:, 2] * magnitudes[:, 1] - probabilities[:, 0] * magnitudes[:, 0]
+        return HurdleOutput(class_logits, probabilities, magnitudes, expected_value)

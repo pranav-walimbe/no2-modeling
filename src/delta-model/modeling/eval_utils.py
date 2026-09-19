@@ -9,8 +9,16 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from modeling.convgru import HurdleOutput
 from scipy.ndimage import gaussian_filter1d
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
+)
 from torch import nn
 from torch.nn import functional as F
 
@@ -18,6 +26,14 @@ TRUE_TARGET_COL = "y_true"
 PREDICTION_COL = "y_pred"
 RESIDUAL_COL = "residual"
 ABSOLUTE_ERROR_COL = "absolute_error"
+TRUE_CLASS_COL = "hurdle_class_true"
+PREDICTED_CLASS_COL = "hurdle_class_predicted"
+DECREASE_PROBABILITY_COL = "probability_decrease"
+STEADY_PROBABILITY_COL = "probability_steady"
+INCREASE_PROBABILITY_COL = "probability_increase"
+DECREASE_MAGNITUDE_COL = "predicted_decrease_magnitude"
+INCREASE_MAGNITUDE_COL = "predicted_increase_magnitude"
+HURDLE_CLASS_NAMES = ("decrease", "steady", "increase")
 MODEL_COMPARISON_METRICS = ("mse", "mae", "rmse", "r2", "pearson_r", "spearman_r")
 DEFAULT_LDS_BINS = 101
 DEFAULT_LDS_SIGMA = 2.0
@@ -115,6 +131,108 @@ class WeightedHuberLoss(nn.Module):
         return torch.sum(weights * losses) / torch.sum(weights)
 
 
+class HurdleLoss(nn.Module):
+    """Class-balanced gate loss with LDS-weighted conditional magnitude losses."""
+
+    def __init__(
+        self,
+        training_targets: np.ndarray,
+        *,
+        steady_threshold: float,
+        classification_weight: float,
+        regression_weight: float,
+        weighting: str,
+        bin_count: int,
+        gaussian_sigma_bins: float,
+        maximum_weight: float,
+        huber_delta: float,
+    ) -> None:
+        super().__init__()
+        targets = np.asarray(training_targets, dtype=np.float64)
+        classes = hurdle_classes(targets, steady_threshold)
+        class_counts = np.bincount(classes, minlength=len(HURDLE_CLASS_NAMES))
+        class_weights = 1.0 / np.sqrt(class_counts.astype(np.float64))
+        class_weights /= np.average(class_weights, weights=class_counts)
+        self.register_buffer("class_weights", torch.tensor(class_weights, dtype=torch.float32))
+        self.steady_threshold = steady_threshold
+        self.classification_weight = classification_weight
+        self.regression_weight = regression_weight
+        self.regression_scale = 1.0 / (huber_delta * huber_delta)
+        loss_options = {
+            "weighting": weighting,
+            "bin_count": bin_count,
+            "gaussian_sigma_bins": gaussian_sigma_bins,
+            "maximum_weight": maximum_weight,
+            "huber_delta": huber_delta,
+        }
+        self.decrease_loss = WeightedHuberLoss(np.abs(targets[classes == 0]), **loss_options)
+        self.increase_loss = WeightedHuberLoss(targets[classes == 2], **loss_options)
+        self.stats = {
+            "steady_threshold": steady_threshold,
+            "classification_weight": classification_weight,
+            "regression_weight": regression_weight,
+            "regression_scale": self.regression_scale,
+            "class_names": list(HURDLE_CLASS_NAMES),
+            "class_counts": class_counts.tolist(),
+            "class_weights": class_weights.tolist(),
+            "decrease_magnitude_loss": self.decrease_loss.stats.to_dict(),
+            "increase_magnitude_loss": self.increase_loss.stats.to_dict(),
+        }
+
+    def weights_for(self, targets: torch.Tensor) -> torch.Tensor:
+        """Return one aggregation weight per training record."""
+        return torch.ones_like(targets)
+
+    def forward(self, output: HurdleOutput, targets: torch.Tensor) -> torch.Tensor:
+        """Return the joint gate and conditional magnitude objective."""
+        classes = torch.where(
+            targets < -self.steady_threshold,
+            torch.zeros_like(targets, dtype=torch.long),
+            torch.where(
+                targets > self.steady_threshold,
+                torch.full_like(targets, 2, dtype=torch.long),
+                torch.ones_like(targets, dtype=torch.long),
+            ),
+        )
+        classification_loss = F.cross_entropy(output.class_logits, classes, weight=self.class_weights)
+        directional_losses = []
+        decrease = classes == 0
+        increase = classes == 2
+        if decrease.any():
+            directional_losses.append(self.decrease_loss(output.magnitudes[decrease, 0], targets[decrease].abs()))
+        if increase.any():
+            directional_losses.append(self.increase_loss(output.magnitudes[increase, 1], targets[increase]))
+        regression_loss = (
+            torch.stack(directional_losses).mean() if directional_losses else output.magnitudes.sum() * 0.0
+        )
+        return (
+            self.classification_weight * classification_loss
+            + self.regression_weight * self.regression_scale * regression_loss
+        )
+
+
+def hurdle_classes(targets: np.ndarray, steady_threshold: float) -> np.ndarray:
+    """Map signed targets to decrease, steady, and increase class indices."""
+    values = np.asarray(targets)
+    return np.where(values < -steady_threshold, 0, np.where(values > steady_threshold, 2, 1)).astype(np.int64)
+
+
+def hurdle_metrics(frame: pd.DataFrame) -> dict[str, object]:
+    """Calculate gate metrics from a hurdle prediction frame."""
+    truth = frame[TRUE_CLASS_COL].to_numpy(dtype=np.int64)
+    predicted = frame[PREDICTED_CLASS_COL].to_numpy(dtype=np.int64)
+    return {
+        "accuracy": float(np.mean(truth == predicted)),
+        "balanced_accuracy": float(balanced_accuracy_score(truth, predicted)),
+        "macro_f1": float(f1_score(truth, predicted, average="macro", zero_division=0)),
+        "confusion_matrix": confusion_matrix(
+            truth,
+            predicted,
+            labels=np.arange(len(HURDLE_CLASS_NAMES)),
+        ).tolist(),
+    }
+
+
 def regression_metrics(y_true: np.ndarray, prediction: np.ndarray) -> dict[str, float | int | None]:
     """Calculate regression errors and associations.
 
@@ -178,6 +296,8 @@ def _model_results(split_frames: dict[str, pd.DataFrame]) -> dict[str, object]:
         name: regression_metrics(subset[TRUE_TARGET_COL].to_numpy(), subset[PREDICTION_COL].to_numpy())
         for name, subset in slices.items()
     }
+    if {TRUE_CLASS_COL, PREDICTED_CLASS_COL}.issubset(test.columns):
+        results["hurdle_gate"] = {name: hurdle_metrics(frame) for name, frame in split_frames.items()}
     return results
 
 
