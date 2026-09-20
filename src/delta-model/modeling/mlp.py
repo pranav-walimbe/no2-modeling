@@ -1,14 +1,16 @@
-"""Compact tabular model for emissions-change prediction."""
+"""Compact tabular model for emissions-change classification."""
 
 import torch
 from torch import nn
+
+from config import MODEL_CLASS_NAMES
 
 TABULAR_HIDDEN_DIM = 32
 TABULAR_EMBEDDING_DIM = 16
 
 
 class TabularMLP(nn.Module):
-    """Regress effective emissions changes from tabular features alone."""
+    """Classify emissions changes from tabular features alone."""
 
     def __init__(
         self,
@@ -26,10 +28,10 @@ class TabularMLP(nn.Module):
             nn.LayerNorm(embedding_dim),
             nn.SiLU(inplace=True),
         )
-        self.regressor = nn.Linear(embedding_dim, 1)
+        self.classifier = nn.Linear(embedding_dim, len(MODEL_CLASS_NAMES))
 
     def encode(self, tabular: torch.Tensor) -> torch.Tensor:
-        """Produce the embedding used by the regression head."""
+        """Produce the embedding used by the classification head."""
         return self.encoder(tabular)
 
     def forward(
@@ -38,9 +40,9 @@ class TabularMLP(nn.Module):
         tabular: torch.Tensor,
         elapsed_hours: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict one unrestricted continuous target from tabular features."""
+        """Predict one logit for each emissions-change class."""
         del image, elapsed_hours
-        return self.regressor(self.encode(tabular)).squeeze(1)
+        return self.classifier(self.encode(tabular))
 
     def num_params(self) -> int:
         """Count trainable model parameters."""

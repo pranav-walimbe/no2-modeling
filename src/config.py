@@ -105,7 +105,8 @@ MODEL_ROBUST_IMAGE_KEYS = ("no2",)
 MODEL_IMAGE_CHANNELS = len(MODEL_IMAGE_KEYS)
 MODEL_INPUT_CHANNELS = MODEL_IMAGE_CHANNELS + len(MODEL_MASK_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
-MODEL_TARGET_COL = "delta_effective_nox_scaled"  # signed asinh-scaled effective emissions change
+MODEL_TARGET_COL = "delta_category"  # three-class decrease, steady, or increase target
+MODEL_CLASS_NAMES = ("decrease", "steady", "increase")
 MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular and fused models
     "major_city_dist",
     "num_coal_units",

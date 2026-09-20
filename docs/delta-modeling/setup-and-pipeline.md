@@ -131,8 +131,8 @@ python -u -m modeling.train
 ```
 
 The trainer fits normalization on training pixels, loads NPZ files on demand,
-and trains independent raster ConvGRU and tabular MLP regressors with
-train-fitted LDS-weighted Huber losses. See [modeling.md](modeling.md) for
+and trains independent partial-convolution ConvGRU and tabular MLP classifiers
+with three-class cross-entropy. See [modeling.md](modeling.md) for
 inputs, leakage controls, architecture, and evaluation.
 
 ## Savio allocations
