@@ -28,34 +28,32 @@ from preprocessing.stratify_utils import (
     build_aoi_membership,
     build_aoi_spatial_frame,
     build_aois,
-    calculate_aoi_scores,
     cluster_aois,
     filter_usable_nox_measurements,
-    select_split_records,
     usable_nox_measurement_expr,
 )
 from preprocessing.tempo_mapping import load_tempo_mapping
 
 from config import (
-    AOI_SELECTION_COUNT,
     EMA_DECAY_TIMESCALE_HOURS,
+    EMA_HISTORY_TIMESTEPS,
     FULL_DATA_PARQUET,
+    LABEL_TIMESTEP_INDEX,
     MIN_COVERAGE_PERCENT,
     SEQUENCE_TIMESTEPS,
     STRAT_BASE_DIR,
-    TEST_RECORDS,
+    STRATIFICATION_EMA_CHANGE_THRESHOLD,
+    STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD,
     TEST_RECORDS_CSV,
-    TRAIN_RECORDS,
     TRAIN_RECORDS_CSV,
-    VAL_RECORDS,
     VAL_RECORDS_CSV,
     VIS_DIR,
 )
 
-SPLIT_RECORD_COUNTS = {"train": TRAIN_RECORDS, "val": VAL_RECORDS, "test": TEST_RECORDS}
-TOTAL_RECORDS = sum(SPLIT_RECORD_COUNTS.values())
-SPLIT_FRACTIONS = {split: count / TOTAL_RECORDS for split, count in SPLIT_RECORD_COUNTS.items()}
+SPLIT_FRACTIONS = {"train": 0.70, "val": 0.15, "test": 0.15}
 SPLIT_SEED = 42
+DELTA_CATEGORY_COL = "delta_category"
+EMA_BUCKET_NAMES = ("decrease", "steady", "increase")
 TIMESTEP_COLUMNS = [
     column
     for index in range(SEQUENCE_TIMESTEPS)
@@ -96,6 +94,7 @@ OUTPUT_COLUMNS = [
     DELTA_NOX_SCALED_COL,
     EFFECTIVE_CURRENT_NOX_COL,
     "effective_delta_nox",
+    DELTA_CATEGORY_COL,
     DELTA_EFFECTIVE_NOX_SCALED_COL,
     LABEL_MODE_COL,
 ]
@@ -116,37 +115,47 @@ REQUIRED_COLUMNS = [
     "facility_nameplate_capacity_mw",
 ]
 
-DEFAULT_AOI_RECORD_SHARE_OUTPUT = Path(VIS_DIR) / "stratification_aoi_record_shares.png"
-DEFAULT_HISTOGRAM_OUTPUT = Path(VIS_DIR) / "stratification_scaled_label_histograms.png"
+DEFAULT_DIAGNOSTIC_OUTPUT = Path(VIS_DIR) / "stratification_ema_balance.png"
 HISTOGRAM_QUANTILES = (0.01, 0.99)
 
 
 def parse_args() -> argparse.Namespace:
     """Parse stratification command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--aoi-record-share-output",
-        type=Path,
-        default=DEFAULT_AOI_RECORD_SHARE_OUTPUT,
-    )
-    parser.add_argument("--histogram-output", type=Path, default=DEFAULT_HISTOGRAM_OUTPUT)
+    parser.add_argument("--diagnostic-output", type=Path, default=DEFAULT_DIAGNOSTIC_OUTPUT)
     return parser.parse_args()
 
 
-def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
-    # Greedily assign large clusters against total record targets
+def _split_by_cluster(
+    frame: pl.DataFrame,
+    category_column: str | None = None,
+) -> dict[str, pl.DataFrame]:
+    # Greedily assign large clusters against record or class-specific targets
+    category_names = EMA_BUCKET_NAMES if category_column is not None else ()
+    count_expressions = [pl.len().alias("records")]
+    count_expressions.extend(
+        (pl.col(category_column) == category).sum().alias(category)
+        for category in category_names
+    )
     cluster_counts = (
         frame.group_by("cluster")
-        .agg(pl.len().alias("records"))
+        .agg(count_expressions)
         .with_columns(pl.col("cluster").hash(seed=SPLIT_SEED).alias("_tie_breaker"))
         .sort(["records", "_tie_breaker"], descending=[True, False])
     )
     if cluster_counts.height < len(SPLIT_FRACTIONS):
         raise ValueError("At least three geographic clusters are required")
 
-    total_records = float(cluster_counts["records"].sum())
-    targets = {split: total_records * fraction for split, fraction in SPLIT_FRACTIONS.items()}
-    assigned = {split: 0.0 for split in SPLIT_FRACTIONS}
+    target_columns = category_names or ("records",)
+    totals = {column: float(cluster_counts[column].sum()) for column in target_columns}
+    targets = {
+        split: {column: totals[column] * fraction for column in target_columns}
+        for split, fraction in SPLIT_FRACTIONS.items()
+    }
+    assigned = {
+        split: {column: 0.0 for column in target_columns}
+        for split in SPLIT_FRACTIONS
+    }
     cluster_assignments: list[dict[str, object]] = []
     assigned_cluster_counts = {split: 0 for split in SPLIT_FRACTIONS}
     for index, cluster in enumerate(cluster_counts.iter_rows(named=True)):
@@ -156,18 +165,19 @@ def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
         destination = min(
             destinations,
             key=lambda destination: sum(
-                (
-                    assigned[split]
-                    + (float(cluster["records"]) if split == destination else 0.0)
-                    - targets[split]
-                )
-                ** 2
+                ((
+                    assigned[split][column]
+                    + (float(cluster[column]) if split == destination else 0.0)
+                    - targets[split][column]
+                ) / max(targets[split][column], 1.0)) ** 2
                 for split in SPLIT_FRACTIONS
+                for column in target_columns
             ),
         )
         cluster_assignments.append({"cluster": cluster["cluster"], "split": destination})
         assigned_cluster_counts[destination] += 1
-        assigned[destination] += float(cluster["records"])
+        for column in target_columns:
+            assigned[destination][column] += float(cluster[column])
 
     assignments = pl.DataFrame(
         cluster_assignments,
@@ -182,11 +192,52 @@ def _split_by_cluster(frame: pl.DataFrame) -> dict[str, pl.DataFrame]:
         for split in SPLIT_FRACTIONS
     }
     for split, split_frame in splits.items():
+        category_summary = ""
+        if category_column is not None:
+            counts = split_frame.group_by(category_column).len()
+            by_category = dict(counts.iter_rows())
+            category_summary = "; " + ", ".join(
+                f"{category}={by_category.get(category, 0):,}" for category in category_names
+            )
         print(
             f"[{split}] assigned {split_frame.height:,}/{frame.height:,} eligible records "
             f"({split_frame.height / frame.height:.1%}; target {SPLIT_FRACTIONS[split]:.1%})"
+            f"{category_summary}"
         )
     return splits
+
+
+def filter_stratification_rule(frame: pl.DataFrame) -> pl.DataFrame:
+    """Keep records whose raw and normalized EMA classes agree.
+
+    Args:
+        frame: Eligible records carrying raw and normalized effective deltas.
+
+    Returns:
+        Agreement-filtered records labeled with the raw EMA class.
+    """
+    normalized_category_column = "_normalized_delta_category"
+    raw_delta = pl.col("effective_delta_nox")
+    normalized_delta = pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL)
+    return (
+        frame.with_columns(
+            pl.when(raw_delta < -STRATIFICATION_EMA_CHANGE_THRESHOLD)
+            .then(pl.lit("decrease"))
+            .when(raw_delta > STRATIFICATION_EMA_CHANGE_THRESHOLD)
+            .then(pl.lit("increase"))
+            .otherwise(pl.lit("steady"))
+            .alias(DELTA_CATEGORY_COL),
+            pl.when(normalized_delta < -STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD)
+            .then(pl.lit("decrease"))
+            .when(normalized_delta > STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD)
+            .then(pl.lit("increase"))
+            .otherwise(pl.lit("steady"))
+            .alias(normalized_category_column),
+        )
+        .filter(pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL).is_finite())
+        .filter(pl.col(DELTA_CATEGORY_COL) == pl.col(normalized_category_column))
+        .drop(normalized_category_column)
+    )
 
 
 def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
@@ -200,101 +251,134 @@ def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _plot_aoi_record_shares(
-    splits: dict[str, pl.DataFrame],
+def select_balanced_ema_records(
+    frame: pl.DataFrame,
+    split: str,
+    *,
+    seed: int = SPLIT_SEED,
+) -> pl.DataFrame:
+    """Select equal deterministic samples from three raw EMA-change buckets.
+
+    Args:
+        frame: Eligible records carrying the raw effective NOx delta.
+        split: Split name used in progress and error messages.
+        seed: Deterministic within-class ordering seed.
+
+    Returns:
+        All three buckets downsampled to the smallest bucket count.
+    """
+    counts = frame.group_by(DELTA_CATEGORY_COL).len().sort(DELTA_CATEGORY_COL)
+    missing_classes = set(EMA_BUCKET_NAMES).difference(counts[DELTA_CATEGORY_COL].to_list())
+    if missing_classes:
+        raise ValueError(f"[{split}] EMA buckets have no records: {', '.join(sorted(missing_classes))}")
+    records_per_class = int(counts["len"].min())
+    selected = []
+    for class_name in EMA_BUCKET_NAMES:
+        class_records = (
+            frame.filter(pl.col(DELTA_CATEGORY_COL) == class_name)
+            .with_columns(
+                pl.struct(AOI_ID_COL, "emissions_hour_utc")
+                .hash(seed=seed)
+                .alias("_selection_tie_breaker")
+            )
+            .sort("_selection_tie_breaker", AOI_ID_COL, "emissions_hour_utc")
+            .head(records_per_class)
+            .drop("_selection_tie_breaker")
+        )
+        selected.append(class_records)
+    balanced = pl.concat(selected).sort(AOI_ID_COL, "emissions_hour_utc")
+    count_summary = ", ".join(
+        f"{row[DELTA_CATEGORY_COL]}={row['len']:,}" for row in counts.iter_rows(named=True)
+    )
+    print(
+        f"[{split}] threshold=+/-{STRATIFICATION_EMA_CHANGE_THRESHOLD:.2f}; eligible {count_summary}; "
+        f"selected {records_per_class:,} per class ({balanced.height:,} total)"
+    )
+    return balanced
+
+
+def _plot_stratification_diagnostics(
+    eligible_splits: dict[str, pl.DataFrame],
+    balanced_splits: dict[str, pl.DataFrame],
     output_path: Path,
 ) -> None:
-    # Show each AOI's percentage of the final sampled records by split
-    split_names = tuple(SPLIT_FRACTIONS)
-    shares_by_split = {
-        name: split.group_by(AOI_ID_COL)
-        .agg(pl.len().alias("record_count"))
-        .with_columns((100 * pl.col("record_count") / split.height).alias("record_share_percent"))
-        .sort("record_share_percent", AOI_ID_COL, descending=[True, False])
-        for name, split in splits.items()
-    }
-    max_aois = max(frame.height for frame in shares_by_split.values())
-    max_share = max(
-        frame["record_share_percent"].max()
-        for frame in shares_by_split.values()
-        if not frame.is_empty()
-    )
-    figure, axes = plt.subplots(
-        1,
-        len(split_names),
-        figsize=(24, max(10, max_aois * 0.32)),
-        constrained_layout=True,
-        sharex=True,
-    )
-    colors = plt.get_cmap("tab10").colors
-    for split_index, (axis, split_name) in enumerate(zip(axes, split_names, strict=True)):
-        split_shares = shares_by_split[split_name]
-        positions = list(range(split_shares.height))
-        percentages = split_shares["record_share_percent"].to_numpy()
-        axis.barh(
-            positions,
-            percentages,
-            color=colors[split_index],
-        )
-        axis.set_yticks(positions, [str(aoi_id) for aoi_id in split_shares[AOI_ID_COL]])
-        axis.invert_yaxis()
-        axis.set_xlim(0, max_share * 1.15)
-        axis.grid(axis="x", alpha=0.25)
-        axis.set_axisbelow(True)
-        axis.set_xlabel("Share of split records (%)")
-        axis.set_ylabel("AOI ID")
-        axis.set_title(f"{split_name}: {split_shares.height} AOIs, {splits[split_name].height:,} records")
-        for position, percentage in zip(positions, percentages, strict=True):
-            axis.text(
-                float(percentage) + max_share * 0.01,
-                position,
-                f"{float(percentage):.2f}%",
-                va="center",
-                fontsize=7,
-            )
-    figure.suptitle("AOI shares of final sampled records by split")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=180)
-    plt.close(figure)
-
-
-def _plot_scaled_label_histograms(splits: dict[str, pl.DataFrame], output_path: Path) -> None:
-    # Plot each target on a common robust x-axis across geographic splits
-    target_rows = (
-        (DELTA_NOX_SCALED_COL, "Scaled hourly NOx delta"),
-        (DELTA_EFFECTIVE_NOX_SCALED_COL, "Scaled effective NOx delta"),
-    )
+    # Compare raw EMA changes and bucket composition before and after balancing
     split_names = tuple(SPLIT_FRACTIONS)
     figure, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
-    for row_index, (column, row_title) in enumerate(target_rows):
-        combined = np.concatenate([split[column].drop_nulls().to_numpy() for split in splits.values()])
-        finite = combined[np.isfinite(combined)]
-        lower, upper = np.quantile(finite, HISTOGRAM_QUANTILES)
-        limit = max(abs(lower), abs(upper))
-        if limit == 0:
-            limit = 1.0
-        for column_index, split_name in enumerate(split_names):
-            axis = axes[row_index, column_index]
-            values = splits[split_name][column].drop_nulls().to_numpy()
-            values = values[np.isfinite(values)]
-            visible = values[np.abs(values) <= limit]
-            axis.hist(visible, bins=50, range=(-limit, limit), edgecolor="white")
-            axis.axvline(0, color="black", linewidth=1)
-            axis.set_title(f"{split_name}: n={len(values):,}")
-            axis.set_xlabel("asinh(delta / prior-quarter median NOx)")
-            axis.set_ylabel("AOI-hour count")
-            if column_index == 0:
-                axis.text(-0.2, 0.5, row_title, rotation=90, va="center", transform=axis.transAxes)
-            axis.text(
-                0.98,
-                0.95,
-                f"shown: {len(visible):,}\nx range: +/-{limit:.3g}",
-                ha="right",
-                va="top",
-                transform=axis.transAxes,
-            )
-    split_counts = ", ".join(f"{name}={splits[name].height:,}" for name in split_names)
-    figure.suptitle(f"Scaled label distributions by split\nSplit counts: {split_counts}")
+    combined = np.concatenate(
+        [split["effective_delta_nox"].drop_nulls().to_numpy() for split in eligible_splits.values()]
+    )
+    finite = combined[np.isfinite(combined)]
+    lower, upper = np.quantile(finite, HISTOGRAM_QUANTILES)
+    limit = max(abs(lower), abs(upper))
+    if limit == 0:
+        limit = 1.0
+    threshold = STRATIFICATION_EMA_CHANGE_THRESHOLD
+    total_eligible = sum(split.height for split in eligible_splits.values())
+    colors = ("#3977af", "#999999", "#d65f4a")
+    for column_index, split_name in enumerate(split_names):
+        eligible = eligible_splits[split_name]
+        balanced = balanced_splits[split_name]
+        values = eligible["effective_delta_nox"].drop_nulls().to_numpy()
+        values = values[np.isfinite(values)]
+        visible = values[np.abs(values) <= limit]
+        aoi_count = eligible[AOI_ID_COL].n_unique()
+
+        histogram_axis = axes[0, column_index]
+        histogram_axis.hist(visible, bins=70, range=(-limit, limit), color="#4c78a8", edgecolor="white")
+        histogram_axis.axvline(0, color="black", linewidth=1)
+        histogram_axis.axvline(-threshold, color="#b22222", linestyle="--", linewidth=1.5)
+        histogram_axis.axvline(threshold, color="#b22222", linestyle="--", linewidth=1.5)
+        histogram_axis.set_title(
+            f"{split_name}: {eligible.height:,} eligible ({eligible.height / total_eligible:.1%}), {aoi_count} AOIs"
+        )
+        histogram_axis.set_xlabel("Raw effective EMA NOx change")
+        histogram_axis.set_ylabel("AOI-hour count")
+        histogram_axis.grid(axis="y", alpha=0.2)
+
+        eligible_counts = np.array(
+            [
+                int((values < -threshold).sum()),
+                int((np.abs(values) <= threshold).sum()),
+                int((values > threshold).sum()),
+            ]
+        )
+        balanced_count = balanced.height // len(EMA_BUCKET_NAMES)
+        balanced_counts = np.full(len(EMA_BUCKET_NAMES), balanced_count)
+        positions = np.arange(len(EMA_BUCKET_NAMES))
+        width = 0.38
+        bucket_axis = axes[1, column_index]
+        before_bars = bucket_axis.bar(
+            positions - width / 2,
+            100 * eligible_counts / eligible_counts.sum(),
+            width,
+            label="Eligible",
+            color=colors,
+            alpha=0.55,
+        )
+        after_bars = bucket_axis.bar(
+            positions + width / 2,
+            100 * balanced_counts / balanced_counts.sum(),
+            width,
+            label="Balanced",
+            color=colors,
+        )
+        bucket_axis.set_xticks(positions, EMA_BUCKET_NAMES)
+        bucket_axis.set_ylim(0, 105)
+        bucket_axis.set_ylabel("Share of records (%)")
+        bucket_axis.grid(axis="y", alpha=0.2)
+        bucket_axis.set_title(f"Maximum balanced set: {balanced.height:,} ({balanced_count:,} per bucket)")
+        bucket_axis.bar_label(before_bars, labels=[f"{count:,}" for count in eligible_counts], fontsize=8)
+        bucket_axis.bar_label(after_bars, labels=[f"{count:,}" for count in balanced_counts], fontsize=8)
+        if column_index == 0:
+            bucket_axis.legend(loc="upper left")
+    split_counts = ", ".join(f"{name}={balanced_splits[name].height:,}" for name in split_names)
+    total_balanced = sum(split.height for split in balanced_splits.values())
+    figure.suptitle(
+        f"Raw +/-{STRATIFICATION_EMA_CHANGE_THRESHOLD:g} and normalized "
+        f"+/-{STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD:g} agreement\n"
+        f"Maximum balanced set: {total_balanced:,} total ({split_counts})"
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=180)
     plt.close(figure)
@@ -312,9 +396,12 @@ def _serialize_no2_paths(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def main() -> None:
-    """Build stratified AOI-hour metadata splits for dataset generation."""
-    args = parse_args()
+def build_stratification_candidates() -> pl.DataFrame:
+    """Build eligible AOI-hour records for every AOI.
+
+    Returns:
+        Eligible records before geographic splitting.
+    """
     source = pl.scan_parquet(FULL_DATA_PARQUET)
     raw_records = source.select(REQUIRED_COLUMNS).with_columns(pl.col("date").cast(pl.Date, strict=False))
     records = raw_records.pipe(filter_usable_nox_measurements).filter(pl.col("noxMass").is_finite())
@@ -346,9 +433,20 @@ def main() -> None:
         )
     )
     frame = hourly.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
-    frame = add_tempo_sequences(frame, observations, SEQUENCE_TIMESTEPS)
-    frame = frame.filter(pl.col(f"timestep_time_t{SEQUENCE_TIMESTEPS - 1}").is_not_null())
-    frame = add_ema_targets(frame, hourly, SEQUENCE_TIMESTEPS, EMA_DECAY_TIMESCALE_HOURS)
+    frame = add_tempo_sequences(
+        frame,
+        observations,
+        SEQUENCE_TIMESTEPS,
+        label_timestep_index=LABEL_TIMESTEP_INDEX,
+    )
+    frame = frame.filter(pl.col(f"timestep_time_t{LABEL_TIMESTEP_INDEX}").is_not_null())
+    frame = add_ema_targets(
+        frame,
+        hourly,
+        EMA_HISTORY_TIMESTEPS,
+        EMA_DECAY_TIMESCALE_HOURS,
+        label_timestep_index=LABEL_TIMESTEP_INDEX,
+    )
     frame = add_scaled_nox_targets(frame)
     frame = frame.with_columns(pl.lit("causal_ema").alias(LABEL_MODE_COL))
     bounds = bounded_aois.select(
@@ -359,31 +457,30 @@ def main() -> None:
         SEQUENCE_TIMESTEPS,
     )
     frame = _filter_metadata_eligibility(frame).filter(pl.col("effective_delta_nox").is_finite())
-    aoi_scores = calculate_aoi_scores(raw_records, hourly, frame, bounded_aois, membership)
-    if aoi_scores.height < AOI_SELECTION_COUNT:
-        raise ValueError(
-            f"Requested {AOI_SELECTION_COUNT} AOIs but only {aoi_scores.height} have complete score inputs"
-        )
-    selected_aoi_scores = aoi_scores.head(AOI_SELECTION_COUNT)
-    frame = frame.join(selected_aoi_scores.select(AOI_ID_COL), on=AOI_ID_COL, how="inner")
-    print(f"Selected the top {selected_aoi_scores.height} of {aoi_scores.height} scoreable AOIs")
-    splits = _split_by_cluster(frame)
+    return frame
+
+
+def main() -> None:
+    """Build stratified AOI-hour metadata splits for dataset generation."""
+    args = parse_args()
+    candidates = build_stratification_candidates()
+    frame = filter_stratification_rule(candidates)
+    print(
+        f"Retained {frame.height:,}/{candidates.height:,} records after raw +/-"
+        f"{STRATIFICATION_EMA_CHANGE_THRESHOLD:g} and normalized +/-"
+        f"{STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD:g} class agreement"
+    )
+    print(f"Using all {frame[AOI_ID_COL].n_unique():,} eligible AOIs")
+    eligible_splits = _split_by_cluster(frame, category_column=DELTA_CATEGORY_COL)
     splits = {
-        split: select_split_records(
-            split_frame,
-            split,
-            SPLIT_RECORD_COUNTS[split],
-            seed=SPLIT_SEED,
-        )
-        for split, split_frame in splits.items()
+        split: select_balanced_ema_records(split_frame, split)
+        for split, split_frame in eligible_splits.items()
     }
-    _plot_aoi_record_shares(splits, args.aoi_record_share_output)
-    print(f"Saved AOI record-share chart to {args.aoi_record_share_output}")
-    _plot_scaled_label_histograms(splits, args.histogram_output)
-    print(f"Saved scaled-label histograms to {args.histogram_output}")
+    _plot_stratification_diagnostics(eligible_splits, splits, args.diagnostic_output)
+    print(f"Saved EMA-balance diagnostics to {args.diagnostic_output}")
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
-    del frame, hourly
+    del frame
     # Project and write one split at a time so the copies never coexist
     for name, destination in (("train", TRAIN_RECORDS_CSV), ("val", VAL_RECORDS_CSV), ("test", TEST_RECORDS_CSV)):
         split = splits.pop(name)

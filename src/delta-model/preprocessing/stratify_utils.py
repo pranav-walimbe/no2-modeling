@@ -188,6 +188,7 @@ def add_tempo_sequences(
     frame: pl.DataFrame,
     observations: pl.DataFrame,
     timesteps: int = SEQUENCE_TIMESTEPS,
+    label_timestep_index: int | None = None,
 ) -> pl.DataFrame:
     """Match complete causal TEMPO sequences to emissions clock hours.
 
@@ -195,10 +196,12 @@ def add_tempo_sequences(
         frame: AOI-hour rows eligible for observation matching.
         observations: AOI scans with timestamps and source path lists.
         timesteps: Number of consecutive scans per record.
+        label_timestep_index: Zero-based scan ending the label interval.
 
     Returns:
         Rows carrying oldest-to-newest scan timestamps, ages, and paths.
     """
+    label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
     time_columns = [f"timestep_time_t{index}" for index in range(timesteps)]
     path_columns = [f"no2_paths_t{index}" for index in range(timesteps)]
     age_columns = [f"timestep_age_hours_t{index}" for index in range(timesteps)]
@@ -237,8 +240,8 @@ def add_tempo_sequences(
         )
         .with_columns(
             pl.datetime_ranges(
-                pl.col(time_columns[-2]).dt.truncate("1h"),
-                (pl.col(time_columns[-1]) - pl.duration(microseconds=1)).dt.truncate("1h"),
+                pl.col(time_columns[label_index - 1]).dt.truncate("1h"),
+                (pl.col(time_columns[label_index]) - pl.duration(microseconds=1)).dt.truncate("1h"),
                 interval="1h",
                 time_zone="UTC",
             ).alias("_emissions_hour")
@@ -251,14 +254,14 @@ def add_tempo_sequences(
         )
         .with_columns(
             (
-                pl.min_horizontal(time_columns[-1], "_emissions_hour_end")
-                - pl.max_horizontal(time_columns[-2], "_emissions_hour")
+                pl.min_horizontal(time_columns[label_index], "_emissions_hour_end")
+                - pl.max_horizontal(time_columns[label_index - 1], "_emissions_hour")
             ).alias("_overlap")
         )
         .filter(pl.col("_overlap") > pl.duration(microseconds=0))
         .with_columns(
             (pl.col("_overlap").dt.total_seconds() * 100 / SECONDS_PER_HOUR).alias("coverage_percent"),
-            pl.col(interval_columns[-1]).alias("tempo_delta_minutes"),
+            pl.col(interval_columns[label_index - 1]).alias("tempo_delta_minutes"),
             *[
                 ((pl.col(time_columns[-1]) - pl.col(time_columns[index])).dt.total_seconds() / SECONDS_PER_HOUR).alias(
                     age_columns[index]
@@ -267,7 +270,7 @@ def add_tempo_sequences(
             ],
         )
         .sort(
-            [AOI_ID_COL, "date", "hour", "_overlap", time_columns[-2]],
+            [AOI_ID_COL, "date", "hour", "_overlap", time_columns[label_index - 1]],
             descending=[False, False, False, True, False],
         )
         .unique(subset=[AOI_ID_COL, "date", "hour"], keep="first", maintain_order=True)
@@ -366,25 +369,28 @@ def add_ema_targets(
     hourly: pl.DataFrame,
     timesteps: int = SEQUENCE_TIMESTEPS,
     decay_timescale_hours: float = EMA_DECAY_TIMESCALE_HOURS,
+    label_timestep_index: int | None = None,
 ) -> pl.DataFrame:
     """Add exact-overlap current and previous scan EMA emissions targets.
 
     Args:
         frame: TEMPO-matched records carrying configured timestep timestamps.
         hourly: Aggregate AOI-hour emissions lookup.
-        timesteps: Shared raster and EMA history length.
+        timesteps: Number of hours in each EMA window.
         decay_timescale_hours: Positive exponential e-folding time in hours.
+        label_timestep_index: Zero-based scan ending the current EMA window.
 
     Returns:
         Records with continuous EMA targets and complete audit components.
     """
     if decay_timescale_hours <= 0:
         raise ValueError("decay_timescale_hours must be positive")
+    label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
     indexed = frame.with_row_index("_label_row")
     current = _scan_ema(
         indexed,
         hourly,
-        f"timestep_time_t{timesteps - 1}",
+        f"timestep_time_t{label_index}",
         "current_ema",
         timesteps,
         decay_timescale_hours,
@@ -392,7 +398,7 @@ def add_ema_targets(
     previous = _scan_ema(
         indexed,
         hourly,
-        f"timestep_time_t{timesteps - 2}",
+        f"timestep_time_t{label_index - 1}",
         "previous_ema",
         timesteps,
         decay_timescale_hours,
