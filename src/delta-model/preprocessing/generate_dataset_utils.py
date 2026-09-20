@@ -249,8 +249,14 @@ class DatasetShardStore:
 
     def clear(self) -> None:
         """Delete the complete disposable shard tree."""
+        def ignore_missing_file(_function: object, _path: str, error_info: tuple[type[BaseException], BaseException, object]) -> None:
+            # Tolerate concurrent or delayed Lustre namespace updates
+            error = error_info[1]
+            if not isinstance(error, FileNotFoundError):
+                raise error
+
         if self.root.exists():
-            shutil.rmtree(self.root)
+            shutil.rmtree(self.root, onerror=ignore_missing_file)
 
     def _prepare_root(self) -> Path:
         # Create the shard root before changing descendants
