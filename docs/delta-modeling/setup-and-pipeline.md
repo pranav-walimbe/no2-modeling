@@ -91,9 +91,11 @@ Run observation tasks from 0 through 31 after indexing succeeds. The mapping
 stage writes monthly granule indexes and daily AOI-observation shards.
 
 Stratification computes consecutive-hour changes and prior-quarter baselines,
-scores AOIs, keeps `AOI_SELECTION_COUNT`, assigns overlap clusters to
-70/15/15 splits, removes each split's upper 5% NOx-mass tail, and samples up to
-300,000/75,000/75,000 records. See [dataset_design.md](dataset_design.md).
+uses every eligible AOI, and requires agreement between raw +/-100 and
+normalized +/-0.05 EMA-change classes. It then assigns overlap clusters toward
+70/15/15 targets for each class and balances each split using its smallest
+class. Labels end at the fourth of five stored scans and use four-hour EMA
+windows. See [dataset_design.md](dataset_design.md).
 
 ## 3. Generate raster datasets
 
@@ -146,7 +148,7 @@ logs, `BEGIN,END,FAIL` email, the Python module and environment above, and
 | Facility metadata | `savio4_htc`, `savio_normal`, 4 CPUs, 8 hours | `python -u src/data-scraping/scrape_locations.py` |
 | TEMPO index | `savio4_htc`, `savio_normal`, 16 CPUs, 2 hours | `preprocessing.tempo_mapping index` |
 | TEMPO observations | `savio4_htc`, `savio_normal`, 4 CPUs per task, 8 hours | `0-31%14` array with the observations command |
-| Stratification | `savio4_htc`, `savio_normal`, `savio4_m512`, 16 CPUs, 2 hours | `python -u -m preprocessing.stratify_plants` |
+| Stratification | `savio4_htc`, `savio_normal`, `savio4_m512`, 16 CPUs, 30 minutes | `python -u -m preprocessing.stratify_plants` |
 | Dataset generation | `savio4_htc`, `savio_normal`, 8 concurrent tasks with 8 CPUs, 12 hours | Launch `preprocessing.generate_dataset` from the login node |
 | Model training | `savio3_gpu`, `a40_gpu3_normal`, 8 CPUs, 1 A40, 2 hours | `python -u -m modeling.train --device cuda` |
 

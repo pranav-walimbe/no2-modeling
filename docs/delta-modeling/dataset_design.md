@@ -10,28 +10,30 @@ applies its coverage checks.
 | Split unit | Geographic clusters of overlapping 72 km AOIs |
 | Split target | Approximately 70% train, 15% validation, 15% test |
 | Targets | Raw and scaled hourly and effective NOx changes |
-| Metadata filters | Required source data and each split's upper 5% NOx-mass cutoff |
+| Metadata filters | Required source data and agreement between raw +/-100 and normalized +/-0.05 classes |
 | Raster gates | At least 95% coverage per timestep and complete 3 by 3 hotspot coverage |
-| Final selection | Every record that passes raster checks |
+| Final selection | Equal decrease, steady, and increase samples based on the smallest bucket in each split |
 | Model selection | Validation only; test remains frozen |
 
-Stratification scores eligible AOIs, keeps the top `AOI_SELECTION_COUNT`, assigns
-intact overlap clusters to splits, applies each split's NOx-mass cutoff, and
-samples at most 300,000/75,000/75,000 records. Dataset generation keeps all
-sampled records that pass raster checks. It never resamples by label.
+Stratification uses every eligible AOI and assigns raw effective EMA changes
+below -100, from -100 through 100, or above 100. It assigns the normalized
+effective EMA change with the same three classes at a 0.05 boundary and keeps
+records only when the two assignments agree. Intact overlap clusters are then
+assigned to approximately 70/15/15 splits by targeting each class separately.
+Each split downsamples all three buckets to that split's smallest bucket.
 
 ## Split independence
 
 - Each cluster of overlapping 72 km AOIs belongs to one split.
-- A deterministic largest-cluster-first assignment targets the 70/15/15 ratio.
-- AOI selection precedes splitting. Splitting precedes outlier pruning, record
-  sampling, and train-only normalization.
-- Each split computes its own 95th-percentile NOx-mass cutoff.
+- A deterministic largest-cluster-first assignment targets 70/15/15 within
+  each filtered label class.
+- Dual-deadband filtering precedes geographic splitting. Splitting precedes
+  within-split bucket balancing and train-only normalization.
 
 This order prevents a plant region from crossing split boundaries and tests
 transfer to unseen regions.
 
-## Metadata eligibility and AOI selection
+## Metadata eligibility and balancing
 
 A candidate requires:
 
@@ -39,22 +41,13 @@ A candidate requires:
 - consecutive TEMPO observations 40 to 70 minutes apart;
 - at least 50% overlap with the assigned emissions hour;
 - a mapped HRRR analysis path, checked during generation;
-- finite prior-quarter power generation and major-city distance for scoring.
+- finite prior-quarter power generation and major-city distance.
 
-Coal share does not determine eligibility. The AOI score is a weighted sum on a
-0 to 100 scale:
-
-| Component | Weight | Definition |
-|---|---:|---|
-| Coal production share | 25% | Positive coal generation divided by all positive generation in the AOI archive |
-| Signal strength | 25% | Percentile rank of log-transformed hourly NOx P75 |
-| Event support | 20% | Rank of meaningful-change counts, with a reward for both directions |
-| Urban isolation | 15% | Linear score from 25 km to 150 km from the nearest major city |
-| Observation yield | 15% | 75% complete-record count rank and 25% complete-record-rate rank |
-
-A meaningful event exceeds 100 lb or 25% of the AOI's previous-quarter median
-NOx, whichever is larger. AOI ID breaks score ties. The split chart reports each
-AOI's share of final sampled records.
+AOI ranking is not applied. A decrease has a raw effective EMA change below
+-100, an increase is above 100, and the inclusive interval from -100 through
+100 is steady. The normalized boundaries are -0.05 and 0.05. A record is
+eligible only when its raw and normalized classes agree. Exact boundaries
+belong to the steady bucket.
 
 ## Targets and features
 
@@ -63,7 +56,8 @@ UTC and retains the source fields, facility timezone, and standard offset for
 auditing. The model derives local mean solar hour from UTC and longitude.
 
 Stratification preserves raw hourly NOx change, effective EMA change, and their
-prior-quarter-scaled forms. It does not create classes or apply a deadband.
+prior-quarter-scaled forms. It writes the sampling bucket to `delta_category`
+as `decrease`, `steady`, or `increase`.
 `TARGET_LABEL_MODE` controls label alignment:
 
 | Mode | Behavior |
@@ -72,6 +66,11 @@ prior-quarter-scaled forms. It does not create classes or apply a deadband.
 | `overlap_weighted` | Averages touched hourly changes by overlap seconds and requires complete label coverage |
 
 `hard_hour` remains the default until both modes are compared on frozen splits.
+
+Each record retains five scans from `t0` through `t4`. Label matching and
+coverage use the interval ending at `t3`, the fourth scan. The current and
+previous effective NOx values are four-hour exponential moving averages ending
+at `t3` and `t2`. The fifth scan remains stored as model input.
 
 Each record stores five time-major 24 by 24 arrays:
 

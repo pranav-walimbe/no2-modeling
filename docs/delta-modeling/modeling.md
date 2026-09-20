@@ -24,6 +24,11 @@ delta_effective_nox_scaled =
     asinh(effective_delta_nox / prior_quarter_median_nox)
 ```
 
+Five scans remain available to the model. The target is aligned to the fourth
+scan: label coverage uses the `t2` to `t3` interval, and the effective change
+compares four-hour EMAs ending at `t3` and `t2`. The `t4` raster remains stored
+as the fifth model input.
+
 Model loading copies this column without another transform, normalization, or
 clip. Both networks use an unrestricted one-value output head.
 

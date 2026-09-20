@@ -52,10 +52,8 @@ TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
 MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # stratified split output directory
-AOI_SELECTION_COUNT = 100  # highest-scoring AOIs retained before geographic splitting
-TRAIN_RECORDS = 300_000  # records passed from stratification to training dataset generation
-VAL_RECORDS = 75_000  # records passed from stratification to validation dataset generation
-TEST_RECORDS = 75_000  # records passed from stratification to test dataset generation
+STRATIFICATION_EMA_CHANGE_THRESHOLD = 100.0  # raw EMA NOx-change boundary used to balance metadata splits
+STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD = 0.05  # normalized EMA boundary required to agree with raw class
 TRAIN_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "train_records.csv")  # train split metadata
 VAL_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "val_records.csv")  # validation split metadata
 TEST_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "test_records.csv")  # test split metadata
@@ -97,7 +95,9 @@ MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applie
 # Delta-model training contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-SEQUENCE_TIMESTEPS = 5  # shared hourly raster and EMA history length
+SEQUENCE_TIMESTEPS = 5  # stored causal raster sequence length
+LABEL_TIMESTEP_INDEX = 3  # zero-based raster timestep ending the emissions label interval
+EMA_HISTORY_TIMESTEPS = 4  # hourly history used by each label-aligned EMA
 EMA_DECAY_TIMESCALE_HOURS = 2.0  # exponential e-folding time kept separate from the sequence length
 MODEL_IMAGE_KEYS = ("no2", "temperature_2m_k", "wind_u_80m_mps", "wind_v_80m_mps")
 MODEL_MASK_KEYS = ("no2_mask",)

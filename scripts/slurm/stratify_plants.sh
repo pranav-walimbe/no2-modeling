@@ -7,15 +7,11 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=02:00:00
+#SBATCH --time=00:30:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=pranav.walimbe@berkeley.edu
 #SBATCH --output=/global/home/users/pranavwalimbe/no2-modeling/logs/%x-%j.log
 #SBATCH --error=/global/home/users/pranavwalimbe/no2-modeling/logs/%x-%j.err
-
-# The m512 constraint allocates 8 GB per core, so 16 cores provide 128 GB.
-# The extra capacity leaves room for streaming emissions aggregation. Polars
-# also uses the requested cores for sorting.
 
 set -euo pipefail
 
@@ -24,8 +20,7 @@ strat_dir="/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"
 recipient="pranav.walimbe@berkeley.edu"
 mail_host="${SLURM_SUBMIT_HOST:-ln002.brc}"
 mail_log="/var/log/maillog"
-aoi_record_shares="/global/home/users/pranavwalimbe/vis/stratification-aoi-record-shares-${SLURM_JOB_ID}.png"
-histogram="/global/home/users/pranavwalimbe/vis/stratification-scaled-label-histograms-${SLURM_JOB_ID}.png"
+diagnostic="/global/home/users/pranavwalimbe/vis/stratification-ema-balance-${SLURM_JOB_ID}.png"
 
 cd "${repo_dir}"
 module load python/3.11.6-gcc-11.4.0
@@ -36,16 +31,11 @@ export PYTHONPATH="${repo_dir}/src:${repo_dir}/src/delta-model"
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
 srun python -u -m preprocessing.stratify_plants \
-    --aoi-record-share-output "${aoi_record_shares}" \
-    --histogram-output "${histogram}" \
+    --diagnostic-output "${diagnostic}" \
     "$@"
 
-if [[ ! -s "${aoi_record_shares}" ]]; then
-    echo "Expected AOI record-share chart was not created: ${aoi_record_shares}" >&2
-    exit 1
-fi
-if [[ ! -s "${histogram}" ]]; then
-    echo "Expected histogram was not created: ${histogram}" >&2
+if [[ ! -s "${diagnostic}" ]]; then
+    echo "Expected stratification diagnostic was not created: ${diagnostic}" >&2
     exit 1
 fi
 
@@ -57,14 +47,18 @@ total_records=$((train_records + val_records + test_records))
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" stat -c %s "${mail_log}")
 printf '%s\n' \
     'Causal EMA stratification completed successfully.' \
+    'Raw EMA-change threshold: +/-100' \
+    'Normalized EMA-change threshold: +/-0.05; raw and normalized classes must agree.' \
+    'Five rasters retained; label interval ends at t3; EMA history is four hours.' \
+    'Filtered AOI clusters were assigned by class to approximately 70/15/15 splits.' \
+    'Every split is independently balanced across decrease, steady, and increase.' \
     "Train: ${train_records} records" \
     "Validation: ${val_records} records" \
     "Test: ${test_records} records" \
     "Total: ${total_records} records" \
-    "AOI record-share chart: ${aoi_record_shares}" \
-    "Scaled-label histogram: ${histogram}" \
+    "Diagnostic: ${diagnostic}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
-        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${aoi_record_shares}' -a '${histogram}' '${recipient}'"
+        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${diagnostic}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do
