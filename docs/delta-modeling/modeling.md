@@ -1,36 +1,30 @@
 # Modeling
 
-The delta-model baseline regresses effective power-plant NOx changes from five
-causal TEMPO scans and aligned hourly HRRR fields.
+The delta-model baseline classifies power-plant NOx changes from five causal
+TEMPO scans and aligned hourly HRRR fields.
 
 ## Contract
 
 | Component | Choice |
 |---|---|
-| Target | `delta_effective_nox_scaled` |
+| Target | `delta_category` |
+| Classes | `decrease`, `steady`, `increase` |
 | Raster input | Five NO2, validity-mask, temperature, and wind U/V rasters |
 | Raster shape | `5 x 5 x 24 x 24` |
 | Tabular input | Ten standardized plant, activity, and cyclic-time features |
-| Split | Geographic AOI clusters, about 80k/15k/15k after raster QC |
-| Raster model | Mask-aware spatial encoder followed by a ConvGRU |
-| Baseline model | Independent tabular MLP |
-| Training loss | LDS-weighted Huber |
-| Selection | Lowest weighted validation Huber loss |
+| Expected split sizes | About 100k train, 20k validation, and 20k test |
+| Raster model | Partial-convolution spatial encoder followed by a ConvGRU |
+| Baseline model | Independent tabular MLP classifier |
+| Training loss | Three-class cross-entropy |
+| Selection | Lowest validation cross-entropy |
 
-The target comes from dataset generation:
+Dataset generation preserves `delta_category` from the geographically
+stratified source records. Model loading maps the ordered class names to the
+indices 0, 1, and 2. It does not recreate classes from a continuous target.
 
-```text
-delta_effective_nox_scaled =
-    asinh(effective_delta_nox / prior_quarter_median_nox)
-```
-
-Five scans remain available to the model. The target is aligned to the fourth
-scan: label coverage uses the `t2` to `t3` interval, and the effective change
-compares four-hour EMAs ending at `t3` and `t2`. The `t4` raster remains stored
-as the fifth model input.
-
-Model loading copies this column without another transform, normalization, or
-clip. Both networks use an unrestricted one-value output head.
+Five scans remain available to the raster model. The target is aligned to the
+fourth scan: label coverage uses the `t2` to `t3` interval, and the fifth scan
+remains stored as model input.
 
 ## Inputs and leakage controls
 
@@ -61,70 +55,44 @@ Training pixels define all raster statistics:
 
 The loader clips normalized numeric raster values to `[-8, 8]`. It fills an
 invalid numeric value with zero and supplies the independent validity mask.
-Validation and test data reuse the training statistics.
+Validation and test data reuse the training statistics. The loader standardizes
+each tabular feature using its training mean and standard deviation.
 
-The loader standardizes each tabular feature using its training mean and
-standard deviation. It does not standardize or transform the regression
-target.
+## Model sizing
 
-## Models
-
-The raster model has about 700,000 trainable parameters. A shared spatial
+The raster classifier has about 701,000 trainable parameters. A shared spatial
 encoder reduces each 24 by 24 frame to a 6 by 6 feature map. A 96-channel
 ConvGRU consumes the five maps in time order. Global average and maximum pools
-produce a 128-value embedding for the regression head.
+produce a 128-value embedding, followed by a 128-value regularized head and
+three output logits.
 
 The NO2 stem uses partial convolutions, which exclude missing cells and adjust
 for available kernel support. A conventional stem handles the complete weather
 rasters. GroupNorm avoids dependence on batch statistics.
 
 The tabular MLP has about 1,000 parameters. It uses a 32-value hidden layer, a
-16-value embedding, and an independent scalar regression head. The MLP provides
-a low-capacity baseline on the same records and target. Its output never enters
-the raster model.
+16-value embedding, and three output logits. It remains deliberately compact
+so it measures the information in scalar features rather than matching the
+raster model through excess capacity.
 
-The model sizes fit the expected 80,000-record training split. Weight sharing
-limits raster-encoder capacity, dropout regularizes the raster head, and early
-stopping uses the geographically held-out validation split.
-
-## Skew-aware loss weights
-
-Most target values lie near zero. Training fits loss weights from the training
-labels only:
-
-1. Assign targets to 101 equal-width bins across the training range.
-2. Smooth bin counts with a Gaussian kernel whose sigma is two bins.
-3. Give each target inverse-square-root smoothed-density weight.
-4. Scale the uncapped weights to mean one over training records.
-5. Cap individual weights at five.
-
-The loss for one batch is:
-
-```text
-sum(weight * huber(prediction, target, delta=0.1)) / sum(weight)
-```
-
-The same training-fitted bins and weights define validation loss. Test labels
-do not affect weights or checkpoint selection. Run metadata records bin count,
-kernel width, cap, Huber delta, target range, and realized weight statistics.
-
-`--loss-weighting none` runs the required unweighted Huber baseline. It changes
-only sample weights and leaves targets untouched.
-
-The weighting follows label distribution smoothing from
-[Yang et al. (ICML 2021)](https://proceedings.mlr.press/v139/yang21m/yang21m.pdf).
-The square-root inverse scheme matches the authors'
-[reference implementation](https://github.com/YyzHarry/imbalanced-regression/blob/main/agedb-dir/datasets.py).
+At roughly 100,000 training examples, the raster model has about seven trainable
+parameters per record. This is moderate for a convolutional sequence model
+because spatial and temporal weights are shared. A 30% head dropout, weight
+decay, and validation early stopping further constrain capacity. Increasing the
+encoder size is not the first response to underfitting; first compare train and
+validation learning curves and per-class recall.
 
 ## Optimization
+
+Both models use unweighted cross-entropy because stratification balances the
+three target classes before raster quality filtering. Saved run metadata records
+the final class counts so any filtering-induced imbalance remains visible.
 
 Both models use AdamW, gradient clipping, mixed precision on CUDA, validation
 loss scheduling, and early stopping. The defaults allow 100 raster epochs and
 75 MLP epochs with 12 epochs of early-stop patience. These are ceilings rather
-than expected run lengths.
-
-The map-style dataset decompresses raster bundles on demand. Persistent loader
-workers overlap I/O with GPU work, and pinned memory applies on CUDA.
+than expected run lengths. A batch size of 128 provides about 780 optimizer
+steps per raster epoch for 100,000 training records.
 
 Run on a compute node:
 
@@ -136,18 +104,12 @@ python -u -m modeling.train
 
 Each split reports:
 
-- mean squared error, mean absolute error, and root mean squared error;
-- R-squared, Pearson correlation, and Spearman correlation;
-- mean prediction bias.
+- accuracy and balanced accuracy;
+- macro F1 and one-vs-rest macro ROC AUC;
+- class counts and per-class recall;
+- the three-class confusion matrix.
 
-The test set also reports these metrics in equal-count low, middle, and high
-absolute-target thirds. This separates performance on the dense near-zero
-region from performance on larger changes. Row-level output includes the stored
-target, prediction, signed residual, and absolute error.
-
-The raster and MLP models use the same splits. Model selection uses validation
-loss only. Test metrics remain reporting outputs.
-
-The emailed prediction artifact shows test-set predicted-versus-observed
-scatterplots for both models. Both panels use shared limits from the pooled
-0.5th and 99.5th percentiles, and each panel reports its model's test MSE.
+The raster and MLP classifiers use the same splits. Model selection uses
+validation cross-entropy only. Test metrics remain reporting outputs. Saved
+prediction CSVs contain each class logit and probability, and the generated
+figures compare both models and show row-normalized test confusion matrices.

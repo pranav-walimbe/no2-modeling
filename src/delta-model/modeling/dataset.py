@@ -16,6 +16,7 @@ from torch.utils.data import Dataset
 from config import (
     DATASET_DF,
     DATASET_DIR,
+    MODEL_CLASS_NAMES,
     MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_ABS,
     MODEL_IMAGE_KEYS,
@@ -357,8 +358,12 @@ class NOxDataset(Dataset):
         feature_mean = np.asarray(self.stats.feature_mean, dtype=np.float64)
         feature_std = np.asarray(self.stats.feature_std, dtype=np.float64)
         self.features = ((raw_features - feature_mean) / feature_std).astype(np.float32)
-        labels = pd.to_numeric(self.frame[MODEL_TARGET_COL], errors="raise").to_numpy(dtype=np.float64)
-        self.labels = labels.astype(np.float32)
+        class_indices = {name: index for index, name in enumerate(MODEL_CLASS_NAMES)}
+        labels = self.frame[MODEL_TARGET_COL].map(class_indices)
+        if labels.isna().any():
+            unknown = sorted(self.frame.loc[labels.isna(), MODEL_TARGET_COL].astype(str).unique())
+            raise ValueError(f"Unsupported {MODEL_TARGET_COL} values: {', '.join(unknown)}")
+        self.labels = labels.to_numpy(dtype=np.int64)
         self.raster_paths = self.frame[RASTER_PATH_COL].to_numpy(dtype=str)
         timestep_times = np.column_stack(
             [

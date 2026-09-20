@@ -1,4 +1,4 @@
-"""Train raster and tabular regressors for effective hourly NOx changes."""
+"""Train partial-convolution and tabular emissions-change classifiers."""
 
 import argparse
 import json
@@ -9,11 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from modeling.convgru import (
-    DEFAULT_DROPOUT,
-    DEFAULT_HEAD_DIM,
-    RasterHurdleConvGRU,
-)
+from modeling.convgru import DEFAULT_DROPOUT, DEFAULT_HEAD_DIM, RasterConvGRUClassifier
 from modeling.dataset import (
     LABEL_MODE_COL,
     MODEL_FEATURE_NAMES,
@@ -23,37 +19,19 @@ from modeling.dataset import (
     save_stats,
 )
 from modeling.eval_utils import (
-    ABSOLUTE_ERROR_COL,
-    DECREASE_MAGNITUDE_COL,
-    DECREASE_PROBABILITY_COL,
-    DEFAULT_HUBER_DELTA,
-    DEFAULT_LDS_BINS,
-    DEFAULT_LDS_SIGMA,
-    DEFAULT_MAX_WEIGHT,
-    INCREASE_MAGNITUDE_COL,
-    INCREASE_PROBABILITY_COL,
+    LOGIT_COLUMNS,
     PREDICTED_CLASS_COL,
-    PREDICTION_COL,
-    RESIDUAL_COL,
-    STEADY_PROBABILITY_COL,
+    PROBABILITY_COLUMNS,
     TRUE_CLASS_COL,
-    TRUE_TARGET_COL,
-    HurdleLoss,
-    WeightedHuberLoss,
-    hurdle_classes,
     save_results,
 )
 from modeling.mlp import TabularMLP
-from modeling.plot_utils import (
-    plot_hurdle_diagnostics,
-    plot_loss_curve,
-    plot_model_comparison,
-    plot_regression_predictions,
-)
+from modeling.plot_utils import plot_confusion_matrices, plot_loss_curve, plot_model_comparison
 from torch import nn
 from torch.utils.data import DataLoader
 
 from config import (
+    MODEL_CLASS_NAMES,
     MODEL_IMAGE_CLIP_ABS,
     MODEL_TARGET_COL,
     NUM_CORES,
@@ -73,11 +51,7 @@ DEFAULT_GRADIENT_CLIP_NORM = 5.0
 DEFAULT_SCHEDULER_PATIENCE = 10
 DEFAULT_SCHEDULER_FACTOR = 0.50
 DEFAULT_EARLY_STOP_PATIENCE = 12
-DEFAULT_STEADY_THRESHOLD = 0.05
-DEFAULT_CLASSIFICATION_LOSS_WEIGHT = 1.0
-DEFAULT_REGRESSION_LOSS_WEIGHT = 1.0
-
-TrainingLoss = WeightedHuberLoss | HurdleLoss
+EXPECTED_SPLIT_RECORDS = {"train": 100_000, "val": 20_000, "test": 20_000}
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,18 +76,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
     parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
-    parser.add_argument("--loss-weighting", choices=("lds_sqrt_inverse", "none"), default="lds_sqrt_inverse")
-    parser.add_argument("--lds-bins", type=int, default=DEFAULT_LDS_BINS)
-    parser.add_argument("--lds-sigma", type=float, default=DEFAULT_LDS_SIGMA)
-    parser.add_argument("--maximum-loss-weight", type=float, default=DEFAULT_MAX_WEIGHT)
-    parser.add_argument("--huber-delta", type=float, default=DEFAULT_HUBER_DELTA)
-    parser.add_argument("--steady-threshold", type=float, default=DEFAULT_STEADY_THRESHOLD)
-    parser.add_argument(
-        "--classification-loss-weight",
-        type=float,
-        default=DEFAULT_CLASSIFICATION_LOSS_WEIGHT,
-    )
-    parser.add_argument("--regression-loss-weight", type=float, default=DEFAULT_REGRESSION_LOSS_WEIGHT)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     return parser.parse_args()
 
@@ -137,7 +99,7 @@ def _seed_everything(seed: int) -> None:
 
 
 def _move_batch(batch: tuple[torch.Tensor, ...], device: torch.device) -> tuple[torch.Tensor, ...]:
-    # Move model inputs and targets onto the training device
+    # Move model inputs and class labels onto the training device
     image, tabular, elapsed_hours, target, index = batch
     non_blocking = device.type == "cuda"
     return (
@@ -153,49 +115,58 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    criterion: TrainingLoss,
+    criterion: nn.Module,
     scaler: torch.cuda.amp.GradScaler,
     device: torch.device,
     gradient_clip_norm: float,
-) -> float:
-    """Train the model for one epoch.
-
-    Args:
-        model: Model to optimize.
-        loader: Training batches.
-        optimizer: Parameter optimizer.
-        criterion: Training loss.
-        scaler: Mixed-precision gradient scaler.
-        device: Training device.
-        gradient_clip_norm: Maximum gradient norm.
-    Returns:
-        Mean training loss per record.
-    """
+) -> tuple[float, float]:
+    """Train one epoch and return mean loss and accuracy."""
     model.train()
-    weighted_loss = 0.0
-    total_weight = 0.0
+    total_loss = 0.0
+    correct = 0
     amp_enabled = device.type == "cuda"
     for batch in loader:
         image, tabular, elapsed_hours, target, _ = _move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
-            loss = criterion(model(image, tabular, elapsed_hours), target)
+            logits = model(image, tabular, elapsed_hours)
+            loss = criterion(logits, target)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
         scaler.step(optimizer)
         scaler.update()
-        batch_weight = criterion.weights_for(target).sum().item()
-        weighted_loss += loss.detach().item() * batch_weight
-        total_weight += batch_weight
-    return weighted_loss / total_weight
+        total_loss += loss.detach().item() * target.numel()
+        correct += int((logits.argmax(dim=1) == target).sum().item())
+    return total_loss / len(loader.dataset), correct / len(loader.dataset)
+
+
+def val_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+) -> tuple[float, float]:
+    """Evaluate one epoch and return mean loss and accuracy."""
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    amp_enabled = device.type == "cuda"
+    with torch.inference_mode():
+        for batch in loader:
+            image, tabular, elapsed_hours, target, _ = _move_batch(batch, device)
+            with torch.autocast(device_type=device.type, enabled=amp_enabled):
+                logits = model(image, tabular, elapsed_hours)
+                loss = criterion(logits, target)
+            total_loss += loss.item() * target.numel()
+            correct += int((logits.argmax(dim=1) == target).sum().item())
+    return total_loss / len(loader.dataset), correct / len(loader.dataset)
 
 
 def fit_model(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    criterion: TrainingLoss,
     *,
     device: torch.device,
     epochs: int,
@@ -205,12 +176,9 @@ def fit_model(
     checkpoint_metadata: dict[str, object],
     phase_name: str,
 ) -> tuple[list[float], list[float], float]:
-    """Fit one model phase and restore its lowest-validation-loss state."""
-    optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
-        lr=learning_rate,
-        weight_decay=args.weight_decay,
-    )
+    """Fit one classifier and restore its lowest-validation-loss state."""
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=args.weight_decay)
+    criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="min",
@@ -224,7 +192,7 @@ def fit_model(
     epochs_without_improvement = 0
 
     for epoch in range(1, epochs + 1):
-        train_loss = train_epoch(
+        train_loss, train_accuracy = train_epoch(
             model,
             train_loader,
             optimizer,
@@ -233,16 +201,15 @@ def fit_model(
             device,
             args.gradient_clip_norm,
         )
-        validation_loss = val_epoch(model, val_loader, criterion, device)
+        validation_loss, validation_accuracy = val_epoch(model, val_loader, criterion, device)
         scheduler.step(validation_loss)
         train_losses.append(train_loss)
         val_losses.append(validation_loss)
-        current_learning_rate = optimizer.param_groups[0]["lr"]
+        learning_rate_now = optimizer.param_groups[0]["lr"]
         print(
-            f"{phase_name} epoch {epoch:03d} | train {train_loss:.5f} | "
-            f"val {validation_loss:.5f} | lr {current_learning_rate:.2e}"
+            f"{phase_name} epoch {epoch:03d} | train loss {train_loss:.5f} acc {train_accuracy:.4f} | "
+            f"val loss {validation_loss:.5f} acc {validation_accuracy:.4f} | lr {learning_rate_now:.2e}"
         )
-
         if validation_loss < best_val_loss:
             best_val_loss = validation_loss
             epochs_without_improvement = 0
@@ -251,6 +218,7 @@ def fit_model(
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "validation_loss": validation_loss,
+                    "validation_accuracy": validation_accuracy,
                     **checkpoint_metadata,
                 },
                 checkpoint_path,
@@ -266,94 +234,27 @@ def fit_model(
     return train_losses, val_losses, best_val_loss
 
 
-def val_epoch(model: nn.Module, loader: DataLoader, criterion: TrainingLoss, device: torch.device) -> float:
-    """Calculate validation loss for one epoch.
-
-    Args:
-        model: Model to evaluate.
-        loader: Validation batches.
-        criterion: Validation loss.
-        device: Evaluation device.
-
-    Returns:
-        Mean validation loss per record.
-    """
-    model.eval()
-    weighted_loss = 0.0
-    total_weight = 0.0
-    amp_enabled = device.type == "cuda"
-    with torch.inference_mode():
-        for batch in loader:
-            image, tabular, elapsed_hours, target, _ = _move_batch(batch, device)
-            with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                loss = criterion(model(image, tabular, elapsed_hours), target)
-            batch_weight = criterion.weights_for(target).sum().item()
-            weighted_loss += loss.item() * batch_weight
-            total_weight += batch_weight
-    return weighted_loss / total_weight
-
-
-def run_inference(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[np.ndarray, np.ndarray]:
-    """Generate continuous predictions for one dataset split.
-
-    Args:
-        model: Trained model.
-        loader: Evaluation batches.
-        device: Inference device.
-
-    Returns:
-        Predictions and corresponding dataset indices.
-    """
-    model.eval()
-    predictions: list[np.ndarray] = []
-    indices: list[np.ndarray] = []
-    amp_enabled = device.type == "cuda"
-    with torch.inference_mode():
-        for batch in loader:
-            image, tabular, elapsed_hours, _, index = _move_batch(batch, device)
-            with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                prediction = model(image, tabular, elapsed_hours)
-            predictions.append(prediction.float().cpu().numpy())
-            indices.append(index.numpy())
-    return np.concatenate(predictions), np.concatenate(indices)
-
-
-def run_hurdle_inference(
-    model: RasterHurdleConvGRU,
+def run_inference(
+    model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Generate hurdle predictions for one dataset split.
-
-    Args:
-        model: Trained hurdle model.
-        loader: Evaluation batches.
-        device: Inference device.
-
-    Returns:
-        Expected values, class probabilities, magnitudes, and dataset indices.
-    """
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generate logits and probabilities for one dataset split."""
     model.eval()
-    predictions: list[np.ndarray] = []
-    probabilities: list[np.ndarray] = []
-    magnitudes: list[np.ndarray] = []
+    logits_batches: list[np.ndarray] = []
+    probability_batches: list[np.ndarray] = []
     indices: list[np.ndarray] = []
     amp_enabled = device.type == "cuda"
     with torch.inference_mode():
         for batch in loader:
             image, tabular, elapsed_hours, _, index = _move_batch(batch, device)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                output = model(image, tabular, elapsed_hours)
-            predictions.append(output.expected_value.float().cpu().numpy())
-            probabilities.append(output.class_probabilities.float().cpu().numpy())
-            magnitudes.append(output.magnitudes.float().cpu().numpy())
+                logits = model(image, tabular, elapsed_hours)
+            logits = logits.float()
+            logits_batches.append(logits.cpu().numpy())
+            probability_batches.append(logits.softmax(dim=1).cpu().numpy())
             indices.append(index.numpy())
-    return (
-        np.concatenate(predictions),
-        np.concatenate(probabilities),
-        np.concatenate(magnitudes),
-        np.concatenate(indices),
-    )
+    return np.concatenate(logits_batches), np.concatenate(probability_batches), np.concatenate(indices)
 
 
 def _loader(dataset: NOxDataset, *, shuffle: bool, args: argparse.Namespace, device: torch.device) -> DataLoader:
@@ -373,63 +274,42 @@ def _loader(dataset: NOxDataset, *, shuffle: bool, args: argparse.Namespace, dev
 
 def _prediction_frame(
     dataset: NOxDataset,
-    predictions: np.ndarray,
-    indices: np.ndarray,
-) -> pd.DataFrame:
-    # Attach continuous predictions and residuals in source-record order
-    frame = dataset.frame.iloc[indices].copy().reset_index(drop=True)
-    frame[TRUE_TARGET_COL] = frame[MODEL_TARGET_COL].to_numpy(dtype=np.float64)
-    frame[PREDICTION_COL] = predictions
-    frame[RESIDUAL_COL] = frame[PREDICTION_COL] - frame[TRUE_TARGET_COL]
-    frame[ABSOLUTE_ERROR_COL] = frame[RESIDUAL_COL].abs()
-    return frame
-
-
-def _hurdle_prediction_frame(
-    dataset: NOxDataset,
-    predictions: np.ndarray,
+    logits: np.ndarray,
     probabilities: np.ndarray,
-    magnitudes: np.ndarray,
     indices: np.ndarray,
-    steady_threshold: float,
 ) -> pd.DataFrame:
-    # Attach both gate and conditional-regression outputs
-    frame = _prediction_frame(dataset, predictions, indices)
-    frame[TRUE_CLASS_COL] = hurdle_classes(frame[TRUE_TARGET_COL].to_numpy(), steady_threshold)
+    # Attach class predictions in source-record order
+    frame = dataset.frame.iloc[indices].copy().reset_index(drop=True)
+    frame[TRUE_CLASS_COL] = dataset.labels[indices]
     frame[PREDICTED_CLASS_COL] = probabilities.argmax(axis=1)
-    frame[DECREASE_PROBABILITY_COL] = probabilities[:, 0]
-    frame[STEADY_PROBABILITY_COL] = probabilities[:, 1]
-    frame[INCREASE_PROBABILITY_COL] = probabilities[:, 2]
-    frame[DECREASE_MAGNITUDE_COL] = magnitudes[:, 0]
-    frame[INCREASE_MAGNITUDE_COL] = magnitudes[:, 1]
+    for column, values in zip(LOGIT_COLUMNS, logits.T, strict=True):
+        frame[column] = values
+    for column, values in zip(PROBABILITY_COLUMNS, probabilities.T, strict=True):
+        frame[column] = values
     return frame
+
+
+def _class_counts(dataset: NOxDataset) -> dict[str, int]:
+    # Count training examples in the configured class order
+    return {name: int(np.sum(dataset.labels == index)) for index, name in enumerate(MODEL_CLASS_NAMES)}
 
 
 def main() -> None:
-    """Train and evaluate one continuous-regression run."""
+    """Train and evaluate raster and tabular classifiers."""
     args = parse_args()
     _seed_everything(args.seed)
     device = _device(args.device)
 
     stats = compute_stats("train")
-    run_name = datetime.now(timezone.utc).strftime("delta_effective_nox_hurdle_%Y%m%d_%H%M%S")
+    run_name = datetime.now(timezone.utc).strftime("delta_category_classification_%Y%m%d_%H%M%S")
     run_dir = Path(RUNS_DIR) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
-
     save_stats(stats, run_dir / "normalization_stats.json")
+
     datasets = {split: NOxDataset(split, stats) for split in ("train", "val", "test")}
     tabular_datasets = {split: NOxDataset(split, stats, load_images=False) for split in datasets}
     clipped_fractions = {split: clipped_pixel_fractions(split, stats) for split in datasets}
-    target_label_mode = str(datasets["train"].frame[LABEL_MODE_COL].iloc[0])
-    regression_criterion = WeightedHuberLoss(
-        datasets["train"].labels,
-        weighting=args.loss_weighting,
-        bin_count=args.lds_bins,
-        gaussian_sigma_bins=args.lds_sigma,
-        maximum_weight=args.maximum_loss_weight,
-        huber_delta=args.huber_delta,
-    ).to(device)
     train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
     eval_loaders = {
         split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in datasets.items()
@@ -438,95 +318,75 @@ def main() -> None:
     tabular_eval_loaders = {
         split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in tabular_datasets.items()
     }
-
     common_checkpoint_metadata = {
         "normalization_stats": stats.to_dict(),
         "model_feature_names": MODEL_FEATURE_NAMES,
         "target_name": MODEL_TARGET_COL,
+        "class_names": MODEL_CLASS_NAMES,
     }
+
     tabular_model = TabularMLP(len(MODEL_FEATURE_NAMES)).to(device)
-    print(f"Training {tabular_model.num_params():,}-parameter tabular MLP on {device}")
+    print(f"Training {tabular_model.num_params():,}-parameter tabular classifier on {device}")
     tabular_train_losses, tabular_val_losses, tabular_best_loss = fit_model(
         tabular_model,
         tabular_train_loader,
         tabular_eval_loaders["val"],
-        regression_criterion,
         device=device,
         epochs=args.tabular_epochs,
         learning_rate=args.tabular_learning_rate,
         args=args,
-        checkpoint_path=checkpoint_dir / "best_tabular_mlp.pt",
-        checkpoint_metadata={
-            **common_checkpoint_metadata,
-            "loss": regression_criterion.stats.to_dict(),
-        },
-        phase_name="Tabular MLP",
+        checkpoint_path=checkpoint_dir / "best_tabular_classifier.pt",
+        checkpoint_metadata=common_checkpoint_metadata,
+        phase_name="Tabular classifier",
     )
     plot_loss_curve(
         tabular_train_losses,
         tabular_val_losses,
         run_dir,
         plot_name="tabular_loss_curve",
-        title="Tabular MLP training and validation loss",
+        title="Tabular classifier training and validation loss",
     )
+    tabular_frames = {}
+    for split, loader in tabular_eval_loaders.items():
+        logits, probabilities, indices = run_inference(tabular_model, loader, device)
+        tabular_frames[split] = _prediction_frame(tabular_datasets[split], logits, probabilities, indices)
     tabular_run = {
         "maximum_epochs": args.tabular_epochs,
         "learning_rate": args.tabular_learning_rate,
         "parameters": tabular_model.num_params(),
         "best_validation_loss": tabular_best_loss,
     }
-    tabular_split_frames = {}
-    for split, loader in tabular_eval_loaders.items():
-        predictions, indices = run_inference(tabular_model, loader, device)
-        tabular_split_frames[split] = _prediction_frame(tabular_datasets[split], predictions, indices)
     del tabular_model, tabular_train_loader, tabular_eval_loaders, tabular_datasets
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    hurdle_criterion = HurdleLoss(
-        datasets["train"].labels,
-        steady_threshold=args.steady_threshold,
-        classification_weight=args.classification_loss_weight,
-        regression_weight=args.regression_loss_weight,
-        weighting=args.loss_weighting,
-        bin_count=args.lds_bins,
-        gaussian_sigma_bins=args.lds_sigma,
-        maximum_weight=args.maximum_loss_weight,
-        huber_delta=args.huber_delta,
-    ).to(device)
-    raster_model = RasterHurdleConvGRU(
-        steady_threshold=args.steady_threshold,
-        class_weights=hurdle_criterion.class_weights,
-        head_dim=args.head_dim,
-        dropout=args.dropout,
-    ).to(device)
-    print(f"Training {raster_model.num_params():,}-parameter raster hurdle ConvGRU on {device}; outputs: {run_dir}")
+    raster_model = RasterConvGRUClassifier(head_dim=args.head_dim, dropout=args.dropout).to(device)
+    print(
+        f"Training {raster_model.num_params():,}-parameter partial-convolution ConvGRU on {device}; outputs: {run_dir}"
+    )
     train_losses, val_losses, best_val_loss = fit_model(
         raster_model,
         train_loader,
         eval_loaders["val"],
-        hurdle_criterion,
         device=device,
         epochs=args.epochs,
         learning_rate=args.learning_rate,
         args=args,
-        checkpoint_path=checkpoint_dir / "best_raster_hurdle.pt",
-        checkpoint_metadata={
-            **common_checkpoint_metadata,
-            "loss": hurdle_criterion.stats,
-        },
-        phase_name="Raster hurdle ConvGRU",
+        checkpoint_path=checkpoint_dir / "best_raster_classifier.pt",
+        checkpoint_metadata=common_checkpoint_metadata,
+        phase_name="Partial-convolution ConvGRU",
     )
     plot_loss_curve(
         train_losses,
         val_losses,
         run_dir,
-        title="Raster hurdle ConvGRU training and validation loss",
+        title="Partial-convolution ConvGRU training and validation loss",
     )
 
+    target_label_mode = str(datasets["train"].frame[LABEL_MODE_COL].iloc[0])
     run_config = {
         "device": str(device),
-        "models": ["raster_hurdle", "mlp"],
+        "models": ["raster_partial_convgru", "mlp"],
         "batch_size": args.batch_size,
         "workers": args.workers,
         "maximum_epochs": args.epochs,
@@ -535,8 +395,6 @@ def main() -> None:
         "seed": args.seed,
         "head_dim": args.head_dim,
         "dropout": args.dropout,
-        "no2_stem_normalization": "group_norm",
-        "sequence_encoder": "mask_aware_spatial_encoder_then_convgru",
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip_norm": args.gradient_clip_norm,
@@ -549,41 +407,27 @@ def main() -> None:
         "image_clip_range": [-MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS],
         "clipped_valid_pixel_fraction": clipped_fractions,
         "target_name": MODEL_TARGET_COL,
+        "class_names": list(MODEL_CLASS_NAMES),
+        "class_counts": {split: _class_counts(dataset) for split, dataset in datasets.items()},
         "target_label_mode": target_label_mode,
-        "loss": {
-            "mlp": regression_criterion.stats.to_dict(),
-            "raster_hurdle": hurdle_criterion.stats,
-        },
         "tabular_features": list(MODEL_FEATURE_NAMES),
-        "prediction_family": "directional_deep_hurdle",
-        "steady_threshold": args.steady_threshold,
-        "raster_hurdle_parameters": raster_model.num_params(),
-        "raster_hurdle_best_validation_loss": best_val_loss,
+        "prediction_family": "three_class_classification",
+        "sequence_encoder": "partial_convolution_spatial_encoder_then_convgru",
+        "expected_split_records": EXPECTED_SPLIT_RECORDS,
+        "raster_parameters": raster_model.num_params(),
+        "raster_best_validation_loss": best_val_loss,
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
-    split_frames = {}
-    for split, loader in eval_loaders.items():
-        predictions, probabilities, magnitudes, indices = run_hurdle_inference(raster_model, loader, device)
-        split_frames[split] = _hurdle_prediction_frame(
-            datasets[split],
-            predictions,
-            probabilities,
-            magnitudes,
-            indices,
-            args.steady_threshold,
-        )
 
-    model_frames = {"raster_hurdle": split_frames, "mlp": tabular_split_frames}
-    plot_regression_predictions(model_frames, run_dir)
+    raster_frames = {}
+    for split, loader in eval_loaders.items():
+        logits, probabilities, indices = run_inference(raster_model, loader, device)
+        raster_frames[split] = _prediction_frame(datasets[split], logits, probabilities, indices)
+    model_frames = {"raster_partial_convgru": raster_frames, "mlp": tabular_frames}
     plot_model_comparison(model_frames, run_dir)
-    plot_hurdle_diagnostics(split_frames["test"], run_dir)
-    save_results(
-        model_frames,
-        run_dir,
-        primary_model_name="raster_hurdle",
-        comparison_model_name="mlp",
-    )
+    plot_confusion_matrices(model_frames, run_dir)
+    save_results(model_frames, run_dir, primary_model_name="raster_partial_convgru")
 
 
 if __name__ == "__main__":
