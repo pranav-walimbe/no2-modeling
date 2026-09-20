@@ -84,7 +84,7 @@ SHARD_WORKER_JOB_NAME = "generate-dataset-shard"
 SHARD_FINALIZER_JOB_NAME = "generate-dataset-finalize"
 TRAINING_JOB_NAME = "train-no2"
 RUN_STARTED_ENV = "DATASET_RUN_STARTED_AT"
-REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DATASET_BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_dataset.sh"
 
 
@@ -533,6 +533,11 @@ def parse_args() -> argparse.Namespace:
         help="worker processes and CPUs allocated to each Slurm shard task",
     )
     parser.add_argument(
+        "--afterok-job-id",
+        type=_positive_int,
+        help="hold the shard array until this Slurm job completes successfully",
+    )
+    parser.add_argument(
         "--refresh-cache",
         action="store_true",
         help="empty both image caches before rebuilding entries for the selected split",
@@ -707,10 +712,12 @@ def _launch_sharded_run(args: argparse.Namespace, split_paths: dict[str, str], s
     shard_arguments = ["--shard-size", str(shard_size)]
     if args.split != "all":
         shard_arguments.extend(("--split", args.split))
+    external_dependency = [f"--dependency=afterok:{args.afterok_job_id}"] if args.afterok_job_id is not None else []
     worker_job_id: str | None = None
     if task_ids:
         worker_job_id = _submit_job(
             [
+                *external_dependency,
                 f"--array={array_spec}%{args.max_parallel_shards}",
                 f"--cpus-per-task={args.workers_per_shard}",
                 f"--job-name={SHARD_WORKER_JOB_NAME}",
@@ -732,6 +739,8 @@ def _launch_sharded_run(args: argparse.Namespace, split_paths: dict[str, str], s
     ]
     if worker_job_id is not None:
         finalizer_options.append(f"--dependency=afterok:{worker_job_id}")
+    else:
+        finalizer_options.extend(external_dependency)
     finalizer_job_id = _submit_job([*finalizer_options, str(DATASET_BATCH_SCRIPT), *shard_arguments])
     print(f"Planned {len(tasks):,} fresh shards")
     print(f"Dataset finalizer: {finalizer_job_id}")
