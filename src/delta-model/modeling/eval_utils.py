@@ -13,7 +13,7 @@ TRUE_CLASS_COL = "class_true"
 PREDICTED_CLASS_COL = "class_predicted"
 PROBABILITY_COLUMNS = tuple(f"probability_{name}" for name in MODEL_CLASS_NAMES)
 LOGIT_COLUMNS = tuple(f"logit_{name}" for name in MODEL_CLASS_NAMES)
-COMPARISON_METRICS = ("accuracy", "balanced_accuracy", "macro_f1")
+COMPARISON_METRICS = ("accuracy", "macro_ovr_roc_auc")
 
 
 def classification_metrics(frame: pd.DataFrame) -> dict[str, object]:

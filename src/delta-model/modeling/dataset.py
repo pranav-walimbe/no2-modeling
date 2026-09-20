@@ -128,8 +128,14 @@ def _raster_path(serialized_path: object, dataset_dir: Path) -> Path:
     return path if path.is_absolute() else dataset_dir / path
 
 
+def _load_rasters(path: Path) -> np.ndarray:
+    # Place physical channels after time so each item is [T, C, H, W]
+    with np.load(path, allow_pickle=False) as bundle:
+        return np.stack([bundle[name] for name in MODEL_IMAGE_KEYS], axis=1)
+
+
 def _load_raster_bundle(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    # Place channels after time so each item is [T, C, H, W]
+    # Load physical channels and masks for reconstruction inputs
     with np.load(path, allow_pickle=False) as bundle:
         rasters = np.stack([bundle[name] for name in MODEL_IMAGE_KEYS], axis=1)
         masks = np.stack([bundle[name] for name in MODEL_MASK_KEYS], axis=1).astype(np.float32)
@@ -179,7 +185,7 @@ def _fit_image_stats(raster_paths: np.ndarray, root: Path, progress_interval: in
     mean = np.zeros(channel_count, dtype=np.float64)
     sum_squared_deviation = np.zeros(channel_count, dtype=np.float64)
     for index, serialized_path in enumerate(raster_paths, start=1):
-        rasters, _ = _load_raster_bundle(_raster_path(serialized_path, root))
+        rasters = _load_rasters(_raster_path(serialized_path, root))
         for channel in range(channel_count):
             values = _valid_channel_values(rasters, channel)
             if channel in STANDARD_IMAGE_CHANNELS:
@@ -221,7 +227,7 @@ def _fit_robust_image_stats(raster_paths: np.ndarray, root: Path, count: np.ndar
         }
         offsets = dict.fromkeys(channels, 0)
         for serialized_path in raster_paths:
-            rasters, _ = _load_raster_bundle(_raster_path(serialized_path, root))
+            rasters = _load_rasters(_raster_path(serialized_path, root))
             for channel, destination in pooled.items():
                 values = _valid_channel_values(rasters, channel)
                 stop = offsets[channel] + values.size
@@ -241,6 +247,7 @@ def compute_stats(
     dataset_dir: str | Path = DATASET_DIR,
     dataframe_dir: str | Path = DATASET_DF,
     progress_interval: int = 1_000,
+    fixed_image_stats: dict[str, object] | None = None,
 ) -> NormalizationStats:
     """Compute memory-bounded normalization statistics from one split.
 
@@ -249,6 +256,7 @@ def compute_stats(
         dataset_dir: Root containing raster bundles.
         dataframe_dir: Directory containing split CSV files.
         progress_interval: Records between progress messages.
+        fixed_image_stats: Existing raster normalization to combine with split tabular statistics.
 
     Returns:
         Frozen image and tabular normalization statistics.
@@ -257,10 +265,17 @@ def compute_stats(
     frame = _read_split_frame(split, Path(dataframe_dir))
     features = _feature_matrix(frame)
     raster_paths = frame[RASTER_PATH_COL].to_numpy(dtype=str)
-    image_center, image_scale, image_valid_pixels = _fit_image_stats(raster_paths, root, progress_interval)
+    if fixed_image_stats is None:
+        image_keys = MODEL_IMAGE_KEYS
+        image_center, image_scale, image_valid_pixels = _fit_image_stats(raster_paths, root, progress_interval)
+    else:
+        image_keys = tuple(str(name) for name in fixed_image_stats["image_keys"])
+        image_center = tuple(float(value) for value in fixed_image_stats["image_center"])
+        image_scale = tuple(float(value) for value in fixed_image_stats["image_scale"])
+        image_valid_pixels = tuple(int(value) for value in fixed_image_stats["image_valid_pixels"])
     feature_std = _safe_scale(features.std(axis=0))
     return NormalizationStats(
-        image_keys=MODEL_IMAGE_KEYS,
+        image_keys=image_keys,
         image_center=tuple(float(value) for value in image_center),
         image_scale=tuple(float(value) for value in image_scale),
         image_valid_pixels=tuple(int(value) for value in image_valid_pixels),
@@ -297,7 +312,7 @@ def clipped_pixel_fractions(
     center = np.asarray(stats.image_center)
     scale = np.asarray(stats.image_scale)
     for serialized_path in frame[RASTER_PATH_COL].to_numpy(dtype=str):
-        rasters, _ = _load_raster_bundle(_raster_path(serialized_path, root))
+        rasters = _load_rasters(_raster_path(serialized_path, root))
         for channel in range(len(MODEL_IMAGE_KEYS)):
             values = _valid_channel_values(rasters, channel)
             normalized = (values - center[channel]) / scale[channel]
@@ -348,9 +363,12 @@ class NOxDataset(Dataset):
         dataset_dir: str | Path = DATASET_DIR,
         dataframe_dir: str | Path = DATASET_DF,
         load_images: bool = True,
+        completed_raster_path: str | Path | None = None,
     ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.load_images = load_images
+        self.completed_raster_path = Path(completed_raster_path) if completed_raster_path else None
+        self._completed_rasters: np.ndarray | None = None
         self.frame = _read_split_frame(split, Path(dataframe_dir))
         self.stats = stats if isinstance(stats, NormalizationStats) else NormalizationStats.from_dict(stats)
 
@@ -378,17 +396,23 @@ class NOxDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         if self.load_images:
-            rasters, masks = _load_raster_bundle(_raster_path(self.raster_paths[index], self.dataset_dir))
-            normalized = np.zeros_like(rasters, dtype=np.float32)
-            for channel in range(len(MODEL_IMAGE_KEYS)):
-                channel_valid = _channel_valid_mask(rasters, channel)
-                channel_values = rasters[:, channel][channel_valid]
-                normalized_channel = normalized[:, channel]
-                normalized_channel[channel_valid] = (
-                    channel_values - self.stats.image_center[channel]
-                ) / self.stats.image_scale[channel]
-            np.clip(normalized, -MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS, out=normalized)
-            image = torch.from_numpy(np.concatenate((normalized, masks), axis=1))
+            if self.completed_raster_path is not None:
+                if self._completed_rasters is None:
+                    self._completed_rasters = np.load(self.completed_raster_path, mmap_mode="r")
+                image = torch.from_numpy(np.array(self._completed_rasters[index], copy=True))
+            else:
+                raster_path = _raster_path(self.raster_paths[index], self.dataset_dir)
+                rasters, masks = _load_raster_bundle(raster_path)
+                normalized = np.zeros_like(rasters, dtype=np.float32)
+                for channel in range(len(MODEL_IMAGE_KEYS)):
+                    channel_valid = _channel_valid_mask(rasters, channel)
+                    channel_values = rasters[:, channel][channel_valid]
+                    normalized_channel = normalized[:, channel]
+                    normalized_channel[channel_valid] = (
+                        channel_values - self.stats.image_center[channel]
+                    ) / self.stats.image_scale[channel]
+                np.clip(normalized, -MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS, out=normalized)
+                image = torch.from_numpy(np.concatenate((normalized, masks), axis=1))
         else:
             image = torch.empty(0, dtype=torch.float32)
         return (
