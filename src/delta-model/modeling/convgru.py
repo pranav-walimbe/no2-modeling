@@ -1,4 +1,4 @@
-"""Mask-aware ConvGRU for emissions-change classification."""
+"""Convolutional recurrent network for emissions-change classification."""
 
 import torch
 from torch import nn
@@ -10,6 +10,8 @@ DEFAULT_HEAD_DIM = 128
 DEFAULT_DROPOUT = 0.20
 VISION_EMBEDDING_DIM = 128
 CONVGRU_HIDDEN_CHANNELS = 96
+ENCODER_ARCHITECTURE_NAME = "convolutional_raster_frame_encoder_v1"
+ENCODER_OUTPUT_CHANNELS = 64
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -45,54 +47,51 @@ class ResidualBlock(nn.Module):
         return self.activation(self.block(inputs) + self.residual(inputs))
 
 
-class PartialConv2d(nn.Module):
-    """Convolve valid values and renormalize for local mask support."""
-
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int) -> None:
-        super().__init__()
-        self.padding = kernel_size // 2
-        self.kernel_area = kernel_size * kernel_size
-        self.convolution = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=kernel_size,
-            padding=self.padding,
-            bias=False,
-        )
-        self.bias = nn.Parameter(torch.zeros(out_channels))
-        self.register_buffer("mask_kernel", torch.ones(1, 1, kernel_size, kernel_size))
-
-    def forward(self, inputs: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        masked = inputs * mask
-        features = self.convolution(masked)
-        with torch.no_grad():
-            support = F.conv2d(mask, self.mask_kernel, padding=self.padding)
-            next_mask = (support > 0).to(inputs.dtype)
-            scale = self.kernel_area / support.clamp_min(1.0)
-        features = (features * scale + self.bias[None, :, None, None]) * next_mask
-        return features, next_mask
-
-
-class MaskedNO2Stem(nn.Module):
-    """Encode NO2 without interpreting missing pixels as physical zeros."""
+class NO2Stem(nn.Module):
+    """Encode a completed NO2 raster with ordinary convolutions."""
 
     def __init__(self, out_channels: int = 16) -> None:
         super().__init__()
-        self.first = PartialConv2d(1, out_channels, kernel_size=5)
+        self.first = nn.Conv2d(1, out_channels, kernel_size=5, padding=2)
         self.first_norm = _group_norm(out_channels)
-        self.second = PartialConv2d(out_channels, out_channels, kernel_size=3)
+        self.second = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.second_norm = _group_norm(out_channels)
         self.activation = nn.SiLU()
 
-    def forward(
-        self,
-        values: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> torch.Tensor:
-        features, mask = self.first(values, mask)
-        features = self.activation(self.first_norm(features)) * mask
-        features, mask = self.second(features, mask)
-        return self.activation(self.second_norm(features)) * mask
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        features = self.activation(self.first_norm(self.first(values)))
+        return self.activation(self.second_norm(self.second(features)))
+
+
+class RasterFrameEncoder(nn.Module):
+    """Encode one completed NO2 and weather frame with ordinary convolutions."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.no2_stem = NO2Stem(out_channels=16)
+        self.weather_stem = nn.Sequential(
+            nn.Conv2d(MODEL_IMAGE_CHANNELS - 1, 16, kernel_size=5, padding=2, bias=False),
+            _group_norm(16),
+            nn.SiLU(inplace=True),
+        )
+        self.stem_fusion = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=1, bias=False),
+            _group_norm(32),
+            nn.SiLU(inplace=True),
+        )
+        self.spatial_encoder = nn.Sequential(
+            ResidualBlock(32, 32),
+            ResidualBlock(32, 48, stride=2),
+            ResidualBlock(48, 48),
+            ResidualBlock(48, ENCODER_OUTPUT_CHANNELS, stride=2),
+            ResidualBlock(ENCODER_OUTPUT_CHANNELS, ENCODER_OUTPUT_CHANNELS),
+        )
+
+    def forward(self, no2: torch.Tensor, weather: torch.Tensor) -> torch.Tensor:
+        no2_features = self.no2_stem(no2)
+        weather_features = self.weather_stem(weather)
+        fused = self.stem_fusion(torch.cat((no2_features, weather_features), dim=1))
+        return self.spatial_encoder(fused)
 
 
 class ConvGRUCell(nn.Module):
@@ -112,7 +111,7 @@ class ConvGRUCell(nn.Module):
 
 
 class RasterConvGRUClassifier(nn.Module):
-    """Classify emissions changes from mask-aware raster sequences."""
+    """Classify emissions changes from completed raster sequences."""
 
     def __init__(
         self,
@@ -121,25 +120,8 @@ class RasterConvGRUClassifier(nn.Module):
         dropout: float = DEFAULT_DROPOUT,
     ) -> None:
         super().__init__()
-        self.no2_stem = MaskedNO2Stem(out_channels=16)
-        self.weather_stem = nn.Sequential(
-            nn.Conv2d(MODEL_IMAGE_CHANNELS - 1, 16, kernel_size=5, padding=2, bias=False),
-            _group_norm(16),
-            nn.SiLU(inplace=True),
-        )
-        self.stem_fusion = nn.Sequential(
-            nn.Conv2d(32, 32, kernel_size=1, bias=False),
-            _group_norm(32),
-            nn.SiLU(inplace=True),
-        )
-        self.spatial_encoder = nn.Sequential(
-            ResidualBlock(32, 32),
-            ResidualBlock(32, 48, stride=2),
-            ResidualBlock(48, 48),
-            ResidualBlock(48, 64, stride=2),
-            ResidualBlock(64, 64),
-        )
-        self.temporal_encoder = ConvGRUCell(64, CONVGRU_HIDDEN_CHANNELS)
+        self.frame_encoder = RasterFrameEncoder()
+        self.temporal_encoder = ConvGRUCell(ENCODER_OUTPUT_CHANNELS, CONVGRU_HIDDEN_CHANNELS)
         self.vision_projection = nn.Sequential(
             nn.Linear(2 * CONVGRU_HIDDEN_CHANNELS, VISION_EMBEDDING_DIM),
             nn.LayerNorm(VISION_EMBEDDING_DIM),
@@ -156,14 +138,13 @@ class RasterConvGRUClassifier(nn.Module):
         )
 
     def _encode_sequence(self, image: torch.Tensor) -> torch.Tensor:
-        batch_size, timesteps, _, height, width = image.shape
-        frames = image.reshape(batch_size * timesteps, image.shape[2], height, width)
+        batch_size, timesteps, channels, height, width = image.shape
+        if channels != MODEL_IMAGE_CHANNELS:
+            raise ValueError(f"Expected {MODEL_IMAGE_CHANNELS} completed raster channels, received {channels}")
+        frames = image.reshape(batch_size * timesteps, channels, height, width)
         no2 = frames[:, :1]
         weather = frames[:, 1:MODEL_IMAGE_CHANNELS]
-        mask = frames[:, MODEL_IMAGE_CHANNELS : MODEL_IMAGE_CHANNELS + 1]
-        no2_features = self.no2_stem(no2, mask)
-        weather_features = self.weather_stem(weather)
-        encoded = self.spatial_encoder(self.stem_fusion(torch.cat((no2_features, weather_features), dim=1)))
+        encoded = self.frame_encoder(no2, weather)
         encoded = encoded.reshape(batch_size, timesteps, *encoded.shape[1:])
 
         hidden = encoded.new_zeros(

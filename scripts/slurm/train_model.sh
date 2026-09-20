@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:A5000:1
-#SBATCH --time=03:00:00
+#SBATCH --time=08:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=pranav.walimbe@berkeley.edu
 #SBATCH --output=/global/home/users/pranavwalimbe/no2-modeling/logs/%x-%j.log
@@ -27,6 +27,19 @@ export MPLBACKEND=Agg
 export MPLCONFIGDIR="/global/home/users/pranavwalimbe/.cache/matplotlib"
 mkdir -p "${MPLCONFIGDIR}"
 
+shared_dataset_dir="/global/scratch/projects/fc_nitrates/ddp/nox/dataset"
+node_work_dir="/tmp/no2-model-training-${SLURM_JOB_ID:?SLURM_JOB_ID is not set}"
+mkdir -p "${node_work_dir}"
+if [[ ! -w "${node_work_dir}" ]]; then
+    echo "Job-local storage is not writable: ${node_work_dir}" >&2
+    exit 1
+fi
+node_dataframe_dir="${node_work_dir}/dataframes"
+echo "Staging split metadata into ${node_dataframe_dir}"
+cp -a "${shared_dataset_dir}/dataframes" "${node_dataframe_dir}"
+export NO2_DATASET_DF="${node_dataframe_dir}"
+df -h "${node_work_dir}"
+
 mkdir -p "/global/home/users/pranavwalimbe/.cache"
 training_output=$(mktemp "/global/home/users/pranavwalimbe/.cache/train-no2-${SLURM_JOB_ID}.XXXXXX.log")
 trap 'rm -f -- "${training_output}"' EXIT
@@ -37,6 +50,7 @@ export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
 srun python -u -m modeling.train \
     --device cuda \
+    --completed-raster-dir "${node_work_dir}/filled-rasters" \
     --batch-size 128 \
     --epochs 100 \
     --tabular-epochs 75 \
@@ -51,6 +65,8 @@ srun python -u -m modeling.train \
     --scheduler-patience 10 \
     --scheduler-factor 0.50 \
     --early-stop-patience 12 \
+    --encoder-freeze-epochs 2 \
+    --encoder-lr-scale 0.1 \
     | tee "${training_output}"
 echo "Training command completed; locating result artifacts"
 

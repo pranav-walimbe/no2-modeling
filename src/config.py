@@ -78,9 +78,15 @@ HRRR_END_DATE = EMISSIONS_END_DATE
 # ============================================================================
 # Delta-model dataset generation
 # ============================================================================
-DATASET_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/dataset"  # root output directory for final dataset
+DATASET_DIR = os.getenv(  # root for shared generation outputs
+    "NO2_DATASET_DIR",
+    "/global/scratch/projects/fc_nitrates/ddp/nox/dataset",
+)
 DATASET_RASTER_DIR = os.path.join(DATASET_DIR, "rasters")  # raster bundles for direct monolithic generation
-DATASET_DF = os.path.join(DATASET_DIR, "dataframes")  # saved tabular features and targets
+DATASET_DF = os.getenv(  # saved tabular features and targets
+    "NO2_DATASET_DF",
+    os.path.join(DATASET_DIR, "dataframes"),
+)
 DATASET_TEMPO_CACHE_DIR = os.path.join(DATASET_DIR, "tempo-cache")  # persistent AOI-scan regridding cache
 DATASET_WEATHER_CACHE_DIR = os.path.join(DATASET_DIR, "weather-cache")  # persistent aligned AOI-hour weather rasters
 DATASET_MAX_PARALLEL_SHARDS = 8  # maximum concurrently running Slurm shard tasks
@@ -95,6 +101,10 @@ MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applie
 # Delta-model training contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
+PRETRAINED_ENCODER_WEIGHTS = os.getenv(  # masked-model checkpoint for delta transfer and gap filling
+    "PRETRAINED_ENCODER_WEIGHTS",
+    "/global/home/users/pranavwalimbe/masked_model_runs/masked_no2_20260920_160456/checkpoints/best_masked_no2.pt",
+)
 SEQUENCE_TIMESTEPS = 5  # stored causal raster sequence length
 LABEL_TIMESTEP_INDEX = 3  # zero-based raster timestep ending the emissions label interval
 EMA_HISTORY_TIMESTEPS = 4  # hourly history used by each label-aligned EMA
