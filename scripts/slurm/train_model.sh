@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:A5000:1
-#SBATCH --time=08:00:00
+#SBATCH --time=36:00:00
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=pranav.walimbe@berkeley.edu
 #SBATCH --output=/global/home/users/pranavwalimbe/no2-modeling/logs/%x-%j.log
@@ -15,10 +15,13 @@
 
 set -euo pipefail
 
-cd "/global/home/users/pranavwalimbe/no2-modeling"
+repo_dir="${NO2_REPOSITORY_DIR:-/global/home/users/pranavwalimbe/no2-modeling}"
+environment_dir="${NO2_ENVIRONMENT_DIR:-${repo_dir}/.venv}"
+
+cd "${repo_dir}"
 module load python/3.11.6-gcc-11.4.0
-source .venv/bin/activate
-export PYTHONPATH="/global/home/users/pranavwalimbe/no2-modeling/src:/global/home/users/pranavwalimbe/no2-modeling/src/delta-model"
+source "${environment_dir}/bin/activate"
+export PYTHONPATH="${repo_dir}/src:${repo_dir}/src/delta-model"
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
