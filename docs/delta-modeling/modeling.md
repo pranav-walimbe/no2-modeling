@@ -45,8 +45,9 @@ convolutions.
 The tabular loader fits means and standard deviations on the delta training
 split. Its nine inputs are major-city distance, total unit count, nameplate
 capacity, prior-quarter same-hour heat input and generation, plus sine and cosine
-encodings of local solar hour and day of year. Older datasets derive total unit
-count by adding their stored coal and natural-gas counts.
+encodings of local solar hour and day of year. Modeling derives total unit count
+by adding the stored coal and natural-gas counts without changing the generated
+dataset.
 
 ## Models
 

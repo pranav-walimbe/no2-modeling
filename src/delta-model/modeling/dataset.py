@@ -105,7 +105,7 @@ def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
     # Create leakage-safe numeric features in their documented order
     columns: list[np.ndarray] = []
     for name in MODEL_RAW_FEATURES:
-        if name == "num_units" and name not in frame:
+        if name == "num_units":
             values = pd.to_numeric(frame["num_coal_units"], errors="coerce") + pd.to_numeric(
                 frame["num_ng_units"], errors="coerce"
             )

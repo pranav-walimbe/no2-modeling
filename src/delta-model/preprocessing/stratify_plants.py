@@ -73,7 +73,6 @@ OUTPUT_COLUMNS = [
     "lon_min",
     "lon_max",
     MAJOR_CITY_DIST_COL,
-    "num_units",
     "num_coal_units",
     "num_ng_units",
     "total_nameplate_capacity_mw",
