@@ -65,7 +65,6 @@ DEFAULT_SCHEDULER_FACTOR = 0.50
 DEFAULT_EARLY_STOP_PATIENCE = 12
 DEFAULT_ENCODER_FREEZE_EPOCHS = 2
 DEFAULT_ENCODER_LR_SCALE = 0.10
-EXPECTED_SPLIT_RECORDS = {"train": 100_000, "val": 20_000, "test": 20_000}
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -700,7 +699,6 @@ def main() -> None:
         "tabular_features": list(MODEL_FEATURE_NAMES),
         "prediction_family": "three_class_classification",
         "sequence_encoder": "completed_raster_convolutional_encoder_then_convgru",
-        "expected_split_records": EXPECTED_SPLIT_RECORDS,
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
