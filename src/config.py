@@ -144,10 +144,6 @@ MASKED_PRETRAINING_WORKERS_PER_SHARD = 8
 MASKED_PRETRAINING_SPLIT_SEED = 42
 
 # ============================================================================
-# Next-raster pretraining
-# ============================================================================
-
-# ============================================================================
 # Shared runtime
 # ============================================================================
 NUM_CORES = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))  # number of cores for parallelized jobs

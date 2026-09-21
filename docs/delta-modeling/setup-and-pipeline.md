@@ -160,4 +160,3 @@ run.
 Masked pretraining reuses delta-model TEMPO and weather caches but maintains its
 own validity cache and AOI-disjoint splits. See
 [`../masked-pretraining/setup-and-pipeline.md`](../masked-pretraining/setup-and-pipeline.md).
-The next-raster pipeline is not implemented yet.
