@@ -15,8 +15,8 @@ from modeling.convgru import (
     DEFAULT_HEAD_DIM,
     ENCODER_ARCHITECTURE_NAME,
     ENCODER_OUTPUT_CHANNELS,
-    RasterConvGRUClassifier,
     RasterFrameEncoder,
+    RasterTabularFusionClassifier,
     ResidualBlock,
 )
 from modeling.dataset import (
@@ -63,8 +63,6 @@ DEFAULT_GRADIENT_CLIP_NORM = 5.0
 DEFAULT_SCHEDULER_PATIENCE = 10
 DEFAULT_SCHEDULER_FACTOR = 0.50
 DEFAULT_EARLY_STOP_PATIENCE = 12
-DEFAULT_ENCODER_FREEZE_EPOCHS = 2
-DEFAULT_ENCODER_LR_SCALE = 0.10
 
 
 def _group_norm(channels: int) -> nn.GroupNorm:
@@ -186,8 +184,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
     parser.add_argument("--pretrained-encoder-weights", default=PRETRAINED_ENCODER_WEIGHTS)
     parser.add_argument("--completed-raster-dir", required=True)
-    parser.add_argument("--encoder-freeze-epochs", type=int, default=DEFAULT_ENCODER_FREEZE_EPOCHS)
-    parser.add_argument("--encoder-lr-scale", type=float, default=DEFAULT_ENCODER_LR_SCALE)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     return parser.parse_args()
 
@@ -287,23 +283,10 @@ def fit_model(
     checkpoint_path: Path,
     checkpoint_metadata: dict[str, object],
     phase_name: str,
-    encoder: nn.Module | None = None,
-    encoder_freeze_epochs: int = 0,
-    encoder_lr_scale: float = 1.0,
 ) -> tuple[list[float], list[float], float]:
     """Fit one classifier and restore its lowest-validation-loss state."""
-    if encoder is None:
-        parameter_groups: list[dict[str, object]] = [{"params": model.parameters(), "lr": learning_rate}]
-    else:
-        encoder_parameters = list(encoder.parameters())
-        encoder_ids = {id(parameter) for parameter in encoder_parameters}
-        parameter_groups = [
-            {"params": [parameter for parameter in model.parameters() if id(parameter) not in encoder_ids]},
-            {"params": encoder_parameters, "lr": learning_rate * encoder_lr_scale},
-        ]
-        for parameter in encoder_parameters:
-            parameter.requires_grad = encoder_freeze_epochs == 0
-    optimizer = torch.optim.AdamW(parameter_groups, lr=learning_rate, weight_decay=args.weight_decay)
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_parameters, lr=learning_rate, weight_decay=args.weight_decay)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -318,10 +301,6 @@ def fit_model(
     epochs_without_improvement = 0
 
     for epoch in range(1, epochs + 1):
-        if encoder is not None and epoch == encoder_freeze_epochs + 1:
-            for parameter in encoder.parameters():
-                parameter.requires_grad = True
-            print(f"Unfroze pretrained frame encoder at epoch {epoch}")
         train_loss, train_accuracy = train_epoch(
             model,
             train_loader,
@@ -517,8 +496,6 @@ def main() -> None:
     masked_checkpoint_path = Path(args.pretrained_encoder_weights)
     if not args.pretrained_encoder_weights:
         raise ValueError("Set PRETRAINED_ENCODER_WEIGHTS or pass --pretrained-encoder-weights")
-    if args.encoder_freeze_epochs < 0 or args.encoder_lr_scale <= 0:
-        raise ValueError("Encoder freeze epochs must be nonnegative and its learning-rate scale must be positive")
 
     run_name = datetime.now(timezone.utc).strftime("delta_category_classification_%Y%m%d_%H%M%S")
     run_dir = Path(RUNS_DIR) / run_name
@@ -601,6 +578,9 @@ def main() -> None:
     histories["mlp"] = (tabular_train_losses, tabular_val_losses)
     model_frames["mlp"] = tabular_frames
     training_summaries["mlp"] = tabular_run
+    tabular_state_dict = {
+        name: parameter.detach().cpu().clone() for name, parameter in tabular_model.state_dict().items()
+    }
     del tabular_model, tabular_train_loader, tabular_eval_loaders, tabular_datasets
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -610,11 +590,14 @@ def main() -> None:
         ("pretrained_encoder_delta", True),
     ):
         _seed_everything(args.seed)
-        raster_model = RasterConvGRUClassifier(head_dim=args.head_dim, dropout=args.dropout).to(device)
+        raster_model = RasterTabularFusionClassifier(
+            len(MODEL_FEATURE_NAMES),
+            tabular_state_dict,
+            head_dim=args.head_dim,
+            dropout=args.dropout,
+        ).to(device)
         if use_pretrained_encoder:
-            raster_model.frame_encoder.load_state_dict(
-                _standard_encoder_state(masked_checkpoint["encoder_state_dict"])
-            )
+            raster_model.frame_encoder.load_state_dict(_standard_encoder_state(masked_checkpoint["encoder_state_dict"]))
         train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
         print(f"Training {raster_model.num_params():,}-parameter {model_name} classifier")
         train_losses, val_losses, best_val_loss = fit_model(
@@ -632,9 +615,6 @@ def main() -> None:
                 "encoder_initialization": "masked_pretrained" if use_pretrained_encoder else "random",
             },
             phase_name=model_name.replace("_", " ").title(),
-            encoder=raster_model.frame_encoder if use_pretrained_encoder else None,
-            encoder_freeze_epochs=args.encoder_freeze_epochs if use_pretrained_encoder else 0,
-            encoder_lr_scale=args.encoder_lr_scale if use_pretrained_encoder else 1.0,
         )
         histories[model_name] = (train_losses, val_losses)
         raster_frames = {}
@@ -648,6 +628,7 @@ def main() -> None:
             "parameters": raster_model.num_params(),
             "best_validation_loss": best_val_loss,
             "encoder_initialization": "masked_pretrained" if use_pretrained_encoder else "random",
+            "fusion": "frozen_tabular_plus_raster_logits",
         }
         plot_loss_curve(
             train_losses,
@@ -685,8 +666,8 @@ def main() -> None:
         "pretrained_encoder_weights": str(masked_checkpoint_path),
         "pretrained_encoder_sha256": masked_checkpoint_sha256,
         "encoder_architecture": ENCODER_ARCHITECTURE_NAME,
-        "encoder_freeze_epochs": args.encoder_freeze_epochs,
-        "encoder_lr_scale": args.encoder_lr_scale,
+        "encoder_freeze_epochs": 0,
+        "encoder_lr_scale": 1.0,
         "completed_raster_paths": {split: str(path) for split, path in completed_paths.items()},
         "image_keys": list(stats.image_keys),
         "image_center": list(stats.image_center),
@@ -697,8 +678,9 @@ def main() -> None:
         "class_counts": {split: _class_counts(dataset) for split, dataset in datasets.items()},
         "target_label_mode": target_label_mode,
         "tabular_features": list(MODEL_FEATURE_NAMES),
-        "prediction_family": "three_class_classification",
-        "sequence_encoder": "completed_raster_convolutional_encoder_then_convgru",
+        "prediction_family": "three_class_categorical_distribution",
+        "sequence_encoder": "completed_raster_convolutional_encoder_then_convgru_with_logit_fusion",
+        "fusion": "frozen_tabular_plus_raster_logits",
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
@@ -707,7 +689,6 @@ def main() -> None:
         histories,
         model_frames,
         run_dir,
-        encoder_unfreeze_epoch=args.encoder_freeze_epochs + 1,
     )
     plot_confusion_matrices(model_frames, run_dir)
     save_results(model_frames, run_dir, primary_model_name="pretrained_encoder_delta")

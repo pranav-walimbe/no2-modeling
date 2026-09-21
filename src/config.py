@@ -119,8 +119,7 @@ MODEL_TARGET_COL = "delta_category"  # three-class decrease, steady, or increase
 MODEL_CLASS_NAMES = ("decrease", "steady", "increase")
 MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular and fused models
     "major_city_dist",
-    "num_coal_units",
-    "num_ng_units",
+    "num_units",
     "total_nameplate_capacity_mw",
     "avg_heat_input",
     "avg_pwr_gen",

@@ -33,7 +33,7 @@ done
 echo "Emailing three-model classification results to ${recipient} via ${mail_host}"
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 \
     "${mail_host}" stat -c %s "${mail_log}")
-printf 'NO2 classification training completed successfully.\n\nThe attachments compare the tabular MLP, random-init delta model, and pretrained-encoder delta model.\n\nRun: %s\nJob: %s\n' \
+printf 'NO2 classification training completed successfully.\n\nThe attachments compare the tabular MLP, random-init fusion model, and pretrained-encoder fusion model.\n\nRun: %s\nJob: %s\n' \
     "${run_dir}" \
     "${job_id}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \

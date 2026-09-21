@@ -65,8 +65,6 @@ srun python -u -m modeling.train \
     --scheduler-patience 10 \
     --scheduler-factor 0.50 \
     --early-stop-patience 12 \
-    --encoder-freeze-epochs 2 \
-    --encoder-lr-scale 0.1 \
     | tee "${training_output}"
 echo "Training command completed; locating result artifacts"
 

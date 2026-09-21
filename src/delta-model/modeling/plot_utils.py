@@ -12,8 +12,8 @@ from config import MODEL_CLASS_NAMES
 
 MODEL_DISPLAY_NAMES = {
     "mlp": "Tabular MLP",
-    "random_init_delta": "Random-init delta",
-    "pretrained_encoder_delta": "Pretrained-encoder delta",
+    "random_init_delta": "Random-init fusion",
+    "pretrained_encoder_delta": "Pretrained-encoder fusion",
 }
 METRIC_DISPLAY_NAMES = {
     "accuracy": "Accuracy",
@@ -82,8 +82,6 @@ def plot_training_comparison(
     histories: dict[str, tuple[list[float], list[float]]],
     model_frames: dict[str, dict[str, pd.DataFrame]],
     run_dir: str | Path,
-    *,
-    encoder_unfreeze_epoch: int,
 ) -> None:
     """Plot all loss curves and final accuracy and AUROC in one figure."""
     sns.set_theme(style="whitegrid", font_scale=0.95)
@@ -95,7 +93,6 @@ def plot_training_comparison(
     for axis, title in zip(axes[0], ("Training loss", "Validation loss"), strict=True):
         axis.set(xlabel="Epoch", ylabel="Cross-entropy", title=title)
         axis.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-        axis.axvline(encoder_unfreeze_epoch, color="black", linestyle="--", alpha=0.5, label="Encoder unfrozen")
         axis.legend()
 
     metric_rows = []

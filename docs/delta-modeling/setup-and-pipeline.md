@@ -113,8 +113,8 @@ The job stages split metadata in job-local `/tmp`, fills missing NO2 into
 temporary memory-mapped arrays, and trains three classifiers:
 
 - a tabular MLP;
-- a random-initialized raster ConvGRU;
-- a raster ConvGRU initialized from masked pretraining.
+- a random-initialized ConvGRU fused with the frozen MLP logits;
+- a masked-pretrained ConvGRU fused with the frozen MLP logits.
 
 The launcher requests one A5000 GPU, four CPUs, and eight hours on
 `savio4_gpu` with `a5k_gpu4_normal`. It emails loss curves, model comparisons,
