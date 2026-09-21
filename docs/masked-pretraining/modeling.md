@@ -3,7 +3,8 @@
 The masked model learns a spatial NO2 representation that can support two uses:
 missing-pixel imputation and initialization of the delta model's frame encoder.
 It receives visible NO2, temperature, wind, and a visibility mask, then predicts
-one complete NO2 raster.
+one complete NO2 raster. See [modeling_result.md](modeling_result.md) for the
+latest training and held-out reconstruction results.
 
 ## Architecture philosophy
 
@@ -28,6 +29,41 @@ skip connections. Skip paths would improve local reconstruction while giving
 the decoder a route around the latent representation. The compact decoder puts
 more pressure on the 64 by 6 by 6 encoder output. The full model has 394,209
 trainable parameters, including 243,680 in the encoder.
+
+```mermaid
+flowchart LR
+    subgraph Inputs[Normalized 24 by 24 inputs]
+        NO2[Masked NO2<br/>1 channel]
+        Mask[Visibility mask<br/>1 channel]
+        Weather[Temperature and wind<br/>3 channels]
+    end
+
+    subgraph Stems[Separate input stems]
+        Partial[Two partial convolutions<br/>5 by 5, then 3 by 3<br/>16 channels]
+        WeatherStem[Weather convolution<br/>5 by 5<br/>16 channels]
+    end
+
+    NO2 --> Partial
+    Mask -->|controls valid support| Partial
+    Weather --> WeatherStem
+    Partial --> Join[Concatenate<br/>32 channels]
+    WeatherStem --> Join
+    Join --> Fuse[1 by 1 fusion<br/>32 by 24 by 24]
+
+    subgraph Encoder[Transferable frame encoder]
+        E24[Residual block<br/>32 by 24 by 24]
+        E12[Downsample and residual blocks<br/>48 by 12 by 12]
+        E6[Downsample and residual blocks<br/>64 by 6 by 6]
+        E24 --> E12 --> E6
+    end
+
+    Fuse --> E24
+    E6 --> Bottleneck[Residual bottleneck<br/>64 by 6 by 6]
+    Bottleneck --> Up12[Bilinear upsample and residual block<br/>48 by 12 by 12]
+    Up12 --> Up24[Bilinear upsample and residual block<br/>32 by 24 by 24]
+    Up24 --> Prediction[1 by 1 convolution<br/>predicted NO2]
+    Prediction --> Fill[Preserve observed pixels<br/>fill synthetic gaps]
+```
 
 ## Objective
 
