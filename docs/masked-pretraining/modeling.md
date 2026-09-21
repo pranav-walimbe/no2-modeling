@@ -3,7 +3,8 @@
 The masked model learns a spatial NO2 representation that can support two uses:
 missing-pixel imputation and initialization of the delta model's frame encoder.
 It receives visible NO2, temperature, wind, and a visibility mask, then predicts
-one complete NO2 raster.
+one complete NO2 raster. See [modeling_result.md](modeling_result.md) for the
+latest training and held-out reconstruction results.
 
 ## Architecture philosophy
 
@@ -28,6 +29,36 @@ skip connections. Skip paths would improve local reconstruction while giving
 the decoder a route around the latent representation. The compact decoder puts
 more pressure on the 64 by 6 by 6 encoder output. The full model has 394,209
 trainable parameters, including 243,680 in the encoder.
+
+```mermaid
+flowchart TB
+    subgraph Inputs[Model inputs]
+        direction LR
+        NO2[Masked NO2 and<br/>visibility mask]
+        Weather[Temperature<br/>and wind]
+    end
+
+    subgraph Stems[Separate feature extraction]
+        direction LR
+        Partial[Mask-aware<br/>NO2 stem]
+        WeatherStem[Weather<br/>stem]
+    end
+
+    NO2 --> Partial
+    Weather --> WeatherStem
+    Partial --> Fuse[Fuse NO2 and weather features]
+    WeatherStem --> Fuse
+    Fuse --> Encoder[Residual spatial encoder<br/>24 by 24 to 6 by 6]
+    Encoder --> Bottleneck[Latent bottleneck]
+    Bottleneck --> Decoder[Residual upsampling decoder<br/>6 by 6 to 24 by 24]
+    Decoder --> Prediction[Predicted NO2]
+    Prediction --> Fill[Fill missing pixels]
+    NO2 -.->|preserve observed pixels| Fill
+    Fill --> Complete[Completed NO2 raster]
+
+    classDef stage font-size:18px
+    class NO2,Weather,Partial,WeatherStem,Fuse,Encoder,Bottleneck,Decoder,Prediction,Fill,Complete stage
+```
 
 ## Objective
 

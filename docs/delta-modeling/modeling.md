@@ -71,6 +71,31 @@ The pretrained encoder stays frozen for the first two epochs, then trains at one
 tenth of the base learning rate. Other pretrained-model parameters use the base
 rate.
 
+```mermaid
+flowchart TB
+    Frames[Five completed raster frames<br/>NO2, temperature, and wind]
+    Frames --> FrameEncoder[Shared spatial frame encoder<br/>random or pretrained initialization]
+    FrameEncoder --> Encoded[Five spatial feature maps]
+    Encoded --> GRU[ConvGRU combines information<br/>across time]
+
+    subgraph Pooling[Summarize the final hidden map]
+        direction LR
+        Average[Global average pool]
+        Maximum[Global maximum pool]
+    end
+
+    GRU --> Average
+    GRU --> Maximum
+    Average --> PoolJoin[Concatenate pooled features]
+    Maximum --> PoolJoin
+    PoolJoin --> Projection[Feature projection]
+    Projection --> Head[Classification head]
+    Head --> Logits[Three logits<br/>decrease, steady, increase]
+
+    classDef stage font-size:18px
+    class Frames,FrameEncoder,Encoded,GRU,Average,Maximum,PoolJoin,Projection,Head,Logits stage
+```
+
 ## Optimization
 
 All three models use unweighted cross-entropy. Stratification balances classes
