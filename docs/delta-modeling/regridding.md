@@ -1,85 +1,67 @@
 # Regridding TEMPO Level 2 pixels
 
-The regridder converts irregular TEMPO footprints into a fixed 24 by 24 grid
-covering 72 km around each AOI. It projects footprints and cells to EPSG:5070,
-intersects indexed polygon candidates, and averages accepted NO2 by overlap area.
+The regridder converts irregular TEMPO footprints into a `24 x 24` grid that
+covers 72 km around each AOI. It projects footprints and cells to EPSG:5070,
+finds intersecting polygons, and averages accepted NO2 by overlap area.
 
 ## Native-pixel filters
 
-An NO2 value contributes when:
+A TEMPO NO2 value contributes when:
 
 - `main_data_quality_flag == 0`;
-- cloud fraction is at most `MIN_PIXEL_CLOUD`, currently 0.20;
-- its value and geometry are valid.
+- cloud fraction is at most 0.20;
+- its value and footprint geometry are valid;
+- its footprint has positive overlap with an output cell.
 
-Filtering occurs before averaging. Cloud and quality diagnostics still cover
-all valid overlapping footprints, including those rejected from NO2.
+The production calculation uses area-only weights and no effective-sample or
+minimum-overlap cutoff. Cloud and quality diagnostics include valid overlapping
+footprints that fail the NO2 filter.
 
-## AOI-scan cache
+## Persistent caches
 
-Each AOI scan produces one compressed NPZ with aligned 24 by 24 `float32`
-rasters:
+Each AOI scan produces a compressed cache file with aligned `float32` rasters:
 
-| Raster | Definition | No support |
+| Raster | Definition | Missing support |
 |---|---|---|
 | `no2` | Area-weighted tropospheric NO2 from accepted footprints | `NaN` |
-| `weighted_cloud_fraction` | Area-weighted cloud fraction from all valid footprints | `NaN` |
-| `good_quality_fraction` | Share of overlapping area with quality flag 0 | `NaN` |
+| `weighted_cloud_fraction` | Area-weighted cloud fraction | `NaN` |
+| `good_quality_fraction` | Area share with quality flag 0 | `NaN` |
 | `retrieval_uncertainty` | Area-weighted uncertainty from accepted footprints | `NaN` |
 | `sum_weight` | Accepted overlap area in km2 | `0.0` |
 
-Ancillary rasters may remain finite where NO2 is missing. Downstream code keeps
-these gaps and creates an explicit NO2 mask.
+Generation deduplicates AOI-scan and AOI-hour work across shards:
 
-`src/delta-model/preprocessing/generate_dataset.py` deduplicates AOI-scan work
-and manages two persistent caches:
+| Cache | Key | Refresh flag |
+|---|---|---|
+| TEMPO | AOI and source-granule set | `--refresh-tempo` |
+| Weather | AOI and UTC hour | `--refresh-weather` |
 
-| Cache | Key | Read grouping | Refresh flag |
-|---|---|---|---|
-| TEMPO | AOI and source granules | Shared granule set | `--refresh-tempo` |
-| Weather | AOI and hour | Shared HRRR file | `--refresh-weather` |
+`--refresh-cache` clears both. When requested, the launcher clears caches before
+array fan-out. Workers write cache files atomically.
 
-`--refresh-cache` clears both caches. A refresh runs before array fan-out because
-all shards share the cache directories. Cache files are written atomically.
+## Published raster bundles
 
-## Model records
+Each retained record stores oldest-to-newest arrays with shape `5 x 24 x 24`:
 
-Each successful record stores oldest-to-newest arrays with shape
-`T x 24 x 24`:
-
-- directly regridded `no2` and its independent `no2_mask`;
+- `no2` and its independent `no2_mask`;
 - `temperature_2m_k`;
-- geographic `wind_u_80m_mps` and `wind_v_80m_mps`.
-
-The companion CSV stores `raster_bundle_path`, per-timestep finite fractions,
-minimum sequence coverage, and cloud, quality, and uncertainty summaries.
+- `wind_u_80m_mps` and `wind_v_80m_mps`.
 
 Weather alignment projects AOI cell centers onto the HRRR Lambert grid,
-bilinearly samples the 3 km fields, and rotates grid-relative wind into
-geographic east and north. See the
-[NOAA HRRR overview](https://rapidrefresh.noaa.gov/).
+bilinearly samples the 3 km fields, and rotates grid-relative winds into
+geographic east and north.
 
-Every timestep needs at least 95% finite NO2 coverage and complete coverage in
-the 3 by 3 source hotspot. The regridder also calculates squared weight,
-effective sample size, overlap area, contributor count, and worst quality for
-validation. These values do not enter model bundles.
+Each timestep must contain at least 90% finite NO2 cells and complete NO2
+support in the 3 by 3 source hotspot. The companion CSV includes per-timestep
+coverage plus sequence-level cloud, quality, and uncertainty summaries.
 
-## EDA decisions
+## Training-time completion
 
-Job 38571783 tested 12 fixed scans and 40 sampled scan pairs. Production keeps:
+Published NO2 rasters retain their gaps. Delta training normalizes the physical
+channels with the masked-model checkpoint statistics, then passes NO2, weather,
+and `no2_mask` through that reconstruction model. The imputer preserves observed
+NO2 and fills mask gaps.
 
-- cloud fraction at most 0.20;
-- area-only NO2 weights;
-- every positive accepted overlap;
-- no effective-sample cutoff.
-
-| Choice | Result |
-|---|---|
-| No overlap floor | Preserved NASA-style area-weighted gridding |
-| Effective-sample floor of 1.25 | Reduced survival to 21.1%; rejected |
-| Area-only weighting | Beat linear and squared inverse-uncertainty weights on median normalized RMS disagreement with Level 3 |
-
-The vectorized implementation matched an independent overlap reference to
-floating-point precision. Warm tessellation took 0.13 to 0.16 seconds per AOI.
-NASA Level 3 is a geometry and unit check, not ground truth, because its grid and
-input filters differ.
+Training writes the completed four-channel sequences to job-local memory-mapped
+arrays under `/tmp`. Both raster classifiers read those arrays and receive
+`NO2`, temperature, wind U, and wind V. They do not receive `no2_mask`.

@@ -1,33 +1,14 @@
 # Delta-model setup and pipeline
 
-The delta model combines TEMPO imagery, EPA CAMPD records, HRRR weather, and
-plant attributes. ERA5 is an optional benchmark.
+The delta pipeline combines TEMPO NO2, EPA CAMPD emissions, HRRR weather, and
+plant attributes to classify emissions changes as `decrease`, `steady`, or
+`increase`.
 
-## Setup
+## Environment
 
-Requirements:
-
-- `uv` and Savio's `python/3.11.6-gcc-11.4.0` module;
-- an EPA CAMPD API key;
-- a NASA Earthdata account with TEMPO access;
-- a Copernicus CDS account only for ERA5;
-- access to the paths configured in `src/config.py`.
-
-Create the locked environment:
-
-```bash
-module load python/3.11.6-gcc-11.4.0
-make setup
-```
-
-To place it in scratch:
-
-```bash
-UV_CACHE_DIR=/global/scratch/users/$USER/uv-cache \
-    make setup VENV=/global/scratch/users/$USER/no2-modeling-venv
-```
-
-Create `.env` in the repository root:
+You need Savio access, `uv`, the `python/3.11.6-gcc-11.4.0` module, an EPA
+CAMPD API key, and a NASA Earthdata account with TEMPO access. Put credentials
+in `.env`:
 
 ```dotenv
 CAMPD_API_KEY=your_campd_api_key
@@ -35,30 +16,28 @@ EARTHDATA_USERNAME=your_nasa_earthdata_username
 EARTHDATA_PASSWORD=your_nasa_earthdata_password
 ```
 
-ERA5 also requires `~/.cdsapirc`:
-
-```yaml
-url: https://cds.climate.copernicus.eu/api
-key: your-api-key
-```
-
-Review `src/config.py`, especially Savio paths, dates, thresholds, `VIS_DIR`,
-and `RUNS_DIR`. Run `make check` after setup.
-
-## Shell environment
-
-Run pipeline commands from the repository root:
+Create the locked environment and verify the repository:
 
 ```bash
 module load python/3.11.6-gcc-11.4.0
+make setup
+make check
+```
+
+Run Python commands from the repository root with:
+
+```bash
 source .venv/bin/activate
 export PYTHONPATH="$PWD/src:$PWD/src/delta-model"
 ```
 
-Set `TEMPO_VERSION` to `V03` or `V04`; `V04` is the default. The pipeline uses
-Level 2 data under `TEMPO/<version>/L2/raw/<year>/<month>/`.
+Review the storage paths, date bounds, and thresholds in `src/config.py` before
+launching a long job. `TEMPO_VERSION` defaults to `V04`.
 
 ## 1. Collect source data
+
+The collection scripts write TEMPO, HRRR, CAMPD, and plant metadata to the
+configured shared paths:
 
 ```bash
 python -u src/data-scraping/scrape_tempo.py
@@ -67,96 +46,91 @@ python -u src/data-scraping/scrape_emissions.py
 python -u src/data-scraping/scrape_locations.py
 ```
 
-The TEMPO collector skips completed files. HRRR output contains hourly `f00`
-analyses for 80 m wind, 2 m temperature, and boundary-layer height. After
-replacing HRRR files, regenerate the dataset with `--refresh-weather`.
+The Slurm launchers under `scripts/slurm/` supply the production resource
+requests. Facility enrichment converts CAMPD local standard time to UTC and
+writes `emissions_hour_utc`. CAMPD standard offsets apply throughout the year.
 
-Facility enrichment uses nationwide CAMPD pages and selects the latest
-attribute year no later than each prediction year. It preserves CAMPD local
-standard date and hour, resolves facility timezones, and writes
-`emissions_hour_utc`. Standard offsets apply year-round because the EPA clock
-does not use daylight-saving time. Failed or incomplete enrichment does not
-replace the prior output.
+## 2. Build TEMPO mappings and metadata splits
 
-## 2. Build mappings and splits
+Submit the mapping index, wait for it to finish, then submit the observation
+array and stratification job:
 
 ```bash
-python -u -m preprocessing.tempo_mapping index --overwrite
-python -u -m preprocessing.tempo_mapping observations \
-    --task-id <TASK_ID> --task-count 32 --overwrite
-python -u -m preprocessing.stratify_plants
+sbatch scripts/slurm/build_tempo_mapping_index.sh --overwrite
+sbatch scripts/slurm/build_tempo_mapping_observations.sh --overwrite
+sbatch scripts/slurm/stratify_plants.sh
 ```
 
-Run observation tasks from 0 through 31 after indexing succeeds. The mapping
-stage writes monthly granule indexes and daily AOI-observation shards.
+The observation launcher runs 32 tasks. Stratification builds causal EMA
+targets, keeps records whose raw and scaled classes agree, assigns overlapping
+AOIs to the same geographic split, and balances the three classes within each
+split. See [dataset_design.md](dataset_design.md).
 
-Stratification computes consecutive-hour changes and prior-quarter baselines,
-uses every eligible AOI, and requires agreement between raw +/-100 and
-normalized +/-0.05 EMA-change classes. It then assigns overlap clusters toward
-70/15/15 targets for each class and balances each split using its smallest
-class. Labels end at the fourth of five stored scans and use four-hour EMA
-windows. See [dataset_design.md](dataset_design.md).
+## 3. Generate raster records
 
-## 3. Generate raster datasets
-
-Launch the Slurm workflow from a login node:
+Launch generation from a login node:
 
 ```bash
-python -u -m preprocessing.generate_dataset --shard-size 20000
+./scripts/launch_dataset_generation.sh
 ```
 
-The launcher submits a throttled shard array and dependent finalizer. Defaults
-allow eight concurrent shards with eight CPUs and workers each. Override them
-with `--max-parallel-shards` and `--workers-per-shard`.
-
-Each launch clears old shards and published metadata but keeps persistent TEMPO
-and weather caches. Use `--refresh-cache`, `--refresh-tempo`, or
-`--refresh-weather` to clear selected caches before fan-out. Do not refresh or
-regenerate while dataset generation or training is active.
-
-Workers write five `T x 24 x 24` arrays per record: NO2, its mask, temperature,
-and geographic wind U/V. They require 95% NO2 coverage per timestep and complete
-3 by 3 source-hotspot coverage. The finalizer validates every source outcome
-and raster before publishing relative paths. A failed worker prevents
-publication; fix the cause and relaunch the complete workflow.
-
-For a local monolithic run, call the module inside an allocation and use
-`--split` when needed. See [regridding.md](regridding.md) for cache and raster
-details.
-
-## 4. Train and evaluate
+The launcher uses 16,000 source records per shard by default and submits up to
+eight concurrent workers plus a dependent finalizer. Override the shard size or
+limit generation to one split with:
 
 ```bash
-python -u -m modeling.train
+./scripts/launch_dataset_generation.sh --shard-size 12000 -- --split train
 ```
 
-The trainer fits normalization on training pixels, loads NPZ files on demand,
-and trains independent partial-convolution ConvGRU and tabular MLP classifiers
-with three-class cross-entropy. See [modeling.md](modeling.md) for
-inputs, leakage controls, architecture, and evaluation.
+Each launch replaces disposable shards and published metadata while retaining
+the TEMPO and weather caches. Pass `--refresh-tempo`, `--refresh-weather`, or
+`--refresh-cache` after the final `--` when a raster contract or source file
+changes. Do not regenerate while a model job reads the dataset.
 
-## Savio allocations
+Workers require at least 90% finite NO2 coverage at each timestep and full
+coverage in the 3 by 3 source hotspot. The finalizer publishes split CSVs only
+after it validates all shard outcomes. See [regridding.md](regridding.md).
 
-Jobs should use `set -euo pipefail`, the `fc_nitrates` account, stage-specific
-logs, `BEGIN,END,FAIL` email, the Python module and environment above, and
-`srun`. Export `SRUN_CPUS_PER_TASK="$SLURM_CPUS_PER_TASK"`.
+## 4. Provide a masked-model checkpoint
 
-| Stage | Savio request | Command |
+Delta training requires a masked NO2 checkpoint for two operations: filling
+missing NO2 pixels and initializing one raster encoder. Set
+`PRETRAINED_ENCODER_WEIGHTS` to the checkpoint path or use the default in
+`src/config.py`.
+
+The masked-pretraining workflow lives in
+[masked-pretraining/setup-and-pipeline.md](../masked-pretraining/setup-and-pipeline.md).
+
+## 5. Train and evaluate
+
+Submit the maintained launcher:
+
+```bash
+sbatch scripts/slurm/train_model.sh
+```
+
+The job stages split metadata in job-local `/tmp`, fills missing NO2 into
+temporary memory-mapped arrays, and trains three classifiers:
+
+- a tabular MLP;
+- a random-initialized raster ConvGRU;
+- a raster ConvGRU initialized from masked pretraining.
+
+The launcher requests one A5000 GPU, four CPUs, and eight hours on
+`savio4_gpu` with `a5k_gpu4_normal`. It emails loss curves, model comparisons,
+and test confusion matrices after a successful run. See
+[modeling.md](modeling.md) for the model contract.
+
+## Current Savio launchers
+
+| Stage | Launcher | Main request |
 |---|---|---|
-| TEMPO download | `savio4_htc`, `savio_normal`, 4 CPUs, 72 hours | `python -u src/data-scraping/scrape_tempo.py` |
-| HRRR download | `savio4_htc`, `savio_normal`, 4 CPUs per task, 48 hours | Date-range array with `scrape_hrrr.py --workers "$SLURM_CPUS_PER_TASK" --overwrite` |
-| Facility metadata | `savio4_htc`, `savio_normal`, 4 CPUs, 8 hours | `python -u src/data-scraping/scrape_locations.py` |
-| TEMPO index | `savio4_htc`, `savio_normal`, 16 CPUs, 2 hours | `preprocessing.tempo_mapping index` |
-| TEMPO observations | `savio4_htc`, `savio_normal`, 4 CPUs per task, 8 hours | `0-31%14` array with the observations command |
-| Stratification | `savio4_htc`, `savio_normal`, `savio4_m512`, 16 CPUs, 30 minutes | `python -u -m preprocessing.stratify_plants` |
-| Dataset generation | `savio4_htc`, `savio_normal`, 8 concurrent tasks with 8 CPUs, 12 hours | Launch `preprocessing.generate_dataset` from the login node |
-| Model training | `savio3_gpu`, `a40_gpu3_normal`, 8 CPUs, 1 A40, 2 hours | `python -u -m modeling.train --device cuda` |
+| TEMPO index | `build_tempo_mapping_index.sh` | 16 CPUs, 2 hours |
+| TEMPO observations | `build_tempo_mapping_observations.sh` | `0-31%14`, 4 CPUs, 8 hours |
+| Stratification | `stratify_plants.sh` | 16 CPUs, 30 minutes, high-memory node |
+| Dataset shards | `launch_dataset_generation.sh` | Up to 8 tasks, 8 CPUs each, 12 hours |
+| Masked pretraining | `train_masked_pretraining.sh` | 1 A5000, 4 CPUs, 8 hours |
+| Delta classification | `train_model.sh` | 1 A5000, 4 CPUs, 8 hours |
 
-Savio policies change. Verify partitions, QoS, and account limits before a long
-run.
-
-## Pretraining pipelines
-
-Masked pretraining reuses delta-model TEMPO and weather caches but maintains its
-own validity cache and AOI-disjoint splits. See
-[`../masked-pretraining/setup-and-pipeline.md`](../masked-pretraining/setup-and-pipeline.md).
+Savio policies and availability can change. Check the requested account,
+partition, and QoS before submission.

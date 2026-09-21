@@ -1,115 +1,110 @@
 # Modeling
 
-The delta-model baseline classifies power-plant NOx changes from five causal
-TEMPO scans and aligned hourly HRRR fields.
+The delta-model trainer compares three classifiers on the same geographic
+splits: a tabular MLP, a random-initialized raster ConvGRU, and a raster ConvGRU
+whose frame encoder starts from masked NO2 pretraining.
 
 ## Contract
 
-| Component | Choice |
+| Component | Current choice |
 |---|---|
-| Target | `delta_category` |
-| Classes | `decrease`, `steady`, `increase` |
-| Raster input | Five NO2, validity-mask, temperature, and wind U/V rasters |
-| Raster shape | `5 x 5 x 24 x 24` |
+| Target | Stored `delta_category` |
+| Classes | `decrease`, `steady`, `increase`, mapped to 0, 1, and 2 |
+| Raster sequence | Five completed `4 x 24 x 24` frames |
+| Raster channels | NO2, 2 m temperature, eastward wind, northward wind |
 | Tabular input | Ten standardized plant, activity, and cyclic-time features |
-| Expected split sizes | About 100k train, 20k validation, and 20k test |
-| Raster model | Partial-convolution spatial encoder followed by a ConvGRU |
-| Baseline model | Independent tabular MLP classifier |
-| Training loss | Three-class cross-entropy |
-| Selection | Lowest validation cross-entropy |
+| Loss | Unweighted three-class cross-entropy |
+| Checkpoint selection | Lowest validation cross-entropy for each model |
+| Primary result | Masked-pretrained raster classifier |
 
-Dataset generation preserves `delta_category` from the geographically
-stratified source records. Model loading maps the ordered class names to the
-indices 0, 1, and 2. It does not recreate classes from a continuous target.
+Dataset generation supplies the class label. The loader does not derive a new
+class from a continuous target. See [dataset_design.md](dataset_design.md) for
+the thresholds and temporal alignment.
 
-Five scans remain available to the raster model. The target is aligned to the
-fourth scan: label coverage uses the `t2` to `t3` interval, and the fifth scan
-remains stored as model input.
+## Normalization and NO2 completion
 
-## Inputs and leakage controls
-
-The raster model receives five ordered timesteps. Each timestep contains:
-
-1. NO2 on finite native support;
-2. 2 m temperature;
-3. geographic eastward wind;
-4. geographic northward wind;
-5. the binary NO2 validity mask.
-
-The tabular MLP receives coal and natural-gas unit counts, total nameplate
-capacity, prior-quarter average heat input and generation, local solar hour,
-and day of year. Sine and cosine encode both time features.
-
-Coordinates, AOI identity, current emissions, prior-quarter NOx, and target
-derivatives stay out of model inputs. Longitude only converts UTC to local
-solar hour.
-
-## Input normalization
-
-Training pixels define all raster statistics:
+Training loads the configured masked-model checkpoint before it builds the
+delta datasets. The checkpoint supplies the raster normalization statistics:
 
 | Channels | Center | Scale |
 |---|---|---|
 | NO2 | Median | `IQR / 1.349` |
 | Temperature and wind | Mean | Population standard deviation |
 
-The loader clips normalized numeric raster values to `[-8, 8]`. It fills an
-invalid numeric value with zero and supplies the independent validity mask.
-Validation and test data reuse the training statistics. The loader standardizes
-each tabular feature using its training mean and standard deviation.
+The loader normalizes values, clips them to `[-8, 8]`, fills numeric gaps with
+zero, and appends `no2_mask` for reconstruction. The masked autoencoder predicts
+NO2 at missing pixels and preserves observed values. Training materializes the
+completed physical channels as split-specific `.npy` files under job-local
+`/tmp`.
 
-## Model sizing
+The raster classifiers consume the completed arrays without a validity mask.
+Their input shape is `5 x 4 x 24 x 24`, and their NO2 stems use ordinary
+convolutions.
 
-The raster classifier has about 701,000 trainable parameters. A shared spatial
-encoder reduces each 24 by 24 frame to a 6 by 6 feature map. A 96-channel
-ConvGRU consumes the five maps in time order. Global average and maximum pools
-produce a 128-value embedding, followed by a 128-value regularized head and
-three output logits.
+The tabular loader fits means and standard deviations on the delta training
+split. Its ten inputs are major-city distance, coal and natural-gas unit counts,
+nameplate capacity, prior-quarter same-hour heat input and generation, plus sine
+and cosine encodings of local solar hour and day of year.
 
-The NO2 stem uses partial convolutions, which exclude missing cells and adjust
-for available kernel support. A conventional stem handles the complete weather
-rasters. GroupNorm avoids dependence on batch statistics.
+## Models
 
-The tabular MLP has about 1,000 parameters. It uses a 32-value hidden layer, a
-16-value embedding, and three output logits. It remains deliberately compact
-so it measures the information in scalar features rather than matching the
-raster model through excess capacity.
+### Tabular baseline
 
-At roughly 100,000 training examples, the raster model has about seven trainable
-parameters per record. This is moderate for a convolutional sequence model
-because spatial and temporal weights are shared. A 30% head dropout, weight
-decay, and validation early stopping further constrain capacity. Increasing the
-encoder size is not the first response to underfitting; first compare train and
-validation learning curves and per-class recall.
+The 1,027-parameter MLP uses a 32-value hidden layer, a 16-value embedding, and
+three output logits. It receives no raster data.
+
+### Raster classifiers
+
+Both 700,803-parameter raster models share one architecture. A frame encoder
+maps each completed image to a `64 x 6 x 6` feature map. A 96-channel ConvGRU
+processes the five maps in time order. Global average and maximum pooling feed a
+128-value projection and a 128-value classification head with three logits.
+
+The random-initialized model trains the full network from its seeded initial
+weights. The pretrained model copies the masked encoder's weather, fusion, and
+residual weights. It maps each partial-convolution NO2 kernel and bias to the
+matching ordinary convolution and discards the fixed mask-counting kernels.
+
+Both raster models use the same imputed arrays. Their comparison measures the
+combined effect of encoder initialization and the transfer fine-tuning schedule.
+The pretrained encoder stays frozen for the first two epochs, then trains at one
+tenth of the base learning rate. Other pretrained-model parameters use the base
+rate.
 
 ## Optimization
 
-Both models use unweighted cross-entropy because stratification balances the
-three target classes before raster quality filtering. Saved run metadata records
-the final class counts so any filtering-induced imbalance remains visible.
+All three models use unweighted cross-entropy. Stratification balances classes
+before raster quality control, and run metadata records the retained count for
+each class and split.
 
-Both models use AdamW, gradient clipping, mixed precision on CUDA, validation
-loss scheduling, and early stopping. The defaults allow 100 raster epochs and
-75 MLP epochs with 12 epochs of early-stop patience. These are ceilings rather
-than expected run lengths. A batch size of 128 provides about 780 optimizer
-steps per raster epoch for 100,000 training records.
+The trainer uses AdamW, gradient clipping, validation-loss scheduling, CUDA
+mixed precision, and early stopping. Defaults allow 100 raster epochs, 75 MLP
+epochs, and 12 epochs without validation improvement. The maintained Slurm
+launcher uses a batch size of 128, a raster learning rate of `3e-4`, 30% head
+dropout, and seed 42.
 
-Run on a compute node:
+Run the production workflow with:
 
 ```bash
-python -u -m modeling.train
+sbatch scripts/slurm/train_model.sh
 ```
 
-## Evaluation
+Direct module execution also requires `--completed-raster-dir` under `/tmp` and
+a valid `--pretrained-encoder-weights` path.
 
-Each split reports:
+## Evaluation and artifacts
 
-- accuracy and balanced accuracy;
-- macro F1 and one-vs-rest macro ROC AUC;
-- class counts and per-class recall;
-- the three-class confusion matrix.
+Each model reports accuracy, balanced accuracy, macro F1, one-vs-rest macro
+AUROC, class counts, per-class recall, and a three-class confusion matrix for
+train, validation, and test.
 
-The raster and MLP classifiers use the same splits. Model selection uses
-validation cross-entropy only. Test metrics remain reporting outputs. Saved
-prediction CSVs contain each class logit and probability, and the generated
-figures compare both models and show row-normalized test confusion matrices.
+The run directory contains:
+
+- best checkpoints for the MLP and both raster models;
+- `run_config.json`, normalization statistics, and loss histories;
+- row-level class logits and probabilities for each model and split;
+- loss curves, model-comparison plots, and row-normalized test confusion
+  matrices.
+
+The trainer selects checkpoints with validation cross-entropy. Test labels
+contribute only to the final reports.
