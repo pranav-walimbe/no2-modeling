@@ -3,6 +3,10 @@
 This pipeline builds a single-timestep dataset from TEMPO NO2 and aligned HRRR
 weather. Emissions values are neither labels nor inputs.
 
+See [`dataset_design.md`](dataset_design.md) for the sample, split, and masking
+contracts. See [`modeling.md`](modeling.md) for the reconstruction model and
+training pipeline.
+
 ## Data contract
 
 | Split | Target records |
@@ -54,8 +58,8 @@ with small clusters. Masked NO2 uses a finite zero fill; the artificial mask
 uses one for observed pixels and zero for masked pixels.
 
 The finalizer publishes dataset-root-relative paths in `train_df.csv`,
-`val_df.csv`, and `test_df.csv`. It reports a shortfall when a candidate pool is
-exhausted and never duplicates records.
+`val_df.csv`, and `test_df.csv`. It fails when discovery does not reach a split
+target and never duplicates records.
 
 ## Launch
 
