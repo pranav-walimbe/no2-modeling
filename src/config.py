@@ -103,7 +103,7 @@ MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applie
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
 PRETRAINED_ENCODER_WEIGHTS = os.getenv(  # masked-model checkpoint for delta transfer and gap filling
     "PRETRAINED_ENCODER_WEIGHTS",
-    "/global/home/users/pranavwalimbe/masked_model_runs/masked_no2_20260920_160456/checkpoints/best_masked_no2.pt",
+    "/global/home/users/pranavwalimbe/masked_model_runs/masked_no2_20260920_211751/checkpoints/best_masked_no2.pt",
 )
 SEQUENCE_TIMESTEPS = 5  # stored causal raster sequence length
 LABEL_TIMESTEP_INDEX = 3  # zero-based raster timestep ending the emissions label interval
