@@ -31,38 +31,33 @@ more pressure on the 64 by 6 by 6 encoder output. The full model has 394,209
 trainable parameters, including 243,680 in the encoder.
 
 ```mermaid
-flowchart LR
-    subgraph Inputs[Normalized 24 by 24 inputs]
-        NO2[Masked NO2<br/>1 channel]
-        Mask[Visibility mask<br/>1 channel]
-        Weather[Temperature and wind<br/>3 channels]
+flowchart TB
+    subgraph Inputs[Model inputs]
+        direction LR
+        NO2[Masked NO2 and<br/>visibility mask]
+        Weather[Temperature<br/>and wind]
     end
 
-    subgraph Stems[Separate input stems]
-        Partial[Two partial convolutions<br/>5 by 5, then 3 by 3<br/>16 channels]
-        WeatherStem[Weather convolution<br/>5 by 5<br/>16 channels]
+    subgraph Stems[Separate feature extraction]
+        direction LR
+        Partial[Mask-aware<br/>NO2 stem]
+        WeatherStem[Weather<br/>stem]
     end
 
     NO2 --> Partial
-    Mask -->|controls valid support| Partial
     Weather --> WeatherStem
-    Partial --> Join[Concatenate<br/>32 channels]
-    WeatherStem --> Join
-    Join --> Fuse[1 by 1 fusion<br/>32 by 24 by 24]
+    Partial --> Fuse[Fuse NO2 and weather features]
+    WeatherStem --> Fuse
+    Fuse --> Encoder[Residual spatial encoder<br/>24 by 24 to 6 by 6]
+    Encoder --> Bottleneck[Latent bottleneck]
+    Bottleneck --> Decoder[Residual upsampling decoder<br/>6 by 6 to 24 by 24]
+    Decoder --> Prediction[Predicted NO2]
+    Prediction --> Fill[Fill missing pixels]
+    NO2 -.->|preserve observed pixels| Fill
+    Fill --> Complete[Completed NO2 raster]
 
-    subgraph Encoder[Transferable frame encoder]
-        E24[Residual block<br/>32 by 24 by 24]
-        E12[Downsample and residual blocks<br/>48 by 12 by 12]
-        E6[Downsample and residual blocks<br/>64 by 6 by 6]
-        E24 --> E12 --> E6
-    end
-
-    Fuse --> E24
-    E6 --> Bottleneck[Residual bottleneck<br/>64 by 6 by 6]
-    Bottleneck --> Up12[Bilinear upsample and residual block<br/>48 by 12 by 12]
-    Up12 --> Up24[Bilinear upsample and residual block<br/>32 by 24 by 24]
-    Up24 --> Prediction[1 by 1 convolution<br/>predicted NO2]
-    Prediction --> Fill[Preserve observed pixels<br/>fill synthetic gaps]
+    classDef stage font-size:18px
+    class NO2,Weather,Partial,WeatherStem,Fuse,Encoder,Bottleneck,Decoder,Prediction,Fill,Complete stage
 ```
 
 ## Objective
