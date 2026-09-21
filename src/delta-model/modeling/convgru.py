@@ -1,6 +1,7 @@
 """Convolutional recurrent network for emissions-change classification."""
 
 import torch
+from modeling.mlp import TabularMLP
 from torch import nn
 from torch.nn import functional as F
 
@@ -170,3 +171,31 @@ class RasterConvGRUClassifier(nn.Module):
 
     def num_params(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
+
+
+class RasterTabularFusionClassifier(RasterConvGRUClassifier):
+    """Add raster evidence to a frozen tabular classifier's logits."""
+
+    def __init__(
+        self,
+        n_features: int,
+        tabular_state_dict: dict[str, torch.Tensor],
+        *,
+        head_dim: int = DEFAULT_HEAD_DIM,
+        dropout: float = DEFAULT_DROPOUT,
+    ) -> None:
+        super().__init__(head_dim=head_dim, dropout=dropout)
+        self.tabular_model = TabularMLP(n_features)
+        self.tabular_model.load_state_dict(tabular_state_dict)
+        self.tabular_model.requires_grad_(False)
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        tabular: torch.Tensor,
+        elapsed_hours: torch.Tensor,
+    ) -> torch.Tensor:
+        raster_logits = super().forward(image, tabular, elapsed_hours)
+        with torch.no_grad():
+            tabular_logits = self.tabular_model(image, tabular, elapsed_hours)
+        return raster_logits + tabular_logits

@@ -103,9 +103,15 @@ def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
 
 def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
     # Create leakage-safe numeric features in their documented order
-    columns: list[np.ndarray] = [
-        pd.to_numeric(frame[name], errors="coerce").to_numpy(dtype=np.float64) for name in MODEL_RAW_FEATURES
-    ]
+    columns: list[np.ndarray] = []
+    for name in MODEL_RAW_FEATURES:
+        if name == "num_units" and name not in frame:
+            values = pd.to_numeric(frame["num_coal_units"], errors="coerce") + pd.to_numeric(
+                frame["num_ng_units"], errors="coerce"
+            )
+        else:
+            values = pd.to_numeric(frame[name], errors="coerce")
+        columns.append(values.to_numpy(dtype=np.float64))
 
     for cyclic_feature in MODEL_CYCLIC_FEATURES:
         if cyclic_feature == "local_solar_hour":

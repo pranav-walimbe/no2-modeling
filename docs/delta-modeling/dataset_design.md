@@ -73,10 +73,10 @@ Each raster bundle stores five arrays with shape `5 x 24 x 24`:
 | `wind_u_80m_mps` | Geographic eastward HRRR wind |
 | `wind_v_80m_mps` | Geographic northward HRRR wind |
 
-The tabular classifier uses major-city distance, coal and natural-gas unit
-counts, nameplate capacity, prior-quarter same-hour heat input and generation,
-local solar hour, and day of year. Sine and cosine encode both time features,
-which yields ten scalar inputs.
+The tabular classifier uses major-city distance, total unit count, nameplate
+capacity, prior-quarter same-hour heat input and generation, local solar hour,
+and day of year. Sine and cosine encode both time features, which yields nine
+scalar inputs.
 
 AOI identity, coordinates, current emissions, and prior-quarter NOx stay out of
 the model inputs. Longitude contributes only to local solar hour.

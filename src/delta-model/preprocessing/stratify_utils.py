@@ -896,6 +896,7 @@ def aggregate_aoi_hours(
         facility_units.join(membership.lazy(), on="facilityId", how="inner")
         .group_by(AOI_ID_COL)
         .agg(
+            pl.len().cast(pl.UInt32).alias("num_units"),
             pl.col("is_coal").sum().cast(pl.UInt32).alias("num_coal_units"),
             pl.col("is_ng").sum().cast(pl.UInt32).alias("num_ng_units"),
         )
