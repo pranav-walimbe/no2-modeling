@@ -23,6 +23,7 @@ from config import (
     MODEL_MASK_KEYS,
     MODEL_RAW_FEATURES,
     MODEL_ROBUST_IMAGE_KEYS,
+    MODEL_TABULAR_FEATURES,
     MODEL_TARGET_COL,
     SEQUENCE_TIMESTEPS,
 )
@@ -47,7 +48,11 @@ def _model_feature_names() -> tuple[str, ...]:
     return tuple(names)
 
 
-MODEL_FEATURE_NAMES = _model_feature_names()
+AVAILABLE_MODEL_FEATURE_NAMES = _model_feature_names()
+unknown_features = set(MODEL_TABULAR_FEATURES).difference(AVAILABLE_MODEL_FEATURE_NAMES)
+if unknown_features:
+    raise ValueError(f"Unsupported configured model features: {sorted(unknown_features)}")
+MODEL_FEATURE_NAMES = tuple(MODEL_TABULAR_FEATURES)
 
 
 @dataclass(frozen=True)
@@ -125,7 +130,9 @@ def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
             angle = 2 * np.pi * (values - 1.0) / 365.25
         columns.extend((np.sin(angle), np.cos(angle)))
 
-    return np.column_stack(columns)
+    full_matrix = np.column_stack(columns)
+    feature_indices = [AVAILABLE_MODEL_FEATURE_NAMES.index(name) for name in MODEL_FEATURE_NAMES]
+    return full_matrix[:, feature_indices]
 
 
 def _raster_path(serialized_path: object, dataset_dir: Path) -> Path:

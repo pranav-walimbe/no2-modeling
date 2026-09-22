@@ -125,6 +125,12 @@ MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular a
     "avg_pwr_gen",
 )
 MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to sine and cosine
+MODEL_TABULAR_FEATURES = (  # selected model inputs after raw and cyclic features are derived
+    "local_solar_hour_sin",
+    "local_solar_hour_cos",
+    "day_of_year_sin",
+    "day_of_year_cos",
+)
 
 # ============================================================================
 # Masked pretraining

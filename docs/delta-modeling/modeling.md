@@ -49,6 +49,11 @@ encodings of local solar hour and day of year. Modeling derives total unit count
 by adding the stored coal and natural-gas counts without changing the generated
 dataset.
 
+`MODEL_TABULAR_FEATURES` in `src/config.py` selects the inputs after modeling
+derives all raw and cyclic columns. The current experiment retains
+`local_solar_hour_sin`, `local_solar_hour_cos`, `day_of_year_sin`, and
+`day_of_year_cos`. The MLP and both frozen fusion branches use that same list.
+
 ## Models
 
 ### Tabular baseline
