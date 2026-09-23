@@ -36,46 +36,6 @@ POPULATED_PLACES_PATH = Path(
 )
 
 
-def select_split_records(
-    frame: pl.DataFrame,
-    split: str,
-    target_records: int,
-    *,
-    seed: int,
-) -> pl.DataFrame:
-    """Prune the highest NOx masses and select a deterministic random sample.
-
-    Args:
-        frame: Eligible records carrying aggregate NOx mass.
-        split: Split name used in progress and error messages.
-        target_records: Maximum number of records to return.
-        seed: Deterministic record-ordering seed.
-
-    Returns:
-        Selected records in AOI and emissions-time order.
-    """
-    if target_records <= 0:
-        raise ValueError("target_records must be positive")
-
-    finite = frame.filter(pl.col(NOX_COL).is_finite())
-    if finite.is_empty():
-        raise ValueError(f"[{split}] no records have finite NOx mass")
-    upper_bound = finite.select(pl.col(NOX_COL).quantile(0.95, interpolation="linear")).item()
-    pruned = finite.filter(pl.col(NOX_COL) <= upper_bound)
-    selected = (
-        pruned.with_columns(pl.struct(AOI_ID_COL, "emissions_hour_utc").hash(seed=seed).alias("_selection_tie_breaker"))
-        .sort("_selection_tie_breaker", AOI_ID_COL, "emissions_hour_utc")
-        .head(target_records)
-        .drop("_selection_tie_breaker")
-        .sort(AOI_ID_COL, "emissions_hour_utc")
-    )
-    print(
-        f"[{split}] NOx mass P95={upper_bound:.6g}; retained {pruned.height:,}/{finite.height:,} "
-        f"after pruning the upper 5%; randomly selected {selected.height:,} records"
-    )
-    return selected
-
-
 def load_major_cities(path: Path = POPULATED_PLACES_PATH) -> pl.DataFrame:
     """Load centroids of populated places meeting the major-city population threshold.
 
