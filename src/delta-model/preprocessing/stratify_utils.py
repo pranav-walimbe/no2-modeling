@@ -21,7 +21,6 @@ from config import (
 )
 
 AOI_ID_COL = "aoi_id"
-AVG_COAL_NOX_COL = "avg_coal_nox"
 MAJOR_CITY_DIST_COL = "major_city_dist"
 LABEL_MODE_COL = "label_mode"
 EFFECTIVE_CURRENT_NOX_COL = "effective_current_nox"
@@ -155,8 +154,6 @@ def add_sequence_weather_paths(frame: pl.DataFrame, timesteps: int = SEQUENCE_TI
     Returns:
         Records with one weather path column per timestep.
     """
-    if timesteps <= 0:
-        raise ValueError("timesteps must be positive")
     expressions = []
     for index in range(timesteps):
         matched_time = (pl.col(f"timestep_time_t{index}") + pl.duration(minutes=30)).dt.truncate("1h")
@@ -186,11 +183,7 @@ def add_tempo_sequences(
     Returns:
         Rows carrying oldest-to-newest scan timestamps, ages, and paths.
     """
-    if timesteps < 2:
-        raise ValueError("timesteps must be at least two")
     label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
-    if not 1 <= label_index < timesteps:
-        raise ValueError("label_timestep_index must select the second or a later timestep")
     time_columns = [f"timestep_time_t{index}" for index in range(timesteps)]
     path_columns = [f"no2_paths_t{index}" for index in range(timesteps)]
     age_columns = [f"timestep_age_hours_t{index}" for index in range(timesteps)]
@@ -372,13 +365,9 @@ def add_ema_targets(
     Returns:
         Records with continuous EMA targets and complete audit components.
     """
-    if timesteps <= 0:
-        raise ValueError("timesteps must be positive")
     if decay_timescale_hours <= 0:
         raise ValueError("decay_timescale_hours must be positive")
     label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
-    if label_index < 1:
-        raise ValueError("label_timestep_index must select the second or a later timestep")
     indexed = frame.with_row_index("_label_row")
     current = _scan_ema(
         indexed,
@@ -542,12 +531,12 @@ def calculate_activity_conditioned_aoi_features(
     )
     activity_features = (
         selected_hours.group_by(AOI_ID_COL)
-        .agg(pl.col("_coal_nox_mass").mean().alias(AVG_COAL_NOX_COL))
+        .agg(pl.col("_coal_nox_mass").mean().alias("avg_coal_nox"))
         .join(selected_record_averages, on=AOI_ID_COL, how="inner")
     )
     return (
         unit_counts.join(activity_features, on=AOI_ID_COL, how="inner")
-        .filter(pl.col(AVG_COAL_NOX_COL).is_finite())
+        .filter(pl.col("avg_coal_nox").is_finite())
         .collect(engine="streaming")
     )
 
@@ -562,15 +551,11 @@ def select_top_coal_aois(aoi_features: pl.DataFrame, fraction: float) -> pl.Data
     Returns:
         Deterministically ranked and selected AOI feature rows.
     """
-    if not 0 < fraction <= 1:
-        raise ValueError("fraction must be in the interval (0, 1]")
     ranked = aoi_features.filter(pl.col("num_coal_units") > 0).sort(
-        AVG_COAL_NOX_COL,
+        "avg_coal_nox",
         AOI_ID_COL,
         descending=[True, False],
     )
-    if ranked.is_empty():
-        raise ValueError("no coal-containing AOIs have finite activity-conditioned features")
     selected_count = math.ceil(ranked.height * fraction)
     return ranked.with_row_index("coal_nox_rank", offset=1).head(selected_count)
 

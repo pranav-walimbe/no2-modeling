@@ -9,7 +9,6 @@ import numpy as np
 import polars as pl
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
-    AVG_COAL_NOX_COL,
     DELTA_NOX_COL,
     EFFECTIVE_CURRENT_NOX_COL,
     LABEL_MODE_COL,
@@ -86,7 +85,7 @@ OUTPUT_COLUMNS = [
     "coverage_percent",
     "avg_heat_input",
     "avg_pwr_gen",
-    AVG_COAL_NOX_COL,
+    "avg_coal_nox",
     NOX_COL,
     DELTA_NOX_COL,
     EFFECTIVE_CURRENT_NOX_COL,
@@ -227,7 +226,7 @@ def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     # Apply non-raster candidate quality requirements
     return frame.filter(
         (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT)
-        & pl.col(AVG_COAL_NOX_COL).is_finite()
+        & pl.col("avg_coal_nox").is_finite()
         & pl.col("avg_heat_input").is_finite()
         & pl.col("avg_pwr_gen").is_finite()
         & pl.col(MAJOR_CITY_DIST_COL).is_finite()
@@ -402,7 +401,7 @@ def build_stratification_candidates() -> pl.DataFrame:
     observations = load_tempo_mapping()
     print(
         f"Selected {aois.height:,}/{aoi_features.filter(pl.col('num_coal_units') > 0).height:,} "
-        f"coal-containing AOIs by {AVG_COAL_NOX_COL}"
+        "coal-containing AOIs by avg_coal_nox"
     )
     invalid_aoi_hours = (
         raw_records.filter(~usable_nox_measurement_expr() | ~pl.col("noxMass").is_finite())
