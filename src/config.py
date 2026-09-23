@@ -130,10 +130,6 @@ MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to s
 # Masked pretraining
 # ============================================================================
 MASKED_PRETRAINING_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/masked_pretraining"
-MASKED_PRETRAINING_VALIDITY_CACHE_DIR = os.path.join(  # legacy raster cache consumed by the migration command
-    MASKED_PRETRAINING_BASE_DIR,
-    "validity-cache",
-)
 MASKED_PRETRAINING_VALIDITY_INDEX = os.path.join(MASKED_PRETRAINING_BASE_DIR, "validity-index.parquet")
 MASKED_PRETRAINING_VALIDITY_UPDATES_DIR = os.path.join(MASKED_PRETRAINING_BASE_DIR, "validity-updates")
 MASKED_PRETRAINING_WORK_DIR = os.path.join(MASKED_PRETRAINING_BASE_DIR, "work")

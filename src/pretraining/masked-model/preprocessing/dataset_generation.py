@@ -15,7 +15,6 @@ import polars as pl
 from dataset_generation_utils import (
     CANDIDATE_SCHEMA,
     FINAL_RECORD_SCHEMA,
-    INVALID_STATUS,
     RETRYABLE_STATUS,
     VALID_STATUS,
     VALIDITY_INDEX_SCHEMA,
@@ -24,6 +23,8 @@ from dataset_generation_utils import (
     candidate_cache_tasks,
     discover_candidate_batch,
     empty_final_records,
+    empty_validity_index,
+    indexed_candidate_outcome,
     merge_validity_frames,
     validity_lookup,
     write_csv_atomic,
@@ -78,6 +79,11 @@ BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_masked_pretrain
 def parse_args() -> argparse.Namespace:
     """Parse launcher and worker options."""
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="clear the persistent validity index before this run",
+    )
     parser.add_argument("--num-shards", type=int, default=MASKED_PRETRAINING_NUM_SHARDS)
     parser.add_argument("--workers-per-shard", type=int, default=MASKED_PRETRAINING_WORKERS_PER_SHARD)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -233,11 +239,9 @@ def _write_candidate_manifests(run_id: str, shard_count: int) -> None:
 
 def _load_persistent_validity_index() -> pl.DataFrame:
     index_path = Path(MASKED_PRETRAINING_VALIDITY_INDEX)
-    if not index_path.is_file():
-        raise FileNotFoundError(
-            f"Missing {index_path}. Run migrate_validity_cache.py before launching dataset generation."
-        )
-    frames = [pl.read_parquet(index_path).cast(VALIDITY_INDEX_SCHEMA)]
+    frames = []
+    if index_path.is_file():
+        frames.append(pl.read_parquet(index_path).cast(VALIDITY_INDEX_SCHEMA))
     update_root = Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR)
     frames.extend(pl.read_parquet(path) for path in sorted(update_root.glob("*/*/*.parquet")))
     return merge_validity_frames(frames)
@@ -262,10 +266,6 @@ def _launch(args: argparse.Namespace) -> None:
         raise ValueError("Launch masked-pretraining generation from a login node")
     if not BATCH_SCRIPT.is_file():
         raise FileNotFoundError(BATCH_SCRIPT)
-    if not Path(MASKED_PRETRAINING_VALIDITY_INDEX).is_file():
-        raise FileNotFoundError(
-            f"Missing {MASKED_PRETRAINING_VALIDITY_INDEX}. Complete the validity-cache migration before launching."
-        )
     active_jobs = subprocess.run(
         [
             "squeue",
@@ -294,6 +294,9 @@ def _launch(args: argparse.Namespace) -> None:
         "--batch-size",
         str(args.batch_size),
     ]
+    prepare_arguments = [*script_arguments]
+    if args.clear_cache:
+        prepare_arguments.append("--clear-cache")
     prepare_job = _submit(
         [
             f"--cpus-per-task={args.workers_per_shard}",
@@ -301,7 +304,7 @@ def _launch(args: argparse.Namespace) -> None:
             "--job-name=masked-data-prepare",
             f"--export=ALL,{STAGE_ENV}=prepare",
         ],
-        script_arguments,
+        prepare_arguments,
     )
     discovery_job = _submit(
         [
@@ -337,8 +340,14 @@ def _run_prepare(args: argparse.Namespace) -> None:
     if args.run_id is None:
         raise ValueError("Prepare requires --run-id")
     started = time.monotonic()
-    index = _load_persistent_validity_index()
     base = Path(MASKED_PRETRAINING_BASE_DIR)
+    base.mkdir(parents=True, exist_ok=True)
+    if args.clear_cache:
+        Path(MASKED_PRETRAINING_VALIDITY_INDEX).unlink(missing_ok=True)
+        _safe_reset(Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR), base)
+        index = empty_validity_index()
+    else:
+        index = _load_persistent_validity_index()
     _safe_reset(Path(MASKED_PRETRAINING_WORK_DIR), base)
     _safe_reset(Path(MASKED_PRETRAINING_SHARD_DIR), base)
     _safe_reset(Path(MASKED_PRETRAINING_DF_DIR), base)
@@ -354,28 +363,6 @@ def _run_prepare(args: argparse.Namespace) -> None:
         work_dir / "run.json",
     )
     print(f"[{_timestamp()}] preparation finished in {time.monotonic() - started:.1f}s")
-
-
-def _indexed_outcome(
-    row: dict[str, object],
-    cache_key: str,
-    indexed: dict[str, object],
-) -> CandidateOutcome:
-    status = str(indexed["status"])
-    if status not in {VALID_STATUS, INVALID_STATUS}:
-        raise ValueError(f"Unsupported validity-index status for {cache_key}: {status}")
-    tempo_path = indexed.get("tempo_cache_path")
-    weather_path = indexed.get("weather_cache_path")
-    if status == VALID_STATUS and (not tempo_path or not weather_path):
-        raise ValueError(f"Valid index entry lacks source cache paths: {cache_key}")
-    return CandidateOutcome(
-        status,
-        row,
-        cache_key,
-        tempo_cache_path=str(tempo_path) if tempo_path else None,
-        weather_cache_path=str(weather_path) if weather_path else None,
-        reason=str(indexed["reason"]) if indexed.get("reason") else None,
-    )
 
 
 def _run_discovery_split(
@@ -419,7 +406,7 @@ def _run_discovery_split(
                     unknown.append(row)
                     cache_misses += 1
                 else:
-                    resolved[scan.cache_key] = _indexed_outcome(row, scan.cache_key, indexed)
+                    resolved[scan.cache_key] = indexed_candidate_outcome(row, scan.cache_key, indexed)
                     index_hits += 1
 
             if unknown:

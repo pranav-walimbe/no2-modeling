@@ -30,17 +30,9 @@ raster arrays:
 - invalid rows store terminal coverage failures;
 - retryable source and weather errors are not persisted.
 
-Run the standalone migration once before using the redesigned generator:
-
-```bash
-sbatch scripts/slurm/migrate_masked_pretraining_validity_cache.sh
-```
-
-After inspecting the published `validity-index.parquet`, rerun the migration
-with `--overwrite --delete-legacy-files` to remove the redundant legacy NPZ and
-JSON files. Deletion occurs only after every valid entry resolves to existing
-TEMPO and weather cache files and the new index is atomically published.
-The generation launcher refuses to submit jobs until this index exists.
+The generator starts with an empty index when none exists and publishes newly
+classified outcomes during finalization. Pass `--clear-cache` to discard the
+existing validity index and rebuild it during the next generation run.
 
 ## Shards and finalization
 
@@ -80,6 +72,6 @@ export PYTHONPATH="$PWD/src:$PWD/src/delta-model"
 python -u src/pretraining/masked-model/preprocessing/dataset_generation.py
 ```
 
-Use `--num-shards`, `--workers-per-shard`, and `--batch-size` to change resource
-limits. The jobs run through
-`scripts/slurm/generate_masked_pretraining_dataset.sh`.
+Use `--clear-cache` to rebuild validity entries. Use `--num-shards`,
+`--workers-per-shard`, and `--batch-size` to change resource limits. The jobs
+run through `scripts/slurm/generate_masked_pretraining_dataset.sh`.

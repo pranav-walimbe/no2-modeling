@@ -235,6 +235,38 @@ def validity_lookup(frame: pl.DataFrame) -> dict[str, dict[str, object]]:
     return {str(row["cache_key"]): row for row in frame.iter_rows(named=True)}
 
 
+def indexed_candidate_outcome(
+    row: dict[str, object],
+    cache_key: str,
+    indexed: dict[str, object],
+) -> CandidateOutcome:
+    """Build a candidate outcome from one validity-index row.
+
+    Args:
+        row: Candidate metadata.
+        cache_key: Stable candidate cache key.
+        indexed: Stored validity-index values.
+
+    Returns:
+        Validated candidate outcome.
+    """
+    status = str(indexed["status"])
+    if status not in {VALID_STATUS, INVALID_STATUS}:
+        raise ValueError(f"Unsupported validity-index status for {cache_key}: {status}")
+    tempo_path = indexed.get("tempo_cache_path")
+    weather_path = indexed.get("weather_cache_path")
+    if status == VALID_STATUS and (not tempo_path or not weather_path):
+        raise ValueError(f"Valid index entry lacks source cache paths: {cache_key}")
+    return CandidateOutcome(
+        status,
+        row,
+        cache_key,
+        tempo_cache_path=str(tempo_path) if tempo_path else None,
+        weather_cache_path=str(weather_path) if weather_path else None,
+        reason=str(indexed["reason"]) if indexed.get("reason") else None,
+    )
+
+
 def candidate_cache_tasks(
     row: dict[str, object],
     *,
