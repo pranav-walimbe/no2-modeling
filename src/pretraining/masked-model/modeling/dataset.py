@@ -21,10 +21,12 @@ from config import (
     MODEL_ROBUST_IMAGE_KEYS,
 )
 
+from .masking import synthetic_visible_mask
+
 RASTER_PATH_COL = "raster_bundle_path"
+CACHE_KEY_COL = "cache_key"
 MASKED_IMAGE_KEYS = MODEL_IMAGE_KEYS
 ORIGINAL_MASK_KEY = "no2_mask"
-ARTIFICIAL_MASK_KEY = "artificial_mask"
 MIN_SCALE = 1e-12
 ROBUST_STD_NORMALIZER = 1.349
 
@@ -174,11 +176,14 @@ class MaskedNO2Dataset(Dataset):
         *,
         dataset_dir: str | Path = MASKED_PRETRAINING_BASE_DIR,
         dataframe_dir: str | Path = MASKED_PRETRAINING_DF_DIR,
+        seed: int = 42,
     ) -> None:
         self.dataset_dir = Path(dataset_dir)
         self.frame = pd.read_csv(Path(dataframe_dir) / f"{split}_df.csv")
         self.stats = stats if isinstance(stats, MaskedNormalizationStats) else MaskedNormalizationStats.from_dict(stats)
         self.raster_paths = self.frame[RASTER_PATH_COL].to_numpy(dtype=str)
+        self.cache_keys = self.frame[CACHE_KEY_COL].to_numpy(dtype=str)
+        self.seed = seed
 
     def __len__(self) -> int:
         return len(self.raster_paths)
@@ -189,7 +194,8 @@ class MaskedNO2Dataset(Dataset):
         with np.load(path, allow_pickle=False) as bundle:
             rasters = np.stack([np.asarray(bundle[name], dtype=np.float32) for name in MASKED_IMAGE_KEYS])
             original_valid = np.asarray(bundle[ORIGINAL_MASK_KEY], dtype=bool)
-            artificial_visible = np.asarray(bundle[ARTIFICIAL_MASK_KEY], dtype=bool)
+
+        artificial_visible = synthetic_visible_mask(original_valid.shape, self.cache_keys[index], self.seed)
 
         center = np.asarray(self.stats.image_center, dtype=np.float32)[:, None, None]
         scale = np.asarray(self.stats.image_scale, dtype=np.float32)[:, None, None]

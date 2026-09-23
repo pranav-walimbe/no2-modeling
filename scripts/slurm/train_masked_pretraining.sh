@@ -29,7 +29,20 @@ mkdir -p "${MPLCONFIGDIR}"
 
 export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
-training_output="${SLURM_TMPDIR:-/tmp}/train-masked-no2-${SLURM_JOB_ID}.log"
+shared_dataset_dir="/global/scratch/projects/fc_nitrates/ddp/nox/masked_pretraining"
+node_dataset_dir="/tmp/masked-pretraining-${SLURM_JOB_ID:?SLURM_JOB_ID is not set}"
+mkdir -p "${node_dataset_dir}"
+if [[ ! -w "${node_dataset_dir}" ]]; then
+    echo "Job-local storage is not writable: ${node_dataset_dir}" >&2
+    exit 1
+fi
+echo "Staging masked-pretraining dataset into ${node_dataset_dir}"
+cp -a "${shared_dataset_dir}/dataframes" "${node_dataset_dir}/dataframes"
+cp -a "${shared_dataset_dir}/shards" "${node_dataset_dir}/shards"
+echo "Dataset staging completed"
+df -h "${node_dataset_dir}"
+
+training_output="${node_dataset_dir}/train-masked-no2-${SLURM_JOB_ID}.log"
 recipient="pranav.walimbe@berkeley.edu"
 
 srun python -u -m modeling.train \
@@ -45,6 +58,8 @@ srun python -u -m modeling.train \
     --scheduler-patience 10 \
     --scheduler-factor 0.50 \
     --early-stop-patience 25 \
+    --dataset-dir "${node_dataset_dir}" \
+    --dataframe-dir "${node_dataset_dir}/dataframes" \
     --runs-dir /global/home/users/pranavwalimbe/masked_model_runs/ \
     | tee "${training_output}"
 echo "Training command completed; locating result artifacts"

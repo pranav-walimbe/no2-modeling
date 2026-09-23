@@ -33,24 +33,6 @@ from config import IMG_SIZE
 VALID_STATUS = "valid"
 INVALID_STATUS = "invalid"
 RETRYABLE_STATUS = "retryable"
-MASKED_NO2_RASTER_NAME = "masked_no2"
-ARTIFICIAL_MASK_NAME = "artificial_mask"
-MIN_MASK_FRACTION = 0.01
-MAX_MASK_FRACTION = 0.10
-MASK_EDGE_STRENGTH = 2.0
-MASK_EDGE_DECAY_PIXELS = 2.0
-MASK_CLUMP_STRENGTH = 0.35
-MASK_CLUMP_SIGMA_PIXELS = 1.0
-MASK_MAX_CLUMP_MULTIPLIER = 2.0
-
-_MASK_ROWS, _MASK_COLUMNS = np.indices((IMG_SIZE, IMG_SIZE))
-_MASK_EDGE_DISTANCE = np.minimum.reduce(
-    (_MASK_ROWS, _MASK_COLUMNS, IMG_SIZE - 1 - _MASK_ROWS, IMG_SIZE - 1 - _MASK_COLUMNS)
-)
-_MASK_BASE_WEIGHTS = 1.0 + MASK_EDGE_STRENGTH * np.exp(-_MASK_EDGE_DISTANCE / MASK_EDGE_DECAY_PIXELS)
-_MASK_COORDINATES = np.column_stack((_MASK_ROWS.ravel(), _MASK_COLUMNS.ravel()))
-_MASK_PAIRWISE_SQUARED_DISTANCE = ((_MASK_COORDINATES[:, None] - _MASK_COORDINATES[None, :]) ** 2).sum(axis=2)
-_MASK_CLUMP_KERNELS = np.exp(-_MASK_PAIRWISE_SQUARED_DISTANCE / (2.0 * MASK_CLUMP_SIGMA_PIXELS**2))
 
 CANDIDATE_SCHEMA = {
     "candidate_index": pl.UInt64,
@@ -108,15 +90,14 @@ class CandidateOutcome:
 
 
 @dataclass(frozen=True)
-class MaskedRecordTask:
-    """One masked raster bundle to assemble from source caches."""
+class PretrainingRecordTask:
+    """One pretraining raster bundle to assemble from source caches."""
 
     row: dict[str, object]
     cache_key: str
     tempo_cache_path: str
     weather_cache_path: str
     output_path: str
-    mask_seed: int
 
 
 def write_parquet_atomic(frame: pl.DataFrame, destination: Path) -> None:
@@ -438,64 +419,17 @@ def load_clean_raster_bundle(tempo_cache_path: str, weather_cache_path: str) -> 
     return arrays
 
 
-def mask_no2_raster(
-    no2: np.ndarray,
-    mask_fraction: float,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Create masked NO2 and its observed-pixel mask.
+def write_pretraining_record(task: PretrainingRecordTask) -> dict[str, object]:
+    """Write one pretraining bundle from indexed source caches.
 
     Args:
-        no2: Complete NO2 raster.
-        mask_fraction: Fraction of raster pixels to mask.
-        rng: Random generator for mask sampling.
-
-    Returns:
-        Masked NO2 and a binary mask where one marks observed pixels.
-    """
-    masked_pixels = np.zeros((IMG_SIZE, IMG_SIZE), dtype=bool)
-    clump_influence = np.zeros(IMG_SIZE * IMG_SIZE, dtype=np.float64)
-    masked_pixel_count = round(mask_fraction * masked_pixels.size)
-
-    for _ in range(masked_pixel_count):
-        clump_multiplier = np.minimum(
-            1.0 + MASK_CLUMP_STRENGTH * clump_influence,
-            MASK_MAX_CLUMP_MULTIPLIER,
-        )
-        weights = _MASK_BASE_WEIGHTS.ravel() * clump_multiplier
-        weights[masked_pixels.ravel()] = 0.0
-        selected_pixel = int(rng.choice(masked_pixels.size, p=weights / weights.sum()))
-        masked_pixels.ravel()[selected_pixel] = True
-        clump_influence += _MASK_CLUMP_KERNELS[selected_pixel]
-
-    masked_no2 = no2.copy()
-    masked_no2[masked_pixels] = 0.0
-    observed_mask = (~masked_pixels).astype(np.uint8)
-    return masked_no2, observed_mask
-
-
-def write_masked_record(task: MaskedRecordTask) -> dict[str, object]:
-    """Write one masked output bundle from indexed source caches.
-
-    Args:
-        task: Source cache paths, output metadata, and mask seed.
+        task: Source cache paths and output metadata.
 
     Returns:
         Published manifest row.
     """
     arrays = load_clean_raster_bundle(task.tempo_cache_path, task.weather_cache_path)
-    no2 = np.asarray(arrays[NO2_RASTER_NAME], dtype=np.float32)
-    rng = np.random.default_rng(task.mask_seed)
-    mask_fraction = rng.uniform(MIN_MASK_FRACTION, MAX_MASK_FRACTION)
-    masked_no2, artificial_mask = mask_no2_raster(no2, mask_fraction, rng)
-    write_npz_atomic(
-        Path(task.output_path),
-        **arrays,
-        **{
-            MASKED_NO2_RASTER_NAME: np.asarray(masked_no2, dtype=np.float32),
-            ARTIFICIAL_MASK_NAME: np.asarray(artificial_mask, dtype=np.uint8),
-        },
-    )
+    write_npz_atomic(Path(task.output_path), **arrays)
     row = task.row
     return {
         "candidate_index": int(row["candidate_index"]),

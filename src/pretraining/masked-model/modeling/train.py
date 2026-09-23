@@ -13,6 +13,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from config import (
+    MASKED_PRETRAINING_BASE_DIR,
     MASKED_PRETRAINING_DF_DIR,
     MODEL_IMAGE_CLIP_ABS,
     MODEL_INPUT_CHANNELS,
@@ -21,6 +22,13 @@ from config import (
 
 from .dataset import MASKED_IMAGE_KEYS, MaskedNO2Dataset, compute_stats, save_stats
 from .eval_utils import evaluate_reconstruction, save_results
+from .masking import (
+    EDGE_DECAY_PIXELS,
+    EDGE_WEIGHT_FLOOR,
+    FRONTIER_SELECTION_PROBABILITY,
+    MAX_MASK_FRACTION,
+    MIN_MASK_FRACTION,
+)
 from .model import ARCHITECTURE_NAME, MaskedNO2Autoencoder, masked_l1_loss
 from .plot_utils import plot_loss_curve, plot_results
 
@@ -51,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
     parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
+    parser.add_argument("--dataset-dir", default=MASKED_PRETRAINING_BASE_DIR)
+    parser.add_argument("--dataframe-dir", default=MASKED_PRETRAINING_DF_DIR)
     parser.add_argument("--runs-dir", required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     return parser.parse_args()
@@ -225,15 +235,24 @@ def main() -> None:
     args = parse_args()
     _seed_everything(args.seed)
     device = _device(args.device)
-    manifest_hash = _manifest_hash()
-    stats = compute_stats()
+    manifest_hash = _manifest_hash(args.dataframe_dir)
+    stats = compute_stats(dataset_dir=args.dataset_dir, dataframe_dir=args.dataframe_dir)
     run_name = datetime.now(timezone.utc).strftime("masked_no2_%Y%m%d_%H%M%S")
     run_dir = Path(args.runs_dir) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
     save_stats(stats, run_dir / "normalization_stats.json")
 
-    datasets = {split: MaskedNO2Dataset(split, stats) for split in ("train", "val", "test")}
+    datasets = {
+        split: MaskedNO2Dataset(
+            split,
+            stats,
+            dataset_dir=args.dataset_dir,
+            dataframe_dir=args.dataframe_dir,
+            seed=args.seed,
+        )
+        for split in ("train", "val", "test")
+    }
     train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
     eval_loaders = {
         split: _loader(dataset, shuffle=False, args=args, device=device)
@@ -247,6 +266,15 @@ def main() -> None:
         "input_channels": MODEL_INPUT_CHANNELS,
         "image_keys": MASKED_IMAGE_KEYS,
         "normalization_stats": stats.to_dict(),
+        "synthetic_masking": {
+            "strategy": "edge_biased_frontier_growth",
+            "minimum_fraction": MIN_MASK_FRACTION,
+            "maximum_fraction": MAX_MASK_FRACTION,
+            "frontier_selection_probability": FRONTIER_SELECTION_PROBABILITY,
+            "edge_decay_pixels": EDGE_DECAY_PIXELS,
+            "edge_weight_floor": EDGE_WEIGHT_FLOOR,
+            "seed": args.seed,
+        },
         "training_data_manifest_sha256": manifest_hash,
     }
     train_losses, validation_losses, best_validation_loss = fit_model(
@@ -289,6 +317,7 @@ def main() -> None:
         "image_center": list(stats.image_center),
         "image_scale": list(stats.image_scale),
         "image_clip_range": [-MODEL_IMAGE_CLIP_ABS, MODEL_IMAGE_CLIP_ABS],
+        "synthetic_masking": checkpoint_metadata["synthetic_masking"],
         "model_parameters": model.num_params(),
         "encoder_parameters": model.encoder.num_params(),
         "best_validation_loss": best_validation_loss,
