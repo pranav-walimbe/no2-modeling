@@ -1,10 +1,14 @@
-"""Build the AOI-disjoint masked-pretraining raster dataset on Savio."""
+"""Build masked-pretraining rasters with locality-aware discovery shards."""
+
+from __future__ import annotations
 
 import argparse
 import os
 import shutil
 import subprocess
-from collections.abc import Iterator
+import time
+from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import polars as pl
@@ -12,20 +16,21 @@ from dataset_generation_utils import (
     CANDIDATE_SCHEMA,
     FINAL_RECORD_SCHEMA,
     INVALID_STATUS,
-    VALID_RECORD_SCHEMA,
+    RETRYABLE_STATUS,
     VALID_STATUS,
-    MaskedDatasetShardStore,
+    VALIDITY_INDEX_SCHEMA,
+    CandidateOutcome,
     MaskedRecordTask,
-    PretrainingShardTask,
-    bounded_parallel_map,
-    build_shard_tasks,
-    materialize_masked_record,
-    process_candidate_batch,
+    candidate_cache_tasks,
+    discover_candidate_batch,
+    empty_final_records,
+    merge_validity_frames,
+    validity_lookup,
     write_csv_atomic,
     write_json_atomic,
+    write_masked_record,
     write_parquet_atomic,
 )
-from preprocessing.generate_dataset_utils import make_scan_task
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
     add_sequence_weather_paths,
@@ -42,14 +47,14 @@ from config import (
     HRRR_DIR,
     MASKED_PRETRAINING_BASE_DIR,
     MASKED_PRETRAINING_DF_DIR,
-    MASKED_PRETRAINING_MAX_PARALLEL_SHARDS,
+    MASKED_PRETRAINING_NUM_SHARDS,
     MASKED_PRETRAINING_SHARD_DIR,
-    MASKED_PRETRAINING_SHARD_SIZE,
     MASKED_PRETRAINING_SPLIT_SEED,
     MASKED_PRETRAINING_TEST_RECORDS,
     MASKED_PRETRAINING_TRAIN_RECORDS,
     MASKED_PRETRAINING_VAL_RECORDS,
-    MASKED_PRETRAINING_VALIDITY_CACHE_DIR,
+    MASKED_PRETRAINING_VALIDITY_INDEX,
+    MASKED_PRETRAINING_VALIDITY_UPDATES_DIR,
     MASKED_PRETRAINING_WORK_DIR,
     MASKED_PRETRAINING_WORKERS_PER_SHARD,
     TEMPO_AOI_MAPPING,
@@ -65,40 +70,62 @@ STAGE_ENV = "MASKED_PRETRAINING_STAGE"
 DEFAULT_BATCH_SIZE = 64
 PROGRESS_INTERVAL = 1_000
 DISCOVERY_TIME_LIMIT = "24:00:00"
-CACHE_INVENTORY_SCHEMA = {"cache_key": pl.String, "status": pl.String}
-CACHE_INVENTORY_FILE = "validity-cache-inventory.parquet"
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_masked_pretraining_dataset.sh"
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse launcher and worker options.
-
-    Returns:
-        Parsed command-line options.
-    """
+    """Parse launcher and worker options."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--clear-cache",
-        "--refresh-cache",
-        dest="clear_cache",
-        action="store_true",
-        help="clear persistent positive and negative validity-cache entries before this run",
-    )
-    parser.add_argument(
-        "--shard-size",
-        type=int,
-        default=MASKED_PRETRAINING_SHARD_SIZE,
-        help="maximum selected records stored in each disposable dataset shard",
-    )
-    parser.add_argument("--max-parallel-shards", type=int, default=MASKED_PRETRAINING_MAX_PARALLEL_SHARDS)
+    parser.add_argument("--num-shards", type=int, default=MASKED_PRETRAINING_NUM_SHARDS)
     parser.add_argument("--workers-per-shard", type=int, default=MASKED_PRETRAINING_WORKERS_PER_SHARD)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--run-id")
     args = parser.parse_args()
-    if args.max_parallel_shards < 1:
-        parser.error("--max-parallel-shards must be positive")
+    if args.num_shards < 1 or args.workers_per_shard < 1 or args.batch_size < 1:
+        parser.error("shard, worker, and batch counts must be positive")
+    if args.run_id is not None and (Path(args.run_id).name != args.run_id or args.run_id in {".", ".."}):
+        parser.error("--run-id must be one path-safe name")
     return args
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _run_work_dir(run_id: str) -> Path:
+    return Path(MASKED_PRETRAINING_WORK_DIR) / run_id
+
+
+def _run_shard_dir(run_id: str) -> Path:
+    return Path(MASKED_PRETRAINING_SHARD_DIR) / run_id
+
+
+def _candidate_path(run_id: str, split: str, shard_id: int) -> Path:
+    return _run_work_dir(run_id) / "candidates" / split / f"{shard_id:06d}.parquet"
+
+
+def _snapshot_path(run_id: str) -> Path:
+    return _run_work_dir(run_id) / "validity-index.parquet"
+
+
+def _update_path(run_id: str, split: str, shard_id: int, candidate_offset: int) -> Path:
+    filename = f"{shard_id:06d}-{candidate_offset:012d}.parquet"
+    return Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR) / run_id / split / filename
+
+
+def _shard_dir(run_id: str, split: str, shard_id: int) -> Path:
+    return _run_shard_dir(run_id) / split / f"{shard_id:06d}"
+
+
+def _record_path(run_id: str, split: str, shard_id: int) -> Path:
+    return _shard_dir(run_id, split, shard_id) / "records.parquet"
+
+
+def _split_quota(target: int, shard_count: int, shard_id: int) -> int:
+    base, remainder = divmod(target, shard_count)
+    return base + int(shard_id < remainder)
 
 
 def _safe_reset(path: Path, base: Path) -> None:
@@ -112,7 +139,6 @@ def _safe_reset(path: Path, base: Path) -> None:
 
 
 def _load_global_aois() -> pl.DataFrame:
-    # Rebuild the global AOI definitions used by the TEMPO mapping
     facilities = (
         pl.scan_parquet(FULL_DATA_PARQUET)
         .select("facilityId", "lat", "lon")
@@ -174,7 +200,7 @@ def _assign_clusters(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.join(assignments, on="cluster", how="inner")
 
 
-def _write_candidate_manifests() -> None:
+def _write_candidate_manifests(run_id: str, shard_count: int) -> None:
     aois = _load_global_aois()
     candidate_pool = _load_candidate_pool(aois)
     candidate_aois = aois.join(candidate_pool.select(AOI_ID_COL).unique(), on=AOI_ID_COL, how="semi")
@@ -188,40 +214,33 @@ def _write_candidate_manifests() -> None:
         frame = (
             assigned.filter(pl.col("split") == split)
             .with_columns(
-                pl.struct("scan_date", "scan_num").hash(seed=MASKED_PRETRAINING_SPLIT_SEED).alias("shard_key"),
-                pl.struct(AOI_ID_COL, "scan_date", "scan_num")
-                .hash(seed=MASKED_PRETRAINING_SPLIT_SEED + 1)
-                .alias("selection_key"),
+                pl.col("tempo_time").dt.truncate("1h").alias("_processing_hour"),
             )
-            .sort("selection_key", AOI_ID_COL, "tempo_time")
+            .sort("_processing_hour", "cluster", AOI_ID_COL, "tempo_time", "scan_num")
+            .drop("_processing_hour")
             .with_row_index("candidate_index")
             .select(list(CANDIDATE_SCHEMA))
+            .cast(CANDIDATE_SCHEMA)
         )
-        manifest = Path(MASKED_PRETRAINING_WORK_DIR) / "candidates" / f"{split}.parquet"
-        write_parquet_atomic(frame.cast(CANDIDATE_SCHEMA), manifest)
-        print(f"[{split}] candidate pool: {frame.height:,} scenes across {frame[AOI_ID_COL].n_unique():,} AOIs")
+        for shard_id in range(shard_count):
+            start = frame.height * shard_id // shard_count
+            stop = frame.height * (shard_id + 1) // shard_count
+            write_parquet_atomic(frame.slice(start, stop - start), _candidate_path(run_id, split, shard_id))
+        print(
+            f"[{_timestamp()}] [{split}] wrote {frame.height:,} locality-ordered candidates across {shard_count} shards"
+        )
 
 
-def _write_validity_cache_inventory() -> None:
-    # Snapshot cache membership before the array stages begin
-    cache_root = Path(MASKED_PRETRAINING_VALIDITY_CACHE_DIR)
-    status_by_key = {
-        path.stem: INVALID_STATUS for path in (cache_root / "invalid").glob("*/*.json")
-    }
-    status_by_key.update(
-        {path.stem: VALID_STATUS for path in (cache_root / "valid").glob("*/*.npz")}
-    )
-    inventory = pl.DataFrame(
-        {
-            "cache_key": list(status_by_key),
-            "status": list(status_by_key.values()),
-        },
-        schema=CACHE_INVENTORY_SCHEMA,
-    ).sort("cache_key")
-    destination = Path(MASKED_PRETRAINING_WORK_DIR) / CACHE_INVENTORY_FILE
-    write_parquet_atomic(inventory, destination)
-    valid_count = int(inventory.filter(pl.col("status") == VALID_STATUS).height)
-    print(f"Validity-cache inventory: {valid_count:,} valid and {inventory.height - valid_count:,} invalid entries")
+def _load_persistent_validity_index() -> pl.DataFrame:
+    index_path = Path(MASKED_PRETRAINING_VALIDITY_INDEX)
+    if not index_path.is_file():
+        raise FileNotFoundError(
+            f"Missing {index_path}. Run migrate_validity_cache.py before launching dataset generation."
+        )
+    frames = [pl.read_parquet(index_path).cast(VALIDITY_INDEX_SCHEMA)]
+    update_root = Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR)
+    frames.extend(pl.read_parquet(path) for path in sorted(update_root.glob("*/*/*.parquet")))
+    return merge_validity_frames(frames)
 
 
 def _submit(options: list[str], script_arguments: list[str]) -> str:
@@ -243,13 +262,17 @@ def _launch(args: argparse.Namespace) -> None:
         raise ValueError("Launch masked-pretraining generation from a login node")
     if not BATCH_SCRIPT.is_file():
         raise FileNotFoundError(BATCH_SCRIPT)
+    if not Path(MASKED_PRETRAINING_VALIDITY_INDEX).is_file():
+        raise FileNotFoundError(
+            f"Missing {MASKED_PRETRAINING_VALIDITY_INDEX}. Complete the validity-cache migration before launching."
+        )
     active_jobs = subprocess.run(
         [
             "squeue",
             "--noheader",
             "--user",
             str(os.environ["USER"]),
-            "--name=masked-data-prepare,masked-data-reuse,masked-data-discover,masked-data-shard,masked-data-finalize",
+            "--name=masked-data-prepare,masked-data-discover,masked-data-finalize",
             "--format=%i",
         ],
         check=True,
@@ -258,23 +281,19 @@ def _launch(args: argparse.Namespace) -> None:
     ).stdout.split()
     if active_jobs:
         raise RuntimeError(f"Masked-pretraining generation jobs are already active: {', '.join(active_jobs)}")
+
+    run_id = args.run_id or datetime.now(timezone.utc).strftime("clean-%Y%m%d-%H%M%S")
     (REPOSITORY_ROOT / "logs").mkdir(exist_ok=True)
-    tasks = build_shard_tasks(SPLIT_TARGETS, args.shard_size)
-    shard_array_spec = f"0-{len(tasks) - 1}%{args.max_parallel_shards}"
-    discovery_array_spec = f"0-{args.max_parallel_shards - 1}"
     script_arguments = [
-        "--shard-size",
-        str(args.shard_size),
-        "--max-parallel-shards",
-        str(args.max_parallel_shards),
+        "--run-id",
+        run_id,
+        "--num-shards",
+        str(args.num_shards),
         "--workers-per-shard",
         str(args.workers_per_shard),
         "--batch-size",
         str(args.batch_size),
     ]
-    prepare_arguments = [*script_arguments]
-    if args.clear_cache:
-        prepare_arguments.append("--clear-cache")
     prepare_job = _submit(
         [
             f"--cpus-per-task={args.workers_per_shard}",
@@ -282,39 +301,17 @@ def _launch(args: argparse.Namespace) -> None:
             "--job-name=masked-data-prepare",
             f"--export=ALL,{STAGE_ENV}=prepare",
         ],
-        prepare_arguments,
-    )
-    reuse_job = _submit(
-        [
-            f"--array={discovery_array_spec}",
-            "--cpus-per-task=1",
-            "--job-name=masked-data-reuse",
-            "--kill-on-invalid-dep=yes",
-            f"--dependency=afterok:{prepare_job}",
-            f"--export=ALL,{STAGE_ENV}=reuse",
-        ],
         script_arguments,
     )
     discovery_job = _submit(
         [
-            f"--array={discovery_array_spec}",
+            f"--array=0-{args.num_shards - 1}",
             f"--cpus-per-task={args.workers_per_shard}",
             f"--time={DISCOVERY_TIME_LIMIT}",
             "--job-name=masked-data-discover",
             "--kill-on-invalid-dep=yes",
-            f"--dependency=afterok:{reuse_job}",
+            f"--dependency=afterok:{prepare_job}",
             f"--export=ALL,{STAGE_ENV}=discover",
-        ],
-        script_arguments,
-    )
-    materialize_job = _submit(
-        [
-            f"--array={shard_array_spec}",
-            f"--cpus-per-task={args.workers_per_shard}",
-            "--job-name=masked-data-shard",
-            "--kill-on-invalid-dep=yes",
-            f"--dependency=afterok:{discovery_job}",
-            f"--export=ALL,{STAGE_ENV}=materialize",
         ],
         script_arguments,
     )
@@ -322,289 +319,229 @@ def _launch(args: argparse.Namespace) -> None:
         [
             "--array=0",
             "--cpus-per-task=1",
-            "--time=04:00:00",
+            "--time=02:00:00",
             "--job-name=masked-data-finalize",
             "--kill-on-invalid-dep=yes",
-            f"--dependency=afterok:{materialize_job}",
+            f"--dependency=afterok:{discovery_job}",
             f"--export=ALL,{STAGE_ENV}=finalize",
         ],
         script_arguments,
     )
-    print(f"Masked-pretraining preparation: {prepare_job}")
-    print(f"Masked-pretraining cache reuse: {reuse_job}")
-    print(f"Masked-pretraining validity discovery: {discovery_job}")
-    print(f"Masked-pretraining shard materialization: {materialize_job}")
-    print(f"Masked-pretraining finalizer: {finalizer_job}")
+    print(f"Masked-pretraining run: {run_id}")
+    print(f"Preparation: {prepare_job}")
+    print(f"Masked-raster discovery: {discovery_job}")
+    print(f"Manifest finalizer: {finalizer_job}")
 
 
 def _run_prepare(args: argparse.Namespace) -> None:
+    if args.run_id is None:
+        raise ValueError("Prepare requires --run-id")
+    started = time.monotonic()
+    index = _load_persistent_validity_index()
     base = Path(MASKED_PRETRAINING_BASE_DIR)
-    base.mkdir(parents=True, exist_ok=True)
     _safe_reset(Path(MASKED_PRETRAINING_WORK_DIR), base)
     _safe_reset(Path(MASKED_PRETRAINING_SHARD_DIR), base)
     _safe_reset(Path(MASKED_PRETRAINING_DF_DIR), base)
-    if args.clear_cache:
-        _safe_reset(Path(MASKED_PRETRAINING_VALIDITY_CACHE_DIR), base)
-    else:
-        Path(MASKED_PRETRAINING_VALIDITY_CACHE_DIR).mkdir(parents=True, exist_ok=True)
-    _write_candidate_manifests()
-    _write_validity_cache_inventory()
-
-
-def _candidate_batches(candidates: pl.DataFrame, batch_size: int) -> Iterator[pl.DataFrame]:
-    # Batch complete scans to reuse granule reads
-    pending: list[pl.DataFrame] = []
-    pending_rows = 0
-    for group in candidates.partition_by(["scan_date", "scan_num"], maintain_order=True):
-        if pending and pending_rows + group.height > batch_size:
-            yield pl.concat(pending, how="vertical")
-            pending = []
-            pending_rows = 0
-        pending.append(group)
-        pending_rows += group.height
-    if pending:
-        yield pl.concat(pending, how="vertical")
-
-
-def _resolve_array_task(shard_size: int) -> tuple[PretrainingShardTask, list[PretrainingShardTask]]:
-    tasks = build_shard_tasks(SPLIT_TARGETS, shard_size)
-    task_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
-    return tasks[task_id], tasks
-
-
-def _reuse_result_path(split: str, worker_id: int) -> Path:
-    return Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split / f"cached-worker-{worker_id:06d}.parquet"
-
-
-def _remaining_candidates_path(split: str, worker_id: int) -> Path:
-    return Path(MASKED_PRETRAINING_WORK_DIR) / "remaining-candidates" / split / f"worker-{worker_id:06d}.parquet"
-
-
-def _discovery_result_path(split: str, worker_id: int) -> Path:
-    return Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split / f"worker-{worker_id:06d}.parquet"
-
-
-def _count_valid_records(split: str) -> int:
-    result_paths = (Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split).glob("*.parquet")
-    return sum(pl.scan_parquet(path).select(pl.len()).collect(engine="streaming").item() for path in result_paths)
-
-
-def _load_discovery_candidates(split: str, worker_id: int, worker_count: int) -> pl.DataFrame:
-    candidate_path = _remaining_candidates_path(split, worker_id)
-    if not candidate_path.is_file():
-        return pl.DataFrame(schema=CANDIDATE_SCHEMA)
-    candidates = pl.read_parquet(candidate_path)
-    if candidates.filter((pl.col("shard_key") % worker_count) != worker_id).height:
-        raise ValueError(f"Discovery candidate partition does not belong to worker {worker_id}")
-    return candidates.sort("selection_key", "scan_date", "scan_num", AOI_ID_COL).cast(CANDIDATE_SCHEMA)
-
-
-def _partition_cached_candidates(
-    candidates: pl.DataFrame,
-    valid_keys: set[str],
-    invalid_keys: set[str],
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    # Separate cached valid records from cache misses while dropping known invalid records
-    cache_keys = [
-        make_scan_task(row, "granule_paths", Path(TEMPO_DIR), Path(DATASET_TEMPO_CACHE_DIR)).cache_key
-        for row in candidates.iter_rows(named=True)
-    ]
-    classified = candidates.with_columns(pl.Series("_cache_key", cache_keys, dtype=pl.String))
-    cached_valid = (
-        classified.filter(pl.col("_cache_key").is_in(list(valid_keys)))
-        .with_columns(
-            pl.col("_cache_key").alias("cache_key"),
-            pl.concat_str(
-                pl.lit(f"{MASKED_PRETRAINING_VALIDITY_CACHE_DIR}/valid/"),
-                pl.col("_cache_key").str.slice(0, 2),
-                pl.lit("/"),
-                pl.col("_cache_key"),
-                pl.lit(".npz"),
-            ).alias("validity_cache_path"),
-        )
-        .select(list(VALID_RECORD_SCHEMA))
-        .cast(VALID_RECORD_SCHEMA)
+    work_dir = _run_work_dir(args.run_id)
+    shard_dir = _run_shard_dir(args.run_id)
+    work_dir.mkdir(parents=True)
+    shard_dir.mkdir(parents=True)
+    write_parquet_atomic(index, _snapshot_path(args.run_id))
+    print(f"[{_timestamp()}] validity index snapshot: {index.height:,} entries")
+    _write_candidate_manifests(args.run_id, args.num_shards)
+    write_json_atomic(
+        {"run_id": args.run_id, "num_shards": args.num_shards, "prepared_at": _timestamp()},
+        work_dir / "run.json",
     )
-    cached_terminal_keys = [*valid_keys, *invalid_keys]
-    remaining = classified.filter(~pl.col("_cache_key").is_in(cached_terminal_keys)).drop("_cache_key")
-    return cached_valid, remaining.cast(CANDIDATE_SCHEMA)
+    print(f"[{_timestamp()}] preparation finished in {time.monotonic() - started:.1f}s")
 
 
-def _run_reuse(args: argparse.Namespace) -> None:
-    worker_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
-    inventory = pl.read_parquet(Path(MASKED_PRETRAINING_WORK_DIR) / CACHE_INVENTORY_FILE)
-    valid_keys = set(inventory.filter(pl.col("status") == VALID_STATUS)["cache_key"].to_list())
-    invalid_keys = set(inventory.filter(pl.col("status") == INVALID_STATUS)["cache_key"].to_list())
-    for split in SPLIT_TARGETS:
-        manifest = Path(MASKED_PRETRAINING_WORK_DIR) / "candidates" / f"{split}.parquet"
-        candidates = (
-            pl.scan_parquet(manifest)
-            .filter((pl.col("shard_key") % args.max_parallel_shards) == worker_id)
-            .sort("selection_key", "scan_date", "scan_num", AOI_ID_COL)
-            .collect(engine="streaming")
+def _indexed_outcome(
+    row: dict[str, object],
+    cache_key: str,
+    indexed: dict[str, object],
+) -> CandidateOutcome:
+    status = str(indexed["status"])
+    if status not in {VALID_STATUS, INVALID_STATUS}:
+        raise ValueError(f"Unsupported validity-index status for {cache_key}: {status}")
+    tempo_path = indexed.get("tempo_cache_path")
+    weather_path = indexed.get("weather_cache_path")
+    if status == VALID_STATUS and (not tempo_path or not weather_path):
+        raise ValueError(f"Valid index entry lacks source cache paths: {cache_key}")
+    return CandidateOutcome(
+        status,
+        row,
+        cache_key,
+        tempo_cache_path=str(tempo_path) if tempo_path else None,
+        weather_cache_path=str(weather_path) if weather_path else None,
+        reason=str(indexed["reason"]) if indexed.get("reason") else None,
+    )
+
+
+def _run_discovery_split(
+    args: argparse.Namespace,
+    split: str,
+    shard_id: int,
+    index: dict[str, dict[str, object]],
+) -> None:
+    if args.run_id is None:
+        raise ValueError("Discovery requires --run-id")
+    quota = _split_quota(SPLIT_TARGETS[split], args.num_shards, shard_id)
+    candidates = pl.read_parquet(_candidate_path(args.run_id, split, shard_id)).cast(CANDIDATE_SCHEMA)
+    records: list[dict[str, object]] = []
+    pending_updates: list[dict[str, object]] = []
+    offset = 0
+    raster_dir = _shard_dir(args.run_id, split, shard_id) / "record-rasters"
+    raster_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    last_published_offset = offset
+    index_hits = 0
+    cache_misses = 0
+    record_writer = ProcessPoolExecutor(max_workers=args.workers_per_shard)
+
+    try:
+        while offset < candidates.height and len(records) < quota:
+            batch = candidates.slice(offset, args.batch_size).to_dicts()
+            keyed_rows: list[tuple[str, dict[str, object]]] = []
+            resolved: dict[str, CandidateOutcome] = {}
+            unknown: list[dict[str, object]] = []
+            for row in batch:
+                scan, _ = candidate_cache_tasks(
+                    row,
+                    tempo_root=Path(TEMPO_DIR),
+                    tempo_cache_dir=Path(DATASET_TEMPO_CACHE_DIR),
+                    hrrr_root=Path(HRRR_DIR),
+                    weather_cache_dir=Path(DATASET_WEATHER_CACHE_DIR),
+                )
+                keyed_rows.append((scan.cache_key, row))
+                indexed = index.get(scan.cache_key)
+                if indexed is None:
+                    unknown.append(row)
+                    cache_misses += 1
+                else:
+                    resolved[scan.cache_key] = _indexed_outcome(row, scan.cache_key, indexed)
+                    index_hits += 1
+
+            if unknown:
+                discovered = discover_candidate_batch(
+                    unknown,
+                    tempo_root=Path(TEMPO_DIR),
+                    tempo_cache_dir=Path(DATASET_TEMPO_CACHE_DIR),
+                    hrrr_root=Path(HRRR_DIR),
+                    weather_cache_dir=Path(DATASET_WEATHER_CACHE_DIR),
+                    workers=args.workers_per_shard,
+                )
+                for outcome in discovered:
+                    resolved[outcome.cache_key] = outcome
+                    if outcome.status != RETRYABLE_STATUS:
+                        validity_row = outcome.validity_row()
+                        pending_updates.append(validity_row)
+                        index[outcome.cache_key] = validity_row
+
+            remaining = quota - len(records)
+            selected = [resolved[key] for key, _ in keyed_rows if resolved[key].status == VALID_STATUS][:remaining]
+            tasks = [
+                MaskedRecordTask(
+                    row=outcome.row,
+                    cache_key=outcome.cache_key,
+                    tempo_cache_path=str(outcome.tempo_cache_path),
+                    weather_cache_path=str(outcome.weather_cache_path),
+                    output_path=str(raster_dir / f"{outcome.cache_key}.npz"),
+                    mask_seed=MASKED_PRETRAINING_SPLIT_SEED + int(outcome.row["candidate_index"]),
+                )
+                for outcome in selected
+            ]
+            records.extend(record_writer.map(write_masked_record, tasks))
+            offset += len(batch)
+
+            should_publish = (
+                offset - last_published_offset >= PROGRESS_INTERVAL
+                or len(records) == quota
+                or offset == candidates.height
+            )
+            if should_publish:
+                if pending_updates:
+                    updates = pl.DataFrame(pending_updates, schema=VALIDITY_INDEX_SCHEMA)
+                    write_parquet_atomic(updates, _update_path(args.run_id, split, shard_id, offset))
+                    pending_updates.clear()
+                write_parquet_atomic(
+                    pl.DataFrame(records, schema=FINAL_RECORD_SCHEMA),
+                    _record_path(args.run_id, split, shard_id),
+                )
+                last_published_offset = offset
+                print(
+                    f"[{_timestamp()}] [{split} shard {shard_id}] {len(records):,}/{quota:,} masked records; "
+                    f"{offset:,}/{candidates.height:,} candidates; {index_hits:,} index hits; "
+                    f"{cache_misses:,} cache misses"
+                )
+    finally:
+        record_writer.shutdown(cancel_futures=True)
+
+    if len(records) != quota:
+        raise ValueError(
+            f"[{split} shard {shard_id}] candidate segment exhausted with {len(records):,}/{quota:,} records"
         )
-        cached_valid, remaining = _partition_cached_candidates(candidates, valid_keys, invalid_keys)
-        write_parquet_atomic(cached_valid, _reuse_result_path(split, worker_id))
-        write_parquet_atomic(remaining, _remaining_candidates_path(split, worker_id))
-        print(
-            f"[{split} cache reuse worker {worker_id}] {cached_valid.height:,} valid reused; "
-            f"{remaining.height:,} uncached candidates remain"
-        )
+    print(f"[{_timestamp()}] [{split} shard {shard_id}] finished in {time.monotonic() - started:.1f}s")
 
 
 def _run_discovery(args: argparse.Namespace) -> None:
-    worker_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
-    for split, target_count in SPLIT_TARGETS.items():
-        candidates = _load_discovery_candidates(split, worker_id, args.max_parallel_shards)
-        result_path = _discovery_result_path(split, worker_id)
-        valid_rows: list[dict[str, object]] = []
-        invalid_count = 0
-        retryable_count = 0
-        completed = 0
-        for batch_frame in _candidate_batches(candidates, args.batch_size):
-            if _count_valid_records(split) >= target_count:
-                break
-            results = process_candidate_batch(
-                list(batch_frame.iter_rows(named=True)),
-                validity_cache_dir=Path(MASKED_PRETRAINING_VALIDITY_CACHE_DIR),
-                tempo_root=Path(TEMPO_DIR),
-                tempo_cache_dir=Path(DATASET_TEMPO_CACHE_DIR),
-                hrrr_root=Path(HRRR_DIR),
-                weather_cache_dir=Path(DATASET_WEATHER_CACHE_DIR),
-                workers=args.workers_per_shard,
-            )
-            valid_rows.extend(
-                {
-                    "candidate_index": int(result.row["candidate_index"]),
-                    "aoi_id": int(result.row["aoi_id"]),
-                    "scan_date": result.row["scan_date"],
-                    "scan_num": int(result.row["scan_num"]),
-                    "tempo_time": result.row["tempo_time"],
-                    "cache_key": result.cache_key,
-                    "validity_cache_path": str(result.raster_path),
-                }
-                for result in results
-                if result.status == VALID_STATUS
-            )
-            invalid_count += sum(result.status != VALID_STATUS and result.status != "retryable" for result in results)
-            retryable_count += sum(result.status == "retryable" for result in results)
-            write_parquet_atomic(pl.DataFrame(valid_rows, schema=VALID_RECORD_SCHEMA), result_path)
-            completed += batch_frame.height
-            if completed % PROGRESS_INTERVAL == 0 or completed == candidates.height:
-                print(
-                    f"[{split} worker {worker_id}] {completed:,}/{candidates.height:,} candidates; "
-                    f"{len(valid_rows):,} valid, {invalid_count:,} invalid, {retryable_count:,} retryable"
-                )
-        print(f"[{split} worker {worker_id}] finished with {len(valid_rows):,} newly valid scenes")
-
-
-def _selected_valid_records(split: str, target_count: int) -> pl.DataFrame:
-    # Select deterministic cache-backed records from this run
-    paths = sorted((Path(MASKED_PRETRAINING_WORK_DIR) / "validity-results" / split).glob("*.parquet"))
-    frames = [pl.read_parquet(path).cast(VALID_RECORD_SCHEMA) for path in paths]
-    return (
-        pl.concat(frames, how="vertical")
-        .unique(subset="cache_key", keep="first")
-        .sort("candidate_index")
-        .head(target_count)
-        if frames
-        else pl.DataFrame(schema=VALID_RECORD_SCHEMA)
-    )
-
-
-def _run_materialize(args: argparse.Namespace) -> None:
-    task, _ = _resolve_array_task(args.shard_size)
-    selected = _selected_valid_records(task.split, task.split_target).slice(task.start, task.size)
-    store = MaskedDatasetShardStore(Path(MASKED_PRETRAINING_SHARD_DIR))
-    shard_dir = store.create(task)
-    raster_dir = shard_dir / "record-rasters" / task.split
-    raster_dir.mkdir(parents=True)
-    record_tasks = [
-        MaskedRecordTask(
-            row=row,
-            output_path=str(raster_dir / f"{row['cache_key']}.npz"),
-            mask_seed=MASKED_PRETRAINING_SPLIT_SEED + task.task_id * args.shard_size + offset,
-        )
-        for offset, row in enumerate(selected.iter_rows(named=True))
-    ]
-    output_rows = list(bounded_parallel_map(materialize_masked_record, record_tasks, args.workers_per_shard))
-    store.write(task, shard_dir, output_rows)
+    if args.run_id is None:
+        raise ValueError("Discovery requires --run-id")
+    shard_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
+    if shard_id >= args.num_shards:
+        raise ValueError(f"Shard {shard_id} is outside configured count {args.num_shards}")
+    index = validity_lookup(pl.read_parquet(_snapshot_path(args.run_id)).cast(VALIDITY_INDEX_SCHEMA))
+    for split in SPLIT_TARGETS:
+        _run_discovery_split(args, split, shard_id, index)
 
 
 def _run_finalizer(args: argparse.Namespace) -> None:
-    tasks = build_shard_tasks(SPLIT_TARGETS, args.shard_size)
-    selected_by_split = {
-        split: _selected_valid_records(split, target_count) for split, target_count in SPLIT_TARGETS.items()
-    }
-    incomplete = {
-        split: (selected.height, SPLIT_TARGETS[split])
-        for split, selected in selected_by_split.items()
-        if selected.height < SPLIT_TARGETS[split]
-    }
-    if incomplete:
-        details = ", ".join(
-            f"{split}={valid_count:,}/{target_count:,}" for split, (valid_count, target_count) in incomplete.items()
-        )
-        raise ValueError(f"Cannot finalize incomplete discovery: {details}")
-
-    store = MaskedDatasetShardStore(Path(MASKED_PRETRAINING_SHARD_DIR))
-    output_by_split: dict[str, list[pl.DataFrame]] = {split: [] for split in SPLIT_TARGETS}
-    for task in tasks:
-        try:
-            output_by_split[task.split].append(store.load(task, resolve_paths=True))
-        except (OSError, TypeError, ValueError, pl.exceptions.PolarsError) as error:
-            raise ValueError(f"Cannot finalize incomplete shard {task.task_id}: {error}") from error
-
-    summaries: list[dict[str, object]] = []
+    if args.run_id is None:
+        raise ValueError("Finalizer requires --run-id")
     base = Path(MASKED_PRETRAINING_BASE_DIR)
-    for split, target_count in SPLIT_TARGETS.items():
-        expected = selected_by_split[split]
-        frames = output_by_split[split]
-        output = (
-            pl.concat(frames, how="vertical").sort("candidate_index")
-            if frames
-            else pl.DataFrame(schema=FINAL_RECORD_SCHEMA)
-        )
-        if output["cache_key"].to_list() != expected["cache_key"].to_list():
-            raise ValueError(f"[{split}] shard records do not match the selected validity-cache records")
-        relative_paths = [str(Path(path).relative_to(base)) for path in output["raster_bundle_path"].to_list()]
-        output = output.with_columns(pl.Series("raster_bundle_path", relative_paths, dtype=pl.String))
+    summaries: list[dict[str, object]] = []
+    for split, target in SPLIT_TARGETS.items():
+        frames = [
+            pl.read_parquet(_record_path(args.run_id, split, shard_id)).cast(FINAL_RECORD_SCHEMA)
+            for shard_id in range(args.num_shards)
+        ]
+        records = pl.concat(frames, how="vertical").sort("candidate_index") if frames else empty_final_records()
+        if records.height != target:
+            raise ValueError(f"[{split}] discovered {records.height:,}/{target:,} requested records")
+        relative_paths = [str(Path(path).relative_to(base)) for path in records["raster_bundle_path"].to_list()]
+        output = records.with_columns(pl.Series("raster_bundle_path", relative_paths, dtype=pl.String))
         write_csv_atomic(output, Path(MASKED_PRETRAINING_DF_DIR) / f"{split}_df.csv")
-        summaries.append(
-            {
-                "split": split,
-                "target_records": target_count,
-                "available_valid_records": expected.height,
-                "published_records": output.height,
-                "target_met": output.height == target_count,
-            }
-        )
+        summaries.append({"split": split, "target_records": target, "published_records": output.height})
+        print(f"[{_timestamp()}] [{split}] published {output.height:,} records")
 
+    index_frames = [pl.read_parquet(_snapshot_path(args.run_id)).cast(VALIDITY_INDEX_SCHEMA)]
+    update_paths = sorted(Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR).glob("*/*/*.parquet"))
+    index_frames.extend(pl.read_parquet(path).cast(VALIDITY_INDEX_SCHEMA) for path in update_paths)
+    merged_index = merge_validity_frames(index_frames)
+    write_parquet_atomic(merged_index, Path(MASKED_PRETRAINING_VALIDITY_INDEX))
     write_json_atomic(
-        {"shard_size": args.shard_size, "splits": summaries},
+        {
+            "run_id": args.run_id,
+            "num_shards": args.num_shards,
+            "validity_index_entries": merged_index.height,
+            "splits": summaries,
+        },
         Path(MASKED_PRETRAINING_DF_DIR) / "generation_summary.json",
     )
-    for summary in summaries:
-        print(
-            f"[{summary['split']}] published {summary['published_records']:,}/"
-            f"{summary['target_records']:,} requested records"
-        )
+    print(f"[{_timestamp()}] compacted {merged_index.height:,} validity-index entries")
+    _safe_reset(Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR), Path(MASKED_PRETRAINING_BASE_DIR))
 
 
 def main() -> None:
-    """Launch, execute, or finalize masked-pretraining generation."""
+    """Launch or execute one masked-raster generation stage."""
     args = parse_args()
     stage = os.getenv(STAGE_ENV, "launch")
     if stage == "launch":
         _launch(args)
     elif stage == "prepare":
         _run_prepare(args)
-    elif stage == "reuse":
-        _run_reuse(args)
     elif stage == "discover":
         _run_discovery(args)
-    elif stage == "materialize":
-        _run_materialize(args)
     elif stage == "finalize":
         _run_finalizer(args)
     else:
