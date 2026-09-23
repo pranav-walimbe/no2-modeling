@@ -127,31 +127,76 @@ def add_timestep_nox(
     hourly: pl.DataFrame,
     timesteps: int = SEQUENCE_TIMESTEPS,
 ) -> pl.DataFrame:
-    """Attach AOI NOx totals for the UTC hour containing each scan.
+    """Attach overlap-weighted AOI NOx rates for every TEMPO interval.
 
     Args:
         frame: Records carrying one scan timestamp per timestep.
-        hourly: Valid AOI-hour emissions totals.
+        hourly: Valid piecewise-constant AOI-hour emissions totals.
         timesteps: Number of scan timestamps to align.
 
     Returns:
-        Records with one hourly NOx value per timestep.
+        Records with one interval-weighted NOx value per timestep.
     """
-    result = frame
+    indexed = frame.with_row_index("_timestep_nox_row")
+    result = indexed
     for index in range(timesteps):
-        hour_column = f"_t{index}_hour"
+        start_column = "_interval_start_t0" if index == 0 else f"timestep_time_t{index - 1}"
+        end_column = f"timestep_time_t{index}"
         nox_column = f"t{index}_nox"
-        lookup = hourly.select(
-            AOI_ID_COL,
-            pl.col("emissions_hour_utc").alias(hour_column),
-            pl.col("nox_mass").alias(nox_column),
+        contributions = (
+            indexed.select(
+                "_timestep_nox_row",
+                AOI_ID_COL,
+                pl.col(start_column).alias("_interval_start"),
+                pl.col(end_column).alias("_interval_end"),
+            )
+            .with_columns(
+                pl.datetime_ranges(
+                    pl.col("_interval_start").dt.truncate("1h"),
+                    (pl.col("_interval_end") - pl.duration(microseconds=1)).dt.truncate("1h"),
+                    interval="1h",
+                    time_zone="UTC",
+                ).alias("_component_hour")
+            )
+            .explode("_component_hour", empty_as_null=True)
+            .with_columns(
+                (
+                    pl.min_horizontal("_interval_end", pl.col("_component_hour") + pl.duration(hours=1))
+                    - pl.max_horizontal("_interval_start", "_component_hour")
+                )
+                .dt.total_seconds()
+                .alias("_overlap_seconds")
+            )
+            .join(
+                hourly.select(
+                    AOI_ID_COL,
+                    pl.col("emissions_hour_utc").alias("_component_hour"),
+                    "nox_mass",
+                ),
+                on=[AOI_ID_COL, "_component_hour"],
+                how="left",
+            )
+            .group_by("_timestep_nox_row")
+            .agg(
+                pl.col("_overlap_seconds").sum().alias("_total_overlap_seconds"),
+                pl.col("_overlap_seconds")
+                .filter(pl.col("nox_mass").is_finite())
+                .sum()
+                .alias("_valid_overlap_seconds"),
+                (pl.col("nox_mass") * pl.col("_overlap_seconds"))
+                .filter(pl.col("nox_mass").is_finite())
+                .sum()
+                .alias("_weighted_nox_sum"),
+            )
+            .with_columns(
+                pl.when(pl.col("_valid_overlap_seconds") == pl.col("_total_overlap_seconds"))
+                .then(pl.col("_weighted_nox_sum") / pl.col("_total_overlap_seconds"))
+                .alias(nox_column)
+            )
+            .select("_timestep_nox_row", nox_column)
         )
-        result = (
-            result.with_columns(pl.col(f"timestep_time_t{index}").dt.truncate("1h").alias(hour_column))
-            .join(lookup, on=[AOI_ID_COL, hour_column], how="left")
-            .drop(hour_column)
-        )
-    return result
+        result = result.join(contributions, on="_timestep_nox_row", how="left")
+    return result.drop("_timestep_nox_row", "_interval_start_t0")
 
 
 def add_tempo_sequences(
@@ -160,7 +205,7 @@ def add_tempo_sequences(
     timesteps: int = SEQUENCE_TIMESTEPS,
     label_timestep_index: int | None = None,
 ) -> pl.DataFrame:
-    """Match complete causal TEMPO sequences to emissions clock hours.
+    """Match five-raster TEMPO sequences to the label scan's clock hour.
 
     Args:
         frame: AOI-hour rows eligible for observation matching.
@@ -169,7 +214,8 @@ def add_tempo_sequences(
         label_timestep_index: Zero-based scan ending the label interval.
 
     Returns:
-        Rows carrying oldest-to-newest scan timestamps and paths.
+        Rows carrying oldest-to-newest scan timestamps, paths, and a preceding
+        timestamp for the first interpolation interval.
     """
     label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
     time_columns = [f"timestep_time_t{index}" for index in range(timesteps)]
@@ -178,7 +224,8 @@ def add_tempo_sequences(
         observations.lazy()
         .sort(AOI_ID_COL, "tempo_time")
         .with_columns(
-            [
+            [pl.col("tempo_time").shift(timesteps).over(AOI_ID_COL).alias("_interval_start_t0")]
+            + [
                 pl.col("tempo_time").shift(timesteps - index - 1).over(AOI_ID_COL).alias(time_columns[index])
                 for index in range(timesteps)
             ]
@@ -189,12 +236,13 @@ def add_tempo_sequences(
         )
     )
     interval_columns = []
-    for index in range(1, timesteps):
+    for index in range(timesteps):
         interval_column = f"_interval_minutes_{index}"
         interval_columns.append(interval_column)
+        start_column = "_interval_start_t0" if index == 0 else time_columns[index - 1]
         sequences = sequences.with_columns(
             (
-                (pl.col(time_columns[index]) - pl.col(time_columns[index - 1])).dt.total_seconds()
+                (pl.col(time_columns[index]) - pl.col(start_column)).dt.total_seconds()
                 / SECONDS_PER_MINUTE
             ).alias(interval_column)
         )
@@ -208,170 +256,69 @@ def add_tempo_sequences(
             )
         )
         .with_columns(
-            pl.datetime_ranges(
-                pl.col(time_columns[label_index - 1]).dt.truncate("1h"),
-                (pl.col(time_columns[label_index]) - pl.duration(microseconds=1)).dt.truncate("1h"),
-                interval="1h",
-                time_zone="UTC",
-            ).alias("_emissions_hour")
+            pl.col(time_columns[label_index]).dt.date().alias("date"),
+            pl.col(time_columns[label_index]).dt.hour().alias("hour"),
+            pl.col(interval_columns[label_index]).alias("label_delta_mins"),
         )
-        .explode("_emissions_hour", empty_as_null=True)
-        .with_columns(
-            pl.col("_emissions_hour").dt.date().alias("date"),
-            pl.col("_emissions_hour").dt.hour().alias("hour"),
-            (pl.col("_emissions_hour") + pl.duration(hours=1)).alias("_emissions_hour_end"),
-        )
-        .with_columns(
-            (
-                pl.min_horizontal(time_columns[label_index], "_emissions_hour_end")
-                - pl.max_horizontal(time_columns[label_index - 1], "_emissions_hour")
-            ).alias("_overlap")
-        )
-        .filter(pl.col("_overlap") > pl.duration(microseconds=0))
-        .with_columns(
-            (pl.col("_overlap").dt.total_seconds() * 100 / SECONDS_PER_HOUR).alias("coverage_percent"),
-            pl.col(interval_columns[label_index - 1]).alias("label_delta_mins"),
-        )
-        .sort(
-            [AOI_ID_COL, "date", "hour", "_overlap", time_columns[label_index - 1]],
-            descending=[False, False, False, True, False],
-        )
-        .unique(subset=[AOI_ID_COL, "date", "hour"], keep="first", maintain_order=True)
         .select(
             AOI_ID_COL,
             "date",
             "hour",
+            "_interval_start_t0",
             *time_columns,
             *path_columns,
             "label_delta_mins",
-            "coverage_percent",
         )
         .collect()
     )
     return frame.join(sequences, on=[AOI_ID_COL, "date", "hour"], how="left")
 
 
-def _scan_ema(
-    indexed: pl.DataFrame,
-    hourly: pl.DataFrame,
-    scan_time_column: str,
-    output_prefix: str,
-    timesteps: int,
-    decay_timescale_hours: float,
-) -> pl.DataFrame:
-    # Integrate piecewise-constant hourly emissions over one causal scan window
-    scan_time = pl.col(scan_time_column)
-    contributions = (
-        indexed.select(
-            "_label_row",
-            AOI_ID_COL,
-            pl.col(scan_time_column).dt.truncate("1s").alias(scan_time_column),
-        )
-        .with_columns((scan_time - pl.duration(hours=timesteps)).alias("_window_start"))
-        .with_columns(
-            pl.datetime_ranges(
-                pl.col("_window_start").dt.truncate("1h"),
-                (scan_time - pl.duration(microseconds=1)).dt.truncate("1h"),
-                interval="1h",
-                time_zone="UTC",
-            ).alias("_component_hour")
-        )
-        .explode("_component_hour", empty_as_null=True)
-        .with_columns(
-            pl.max_horizontal("_window_start", "_component_hour").alias("_overlap_start"),
-            pl.min_horizontal(scan_time_column, pl.col("_component_hour") + pl.duration(hours=1)).alias("_overlap_end"),
-        )
-        .with_columns((pl.col("_overlap_end") - pl.col("_overlap_start")).dt.total_seconds().alias("_overlap_seconds"))
-        .with_columns(
-            ((scan_time - pl.col("_overlap_start")).dt.total_seconds() - pl.col("_overlap_seconds") / 2)
-            .truediv(SECONDS_PER_HOUR)
-            .alias("_age_hours")
-        )
-        .with_columns(
-            (pl.col("_overlap_seconds") * (-pl.col("_age_hours") / decay_timescale_hours).exp()).alias("_raw_weight")
-        )
-        .join(
-            hourly.select(
-                AOI_ID_COL,
-                pl.col("emissions_hour_utc").alias("_component_hour"),
-                "nox_mass",
-            ),
-            on=[AOI_ID_COL, "_component_hour"],
-            how="left",
-        )
-        .with_columns(
-            (pl.col("_raw_weight") / pl.col("_raw_weight").sum().over("_label_row")).alias("_normalized_weight")
-        )
-        .sort("_label_row", "_component_hour")
-    )
-    aggregate = contributions.group_by("_label_row", maintain_order=True).agg(
-        pl.col("_overlap_seconds").sum().alias("_total_overlap_seconds"),
-        pl.col("_overlap_seconds").filter(pl.col("nox_mass").is_finite()).sum().alias("_valid_overlap_seconds"),
-        (pl.col("nox_mass") * pl.col("_normalized_weight")).sum().alias(f"{output_prefix}_nox"),
-        pl.col("_component_hour").alias(f"{output_prefix}_component_hours"),
-        pl.col("nox_mass").alias(f"{output_prefix}_component_nox_mass"),
-        pl.col("_overlap_seconds").alias(f"{output_prefix}_overlap_seconds"),
-        pl.col("_age_hours").alias(f"{output_prefix}_age_hours"),
-        pl.col("_normalized_weight").alias(f"{output_prefix}_normalized_weights"),
-    )
-    expected_overlap_seconds = timesteps * SECONDS_PER_HOUR
-    return aggregate.with_columns(
-        pl.when(
-            (pl.col("_total_overlap_seconds") == expected_overlap_seconds)
-            & (pl.col("_valid_overlap_seconds") == expected_overlap_seconds)
-        )
-        .then(pl.col(f"{output_prefix}_nox"))
-        .otherwise(None)
-        .alias(f"{output_prefix}_nox")
-    ).drop("_total_overlap_seconds", "_valid_overlap_seconds")
-
-
 def add_ema_targets(
     frame: pl.DataFrame,
-    hourly: pl.DataFrame,
     timesteps: int = SEQUENCE_TIMESTEPS,
     decay_timescale_hours: float = EMA_DECAY_TIMESCALE_HOURS,
     label_timestep_index: int | None = None,
 ) -> pl.DataFrame:
-    """Add exact-overlap current and previous scan EMA emissions targets.
+    """Add an irregular-time EMA over interpolated timestep NOx values.
 
     Args:
         frame: TEMPO-matched records carrying configured timestep timestamps.
-        hourly: Aggregate AOI-hour emissions lookup.
-        timesteps: Number of hours in each EMA window.
+        timesteps: Number of interpolated timestep values in the EMA.
         decay_timescale_hours: Positive exponential e-folding time in hours.
         label_timestep_index: Zero-based scan ending the current EMA window.
 
     Returns:
-        Records with continuous EMA targets and complete audit components.
+        Records with previous and current EMA states plus their difference.
     """
-    if decay_timescale_hours <= 0:
-        raise ValueError("decay_timescale_hours must be positive")
     label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
-    indexed = frame.with_row_index("_label_row")
-    current = _scan_ema(
-        indexed,
-        hourly,
-        f"timestep_time_t{label_index}",
-        "current_ema",
-        timesteps,
-        decay_timescale_hours,
-    )
-    previous = _scan_ema(
-        indexed,
-        hourly,
-        f"timestep_time_t{label_index - 1}",
-        "previous_ema",
-        timesteps,
-        decay_timescale_hours,
-    )
-    return (
-        indexed.join(current, on="_label_row", how="left")
-        .join(previous, on="_label_row", how="left")
-        .with_columns(
-            (pl.col("current_ema_nox") - pl.col("previous_ema_nox")).alias("effective_delta_nox")
-        )
-        .drop("_label_row", "current_ema_nox", "previous_ema_nox")
+    first_index = label_index - timesteps + 1
+    ema = pl.col(f"t{first_index}_nox")
+    previous_ema = ema
+    for index in range(first_index + 1, label_index + 1):
+        interval_hours = (
+            pl.col(f"timestep_time_t{index}") - pl.col(f"timestep_time_t{index - 1}")
+        ).dt.total_seconds() / SECONDS_PER_HOUR
+        retention = (-interval_hours / decay_timescale_hours).exp()
+        previous_ema = ema
+        ema = retention * ema + (1 - retention) * pl.col(f"t{index}_nox")
+
+    age_columns = [
+        (
+            (
+                pl.col(f"timestep_time_t{label_index}")
+                - pl.col(f"timestep_time_t{index}")
+            ).dt.total_seconds()
+            / SECONDS_PER_HOUR
+        ).alias(f"timestep_age_hours_t{index}")
+        for index in range(SEQUENCE_TIMESTEPS)
+    ]
+    return frame.with_columns(
+        *age_columns,
+        previous_ema.alias("effective_previous_nox"),
+        ema.alias("effective_current_nox"),
+    ).with_columns(
+        (pl.col("effective_current_nox") - pl.col("effective_previous_nox")).alias("effective_delta_nox")
     )
 
 
