@@ -9,27 +9,25 @@ import numpy as np
 import polars as pl
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
-    DELTA_EFFECTIVE_NOX_SCALED_COL,
+    AVG_COAL_NOX_COL,
     DELTA_NOX_COL,
-    DELTA_NOX_SCALED_COL,
     EFFECTIVE_CURRENT_NOX_COL,
     LABEL_MODE_COL,
     MAJOR_CITY_DIST_COL,
     NOX_COL,
-    PREV_QTR_MED_NOX_COL,
-    PREVIOUS_QUARTER_POWER_COL,
     add_aoi_bounds,
     add_ema_targets,
     add_major_city_distance,
-    add_scaled_nox_targets,
     add_sequence_weather_paths,
     add_tempo_sequences,
     aggregate_aoi_hours,
     build_aoi_membership,
     build_aoi_spatial_frame,
     build_aois,
+    calculate_activity_conditioned_aoi_features,
     cluster_aois,
     filter_usable_nox_measurements,
+    select_top_coal_aois,
     usable_nox_measurement_expr,
 )
 from preprocessing.tempo_mapping import load_tempo_mapping
@@ -42,8 +40,8 @@ from config import (
     MIN_COVERAGE_PERCENT,
     SEQUENCE_TIMESTEPS,
     STRAT_BASE_DIR,
+    STRATIFICATION_AOI_FRACTION,
     STRATIFICATION_EMA_CHANGE_THRESHOLD,
-    STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD,
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
     VAL_RECORDS_CSV,
@@ -75,7 +73,7 @@ OUTPUT_COLUMNS = [
     MAJOR_CITY_DIST_COL,
     "num_coal_units",
     "num_ng_units",
-    "total_nameplate_capacity_mw",
+    "num_units",
     "_source_east_km",
     "_source_north_km",
     "_source_unit_count",
@@ -88,14 +86,12 @@ OUTPUT_COLUMNS = [
     "coverage_percent",
     "avg_heat_input",
     "avg_pwr_gen",
+    AVG_COAL_NOX_COL,
     NOX_COL,
-    PREV_QTR_MED_NOX_COL,
     DELTA_NOX_COL,
-    DELTA_NOX_SCALED_COL,
     EFFECTIVE_CURRENT_NOX_COL,
     "effective_delta_nox",
     DELTA_CATEGORY_COL,
-    DELTA_EFFECTIVE_NOX_SCALED_COL,
     LABEL_MODE_COL,
 ]
 REQUIRED_COLUMNS = [
@@ -107,12 +103,12 @@ REQUIRED_COLUMNS = [
     "hour",
     "emissions_hour_utc",
     "noxMass",
+    "opTime",
     "grossLoad",
     "heatInput",
     "noxMassMeasureFlg",
     "primaryFuelInfo",
     "attributePrimaryFuelInfo",
-    "facility_nameplate_capacity_mw",
 ]
 
 DEFAULT_DIAGNOSTIC_OUTPUT = Path(VIS_DIR) / "stratification_ema_balance.png"
@@ -208,35 +204,22 @@ def _split_by_cluster(
 
 
 def filter_stratification_rule(frame: pl.DataFrame) -> pl.DataFrame:
-    """Keep records whose raw and normalized EMA classes agree.
+    """Assign classes from the raw effective EMA change.
 
     Args:
-        frame: Eligible records carrying raw and normalized effective deltas.
+        frame: Eligible records carrying raw effective deltas.
 
     Returns:
-        Agreement-filtered records labeled with the raw EMA class.
+        Records labeled with the raw EMA class.
     """
-    normalized_category_column = "_normalized_delta_category"
     raw_delta = pl.col("effective_delta_nox")
-    normalized_delta = pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL)
-    return (
-        frame.with_columns(
-            pl.when(raw_delta < -STRATIFICATION_EMA_CHANGE_THRESHOLD)
-            .then(pl.lit("decrease"))
-            .when(raw_delta > STRATIFICATION_EMA_CHANGE_THRESHOLD)
-            .then(pl.lit("increase"))
-            .otherwise(pl.lit("steady"))
-            .alias(DELTA_CATEGORY_COL),
-            pl.when(normalized_delta < -STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD)
-            .then(pl.lit("decrease"))
-            .when(normalized_delta > STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD)
-            .then(pl.lit("increase"))
-            .otherwise(pl.lit("steady"))
-            .alias(normalized_category_column),
-        )
-        .filter(pl.col(DELTA_EFFECTIVE_NOX_SCALED_COL).is_finite())
-        .filter(pl.col(DELTA_CATEGORY_COL) == pl.col(normalized_category_column))
-        .drop(normalized_category_column)
+    return frame.with_columns(
+        pl.when(raw_delta < -STRATIFICATION_EMA_CHANGE_THRESHOLD)
+        .then(pl.lit("decrease"))
+        .when(raw_delta > STRATIFICATION_EMA_CHANGE_THRESHOLD)
+        .then(pl.lit("increase"))
+        .otherwise(pl.lit("steady"))
+        .alias(DELTA_CATEGORY_COL)
     )
 
 
@@ -244,10 +227,10 @@ def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     # Apply non-raster candidate quality requirements
     return frame.filter(
         (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT)
+        & pl.col(AVG_COAL_NOX_COL).is_finite()
+        & pl.col("avg_heat_input").is_finite()
         & pl.col("avg_pwr_gen").is_finite()
         & pl.col(MAJOR_CITY_DIST_COL).is_finite()
-        & pl.col(PREVIOUS_QUARTER_POWER_COL).is_finite()
-        & (pl.col(PREVIOUS_QUARTER_POWER_COL) > 0)
     )
 
 
@@ -375,8 +358,7 @@ def _plot_stratification_diagnostics(
     split_counts = ", ".join(f"{name}={balanced_splits[name].height:,}" for name in split_names)
     total_balanced = sum(split.height for split in balanced_splits.values())
     figure.suptitle(
-        f"Raw +/-{STRATIFICATION_EMA_CHANGE_THRESHOLD:g} and normalized "
-        f"+/-{STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD:g} agreement\n"
+        f"Raw EMA change threshold +/-{STRATIFICATION_EMA_CHANGE_THRESHOLD:g}\n"
         f"Maximum balanced set: {total_balanced:,} total ({split_counts})"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -407,11 +389,21 @@ def build_stratification_candidates() -> pl.DataFrame:
     records = raw_records.pipe(filter_usable_nox_measurements).filter(pl.col("noxMass").is_finite())
 
     facilities = raw_records.select("facilityId", "lat", "lon").drop_nulls().unique(subset="facilityId").collect()
-    aois = build_aois(facilities)
+    all_aois = build_aois(facilities)
+    all_spatial_aois = build_aoi_spatial_frame(all_aois)
+    membership = build_aoi_membership(all_aois, facilities, all_spatial_aois)
+    aoi_features = calculate_activity_conditioned_aoi_features(raw_records, membership)
+    selected_features = select_top_coal_aois(aoi_features, STRATIFICATION_AOI_FRACTION)
+    selected_ids = selected_features.select(AOI_ID_COL)
+    aois = all_aois.join(selected_ids, on=AOI_ID_COL, how="inner")
+    membership = membership.join(selected_ids, on=AOI_ID_COL, how="inner")
+    spatial_aois = build_aoi_spatial_frame(aois)
     bounded_aois = add_major_city_distance(add_aoi_bounds(aois))
     observations = load_tempo_mapping()
-    spatial_aois = build_aoi_spatial_frame(aois)
-    membership = build_aoi_membership(aois, facilities, spatial_aois)
+    print(
+        f"Selected {aois.height:,}/{aoi_features.filter(pl.col('num_coal_units') > 0).height:,} "
+        f"coal-containing AOIs by {AVG_COAL_NOX_COL}"
+    )
     invalid_aoi_hours = (
         raw_records.filter(~usable_nox_measurement_expr() | ~pl.col("noxMass").is_finite())
         .join(membership.lazy(), on="facilityId", how="inner")
@@ -421,16 +413,10 @@ def build_stratification_candidates() -> pl.DataFrame:
         .collect(engine="streaming")
     )
     hourly = (
-        aggregate_aoi_hours(records, aois, membership)
+        aggregate_aoi_hours(records, aois, membership, selected_features)
         .join(invalid_aoi_hours, on=[AOI_ID_COL, "emissions_hour_utc"], how="left")
         .filter(pl.col("_has_invalid_nox").is_null())
         .drop("_has_invalid_nox")
-        .filter(
-            pl.col("avg_heat_input").is_not_null()
-            & pl.col("avg_pwr_gen").is_not_null()
-            & pl.col(PREV_QTR_MED_NOX_COL).is_finite()
-            & (pl.col(PREV_QTR_MED_NOX_COL) > 0)
-        )
     )
     frame = hourly.join(cluster_aois(aois, spatial_aois), on=AOI_ID_COL, how="left")
     frame = add_tempo_sequences(
@@ -447,7 +433,6 @@ def build_stratification_candidates() -> pl.DataFrame:
         EMA_DECAY_TIMESCALE_HOURS,
         label_timestep_index=LABEL_TIMESTEP_INDEX,
     )
-    frame = add_scaled_nox_targets(frame)
     frame = frame.with_columns(pl.lit("causal_ema").alias(LABEL_MODE_COL))
     bounds = bounded_aois.select(
         AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
@@ -466,11 +451,10 @@ def main() -> None:
     candidates = build_stratification_candidates()
     frame = filter_stratification_rule(candidates)
     print(
-        f"Retained {frame.height:,}/{candidates.height:,} records after raw +/-"
-        f"{STRATIFICATION_EMA_CHANGE_THRESHOLD:g} and normalized +/-"
-        f"{STRATIFICATION_NORMALIZED_CHANGE_THRESHOLD:g} class agreement"
+        f"Labeled {frame.height:,} records with raw EMA threshold +/-"
+        f"{STRATIFICATION_EMA_CHANGE_THRESHOLD:g}"
     )
-    print(f"Using all {frame[AOI_ID_COL].n_unique():,} eligible AOIs")
+    print(f"Using {frame[AOI_ID_COL].n_unique():,} eligible selected AOIs")
     eligible_splits = _split_by_cluster(frame, category_column=DELTA_CATEGORY_COL)
     splits = {
         split: select_balanced_ema_records(split_frame, split)

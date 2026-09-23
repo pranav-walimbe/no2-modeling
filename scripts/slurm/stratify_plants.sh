@@ -47,9 +47,9 @@ total_records=$((train_records + val_records + test_records))
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" stat -c %s "${mail_log}")
 printf '%s\n' \
     'Causal EMA stratification completed successfully.' \
+    'Selected the highest coal-NOx-ranked half of coal-containing AOIs.' \
     'Raw EMA-change threshold: +/-100' \
-    'Normalized EMA-change threshold: +/-0.05; raw and normalized classes must agree.' \
-    'Five rasters retained; label interval ends at t3; EMA history is four hours.' \
+    'Four rasters retained; label interval ends at t2; EMA history is four hours.' \
     'Filtered AOI clusters were assigned by class to approximately 70/15/15 splits.' \
     'Every split is independently balanced across decrease, steady, and increase.' \
     "Train: ${train_records} records" \

@@ -1,5 +1,6 @@
 """Utilities for building and splitting AOI-hour records."""
 
+import math
 from pathlib import Path
 
 import geopandas as gpd
@@ -20,31 +21,13 @@ from config import (
 )
 
 AOI_ID_COL = "aoi_id"
-AOI_SCORE_COL = "aoi_score"
-COAL_SHARE_COL = "coal_production_share"
-SIGNAL_STRENGTH_SCORE_COL = "signal_strength_score"
-EVENT_SUPPORT_SCORE_COL = "event_support_score"
-URBAN_ISOLATION_SCORE_COL = "urban_isolation_score"
-OBSERVATION_YIELD_SCORE_COL = "observation_yield_score"
-AOI_SCORE_COMPONENTS = (
-    (COAL_SHARE_COL, 0.25, "Coal production share"),
-    (SIGNAL_STRENGTH_SCORE_COL, 0.25, "Signal strength"),
-    (EVENT_SUPPORT_SCORE_COL, 0.20, "Event support"),
-    (URBAN_ISOLATION_SCORE_COL, 0.15, "Urban isolation"),
-    (OBSERVATION_YIELD_SCORE_COL, 0.15, "Observation yield"),
-)
-AOI_EVENT_ABSOLUTE_DELTA_THRESHOLD = 100.0
+AVG_COAL_NOX_COL = "avg_coal_nox"
 MAJOR_CITY_DIST_COL = "major_city_dist"
 LABEL_MODE_COL = "label_mode"
-PREVIOUS_QUARTER_COAL_POWER_COL = "_previous_quarter_coal_power"
-PREVIOUS_QUARTER_POWER_COL = "_previous_quarter_power"
-PREV_QTR_MED_NOX_COL = "prev_qtr_med_nox"
 EFFECTIVE_CURRENT_NOX_COL = "effective_current_nox"
 EFFECTIVE_PREVIOUS_NOX_COL = "effective_previous_nox"
 NOX_COL = "nox"
 DELTA_NOX_COL = "delta_nox"
-DELTA_NOX_SCALED_COL = "delta_nox_scaled"
-DELTA_EFFECTIVE_NOX_SCALED_COL = "delta_effective_nox_scaled"
 METERS_PER_KM = 1000.0
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_MINUTE = 60
@@ -172,6 +155,8 @@ def add_sequence_weather_paths(frame: pl.DataFrame, timesteps: int = SEQUENCE_TI
     Returns:
         Records with one weather path column per timestep.
     """
+    if timesteps <= 0:
+        raise ValueError("timesteps must be positive")
     expressions = []
     for index in range(timesteps):
         matched_time = (pl.col(f"timestep_time_t{index}") + pl.duration(minutes=30)).dt.truncate("1h")
@@ -201,7 +186,11 @@ def add_tempo_sequences(
     Returns:
         Rows carrying oldest-to-newest scan timestamps, ages, and paths.
     """
+    if timesteps < 2:
+        raise ValueError("timesteps must be at least two")
     label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
+    if not 1 <= label_index < timesteps:
+        raise ValueError("label_timestep_index must select the second or a later timestep")
     time_columns = [f"timestep_time_t{index}" for index in range(timesteps)]
     path_columns = [f"no2_paths_t{index}" for index in range(timesteps)]
     age_columns = [f"timestep_age_hours_t{index}" for index in range(timesteps)]
@@ -383,9 +372,13 @@ def add_ema_targets(
     Returns:
         Records with continuous EMA targets and complete audit components.
     """
+    if timesteps <= 0:
+        raise ValueError("timesteps must be positive")
     if decay_timescale_hours <= 0:
         raise ValueError("decay_timescale_hours must be positive")
     label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
+    if label_index < 1:
+        raise ValueError("label_timestep_index must select the second or a later timestep")
     indexed = frame.with_row_index("_label_row")
     current = _scan_ema(
         indexed,
@@ -414,25 +407,6 @@ def add_ema_targets(
             (pl.col(EFFECTIVE_CURRENT_NOX_COL) - pl.col(EFFECTIVE_PREVIOUS_NOX_COL)).alias("effective_delta_nox")
         )
         .drop("_label_row", "current_ema_nox", "previous_ema_nox")
-    )
-
-
-def add_scaled_nox_targets(frame: pl.DataFrame) -> pl.DataFrame:
-    """Add canonical raw and effective delta targets scaled by prior-quarter median NOx.
-
-    Args:
-        frame: AOI-hour records with raw and effective NOx changes.
-
-    Returns:
-        Records with unscaled aliases and asinh-scaled delta targets.
-    """
-    return frame.with_columns(
-        pl.col("delta_nox_mass").alias(DELTA_NOX_COL),
-    ).with_columns(
-        (pl.col(DELTA_NOX_COL) / pl.col(PREV_QTR_MED_NOX_COL)).arcsinh().alias(DELTA_NOX_SCALED_COL),
-        (pl.col("effective_delta_nox") / pl.col(PREV_QTR_MED_NOX_COL))
-        .arcsinh()
-        .alias(DELTA_EFFECTIVE_NOX_SCALED_COL),
     )
 
 
@@ -501,181 +475,104 @@ def _fuel_flags() -> tuple[pl.Expr, pl.Expr]:
     return fuel.str.contains("coal"), fuel.str.contains("natural gas")
 
 
-def calculate_aoi_scores(
+def calculate_activity_conditioned_aoi_features(
     records: pl.DataFrame | pl.LazyFrame,
-    hourly: pl.DataFrame,
-    eligible_records: pl.DataFrame,
-    aois: pl.DataFrame,
     membership: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Score AOIs for source strength, events, isolation, and observation yield.
+    """Calculate static AOI features over higher-activity hours.
 
     Args:
-        records: Full unit-hour emissions history with production and fuel fields.
-        hourly: Valid AOI-hour emissions aggregates over the full history.
-        eligible_records: AOI-hour rows with complete sequence metadata and targets.
-        aois: AOI centroids carrying distance to the nearest major city.
+        records: Full unit-hour emissions history.
         membership: Facility-to-AOI membership table.
 
     Returns:
-        One row per scoreable AOI with raw diagnostics and component scores.
+        One row per AOI with unit counts and activity-conditioned averages.
     """
     records_lazy = records.lazy() if isinstance(records, pl.DataFrame) else records
-    coal, _ = _fuel_flags()
-    production = (
-        records_lazy.filter(pl.col("grossLoad").is_finite() & (pl.col("grossLoad") > 0))
-        .with_columns(coal.alias("_is_coal"))
-        .join(membership.lazy(), on="facilityId", how="inner")
+    coal, natural_gas = _fuel_flags()
+    tagged = records_lazy.with_columns(coal.alias("_is_coal"), natural_gas.alias("_is_ng"))
+    unit_counts = (
+        tagged.join(membership.lazy(), on="facilityId", how="inner")
+        .group_by(AOI_ID_COL, "facilityId", "unitId")
+        .agg(pl.col("_is_coal").any(), pl.col("_is_ng").any())
         .group_by(AOI_ID_COL)
         .agg(
-            pl.col("grossLoad").sum().alias("_total_production"),
-            pl.col("grossLoad").filter(pl.col("_is_coal")).sum().alias("_coal_production"),
+            pl.len().cast(pl.UInt32).alias("num_units"),
+            pl.col("_is_coal").sum().cast(pl.UInt32).alias("num_coal_units"),
+            pl.col("_is_ng").sum().cast(pl.UInt32).alias("num_ng_units"),
         )
-        .with_columns(
-            (pl.col("_coal_production") / pl.col("_total_production")).alias(COAL_SHARE_COL)
+    )
+    hourly = (
+        tagged.filter(pl.col("opTime").is_finite() & (pl.col("opTime") >= 0))
+        .join(membership.lazy(), on="facilityId", how="inner")
+        .group_by(AOI_ID_COL, "emissions_hour_utc")
+        .agg(
+            pl.col("opTime").mean().alias("_mean_unit_operating_time"),
+            pl.col("noxMass")
+            .filter(
+                pl.col("_is_coal")
+                & usable_nox_measurement_expr()
+                & pl.col("noxMass").is_finite()
+                & (pl.col("noxMass") >= 0)
+            )
+            .sum()
+            .alias("_coal_nox_mass"),
         )
+    )
+    activity_cutoffs = hourly.group_by(AOI_ID_COL).agg(
+        pl.col("_mean_unit_operating_time").median().alias("_median_avg_op_time")
+    )
+    selected_hours = (
+        hourly.join(activity_cutoffs, on=AOI_ID_COL, how="inner")
+        .filter(pl.col("_mean_unit_operating_time") >= pl.col("_median_avg_op_time"))
+        .select(AOI_ID_COL, "emissions_hour_utc", "_coal_nox_mass")
+    )
+    selected_record_averages = (
+        tagged.join(membership.lazy(), on="facilityId", how="inner")
+        .join(
+            selected_hours.select(AOI_ID_COL, "emissions_hour_utc"),
+            on=[AOI_ID_COL, "emissions_hour_utc"],
+            how="inner",
+        )
+        .group_by(AOI_ID_COL)
+        .agg(
+            pl.col("heatInput").filter(pl.col("heatInput").is_finite()).mean().alias("avg_heat_input"),
+            pl.col("grossLoad").filter(pl.col("grossLoad").is_finite()).mean().alias("avg_pwr_gen"),
+        )
+    )
+    activity_features = (
+        selected_hours.group_by(AOI_ID_COL)
+        .agg(pl.col("_coal_nox_mass").mean().alias(AVG_COAL_NOX_COL))
+        .join(selected_record_averages, on=AOI_ID_COL, how="inner")
+    )
+    return (
+        unit_counts.join(activity_features, on=AOI_ID_COL, how="inner")
+        .filter(pl.col(AVG_COAL_NOX_COL).is_finite())
         .collect(engine="streaming")
     )
 
-    event_threshold = pl.max_horizontal(
-        pl.lit(AOI_EVENT_ABSOLUTE_DELTA_THRESHOLD),
-        pl.col(PREV_QTR_MED_NOX_COL) * 0.25,
-    )
-    emissions_metrics = (
-        hourly.group_by(AOI_ID_COL)
-        .agg(
-            pl.col(NOX_COL)
-            .filter(pl.col(NOX_COL).is_finite() & (pl.col(NOX_COL) >= 0))
-            .quantile(0.75, interpolation="linear")
-            .alias("signal_strength_p75"),
-            (pl.col("delta_nox_mass") >= event_threshold).sum().alias("up_event_count"),
-            (pl.col("delta_nox_mass") <= -event_threshold).sum().alias("down_event_count"),
-            pl.len().alias("candidate_hour_count"),
-        )
-        .with_columns(
-            (pl.col("up_event_count") + pl.col("down_event_count")).alias("event_count")
-        )
-        .with_columns(
-            (
-                2
-                * pl.min_horizontal("up_event_count", "down_event_count")
-                / pl.max_horizontal("event_count", pl.lit(1))
-            ).alias("event_direction_balance")
-        )
-        .with_columns(
-            (
-                pl.col("event_count").log1p()
-                * (0.75 + 0.25 * pl.col("event_direction_balance"))
-            ).alias("event_support_raw")
-        )
-    )
-    observation_metrics = eligible_records.group_by(AOI_ID_COL).agg(
-        pl.len().alias("observable_record_count")
-    )
-    scores = (
-        production.join(emissions_metrics, on=AOI_ID_COL, how="inner")
-        .join(observation_metrics, on=AOI_ID_COL, how="inner")
-        .join(aois.select(AOI_ID_COL, MAJOR_CITY_DIST_COL), on=AOI_ID_COL, how="inner")
-        .filter(
-            pl.col(COAL_SHARE_COL).is_finite()
-            & pl.col("signal_strength_p75").is_finite()
-            & pl.col(MAJOR_CITY_DIST_COL).is_finite()
-            & (pl.col("_total_production") > 0)
-            & (pl.col("candidate_hour_count") > 0)
-            & (pl.col("observable_record_count") > 0)
-        )
-        .with_columns(
-            (pl.col("observable_record_count") / pl.col("candidate_hour_count")).alias(
-                "observation_rate"
-            ),
-            pl.col("signal_strength_p75").log1p().alias("signal_strength_raw"),
-            ((pl.col(MAJOR_CITY_DIST_COL) - 25.0) / 125.0)
-            .clip(0.0, 1.0)
-            .alias(URBAN_ISOLATION_SCORE_COL),
-        )
-        .with_columns(
-            (pl.col("signal_strength_raw").rank(method="average") / pl.len()).alias(
-                SIGNAL_STRENGTH_SCORE_COL
-            ),
-            pl.when(pl.col("event_count") > 0)
-            .then(pl.col("event_support_raw").rank(method="average") / pl.len())
-            .otherwise(0.0)
-            .alias(EVENT_SUPPORT_SCORE_COL),
-            (pl.col("observable_record_count").log1p().rank(method="average") / pl.len()).alias(
-                "_observation_count_score"
-            ),
-            (pl.col("observation_rate").rank(method="average") / pl.len()).alias(
-                "_observation_rate_score"
-            ),
-        )
-        .with_columns(
-            (
-                0.75 * pl.col("_observation_count_score")
-                + 0.25 * pl.col("_observation_rate_score")
-            ).alias(OBSERVATION_YIELD_SCORE_COL)
-        )
-        .with_columns(
-            (
-                100
-                * pl.sum_horizontal(
-                    [pl.col(column) * weight for column, weight, _ in AOI_SCORE_COMPONENTS]
-                )
-            ).alias(AOI_SCORE_COL)
-        )
-        .drop("_coal_production", "_observation_count_score", "_observation_rate_score")
-        .sort(AOI_SCORE_COL, AOI_ID_COL, descending=[True, False])
-    )
-    return scores
 
-
-def previous_quarter_power_priorities(
-    records: pl.LazyFrame,
-    membership: pl.DataFrame,
-) -> pl.LazyFrame:
-    """Build lagged AOI power summaries for record prioritization.
+def select_top_coal_aois(aoi_features: pl.DataFrame, fraction: float) -> pl.DataFrame:
+    """Select the highest coal-NOx-ranked share of coal-containing AOIs.
 
     Args:
-        records: Unit-hour emissions records with fuel and gross-load fields.
-        membership: Facility-to-AOI membership table.
+        aoi_features: Static AOI features carrying coal-unit counts and coal NOx.
+        fraction: Selected share in the interval ``(0, 1]``.
 
     Returns:
-        Total and coal power summaries shifted into the following quarter.
+        Deterministically ranked and selected AOI feature rows.
     """
-    coal, _ = _fuel_flags()
-    unit_quarter = (
-        records.with_columns(
-            pl.col("date").dt.year().alias("_priority_year"),
-            pl.col("date").dt.quarter().alias("_priority_quarter"),
-            coal.alias("_priority_is_coal"),
-        )
-        .filter(pl.col("grossLoad").is_finite())
-        .group_by("facilityId", "unitId", "_priority_year", "_priority_quarter")
-        .agg(
-            pl.col("grossLoad").mean().alias("_unit_average_power"),
-            pl.col("_priority_is_coal").any(),
-        )
+    if not 0 < fraction <= 1:
+        raise ValueError("fraction must be in the interval (0, 1]")
+    ranked = aoi_features.filter(pl.col("num_coal_units") > 0).sort(
+        AVG_COAL_NOX_COL,
+        AOI_ID_COL,
+        descending=[True, False],
     )
-    return (
-        unit_quarter.join(membership.lazy(), on="facilityId", how="inner")
-        .group_by(AOI_ID_COL, "_priority_year", "_priority_quarter")
-        .agg(
-            pl.col("_unit_average_power").sum().alias(PREVIOUS_QUARTER_POWER_COL),
-            pl.col("_unit_average_power")
-            .filter(pl.col("_priority_is_coal"))
-            .sum()
-            .alias(PREVIOUS_QUARTER_COAL_POWER_COL),
-        )
-        .with_columns(
-            pl.when(pl.col("_priority_quarter") == 4)
-            .then(pl.col("_priority_year") + 1)
-            .otherwise(pl.col("_priority_year"))
-            .alias("_priority_year"),
-            pl.when(pl.col("_priority_quarter") == 4)
-            .then(1)
-            .otherwise(pl.col("_priority_quarter") + 1)
-            .alias("_priority_quarter"),
-        )
-    )
+    if ranked.is_empty():
+        raise ValueError("no coal-containing AOIs have finite activity-conditioned features")
+    selected_count = math.ceil(ranked.height * fraction)
+    return ranked.with_row_index("coal_nox_rank", offset=1).head(selected_count)
 
 
 def filter_usable_nox_measurements(
@@ -700,57 +597,6 @@ def usable_nox_measurement_expr() -> pl.Expr:
         .str.contains(r"invalid|unavailable")
     )
     return ~unusable
-
-
-def add_previous_quarter_same_hour_averages(hourly: pl.LazyFrame) -> pl.LazyFrame:
-    """Replace hourly heat and power means with prior-quarter same-hour means."""
-    quarter_columns = hourly.with_columns(
-        pl.col("date").dt.year().alias("_year"),
-        pl.col("date").dt.quarter().alias("_quarter"),
-    )
-    previous_quarter = (
-        quarter_columns.group_by(AOI_ID_COL, "_year", "_quarter", "hour")
-        .agg(
-            pl.col("_hourly_avg_heat_input").mean().alias("avg_heat_input"),
-            pl.col("_hourly_avg_pwr_gen").mean().alias("avg_pwr_gen"),
-        )
-        .with_columns(
-            pl.when(pl.col("_quarter") == 4).then(pl.col("_year") + 1).otherwise(pl.col("_year")).alias("_year"),
-            pl.when(pl.col("_quarter") == 4).then(1).otherwise(pl.col("_quarter") + 1).alias("_quarter"),
-        )
-    )
-    return (
-        quarter_columns.drop("_hourly_avg_heat_input", "_hourly_avg_pwr_gen")
-        .join(previous_quarter, on=[AOI_ID_COL, "_year", "_quarter", "hour"], how="left")
-        .drop("_year", "_quarter")
-    )
-
-
-def add_previous_quarter_nox_median(hourly: pl.LazyFrame) -> pl.LazyFrame:
-    """Add the AOI's median hourly NOx mass from the prior quarter.
-
-    Args:
-        hourly: AOI-hour rows containing date and aggregate NOx mass.
-
-    Returns:
-        Rows with a leakage-safe prior-quarter median when the immediately
-        preceding quarter is available.
-    """
-    quarter_columns = hourly.with_columns(
-        pl.col("date").dt.year().alias("_year"),
-        pl.col("date").dt.quarter().alias("_quarter"),
-    )
-    previous_quarter = (
-        quarter_columns.group_by(AOI_ID_COL, "_year", "_quarter")
-        .agg(pl.col("nox_mass").median().alias(PREV_QTR_MED_NOX_COL))
-        .with_columns(
-            pl.when(pl.col("_quarter") == 4).then(pl.col("_year") + 1).otherwise(pl.col("_year")).alias("_year"),
-            pl.when(pl.col("_quarter") == 4).then(1).otherwise(pl.col("_quarter") + 1).alias("_quarter"),
-        )
-    )
-    return quarter_columns.join(previous_quarter, on=[AOI_ID_COL, "_year", "_quarter"], how="left").drop(
-        "_year", "_quarter"
-    )
 
 
 def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
@@ -855,16 +701,21 @@ def aggregate_aoi_hours(
     records: pl.DataFrame | pl.LazyFrame,
     aois: pl.DataFrame,
     membership: pl.DataFrame,
+    aoi_features: pl.DataFrame,
 ) -> pl.DataFrame:
-    """Aggregate unit observations and prediction-date attributes to AOI hours."""
+    """Aggregate unit observations and attach static AOI features.
+
+    Args:
+        records: Usable unit-hour emissions records.
+        aois: Selected AOI centroids and projected coordinates.
+        membership: Facility-to-selected-AOI membership table.
+        aoi_features: Static activity-conditioned AOI features.
+
+    Returns:
+        One row per selected AOI and emissions hour.
+    """
     records_lazy = records.lazy() if isinstance(records, pl.DataFrame) else records
-    coal, natural_gas = _fuel_flags()
-    power_priorities = previous_quarter_power_priorities(records_lazy, membership)
-    facility_units = (
-        records_lazy.with_columns(coal.alias("is_coal"), natural_gas.alias("is_ng"))
-        .group_by("facilityId", "unitId")
-        .agg(pl.col("is_coal").any(), pl.col("is_ng").any())
-    )
+    facility_units = records_lazy.select("facilityId", "unitId").unique()
     facility_unit_counts = facility_units.group_by("facilityId").agg(
         pl.len().cast(pl.UInt32).alias("_source_unit_count")
     )
@@ -892,35 +743,10 @@ def aggregate_aoi_hours(
             pl.col("_source_unit_count").cast(pl.String).str.join(",").alias("_source_unit_count"),
         )
     )
-    unit_counts = (
-        facility_units.join(membership.lazy(), on="facilityId", how="inner")
-        .group_by(AOI_ID_COL)
-        .agg(
-            pl.col("is_coal").sum().cast(pl.UInt32).alias("num_coal_units"),
-            pl.col("is_ng").sum().cast(pl.UInt32).alias("num_ng_units"),
-        )
-    )
-    facility_capacity = (
-        records_lazy.select(
-            "facilityId",
-            "emissions_hour_utc",
-            "facility_nameplate_capacity_mw",
-        )
-        .unique(subset=["facilityId", "emissions_hour_utc"])
-        .join(membership.lazy(), on="facilityId", how="inner")
-        .group_by(AOI_ID_COL, "emissions_hour_utc")
-        .agg(
-            pl.col("facility_nameplate_capacity_mw").sum().alias("total_nameplate_capacity_mw"),
-        )
-    )
     hourly = (
         records_lazy.join(membership.lazy(), on="facilityId", how="inner")
         .group_by(AOI_ID_COL, "emissions_hour_utc")
-        .agg(
-            pl.col("noxMass").sum().alias("nox_mass"),
-            pl.col("heatInput").mean().alias("_hourly_avg_heat_input"),
-            pl.col("grossLoad").mean().alias("_hourly_avg_pwr_gen"),
-        )
+        .agg(pl.col("noxMass").sum().alias("nox_mass"))
         .with_columns(
             pl.col("emissions_hour_utc").dt.date().alias("date"),
             pl.col("emissions_hour_utc").dt.hour().cast(pl.Int8).alias("hour"),
@@ -928,15 +754,9 @@ def aggregate_aoi_hours(
         )
     )
     return (
-        add_delta_nox_targets(add_previous_quarter_nox_median(add_previous_quarter_same_hour_averages(hourly)))
-        .with_columns(
-            pl.col("date").dt.year().alias("_priority_year"),
-            pl.col("date").dt.quarter().alias("_priority_quarter"),
-        )
-        .join(power_priorities, on=[AOI_ID_COL, "_priority_year", "_priority_quarter"], how="left")
-        .drop("_priority_year", "_priority_quarter")
-        .join(facility_capacity, on=[AOI_ID_COL, "emissions_hour_utc"], how="left")
-        .join(unit_counts, on=AOI_ID_COL, how="left")
+        add_delta_nox_targets(hourly)
+        .with_columns(pl.col("delta_nox_mass").alias(DELTA_NOX_COL))
+        .join(aoi_features.lazy(), on=AOI_ID_COL, how="inner")
         .join(source_locations, on=AOI_ID_COL, how="left")
         .join(aois.select(AOI_ID_COL, "lat", "lon", "x_m", "y_m").lazy(), on=AOI_ID_COL, how="left")
         .sort(AOI_ID_COL, "date", "hour")
