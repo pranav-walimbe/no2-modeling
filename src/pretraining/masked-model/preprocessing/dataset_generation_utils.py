@@ -1,5 +1,7 @@
 """Shared utilities for masked-pretraining dataset generation."""
 
+from __future__ import annotations
+
 import json
 import os
 import tempfile
@@ -33,7 +35,6 @@ INVALID_STATUS = "invalid"
 RETRYABLE_STATUS = "retryable"
 MASKED_NO2_RASTER_NAME = "masked_no2"
 ARTIFICIAL_MASK_NAME = "artificial_mask"
-SHARD_RECORDS_FILE = "records.csv"
 MIN_MASK_FRACTION = 0.01
 MAX_MASK_FRACTION = 0.10
 MASK_EDGE_STRENGTH = 2.0
@@ -61,18 +62,14 @@ CANDIDATE_SCHEMA = {
     "tempo_time": pl.Datetime(time_zone="UTC"),
     "granule_paths": pl.List(pl.String),
     "weather_path": pl.String,
-    "shard_key": pl.UInt64,
-    "selection_key": pl.UInt64,
 }
 
-VALID_RECORD_SCHEMA = {
-    "candidate_index": pl.UInt64,
-    "aoi_id": pl.Int64,
-    "scan_date": pl.Date,
-    "scan_num": pl.Int32,
-    "tempo_time": pl.Datetime(time_zone="UTC"),
+VALIDITY_INDEX_SCHEMA = {
     "cache_key": pl.String,
-    "validity_cache_path": pl.String,
+    "status": pl.String,
+    "tempo_cache_path": pl.String,
+    "weather_cache_path": pl.String,
+    "reason": pl.String,
 }
 
 FINAL_RECORD_SCHEMA = {
@@ -87,108 +84,37 @@ FINAL_RECORD_SCHEMA = {
 
 
 @dataclass(frozen=True)
-class PretrainingShardTask:
-    """One deterministic output-record range assigned to an array task."""
-
-    task_id: int
-    split: str
-    shard_index: int
-    start: int
-    stop: int
-    split_target: int
-
-    @property
-    def size(self) -> int:
-        """Return the maximum record count for the shard."""
-        return self.stop - self.start
-
-
-@dataclass(frozen=True)
-class CandidateResult:
-    """Terminal or retryable outcome for one AOI-scene candidate."""
+class CandidateOutcome:
+    """Cache paths or failure state for one candidate."""
 
     status: str
     row: dict[str, object]
     cache_key: str
-    raster_path: str | None = None
+    tempo_cache_path: str | None = None
+    weather_cache_path: str | None = None
     reason: str | None = None
+
+    def validity_row(self) -> dict[str, object]:
+        """Return this outcome in persistent validity-index form."""
+        return {
+            "cache_key": self.cache_key,
+            "status": self.status,
+            "tempo_cache_path": self.tempo_cache_path,
+            "weather_cache_path": self.weather_cache_path,
+            "reason": self.reason,
+        }
 
 
 @dataclass(frozen=True)
 class MaskedRecordTask:
-    """One selected validity-cache entry to materialize in a fresh shard."""
+    """One masked raster bundle to assemble from source caches."""
 
     row: dict[str, object]
+    cache_key: str
+    tempo_cache_path: str
+    weather_cache_path: str
     output_path: str
     mask_seed: int
-
-
-@dataclass(frozen=True)
-class MaskedDatasetShardStore:
-    """Manage disposable masked-pretraining dataset shards."""
-
-    root: Path
-
-    def create(self, task: PretrainingShardTask) -> Path:
-        """Create a shard directory.
-
-        Args:
-            task: Shard coordinates.
-
-        Returns:
-            Path to the new shard directory.
-        """
-        split_root = self.root / task.split
-        split_root.mkdir(parents=True, exist_ok=True)
-        shard_dir = split_root / f"{task.shard_index:06d}"
-        shard_dir.mkdir()
-        return shard_dir
-
-    def write(self, task: PretrainingShardTask, shard_dir: Path, rows: list[dict[str, object]]) -> None:
-        """Publish a shard manifest.
-
-        Args:
-            task: Shard coordinates.
-            shard_dir: Shard directory.
-            rows: Final record rows.
-        """
-        frame = pl.DataFrame(rows, schema=FINAL_RECORD_SCHEMA).sort("candidate_index")
-        relative_paths = [str(Path(path).relative_to(shard_dir)) for path in frame["raster_bundle_path"].to_list()]
-        frame = frame.with_columns(pl.Series("raster_bundle_path", relative_paths, dtype=pl.String))
-        write_csv_atomic(frame, shard_dir / SHARD_RECORDS_FILE)
-        print(f"[{task.split} shard {task.shard_index}] wrote {frame.height:,} masked records")
-
-    def load(self, task: PretrainingShardTask, *, resolve_paths: bool = False) -> pl.DataFrame:
-        """Load and validate a shard.
-
-        Args:
-            task: Shard coordinates.
-            resolve_paths: Convert raster paths to absolute shard paths.
-
-        Returns:
-            Validated record manifest.
-        """
-        shard_dir = self.root / task.split / f"{task.shard_index:06d}"
-        frame = pl.read_csv(shard_dir / SHARD_RECORDS_FILE, schema_overrides=FINAL_RECORD_SCHEMA)
-        if frame.height > task.size:
-            raise ValueError(f"Shard {task.task_id} contains more than {task.size:,} records")
-        raster_directory = Path("record-rasters") / task.split
-        relative_paths = [Path(str(path)) for path in frame["raster_bundle_path"].to_list()]
-        if any(path.is_absolute() or path.parent != raster_directory for path in relative_paths):
-            raise ValueError(f"Shard {task.task_id} contains a raster path outside {raster_directory}")
-        if len(set(relative_paths)) != len(relative_paths):
-            raise ValueError(f"Shard {task.task_id} contains duplicate raster paths")
-        if any(not (shard_dir / path).is_file() for path in relative_paths):
-            raise ValueError(f"Shard {task.task_id} references a missing raster bundle")
-        if resolve_paths:
-            frame = frame.with_columns(
-                pl.Series(
-                    "raster_bundle_path",
-                    [str(shard_dir / path) for path in relative_paths],
-                    dtype=pl.String,
-                )
-            )
-        return frame
 
 
 def write_parquet_atomic(frame: pl.DataFrame, destination: Path) -> None:
@@ -268,206 +194,223 @@ def write_npz_atomic(destination: Path, **arrays: np.ndarray) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
-def build_shard_tasks(
-    targets: dict[str, int],
-    shard_size: int,
-) -> list[PretrainingShardTask]:
-    """Partition split targets into fixed-size output shards.
+def empty_validity_index() -> pl.DataFrame:
+    """Return an empty validity-index frame."""
+    return pl.DataFrame(schema=VALIDITY_INDEX_SCHEMA)
+
+
+def empty_final_records() -> pl.DataFrame:
+    """Return an empty final-record frame."""
+    return pl.DataFrame(schema=FINAL_RECORD_SCHEMA)
+
+
+def merge_validity_frames(frames: list[pl.DataFrame]) -> pl.DataFrame:
+    """Merge validity-index frames with later rows taking precedence.
 
     Args:
-        targets: Requested record count for each split.
-        shard_size: Maximum records per shard.
+        frames: Index snapshots and ordered update frames.
 
     Returns:
-        Ordered shard tasks for all splits.
+        One row per cache key.
     """
-    tasks: list[PretrainingShardTask] = []
-    for split, target_count in targets.items():
-        for shard_index, start in enumerate(range(0, target_count, shard_size)):
-            tasks.append(
-                PretrainingShardTask(
-                    task_id=len(tasks),
-                    split=split,
-                    shard_index=shard_index,
-                    start=start,
-                    stop=min(start + shard_size, target_count),
-                    split_target=target_count,
-                )
-            )
-    return tasks
+    populated = [frame.cast(VALIDITY_INDEX_SCHEMA) for frame in frames if frame.height]
+    if not populated:
+        return empty_validity_index()
+    return (
+        pl.concat(populated, how="vertical")
+        .unique(subset="cache_key", keep="last", maintain_order=True)
+        .sort("cache_key")
+    )
 
 
-def cached_candidate_result(
+def validity_lookup(frame: pl.DataFrame) -> dict[str, dict[str, object]]:
+    """Create a cache-key lookup from a validity-index frame.
+
+    Args:
+        frame: Persistent validity records.
+
+    Returns:
+        Mapping from cache key to validity row.
+    """
+    return {str(row["cache_key"]): row for row in frame.iter_rows(named=True)}
+
+
+def indexed_candidate_outcome(
     row: dict[str, object],
-    scan_task: ScanTask,
-    cache_dir: Path,
-) -> CandidateResult | None:
-    """Return a cached terminal result for a candidate.
+    cache_key: str,
+    indexed: dict[str, object],
+) -> CandidateOutcome:
+    """Build a candidate outcome from one validity-index row.
 
     Args:
         row: Candidate metadata.
-        scan_task: TEMPO scan task with the stable cache key.
-        cache_dir: Persistent validity-cache root.
+        cache_key: Stable candidate cache key.
+        indexed: Stored validity-index values.
 
     Returns:
-        A valid or invalid result when cached, else ``None``.
+        Validated candidate outcome.
     """
-    valid_path = cache_dir / "valid" / scan_task.cache_key[:2] / f"{scan_task.cache_key}.npz"
-    if valid_path.is_file():
-        return CandidateResult(VALID_STATUS, row, scan_task.cache_key, str(valid_path))
-    invalid_path = cache_dir / "invalid" / scan_task.cache_key[:2] / f"{scan_task.cache_key}.json"
-    if invalid_path.is_file():
-        try:
-            reason = str(json.loads(invalid_path.read_text()).get("reason", "cached invalid raster"))
-        except (OSError, TypeError, ValueError):
-            reason = "cached invalid raster"
-        return CandidateResult(INVALID_STATUS, row, scan_task.cache_key, reason=reason)
-    return None
-
-
-def _mark_invalid(
-    row: dict[str, object],
-    scan_task: ScanTask,
-    cache_dir: Path,
-    reason: str,
-    valid_pixel_count: int,
-) -> CandidateResult:
-    invalid_path = cache_dir / "invalid" / scan_task.cache_key[:2] / f"{scan_task.cache_key}.json"
-    write_json_atomic(
-        {
-            "cache_key": scan_task.cache_key,
-            "aoi_id": int(row["aoi_id"]),
-            "tempo_time": str(row["tempo_time"]),
-            "valid": False,
-            "valid_pixel_count": valid_pixel_count,
-            "pixel_count": IMG_SIZE * IMG_SIZE,
-            "reason": reason,
-        },
-        invalid_path,
+    status = str(indexed["status"])
+    if status not in {VALID_STATUS, INVALID_STATUS}:
+        raise ValueError(f"Unsupported validity-index status for {cache_key}: {status}")
+    tempo_path = indexed.get("tempo_cache_path")
+    weather_path = indexed.get("weather_cache_path")
+    if status == VALID_STATUS and (not tempo_path or not weather_path):
+        raise ValueError(f"Valid index entry lacks source cache paths: {cache_key}")
+    return CandidateOutcome(
+        status,
+        row,
+        cache_key,
+        tempo_cache_path=str(tempo_path) if tempo_path else None,
+        weather_cache_path=str(weather_path) if weather_path else None,
+        reason=str(indexed["reason"]) if indexed.get("reason") else None,
     )
-    return CandidateResult(INVALID_STATUS, row, scan_task.cache_key, reason=reason)
 
 
-def process_candidate_batch(
+def candidate_cache_tasks(
+    row: dict[str, object],
+    *,
+    tempo_root: Path,
+    tempo_cache_dir: Path,
+    hrrr_root: Path,
+    weather_cache_dir: Path,
+) -> tuple[ScanTask, WeatherTask]:
+    """Build the TEMPO and weather cache tasks for one candidate.
+
+    Args:
+        row: Candidate metadata.
+        tempo_root: Raw TEMPO archive root.
+        tempo_cache_dir: Regridded TEMPO cache.
+        hrrr_root: Raw HRRR archive root.
+        weather_cache_dir: Aligned weather cache.
+
+    Returns:
+        TEMPO and weather tasks with stable cache paths.
+    """
+    scan = make_scan_task(row, "granule_paths", tempo_root, tempo_cache_dir)
+    weather = make_weather_task(row, "weather_path", hrrr_root, weather_cache_dir)
+    return scan, weather
+
+
+def discover_candidate_batch(
     rows: list[dict[str, object]],
     *,
-    validity_cache_dir: Path,
     tempo_root: Path,
     tempo_cache_dir: Path,
     hrrr_root: Path,
     weather_cache_dir: Path,
     workers: int,
-) -> list[CandidateResult]:
-    """Build complete raster bundles for one candidate batch.
+) -> list[CandidateOutcome]:
+    """Resolve cache misses and classify one candidate batch.
 
     Args:
-        rows: Candidate metadata rows.
-        validity_cache_dir: Persistent validity-cache root.
-        tempo_root: TEMPO granule root.
-        tempo_cache_dir: Shared regridded TEMPO cache root.
-        hrrr_root: HRRR source root.
-        weather_cache_dir: Shared aligned-weather cache root.
-        workers: Maximum parallel processes.
+        rows: Candidate rows absent from the validity index.
+        tempo_root: Raw TEMPO archive root.
+        tempo_cache_dir: Regridded TEMPO cache.
+        hrrr_root: Raw HRRR archive root.
+        weather_cache_dir: Aligned weather cache.
+        workers: Maximum worker processes for source processing.
 
     Returns:
-        Candidate outcomes in input order.
+        Outcomes in input order.
     """
-    results: dict[str, CandidateResult] = {}
+    outcomes: dict[str, CandidateOutcome] = {}
     scans: dict[str, ScanTask] = {}
     weather: dict[str, WeatherTask] = {}
-    pending_scans: list[ScanTask] = []
     rows_by_key: dict[str, dict[str, object]] = {}
+    ordered_keys: list[str] = []
     for row in rows:
-        scan = make_scan_task(row, "granule_paths", tempo_root, tempo_cache_dir)
+        scan, weather_task = candidate_cache_tasks(
+            row,
+            tempo_root=tempo_root,
+            tempo_cache_dir=tempo_cache_dir,
+            hrrr_root=hrrr_root,
+            weather_cache_dir=weather_cache_dir,
+        )
         scans[scan.cache_key] = scan
-        weather[scan.cache_key] = make_weather_task(row, "weather_path", hrrr_root, weather_cache_dir)
+        weather[scan.cache_key] = weather_task
         rows_by_key[scan.cache_key] = row
-        cached = cached_candidate_result(row, scan, validity_cache_dir)
-        if cached is None:
-            pending_scans.append(scan)
-        else:
-            results[scan.cache_key] = cached
+        ordered_keys.append(scan.cache_key)
 
     scan_errors: dict[str, str | None] = {}
-    for batch_results in bounded_parallel_map(process_scan_batch, scan_batches(pending_scans), workers):
+    for batch_results in bounded_parallel_map(process_scan_batch, scan_batches(scans.values()), workers):
         scan_errors.update({result.cache_key: result.error for result in batch_results})
-    full_coverage_keys: list[str] = []
-    for scan in pending_scans:
-        row = rows_by_key[scan.cache_key]
-        error = scan_errors.get(scan.cache_key)
-        if error is not None:
-            results[scan.cache_key] = CandidateResult(
-                RETRYABLE_STATUS,
-                row,
-                scan.cache_key,
-                reason=error,
-            )
-            continue
-        try:
-            with np.load(scan.cache_path, allow_pickle=False) as bundle:
-                no2 = np.asarray(bundle[NO2_RASTER_NAME], dtype=np.float32)
-            valid_pixel_count = int(np.isfinite(no2).sum())
-        except (KeyError, OSError, TypeError, ValueError) as error:
-            results[scan.cache_key] = CandidateResult(
-                RETRYABLE_STATUS,
-                row,
-                scan.cache_key,
-                reason=f"TEMPO cache read failed: {error}",
-            )
-            continue
-        if no2.shape != (IMG_SIZE, IMG_SIZE) or valid_pixel_count != IMG_SIZE * IMG_SIZE:
-            results[scan.cache_key] = _mark_invalid(
-                row,
-                scan,
-                validity_cache_dir,
-                "NO2 coverage is below 100%",
-                valid_pixel_count,
-            )
-            continue
-        full_coverage_keys.append(scan.cache_key)
 
-    pending_weather = [weather[key] for key in full_coverage_keys]
-    weather_errors: dict[str, str | None] = {}
-    for batch_results in bounded_parallel_map(process_weather_batch, weather_batches(pending_weather), workers):
-        weather_errors.update({result.cache_key: result.error for result in batch_results})
-    for key in full_coverage_keys:
+    complete_keys: list[str] = []
+    for key, scan in scans.items():
         row = rows_by_key[key]
-        scan = scans[key]
-        item = weather[key]
-        error = weather_errors.get(item.cache_key)
+        error = scan_errors.get(key)
         if error is not None:
-            results[key] = CandidateResult(RETRYABLE_STATUS, row, key, reason=error)
+            outcomes[key] = CandidateOutcome(RETRYABLE_STATUS, row, key, reason=error)
             continue
         try:
             with np.load(scan.cache_path, allow_pickle=False) as bundle:
                 no2 = np.asarray(bundle[NO2_RASTER_NAME], dtype=np.float32)
-            weather_arrays = extract_weather_cache(item.cache_path)
-            arrays = {
-                NO2_RASTER_NAME: no2,
-                NO2_MASK_NAME: np.ones_like(no2, dtype=np.uint8),
-                TEMPERATURE_RASTER_NAME: weather_arrays[TEMPERATURE_RASTER_NAME],
-                WIND_U_RASTER_NAME: weather_arrays[WIND_U_RASTER_NAME],
-                WIND_V_RASTER_NAME: weather_arrays[WIND_V_RASTER_NAME],
-            }
-            if any(array.shape != (IMG_SIZE, IMG_SIZE) or not np.isfinite(array).all() for array in arrays.values()):
-                results[key] = CandidateResult(
-                    RETRYABLE_STATUS,
-                    row,
-                    key,
-                    reason="Weather or NO2 bundle is not completely finite",
-                )
-                continue
-            destination = validity_cache_dir / "valid" / key[:2] / f"{key}.npz"
-            write_npz_atomic(destination, **arrays)
-            results[key] = CandidateResult(VALID_STATUS, row, key, str(destination))
         except (KeyError, OSError, TypeError, ValueError) as error:
-            results[key] = CandidateResult(
+            outcomes[key] = CandidateOutcome(
                 RETRYABLE_STATUS,
                 row,
                 key,
-                reason=f"Raster bundle assembly failed: {error}",
+                reason=f"TEMPO cache read failed: {error}",
             )
-    return [results[make_scan_task(row, "granule_paths", tempo_root, tempo_cache_dir).cache_key] for row in rows]
+            continue
+        if no2.shape != (IMG_SIZE, IMG_SIZE) or not np.isfinite(no2).all():
+            outcomes[key] = CandidateOutcome(
+                INVALID_STATUS,
+                row,
+                key,
+                tempo_cache_path=scan.cache_path,
+                reason="NO2 coverage is below 100%",
+            )
+            continue
+        complete_keys.append(key)
+
+    weather_errors: dict[str, str | None] = {}
+    weather_tasks = [weather[key] for key in complete_keys]
+    for batch_results in bounded_parallel_map(process_weather_batch, weather_batches(weather_tasks), workers):
+        weather_errors.update({result.cache_key: result.error for result in batch_results})
+
+    for key in complete_keys:
+        row = rows_by_key[key]
+        scan = scans[key]
+        weather_task = weather[key]
+        error = weather_errors.get(weather_task.cache_key)
+        if error is not None:
+            outcomes[key] = CandidateOutcome(RETRYABLE_STATUS, row, key, reason=error)
+            continue
+        outcomes[key] = CandidateOutcome(
+            VALID_STATUS,
+            row,
+            key,
+            tempo_cache_path=scan.cache_path,
+            weather_cache_path=weather_task.cache_path,
+        )
+    return [outcomes[key] for key in ordered_keys]
+
+
+def load_clean_raster_bundle(tempo_cache_path: str, weather_cache_path: str) -> dict[str, np.ndarray]:
+    """Load one clean model bundle from the shared source caches.
+
+    Args:
+        tempo_cache_path: Regridded TEMPO NPZ path.
+        weather_cache_path: Aligned weather NPZ path.
+
+    Returns:
+        Complete model raster arrays.
+    """
+    with np.load(tempo_cache_path, allow_pickle=False) as bundle:
+        no2 = np.asarray(bundle[NO2_RASTER_NAME], dtype=np.float32)
+    weather = extract_weather_cache(weather_cache_path)
+    arrays = {
+        NO2_RASTER_NAME: no2,
+        NO2_MASK_NAME: np.ones_like(no2, dtype=np.uint8),
+        TEMPERATURE_RASTER_NAME: np.asarray(weather[TEMPERATURE_RASTER_NAME], dtype=np.float32),
+        WIND_U_RASTER_NAME: np.asarray(weather[WIND_U_RASTER_NAME], dtype=np.float32),
+        WIND_V_RASTER_NAME: np.asarray(weather[WIND_V_RASTER_NAME], dtype=np.float32),
+    }
+    if any(array.shape != (IMG_SIZE, IMG_SIZE) or not np.isfinite(array).all() for array in arrays.values()):
+        raise ValueError("Clean raster bundle contains an invalid shape or non-finite values")
+    return arrays
 
 
 def mask_no2_raster(
@@ -506,33 +449,20 @@ def mask_no2_raster(
     return masked_no2, observed_mask
 
 
-def materialize_masked_record(task: MaskedRecordTask) -> dict[str, object]:
-    """Materialize a masked raster record.
+def write_masked_record(task: MaskedRecordTask) -> dict[str, object]:
+    """Write one masked output bundle from indexed source caches.
 
     Args:
-        task: Cached source record and output parameters.
+        task: Source cache paths, output metadata, and mask seed.
 
     Returns:
-        Final manifest row.
+        Published manifest row.
     """
-    row = task.row
-    with np.load(str(row["validity_cache_path"]), allow_pickle=False) as cached:
-        arrays = {
-            name: np.asarray(cached[name])
-            for name in (
-                NO2_RASTER_NAME,
-                NO2_MASK_NAME,
-                TEMPERATURE_RASTER_NAME,
-                WIND_U_RASTER_NAME,
-                WIND_V_RASTER_NAME,
-            )
-        }
+    arrays = load_clean_raster_bundle(task.tempo_cache_path, task.weather_cache_path)
     no2 = np.asarray(arrays[NO2_RASTER_NAME], dtype=np.float32)
     rng = np.random.default_rng(task.mask_seed)
     mask_fraction = rng.uniform(MIN_MASK_FRACTION, MAX_MASK_FRACTION)
     masked_no2, artificial_mask = mask_no2_raster(no2, mask_fraction, rng)
-    if masked_no2.shape != no2.shape or artificial_mask.shape != no2.shape:
-        raise ValueError("Masked NO2 and artificial mask must match the original NO2 shape")
     write_npz_atomic(
         Path(task.output_path),
         **arrays,
@@ -541,7 +471,13 @@ def materialize_masked_record(task: MaskedRecordTask) -> dict[str, object]:
             ARTIFICIAL_MASK_NAME: np.asarray(artificial_mask, dtype=np.uint8),
         },
     )
+    row = task.row
     return {
-        **{name: row[name] for name in FINAL_RECORD_SCHEMA if name != "raster_bundle_path"},
+        "candidate_index": int(row["candidate_index"]),
+        "aoi_id": int(row["aoi_id"]),
+        "scan_date": row["scan_date"],
+        "scan_num": int(row["scan_num"]),
+        "tempo_time": row["tempo_time"],
+        "cache_key": task.cache_key,
         "raster_bundle_path": task.output_path,
     }
