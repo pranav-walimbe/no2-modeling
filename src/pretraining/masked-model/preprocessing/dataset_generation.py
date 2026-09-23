@@ -19,7 +19,7 @@ from dataset_generation_utils import (
     VALID_STATUS,
     VALIDITY_INDEX_SCHEMA,
     CandidateOutcome,
-    MaskedRecordTask,
+    PretrainingRecordTask,
     candidate_cache_tasks,
     discover_candidate_batch,
     empty_final_records,
@@ -29,8 +29,8 @@ from dataset_generation_utils import (
     validity_lookup,
     write_csv_atomic,
     write_json_atomic,
-    write_masked_record,
     write_parquet_atomic,
+    write_pretraining_record,
 )
 from preprocessing.generate_dataset_utils import cache_inventory
 from preprocessing.stratify_utils import (
@@ -475,17 +475,16 @@ def _run_discovery_split(
             remaining = quota - len(records)
             selected = [resolved[key] for key, _ in keyed_rows if resolved[key].status == VALID_STATUS][:remaining]
             tasks = [
-                MaskedRecordTask(
+                PretrainingRecordTask(
                     row=outcome.row,
                     cache_key=outcome.cache_key,
                     tempo_cache_path=str(outcome.tempo_cache_path),
                     weather_cache_path=str(outcome.weather_cache_path),
                     output_path=str(raster_dir / f"{outcome.cache_key}.npz"),
-                    mask_seed=MASKED_PRETRAINING_SPLIT_SEED + int(outcome.row["candidate_index"]),
                 )
                 for outcome in selected
             ]
-            records.extend(record_writer.map(write_masked_record, tasks))
+            records.extend(record_writer.map(write_pretraining_record, tasks))
             offset += len(batch)
 
             should_publish = (

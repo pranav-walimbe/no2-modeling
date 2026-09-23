@@ -26,7 +26,7 @@ The persistent Parquet index records each AOI-scene outcome without duplicating
 raster arrays:
 
 - valid rows store the TEMPO and weather cache paths needed to reconstruct a
-  masked dataset bundle;
+  pretraining raster bundle;
 - invalid rows store terminal coverage failures;
 - retryable source and weather errors are not persisted.
 
@@ -43,7 +43,7 @@ The launcher submits three dependent stages:
    divide each split into `N` contiguous candidate segments.
 2. Let each discovery shard fill its deterministic split quota. It reuses
    indexed cache paths and the cache-membership flags in its candidate manifest,
-   then writes freshly masked bundles directly to its output directory. Targeted
+   then writes clean raster bundles directly to its output directory. Targeted
    filesystem checks are limited to inventory misses, including files that may
    have been created after preparation.
 3. Concatenate the small shard manifests and publish the split CSVs.
@@ -61,7 +61,8 @@ reusable even when the earlier dataset run failed.
 The finalizer publishes dataset-root-relative paths in `train_df.csv`,
 `val_df.csv`, and `test_df.csv`. It performs count validation, compacts validity
 updates into the main index, and does not issue one filesystem lookup per
-raster. Synthetic masks remain generated and stored during dataset generation.
+raster. Synthetic masks are generated deterministically by the model loader
+rather than stored during dataset generation.
 
 ## Launch
 
