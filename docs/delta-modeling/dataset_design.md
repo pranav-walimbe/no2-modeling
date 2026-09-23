@@ -22,7 +22,8 @@ The pipeline applies these steps in order:
 1. Average unit operating time within each AOI-hour and calculate its median
    for each AOI. Retain AOI-hours at or above that median, then average their
    hourly coal-unit NOx sums. Remove AOIs without coal units and retain the
-   highest-ranked half.
+   highest-ranked half. Stratification also saves a line plot of average coal
+   NOx against the percentile of all scored coal-containing AOIs.
 2. Aggregate usable CAMPD measurements for the selected AOIs by UTC hour. Add
    unit counts, major-city distance, and full-history heat-input and generation
    averages calculated over the same higher-activity AOI-hours.

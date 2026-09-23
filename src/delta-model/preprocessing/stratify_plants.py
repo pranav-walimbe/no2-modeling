@@ -106,6 +106,7 @@ REQUIRED_COLUMNS = [
 ]
 
 DEFAULT_DIAGNOSTIC_OUTPUT = Path(VIS_DIR) / "stratification_ema_balance.png"
+DEFAULT_AOI_SCORE_OUTPUT = Path(VIS_DIR) / "stratification_aoi_score_percentiles.png"
 HISTOGRAM_QUANTILES = (0.01, 0.99)
 
 
@@ -113,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     """Parse stratification command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--diagnostic-output", type=Path, default=DEFAULT_DIAGNOSTIC_OUTPUT)
+    parser.add_argument("--aoi-score-output", type=Path, default=DEFAULT_AOI_SCORE_OUTPUT)
     return parser.parse_args()
 
 
@@ -360,6 +362,40 @@ def _plot_stratification_diagnostics(
     plt.close(figure)
 
 
+def _plot_aoi_score_percentiles(aoi_features: pl.DataFrame, output_path: Path) -> None:
+    # Plot the complete coal-containing AOI scoring distribution
+    coal_scores = (
+        aoi_features.filter(pl.col("num_coal_units") > 0)
+        .select("avg_coal_nox")
+        .sort("avg_coal_nox")
+    )
+    percentiles = 100 * np.arange(1, coal_scores.height + 1) / coal_scores.height
+    selection_cutoff = 100 * (1 - STRATIFICATION_AOI_FRACTION)
+
+    figure, axis = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    axis.plot(percentiles, coal_scores["avg_coal_nox"].to_numpy(), color="#b24a33", linewidth=2)
+    axis.axvline(selection_cutoff, color="#333333", linestyle="--", linewidth=1.5)
+    axis.axvspan(selection_cutoff, 100, color="#b24a33", alpha=0.08)
+    axis.set(
+        title=f"Coal-containing AOI scores ({coal_scores.height:,} AOIs)",
+        xlabel="AOI score percentile",
+        ylabel="Average coal NOx mass (lb/hour)",
+        xlim=(0, 100),
+    )
+    axis.grid(alpha=0.2)
+    axis.text(
+        selection_cutoff,
+        0.98,
+        f" Top {STRATIFICATION_AOI_FRACTION:.0%} retained",
+        transform=axis.get_xaxis_transform(),
+        ha="left",
+        va="top",
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180)
+    plt.close(figure)
+
+
 def _serialize_no2_paths(frame: pl.DataFrame) -> pl.DataFrame:
     # Encode every configured TEMPO granule list for CSV output
     return frame.with_columns(
@@ -372,8 +408,11 @@ def _serialize_no2_paths(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def build_stratification_candidates() -> pl.DataFrame:
+def build_stratification_candidates(aoi_score_output: Path = DEFAULT_AOI_SCORE_OUTPUT) -> pl.DataFrame:
     """Build eligible AOI-hour records for every AOI.
+
+    Args:
+        aoi_score_output: Destination for the AOI score percentile plot.
 
     Returns:
         Eligible records before geographic splitting.
@@ -387,6 +426,8 @@ def build_stratification_candidates() -> pl.DataFrame:
     all_spatial_aois = build_aoi_spatial_frame(all_aois)
     membership = build_aoi_membership(all_aois, facilities, all_spatial_aois)
     aoi_features = calculate_activity_conditioned_aoi_features(raw_records, membership)
+    _plot_aoi_score_percentiles(aoi_features, aoi_score_output)
+    print(f"Saved AOI score percentiles to {aoi_score_output}")
     selected_features = select_top_coal_aois(aoi_features, STRATIFICATION_AOI_FRACTION)
     selected_ids = selected_features.select(AOI_ID_COL)
     aois = all_aois.join(selected_ids, on=AOI_ID_COL, how="inner")
@@ -445,7 +486,7 @@ def build_stratification_candidates() -> pl.DataFrame:
 def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
     args = parse_args()
-    candidates = build_stratification_candidates()
+    candidates = build_stratification_candidates(args.aoi_score_output)
     frame = filter_stratification_rule(candidates)
     print(
         f"Labeled {frame.height:,} records with raw EMA threshold +/-"
