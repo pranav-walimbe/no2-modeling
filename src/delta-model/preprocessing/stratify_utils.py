@@ -23,7 +23,6 @@ from config import (
 AOI_ID_COL = "aoi_id"
 MAJOR_CITY_DIST_COL = "major_city_dist"
 LABEL_MODE_COL = "label_mode"
-NOX_COL = "nox"
 METERS_PER_KM = 1000.0
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_MINUTE = 60
@@ -121,6 +120,38 @@ def add_sequence_weather_paths(frame: pl.DataFrame, timesteps: int = SEQUENCE_TI
         )
         expressions.append(path.alias(f"weather_path_t{index}"))
     return frame.with_columns(expressions)
+
+
+def add_timestep_nox(
+    frame: pl.DataFrame,
+    hourly: pl.DataFrame,
+    timesteps: int = SEQUENCE_TIMESTEPS,
+) -> pl.DataFrame:
+    """Attach AOI NOx totals for the UTC hour containing each scan.
+
+    Args:
+        frame: Records carrying one scan timestamp per timestep.
+        hourly: Valid AOI-hour emissions totals.
+        timesteps: Number of scan timestamps to align.
+
+    Returns:
+        Records with one hourly NOx value per timestep.
+    """
+    result = frame
+    for index in range(timesteps):
+        hour_column = f"_t{index}_hour"
+        nox_column = f"t{index}_nox"
+        lookup = hourly.select(
+            AOI_ID_COL,
+            pl.col("emissions_hour_utc").alias(hour_column),
+            pl.col("nox_mass").alias(nox_column),
+        )
+        result = (
+            result.with_columns(pl.col(f"timestep_time_t{index}").dt.truncate("1h").alias(hour_column))
+            .join(lookup, on=[AOI_ID_COL, hour_column], how="left")
+            .drop(hour_column)
+        )
+    return result
 
 
 def add_tempo_sequences(
@@ -680,7 +711,6 @@ def aggregate_aoi_hours(
         .with_columns(
             pl.col("emissions_hour_utc").dt.date().alias("date"),
             pl.col("emissions_hour_utc").dt.hour().cast(pl.Int8).alias("hour"),
-            pl.col("nox_mass").alias(NOX_COL),
         )
     )
     return (

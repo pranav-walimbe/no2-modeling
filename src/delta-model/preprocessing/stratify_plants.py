@@ -11,12 +11,12 @@ from preprocessing.stratify_utils import (
     AOI_ID_COL,
     LABEL_MODE_COL,
     MAJOR_CITY_DIST_COL,
-    NOX_COL,
     add_aoi_bounds,
     add_ema_targets,
     add_major_city_distance,
     add_sequence_weather_paths,
     add_tempo_sequences,
+    add_timestep_nox,
     aggregate_aoi_hours,
     build_aoi_membership,
     build_aoi_spatial_frame,
@@ -54,6 +54,7 @@ TIMESTEP_COLUMNS = [
     for index in range(SEQUENCE_TIMESTEPS)
     for column in (
         f"t{index}_timestamp",
+        f"t{index}_nox",
         f"no2_paths_t{index}",
         f"weather_path_t{index}",
     )
@@ -83,7 +84,6 @@ OUTPUT_COLUMNS = [
     "avg_heat_input",
     "avg_pwr_gen",
     "avg_coal_nox",
-    NOX_COL,
     "effective_delta_nox",
     DELTA_CATEGORY_COL,
     LABEL_MODE_COL,
@@ -419,6 +419,7 @@ def build_stratification_candidates() -> pl.DataFrame:
         SEQUENCE_TIMESTEPS,
         label_timestep_index=LABEL_TIMESTEP_INDEX,
     )
+    frame = add_timestep_nox(frame, hourly, SEQUENCE_TIMESTEPS)
     frame = frame.filter(pl.col(f"timestep_time_t{LABEL_TIMESTEP_INDEX}").is_not_null())
     frame = add_ema_targets(
         frame,
