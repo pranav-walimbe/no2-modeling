@@ -121,6 +121,124 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _assignment_counts(
+    clusters: list[dict[str, object]],
+    destinations: list[str],
+    columns: tuple[str, ...],
+) -> dict[str, dict[str, float]]:
+    # Sum class counts for the current cluster assignment
+    counts = {split: {column: 0.0 for column in columns} for split in SPLIT_FRACTIONS}
+    for cluster, destination in zip(clusters, destinations, strict=True):
+        for column in columns:
+            counts[destination][column] += float(cluster[column])
+    return counts
+
+
+def _assignment_objective(
+    counts: dict[str, dict[str, float]],
+    totals: dict[str, float],
+    columns: tuple[str, ...],
+) -> tuple[float, float, float, float]:
+    # Prioritize retained balance capacity before split and class proportions
+    maximum_balanced_records = min(totals.values())
+    balanced_counts = {split: min(counts[split].values()) for split in SPLIT_FRACTIONS}
+    retention_loss = (
+        maximum_balanced_records - sum(balanced_counts.values())
+    ) / max(maximum_balanced_records, 1.0)
+    split_balance_error = sum(
+        (
+            (balanced_counts[split] - maximum_balanced_records * fraction)
+            / max(maximum_balanced_records * fraction, 1.0)
+        )
+        ** 2
+        for split, fraction in SPLIT_FRACTIONS.items()
+    )
+    class_target_error = sum(
+        (
+            (counts[split][column] - totals[column] * fraction)
+            / max(totals[column] * fraction, 1.0)
+        )
+        ** 2
+        for split, fraction in SPLIT_FRACTIONS.items()
+        for column in columns
+    )
+    return (
+        retention_loss,
+        split_balance_error + class_target_error,
+        split_balance_error,
+        class_target_error,
+    )
+
+
+def _refine_cluster_assignments(
+    clusters: list[dict[str, object]],
+    destinations: list[str],
+    columns: tuple[str, ...],
+    totals: dict[str, float],
+) -> list[str]:
+    # Improve the greedy result through deterministic moves and swaps
+    refined = list(destinations)
+    while True:
+        counts = _assignment_counts(clusters, refined, columns)
+        current_objective = _assignment_objective(counts, totals, columns)
+        best_objective = current_objective
+        best_action: tuple[str, int, str | int] | None = None
+        cluster_counts = {
+            split: sum(destination == split for destination in refined)
+            for split in SPLIT_FRACTIONS
+        }
+
+        for index, cluster in enumerate(clusters):
+            source = refined[index]
+            if cluster_counts[source] == 1:
+                continue
+            for destination in SPLIT_FRACTIONS:
+                if destination == source:
+                    continue
+                candidate_counts = {split: dict(values) for split, values in counts.items()}
+                for column in columns:
+                    value = float(cluster[column])
+                    candidate_counts[source][column] -= value
+                    candidate_counts[destination][column] += value
+                objective = _assignment_objective(candidate_counts, totals, columns)
+                if objective < best_objective:
+                    best_objective = objective
+                    best_action = ("move", index, destination)
+
+        for left in range(len(clusters)):
+            for right in range(left + 1, len(clusters)):
+                left_split = refined[left]
+                right_split = refined[right]
+                if left_split == right_split:
+                    continue
+                candidate_counts = {split: dict(values) for split, values in counts.items()}
+                for column in columns:
+                    left_value = float(clusters[left][column])
+                    right_value = float(clusters[right][column])
+                    candidate_counts[left_split][column] += right_value - left_value
+                    candidate_counts[right_split][column] += left_value - right_value
+                objective = _assignment_objective(candidate_counts, totals, columns)
+                if objective < best_objective:
+                    best_objective = objective
+                    best_action = ("swap", left, right)
+
+        if best_action is None:
+            print(
+                "Cluster assignment objective: "
+                f"retention_loss={current_objective[0]:.6f}, "
+                f"combined_split_error={current_objective[1]:.6f}, "
+                f"split_balance_error={current_objective[2]:.6f}, "
+                f"class_target_error={current_objective[3]:.6f}"
+            )
+            return refined
+        if best_action[0] == "move":
+            refined[best_action[1]] = str(best_action[2])
+        else:
+            left = best_action[1]
+            right = int(best_action[2])
+            refined[left], refined[right] = refined[right], refined[left]
+
+
 def _split_by_cluster(
     frame: pl.DataFrame,
     category_column: str | None = None,
@@ -151,14 +269,15 @@ def _split_by_cluster(
         split: {column: 0.0 for column in target_columns}
         for split in SPLIT_FRACTIONS
     }
-    cluster_assignments: list[dict[str, object]] = []
+    clusters = list(cluster_counts.iter_rows(named=True))
+    destinations: list[str] = []
     assigned_cluster_counts = {split: 0 for split in SPLIT_FRACTIONS}
-    for index, cluster in enumerate(cluster_counts.iter_rows(named=True)):
+    for index, cluster in enumerate(clusters):
         empty_splits = [split for split, count in assigned_cluster_counts.items() if count == 0]
         remaining_clusters = cluster_counts.height - index
-        destinations = empty_splits if remaining_clusters == len(empty_splits) else SPLIT_FRACTIONS
+        choices = empty_splits if remaining_clusters == len(empty_splits) else SPLIT_FRACTIONS
         destination = min(
-            destinations,
+            choices,
             key=lambda destination: sum(
                 ((
                     assigned[split][column]
@@ -169,11 +288,21 @@ def _split_by_cluster(
                 for column in target_columns
             ),
         )
-        cluster_assignments.append({"cluster": cluster["cluster"], "split": destination})
+        destinations.append(destination)
         assigned_cluster_counts[destination] += 1
         for column in target_columns:
             assigned[destination][column] += float(cluster[column])
 
+    destinations = _refine_cluster_assignments(
+        clusters,
+        destinations,
+        tuple(target_columns),
+        totals,
+    )
+    cluster_assignments = [
+        {"cluster": cluster["cluster"], "split": destination}
+        for cluster, destination in zip(clusters, destinations, strict=True)
+    ]
     assignments = pl.DataFrame(
         cluster_assignments,
         schema={"cluster": frame.schema["cluster"], "split": pl.String},

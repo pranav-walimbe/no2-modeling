@@ -59,7 +59,7 @@ total_records=$((train_records + val_records + test_records))
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" stat -c %s "${mail_log}")
 printf '%s\n' \
     'Overlap-interpolated EMA stratification completed successfully.' \
-    'Selected the highest coal-NOx-ranked half of coal-containing AOIs.' \
+    'Selected coal-containing AOIs at or above the 40th coal-NOx score percentile.' \
     'Raw EMA-change threshold: +/-100' \
     'Five rasters retained; the irregular-time EMA uses t0 through t3; t4 is post-label.' \
     'Each timestep NOx value is weighted by CAMPD-hour overlap over its preceding TEMPO interval.' \

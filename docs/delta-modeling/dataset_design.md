@@ -22,7 +22,7 @@ The pipeline applies these steps in order:
 1. Average unit operating time within each AOI-hour and calculate its median
    for each AOI. Retain AOI-hours at or above that median, then average their
    hourly coal-unit NOx sums. Remove AOIs without coal units and retain the
-   highest-ranked half. Stratification also saves a line plot of average coal
+   AOIs at or above the 40th score percentile. Stratification also saves a line plot of average coal
    NOx against the percentile of all scored coal-containing AOIs.
 2. Aggregate usable CAMPD measurements for the selected AOIs by UTC hour. Add
    unit counts, major-city distance, and full-history heat-input and generation
@@ -38,7 +38,8 @@ The pipeline applies these steps in order:
    new value than a 40-minute interval. Keep `t4_nox` as post-label context.
 6. Assign classes from the raw effective NOx change.
 7. Assign each overlap cluster to one split with a deterministic procedure that
-   targets the 70/15/15 ratio for each class.
+   first maximizes post-balance retention, then targets 70/15/15 for the
+   balanced records and each class.
 8. Downsample each class to the smallest class count within its split.
 9. Generate rasters and reject records that fail coverage or source-file checks.
 
