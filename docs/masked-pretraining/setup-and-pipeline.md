@@ -39,10 +39,13 @@ existing validity index and rebuild it during the next generation run.
 The launcher submits three dependent stages:
 
 1. Snapshot the validity index, build the AOI-disjoint splits, order each split
-   by UTC hour and AOI, and divide it into `N` contiguous candidate segments.
+   by UTC hour and AOI, inventory the flat TEMPO and weather caches once, and
+   divide each split into `N` contiguous candidate segments.
 2. Let each discovery shard fill its deterministic split quota. It reuses
-   indexed cache paths, performs targeted TEMPO and weather cache lookups for
-   misses, and writes freshly masked bundles directly to its output directory.
+   indexed cache paths and the cache-membership flags in its candidate manifest,
+   then writes freshly masked bundles directly to its output directory. Targeted
+   filesystem checks are limited to inventory misses, including files that may
+   have been created after preparation.
 3. Concatenate the small shard manifests and publish the split CSVs.
 
 The default is eight discovery shards. Per-shard quotas sum exactly to the split
