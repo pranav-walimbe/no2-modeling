@@ -57,7 +57,7 @@ srun python -u -m modeling.train \
     --gradient-clip-norm 5.0 \
     --scheduler-patience 10 \
     --scheduler-factor 0.50 \
-    --early-stop-patience 25 \
+    --early-stop-patience 15 \
     --dataset-dir "${node_dataset_dir}" \
     --dataframe-dir "${node_dataset_dir}/dataframes" \
     --runs-dir /global/home/users/pranavwalimbe/masked_model_runs/ \
