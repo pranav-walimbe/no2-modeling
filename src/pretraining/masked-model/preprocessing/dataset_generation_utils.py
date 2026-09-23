@@ -62,6 +62,8 @@ CANDIDATE_SCHEMA = {
     "tempo_time": pl.Datetime(time_zone="UTC"),
     "granule_paths": pl.List(pl.String),
     "weather_path": pl.String,
+    "tempo_cached": pl.Boolean,
+    "weather_cached": pl.Boolean,
 }
 
 VALIDITY_INDEX_SCHEMA = {
@@ -300,6 +302,8 @@ def discover_candidate_batch(
     hrrr_root: Path,
     weather_cache_dir: Path,
     workers: int,
+    tempo_cache_additions: set[str],
+    weather_cache_additions: set[str],
 ) -> list[CandidateOutcome]:
     """Resolve cache misses and classify one candidate batch.
 
@@ -310,6 +314,8 @@ def discover_candidate_batch(
         hrrr_root: Raw HRRR archive root.
         weather_cache_dir: Aligned weather cache.
         workers: Maximum worker processes for source processing.
+        tempo_cache_additions: TEMPO files created since preparation.
+        weather_cache_additions: Weather files created since preparation.
 
     Returns:
         Outcomes in input order.
@@ -332,9 +338,16 @@ def discover_candidate_batch(
         rows_by_key[scan.cache_key] = row
         ordered_keys.append(scan.cache_key)
 
-    scan_errors: dict[str, str | None] = {}
-    for batch_results in bounded_parallel_map(process_scan_batch, scan_batches(scans.values()), workers):
+    cached_scan_keys = {
+        key
+        for key, scan in scans.items()
+        if bool(rows_by_key[key]["tempo_cached"]) or Path(scan.cache_path).name in tempo_cache_additions
+    }
+    scan_errors: dict[str, str | None] = {key: None for key in cached_scan_keys}
+    missing_scans = [scan for key, scan in scans.items() if key not in cached_scan_keys]
+    for batch_results in bounded_parallel_map(process_scan_batch, scan_batches(missing_scans), workers):
         scan_errors.update({result.cache_key: result.error for result in batch_results})
+        tempo_cache_additions.update(Path(result.cache_path).name for result in batch_results if result.error is None)
 
     complete_keys: list[str] = []
     for key, scan in scans.items():
@@ -365,10 +378,22 @@ def discover_candidate_batch(
             continue
         complete_keys.append(key)
 
-    weather_errors: dict[str, str | None] = {}
-    weather_tasks = [weather[key] for key in complete_keys]
-    for batch_results in bounded_parallel_map(process_weather_batch, weather_batches(weather_tasks), workers):
+    weather_by_key: dict[str, WeatherTask] = {}
+    cached_weather_keys: set[str] = set()
+    for key in complete_keys:
+        task = weather[key]
+        weather_by_key[task.cache_key] = task
+        if bool(rows_by_key[key]["weather_cached"]) or Path(task.cache_path).name in weather_cache_additions:
+            cached_weather_keys.add(task.cache_key)
+    missing_weather = {
+        key: task for key, task in weather_by_key.items() if key not in cached_weather_keys
+    }
+    weather_errors: dict[str, str | None] = {key: None for key in cached_weather_keys}
+    for batch_results in bounded_parallel_map(process_weather_batch, weather_batches(missing_weather.values()), workers):
         weather_errors.update({result.cache_key: result.error for result in batch_results})
+        weather_cache_additions.update(
+            Path(result.cache_path).name for result in batch_results if result.error is None
+        )
 
     for key in complete_keys:
         row = rows_by_key[key]

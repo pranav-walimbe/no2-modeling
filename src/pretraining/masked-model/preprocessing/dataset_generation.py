@@ -32,6 +32,7 @@ from dataset_generation_utils import (
     write_masked_record,
     write_parquet_atomic,
 )
+from preprocessing.generate_dataset_utils import cache_inventory
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
     add_sequence_weather_paths,
@@ -206,7 +207,12 @@ def _assign_clusters(frame: pl.DataFrame) -> pl.DataFrame:
     return frame.join(assignments, on="cluster", how="inner")
 
 
-def _write_candidate_manifests(run_id: str, shard_count: int) -> None:
+def _write_candidate_manifests(
+    run_id: str,
+    shard_count: int,
+    tempo_inventory: set[str],
+    weather_inventory: set[str],
+) -> None:
     aois = _load_global_aois()
     candidate_pool = _load_candidate_pool(aois)
     candidate_aois = aois.join(candidate_pool.select(AOI_ID_COL).unique(), on=AOI_ID_COL, how="semi")
@@ -225,6 +231,25 @@ def _write_candidate_manifests(run_id: str, shard_count: int) -> None:
             .sort("_processing_hour", "cluster", AOI_ID_COL, "tempo_time", "scan_num")
             .drop("_processing_hour")
             .with_row_index("candidate_index")
+        )
+        inventory_started = time.monotonic()
+        tempo_cached: list[bool] = []
+        weather_cached: list[bool] = []
+        for row in frame.iter_rows(named=True):
+            scan, weather = candidate_cache_tasks(
+                row,
+                tempo_root=Path(TEMPO_DIR),
+                tempo_cache_dir=Path(DATASET_TEMPO_CACHE_DIR),
+                hrrr_root=Path(HRRR_DIR),
+                weather_cache_dir=Path(DATASET_WEATHER_CACHE_DIR),
+            )
+            tempo_cached.append(Path(scan.cache_path).name in tempo_inventory)
+            weather_cached.append(Path(weather.cache_path).name in weather_inventory)
+        frame = (
+            frame.with_columns(
+                pl.Series("tempo_cached", tempo_cached, dtype=pl.Boolean),
+                pl.Series("weather_cached", weather_cached, dtype=pl.Boolean),
+            )
             .select(list(CANDIDATE_SCHEMA))
             .cast(CANDIDATE_SCHEMA)
         )
@@ -233,7 +258,8 @@ def _write_candidate_manifests(run_id: str, shard_count: int) -> None:
             stop = frame.height * (shard_id + 1) // shard_count
             write_parquet_atomic(frame.slice(start, stop - start), _candidate_path(run_id, split, shard_id))
         print(
-            f"[{_timestamp()}] [{split}] wrote {frame.height:,} locality-ordered candidates across {shard_count} shards"
+            f"[{_timestamp()}] [{split}] wrote {frame.height:,} locality-ordered candidates across "
+            f"{shard_count} shards in {time.monotonic() - inventory_started:.1f}s"
         )
 
 
@@ -245,6 +271,15 @@ def _load_persistent_validity_index() -> pl.DataFrame:
     update_root = Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR)
     frames.extend(pl.read_parquet(path) for path in sorted(update_root.glob("*/*/*.parquet")))
     return merge_validity_frames(frames)
+
+
+def _build_cache_inventory(cache_name: str, cache_dir: Path) -> set[str]:
+    started = time.monotonic()
+    print(f"[{_timestamp()}] [{cache_name}] cache inventory started: {cache_dir}")
+    filenames = cache_inventory(cache_dir)
+    elapsed = time.monotonic() - started
+    print(f"[{_timestamp()}] [{cache_name}] cache inventory finished: {len(filenames):,} entries in {elapsed:.1f}s")
+    return filenames
 
 
 def _submit(options: list[str], script_arguments: list[str]) -> str:
@@ -357,9 +392,17 @@ def _run_prepare(args: argparse.Namespace) -> None:
     shard_dir.mkdir(parents=True)
     write_parquet_atomic(index, _snapshot_path(args.run_id))
     print(f"[{_timestamp()}] validity index snapshot: {index.height:,} entries")
-    _write_candidate_manifests(args.run_id, args.num_shards)
+    tempo_inventory = _build_cache_inventory("tempo-cache", Path(DATASET_TEMPO_CACHE_DIR))
+    weather_inventory = _build_cache_inventory("weather-cache", Path(DATASET_WEATHER_CACHE_DIR))
+    _write_candidate_manifests(args.run_id, args.num_shards, tempo_inventory, weather_inventory)
     write_json_atomic(
-        {"run_id": args.run_id, "num_shards": args.num_shards, "prepared_at": _timestamp()},
+        {
+            "run_id": args.run_id,
+            "num_shards": args.num_shards,
+            "tempo_cache_entries": len(tempo_inventory),
+            "weather_cache_entries": len(weather_inventory),
+            "prepared_at": _timestamp(),
+        },
         work_dir / "run.json",
     )
     print(f"[{_timestamp()}] preparation finished in {time.monotonic() - started:.1f}s")
@@ -370,6 +413,8 @@ def _run_discovery_split(
     split: str,
     shard_id: int,
     index: dict[str, dict[str, object]],
+    tempo_cache_additions: set[str],
+    weather_cache_additions: set[str],
 ) -> None:
     if args.run_id is None:
         raise ValueError("Discovery requires --run-id")
@@ -417,6 +462,8 @@ def _run_discovery_split(
                     hrrr_root=Path(HRRR_DIR),
                     weather_cache_dir=Path(DATASET_WEATHER_CACHE_DIR),
                     workers=args.workers_per_shard,
+                    tempo_cache_additions=tempo_cache_additions,
+                    weather_cache_additions=weather_cache_additions,
                 )
                 for outcome in discovered:
                     resolved[outcome.cache_key] = outcome
@@ -478,8 +525,17 @@ def _run_discovery(args: argparse.Namespace) -> None:
     if shard_id >= args.num_shards:
         raise ValueError(f"Shard {shard_id} is outside configured count {args.num_shards}")
     index = validity_lookup(pl.read_parquet(_snapshot_path(args.run_id)).cast(VALIDITY_INDEX_SCHEMA))
+    tempo_cache_additions: set[str] = set()
+    weather_cache_additions: set[str] = set()
     for split in SPLIT_TARGETS:
-        _run_discovery_split(args, split, shard_id, index)
+        _run_discovery_split(
+            args,
+            split,
+            shard_id,
+            index,
+            tempo_cache_additions,
+            weather_cache_additions,
+        )
 
 
 def _run_finalizer(args: argparse.Namespace) -> None:
