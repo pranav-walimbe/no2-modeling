@@ -1,6 +1,6 @@
 # Dataset design
 
-Each record joins five TEMPO scans, hourly HRRR fields, plant metadata, and one
+Each record joins four TEMPO scans, hourly HRRR fields, plant metadata, and one
 three-class emissions-change label for a 72 km area of interest (AOI).
 
 ## Contract
@@ -19,20 +19,27 @@ three-class emissions-change label for a 72 km area of interest (AOI).
 
 The pipeline applies these steps in order:
 
-1. Aggregate usable CAMPD measurements by AOI and UTC hour. Add prior-quarter
-   same-hour heat input and generation, prior-quarter median hourly NOx, plant
-   attributes, and major-city distance.
-2. Match five consecutive TEMPO scans whose adjacent timestamps are 40 to 70
-   minutes apart. The `t2` to `t3` interval must cover at least 50% of its
-   assigned emissions hour.
-3. Calculate four-hour, exponentially weighted NOx averages ending at `t2` and
-   `t3`. Both windows require complete CAMPD coverage.
-4. Assign raw and scaled effective-change classes. Keep a record only when both
-   classes agree.
-5. Assign each overlap cluster to one split with a deterministic procedure that
+1. Average unit operating time within each AOI-hour and calculate its median
+   for each AOI. Retain AOI-hours at or above that median, then average their
+   hourly coal-unit NOx sums. Remove AOIs without coal units and retain the
+   highest-ranked half. Stratification also saves a line plot of average coal
+   NOx against the percentile of all scored coal-containing AOIs.
+2. Aggregate usable CAMPD measurements for the selected AOIs by UTC hour. Add
+   unit counts, major-city distance, and full-history heat-input and generation
+   averages calculated over the same higher-activity AOI-hours.
+3. Match four consecutive TEMPO scans whose adjacent timestamps are 40 to 70
+   minutes apart. The `t1` to `t2` interval must cover at least 50% of its
+   assigned emissions hour. Store the scan times as `t0_timestamp` through
+   `t3_timestamp`, the containing-hour emissions as `t0_nox` through `t3_nox`,
+   and the `t1` to `t2` duration as `label_delta_mins`.
+4. Calculate four-hour, exponentially weighted NOx averages ending at `t1` and
+   `t2`. The history reaches before `t0` and includes the preceding emissions
+   hour. Both windows require complete CAMPD coverage.
+5. Assign classes from the raw effective NOx change.
+6. Assign each overlap cluster to one split with a deterministic procedure that
    targets the 70/15/15 ratio for each class.
-6. Downsample each class to the smallest class count within its split.
-7. Generate rasters and reject records that fail coverage or source-file checks.
+7. Downsample each class to the smallest class count within its split.
+8. Generate rasters and reject records that fail coverage or source-file checks.
 
 Raster quality control can change class counts after balancing. The finalizer
 reports those counts and does not rebalance the retained records.
@@ -42,28 +49,26 @@ reports those counts and does not rebalance the retained records.
 The audit target is:
 
 ```text
-delta_effective_nox_scaled =
-    asinh((current_ema_nox - previous_ema_nox) / prev_qtr_med_nox)
+effective_delta_nox = current_ema_nox - previous_ema_nox
 ```
 
-`current_ema_nox` covers the four hours ending at `t3`; `previous_ema_nox`
-covers the four hours ending at `t2`. Both use a two-hour exponential decay
+`current_ema_nox` covers the four hours ending at `t2`; `previous_ema_nox`
+covers the four hours ending at `t1`. Both use a two-hour exponential decay
 timescale.
 
-The raw class uses `effective_delta_nox` with boundaries at -100 and +100. The
-scaled class uses `delta_effective_nox_scaled` with boundaries at -0.05 and
-+0.05. Values on a boundary belong to `steady`. The pipeline writes the agreed
-class to `delta_category`, which the classifier consumes without recreating it
-from a continuous value.
+The class uses `effective_delta_nox` with boundaries at -100 and +100. Values
+on a boundary belong to `steady`. The pipeline writes the class to
+`delta_category`, which the classifier consumes without recreating it from a
+continuous value.
 
 Metadata records this target construction as `label_mode=causal_ema`. The label
-ends at `t3`, but the current raster classifier receives the full `t0` through
-`t4` sequence. Its prediction therefore uses the observation after the labeled
+ends at `t2`, but the raster classifier receives the full `t0` through `t3`
+sequence. Its prediction therefore uses one observation after the labeled
 interval.
 
 ## Stored inputs
 
-Each raster bundle stores five arrays with shape `5 x 24 x 24`:
+Each raster bundle stores five arrays with shape `4 x 24 x 24`:
 
 | Array | Contents |
 |---|---|
@@ -73,14 +78,10 @@ Each raster bundle stores five arrays with shape `5 x 24 x 24`:
 | `wind_u_80m_mps` | Geographic eastward HRRR wind |
 | `wind_v_80m_mps` | Geographic northward HRRR wind |
 
-The tabular classifier derives total unit count from the stored coal and
-natural-gas counts. It combines that feature with major-city distance,
-nameplate capacity, prior-quarter same-hour heat input and generation, local
-solar hour, and day of year. Sine and cosine encode both time features, which
-yields nine scalar inputs.
-
-AOI identity, coordinates, current emissions, and prior-quarter NOx stay out of
-the model inputs. Longitude contributes only to local solar hour.
+Stratification metadata stores coal, natural-gas, and total unit counts. It also
+stores major-city distance and activity-conditioned averages for heat input,
+generation, and coal NOx. It does not store nameplate capacity or normalized
+NOx-change targets.
 
 ## Raster checks and publication
 

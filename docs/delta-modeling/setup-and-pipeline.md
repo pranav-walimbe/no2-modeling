@@ -61,10 +61,11 @@ sbatch scripts/slurm/build_tempo_mapping_observations.sh --overwrite
 sbatch scripts/slurm/stratify_plants.sh
 ```
 
-The observation launcher runs 32 tasks. Stratification builds causal EMA
-targets, keeps records whose raw and scaled classes agree, assigns overlapping
-AOIs to the same geographic split, and balances the three classes within each
-split. See [dataset_design.md](dataset_design.md).
+The observation launcher runs 32 tasks. Stratification ranks coal-containing
+AOIs by activity-conditioned coal NOx, retains the highest half, builds causal
+EMA targets, assigns overlapping AOIs to the same geographic split, and
+balances the three classes within each split. See
+[dataset_design.md](dataset_design.md).
 
 ## 3. Generate raster records
 

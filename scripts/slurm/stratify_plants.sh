@@ -21,6 +21,7 @@ recipient="pranav.walimbe@berkeley.edu"
 mail_host="${SLURM_SUBMIT_HOST:-ln002.brc}"
 mail_log="/var/log/maillog"
 diagnostic="/global/home/users/pranavwalimbe/vis/stratification-ema-balance-${SLURM_JOB_ID}.png"
+aoi_scores="/global/home/users/pranavwalimbe/vis/stratification-aoi-score-percentiles-${SLURM_JOB_ID}.png"
 
 cd "${repo_dir}"
 module load python/3.11.6-gcc-11.4.0
@@ -32,10 +33,15 @@ export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
 srun python -u -m preprocessing.stratify_plants \
     --diagnostic-output "${diagnostic}" \
+    --aoi-score-output "${aoi_scores}" \
     "$@"
 
 if [[ ! -s "${diagnostic}" ]]; then
     echo "Expected stratification diagnostic was not created: ${diagnostic}" >&2
+    exit 1
+fi
+if [[ ! -s "${aoi_scores}" ]]; then
+    echo "Expected AOI score visualization was not created: ${aoi_scores}" >&2
     exit 1
 fi
 
@@ -47,9 +53,9 @@ total_records=$((train_records + val_records + test_records))
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" stat -c %s "${mail_log}")
 printf '%s\n' \
     'Causal EMA stratification completed successfully.' \
+    'Selected the highest coal-NOx-ranked half of coal-containing AOIs.' \
     'Raw EMA-change threshold: +/-100' \
-    'Normalized EMA-change threshold: +/-0.05; raw and normalized classes must agree.' \
-    'Five rasters retained; label interval ends at t3; EMA history is four hours.' \
+    'Four rasters retained; label interval ends at t2; EMA history is four hours.' \
     'Filtered AOI clusters were assigned by class to approximately 70/15/15 splits.' \
     'Every split is independently balanced across decrease, steady, and increase.' \
     "Train: ${train_records} records" \
@@ -57,8 +63,9 @@ printf '%s\n' \
     "Test: ${test_records} records" \
     "Total: ${total_records} records" \
     "Diagnostic: ${diagnostic}" \
+    "AOI scores: ${aoi_scores}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
-        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${diagnostic}' '${recipient}'"
+        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${diagnostic}' -a '${aoi_scores}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do
