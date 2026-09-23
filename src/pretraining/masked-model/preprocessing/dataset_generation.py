@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -72,6 +72,9 @@ STAGE_ENV = "MASKED_PRETRAINING_STAGE"
 DEFAULT_BATCH_SIZE = 64
 PROGRESS_INTERVAL = 1_000
 DISCOVERY_TIME_LIMIT = "24:00:00"
+CLEANUP_TIME_LIMIT = "12:00:00"
+MAX_CLEANUP_WORKERS = 16
+MAX_SHARD_DIRECTORY_DEPTH = 3
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_masked_pretraining_dataset.sh"
@@ -89,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers-per-shard", type=int, default=MASKED_PRETRAINING_WORKERS_PER_SHARD)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--run-id")
+    parser.add_argument("--cleanup-path", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.num_shards < 1 or args.workers_per_shard < 1 or args.batch_size < 1:
         parser.error("shard, worker, and batch counts must be positive")
@@ -143,6 +147,64 @@ def _safe_reset(path: Path, base: Path) -> None:
     if resolved.exists():
         shutil.rmtree(resolved)
     resolved.mkdir(parents=True)
+
+
+def _retire_directory(path: Path, base: Path, run_id: str) -> Path | None:
+    resolved = path.resolve()
+    resolved_base = base.resolve()
+    if resolved == resolved_base or resolved_base not in resolved.parents:
+        raise ValueError(f"Refusing to retire unsafe path: {resolved}")
+    if not resolved.exists():
+        resolved.mkdir(parents=True)
+        return None
+
+    cleanup_root = resolved_base / ".cleanup"
+    cleanup_root.mkdir(parents=True, exist_ok=True)
+    retired = cleanup_root / f"{resolved.name}-{run_id}"
+    if retired.exists():
+        raise FileExistsError(f"Cleanup destination already exists: {retired}")
+    resolved.rename(retired)
+    resolved.mkdir(parents=True)
+    return retired
+
+
+def _shard_cleanup_targets(root: Path) -> list[Path]:
+    pending = [(path, 1) for path in root.iterdir() if path.is_dir()]
+    targets: list[Path] = []
+    while pending:
+        path, depth = pending.pop()
+        if len(path.name) == 6 and path.name.isdigit():
+            targets.append(path)
+            continue
+        if depth < MAX_SHARD_DIRECTORY_DEPTH:
+            pending.extend((child, depth + 1) for child in path.iterdir() if child.is_dir())
+    return sorted(targets) or [path for path in root.iterdir() if path.is_dir()]
+
+
+def _cleanup_worker_count(root: Path) -> int:
+    return max(1, min(len(_shard_cleanup_targets(root)), MAX_CLEANUP_WORKERS))
+
+
+def _remove_retired_shards(root: Path, base: Path, workers: int) -> None:
+    resolved = root.resolve()
+    cleanup_root = base.resolve() / ".cleanup"
+    if resolved.parent != cleanup_root:
+        raise ValueError(f"Refusing to clear unsafe cleanup path: {resolved}")
+    if not resolved.exists():
+        print(f"[{_timestamp()}] retired shard directory is already absent: {resolved}")
+        return
+
+    targets = _shard_cleanup_targets(resolved)
+    worker_count = max(1, min(workers, len(targets)))
+    started = time.monotonic()
+    print(
+        f"[{_timestamp()}] deleting {len(targets):,} retired shard directories "
+        f"with {worker_count} workers: {resolved}"
+    )
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        list(executor.map(shutil.rmtree, targets))
+    shutil.rmtree(resolved)
+    print(f"[{_timestamp()}] retired shard deletion finished in {time.monotonic() - started:.1f}s")
 
 
 def _load_global_aois() -> pl.DataFrame:
@@ -296,6 +358,18 @@ def _submit(options: list[str], script_arguments: list[str]) -> str:
     return job_id
 
 
+def _submit_cleanup(path: Path, workers: int) -> str:
+    return _submit(
+        [
+            f"--cpus-per-task={workers}",
+            f"--time={CLEANUP_TIME_LIMIT}",
+            "--job-name=masked-data-cleanup",
+            f"--export=ALL,{STAGE_ENV}=cleanup",
+        ],
+        ["--cleanup-path", str(path), "--workers-per-shard", str(workers)],
+    )
+
+
 def _launch(args: argparse.Namespace) -> None:
     if os.getenv("SLURM_JOB_ID") is not None:
         raise ValueError("Launch masked-pretraining generation from a login node")
@@ -384,7 +458,14 @@ def _run_prepare(args: argparse.Namespace) -> None:
     else:
         index = _load_persistent_validity_index()
     _safe_reset(Path(MASKED_PRETRAINING_WORK_DIR), base)
-    _safe_reset(Path(MASKED_PRETRAINING_SHARD_DIR), base)
+    retired_shards = _retire_directory(Path(MASKED_PRETRAINING_SHARD_DIR), base, args.run_id)
+    if retired_shards is not None:
+        cleanup_workers = _cleanup_worker_count(retired_shards)
+        cleanup_job = _submit_cleanup(retired_shards, cleanup_workers)
+        print(
+            f"[{_timestamp()}] retired old shards to {retired_shards}; "
+            f"background cleanup job {cleanup_job} has {cleanup_workers} workers"
+        )
     _safe_reset(Path(MASKED_PRETRAINING_DF_DIR), base)
     work_dir = _run_work_dir(args.run_id)
     shard_dir = _run_shard_dir(args.run_id)
@@ -406,6 +487,13 @@ def _run_prepare(args: argparse.Namespace) -> None:
         work_dir / "run.json",
     )
     print(f"[{_timestamp()}] preparation finished in {time.monotonic() - started:.1f}s")
+
+
+def _run_cleanup(args: argparse.Namespace) -> None:
+    if args.cleanup_path is None:
+        raise ValueError("Cleanup requires --cleanup-path")
+    workers = int(os.environ.get("SLURM_CPUS_PER_TASK", args.workers_per_shard))
+    _remove_retired_shards(args.cleanup_path, Path(MASKED_PRETRAINING_BASE_DIR), workers)
 
 
 def _run_discovery_split(
@@ -586,6 +674,8 @@ def main() -> None:
         _run_discovery(args)
     elif stage == "finalize":
         _run_finalizer(args)
+    elif stage == "cleanup":
+        _run_cleanup(args)
     else:
         raise ValueError(f"Unsupported {STAGE_ENV}: {stage}")
 
