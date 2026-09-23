@@ -23,10 +23,7 @@ from config import (
 AOI_ID_COL = "aoi_id"
 MAJOR_CITY_DIST_COL = "major_city_dist"
 LABEL_MODE_COL = "label_mode"
-EFFECTIVE_CURRENT_NOX_COL = "effective_current_nox"
-EFFECTIVE_PREVIOUS_NOX_COL = "effective_previous_nox"
 NOX_COL = "nox"
-DELTA_NOX_COL = "delta_nox"
 METERS_PER_KM = 1000.0
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_MINUTE = 60
@@ -181,12 +178,11 @@ def add_tempo_sequences(
         label_timestep_index: Zero-based scan ending the label interval.
 
     Returns:
-        Rows carrying oldest-to-newest scan timestamps, ages, and paths.
+        Rows carrying oldest-to-newest scan timestamps and paths.
     """
     label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
     time_columns = [f"timestep_time_t{index}" for index in range(timesteps)]
     path_columns = [f"no2_paths_t{index}" for index in range(timesteps)]
-    age_columns = [f"timestep_age_hours_t{index}" for index in range(timesteps)]
     sequences = (
         observations.lazy()
         .sort(AOI_ID_COL, "tempo_time")
@@ -243,13 +239,7 @@ def add_tempo_sequences(
         .filter(pl.col("_overlap") > pl.duration(microseconds=0))
         .with_columns(
             (pl.col("_overlap").dt.total_seconds() * 100 / SECONDS_PER_HOUR).alias("coverage_percent"),
-            pl.col(interval_columns[label_index - 1]).alias("tempo_delta_minutes"),
-            *[
-                ((pl.col(time_columns[-1]) - pl.col(time_columns[index])).dt.total_seconds() / SECONDS_PER_HOUR).alias(
-                    age_columns[index]
-                )
-                for index in range(timesteps)
-            ],
+            pl.col(interval_columns[label_index - 1]).alias("label_delta_mins"),
         )
         .sort(
             [AOI_ID_COL, "date", "hour", "_overlap", time_columns[label_index - 1]],
@@ -261,9 +251,8 @@ def add_tempo_sequences(
             "date",
             "hour",
             *time_columns,
-            *age_columns,
             *path_columns,
-            "tempo_delta_minutes",
+            "label_delta_mins",
             "coverage_percent",
         )
         .collect()
@@ -389,11 +378,7 @@ def add_ema_targets(
         indexed.join(current, on="_label_row", how="left")
         .join(previous, on="_label_row", how="left")
         .with_columns(
-            pl.col("current_ema_nox").alias(EFFECTIVE_CURRENT_NOX_COL),
-            pl.col("previous_ema_nox").alias(EFFECTIVE_PREVIOUS_NOX_COL),
-        )
-        .with_columns(
-            (pl.col(EFFECTIVE_CURRENT_NOX_COL) - pl.col(EFFECTIVE_PREVIOUS_NOX_COL)).alias("effective_delta_nox")
+            (pl.col("current_ema_nox") - pl.col("previous_ema_nox")).alias("effective_delta_nox")
         )
         .drop("_label_row", "current_ema_nox", "previous_ema_nox")
     )
@@ -739,9 +724,7 @@ def aggregate_aoi_hours(
         )
     )
     return (
-        add_delta_nox_targets(hourly)
-        .with_columns(pl.col("delta_nox_mass").alias(DELTA_NOX_COL))
-        .join(aoi_features.lazy(), on=AOI_ID_COL, how="inner")
+        hourly.join(aoi_features.lazy(), on=AOI_ID_COL, how="inner")
         .join(source_locations, on=AOI_ID_COL, how="left")
         .join(aois.select(AOI_ID_COL, "lat", "lon", "x_m", "y_m").lazy(), on=AOI_ID_COL, how="left")
         .sort(AOI_ID_COL, "date", "hour")

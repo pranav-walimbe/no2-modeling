@@ -9,8 +9,6 @@ import numpy as np
 import polars as pl
 from preprocessing.stratify_utils import (
     AOI_ID_COL,
-    DELTA_NOX_COL,
-    EFFECTIVE_CURRENT_NOX_COL,
     LABEL_MODE_COL,
     MAJOR_CITY_DIST_COL,
     NOX_COL,
@@ -55,8 +53,7 @@ TIMESTEP_COLUMNS = [
     column
     for index in range(SEQUENCE_TIMESTEPS)
     for column in (
-        f"timestep_time_t{index}",
-        f"timestep_age_hours_t{index}",
+        f"t{index}_timestamp",
         f"no2_paths_t{index}",
         f"weather_path_t{index}",
     )
@@ -81,14 +78,12 @@ OUTPUT_COLUMNS = [
     "emissions_hour_utc",
     "cluster",
     *TIMESTEP_COLUMNS,
-    "tempo_delta_minutes",
+    "label_delta_mins",
     "coverage_percent",
     "avg_heat_input",
     "avg_pwr_gen",
     "avg_coal_nox",
     NOX_COL,
-    DELTA_NOX_COL,
-    EFFECTIVE_CURRENT_NOX_COL,
     "effective_delta_nox",
     DELTA_CATEGORY_COL,
     LABEL_MODE_COL,
@@ -441,7 +436,9 @@ def build_stratification_candidates() -> pl.DataFrame:
         SEQUENCE_TIMESTEPS,
     )
     frame = _filter_metadata_eligibility(frame).filter(pl.col("effective_delta_nox").is_finite())
-    return frame
+    return frame.rename(
+        {f"timestep_time_t{index}": f"t{index}_timestamp" for index in range(SEQUENCE_TIMESTEPS)}
+    )
 
 
 def main() -> None:

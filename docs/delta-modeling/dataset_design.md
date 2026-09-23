@@ -28,7 +28,8 @@ The pipeline applies these steps in order:
    averages calculated over the same higher-activity AOI-hours.
 3. Match four consecutive TEMPO scans whose adjacent timestamps are 40 to 70
    minutes apart. The `t1` to `t2` interval must cover at least 50% of its
-   assigned emissions hour.
+   assigned emissions hour. Store the scan times as `t0_timestamp` through
+   `t3_timestamp` and the `t1` to `t2` duration as `label_delta_mins`.
 4. Calculate four-hour, exponentially weighted NOx averages ending at `t1` and
    `t2`. The history reaches before `t0` and includes the preceding emissions
    hour. Both windows require complete CAMPD coverage.
