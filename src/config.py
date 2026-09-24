@@ -104,7 +104,7 @@ PRETRAINED_ENCODER_WEIGHTS = os.getenv(  # masked-model checkpoint for delta tra
     "PRETRAINED_ENCODER_WEIGHTS",
     "/global/home/users/pranavwalimbe/masked_model_runs/masked_no2_20260920_211751/checkpoints/best_masked_no2.pt",
 )
-SEQUENCE_TIMESTEPS = 5  # four label rasters followed by one post-label raster
+SEQUENCE_TIMESTEPS = 4  # four causal rasters ending at the label timestamp
 LABEL_TIMESTEP_INDEX = 3  # zero-based final raster timestep consumed by the label EMA
 EMA_HISTORY_TIMESTEPS = 4  # interpolated timestep values consumed by the label EMA
 EMA_DECAY_TIMESCALE_HOURS = 2.0  # exponential e-folding time kept separate from the sequence length

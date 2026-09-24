@@ -427,23 +427,17 @@ def _plot_timestep_nox_deltas(
     kernel /= kernel.sum()
 
     figure, axis = plt.subplots(figsize=(12, 7), constrained_layout=True)
-    colors = ("#3977af", "#59a14f", "#f28e2b", "#b24a33")
-    for transition_index, ((label, values), color) in enumerate(
-        zip(transitions.items(), colors, strict=True),
-        start=1,
-    ):
+    colors = ("#3977af", "#59a14f", "#f28e2b")
+    for (label, values), color in zip(transitions.items(), colors, strict=True):
         visible = values[np.isfinite(values) & (np.abs(values) <= limit)]
         density, _ = np.histogram(visible, bins=bin_edges, density=True)
         smoothed = np.convolve(density, kernel, mode="same")
-        linestyle = "--" if transition_index == SEQUENCE_TIMESTEPS - 1 else "-"
-        suffix = " (post-label)" if transition_index == SEQUENCE_TIMESTEPS - 1 else ""
         axis.plot(
             bin_centers,
             smoothed,
             color=color,
-            linestyle=linestyle,
             linewidth=2.2,
-            label=f"{label}{suffix}",
+            label=label,
         )
 
     axis.axvline(0, color="#222222", linewidth=1)
@@ -532,7 +526,7 @@ def build_stratification_candidates(aoi_score_output: Path = DEFAULT_AOI_SCORE_O
         EMA_DECAY_TIMESCALE_HOURS,
         label_timestep_index=LABEL_TIMESTEP_INDEX,
     )
-    frame = frame.with_columns(pl.lit("overlap_interpolated_timestep_ema").alias(LABEL_MODE_COL))
+    frame = frame.with_columns(pl.lit("linear_interpolated_timestep_ema").alias(LABEL_MODE_COL))
     bounds = bounded_aois.select(
         AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
     )

@@ -39,7 +39,7 @@ completed physical channels as split-specific `.npy` files under job-local
 `/tmp`.
 
 The raster classifiers consume the completed arrays without a validity mask.
-Their input shape is `5 x 4 x 24 x 24`, and their NO2 stems use ordinary
+Their input shape is `4 x 4 x 24 x 24`, and their NO2 stems use ordinary
 convolutions.
 
 The tabular loader fits means and standard deviations on the delta training
@@ -60,7 +60,7 @@ three output logits. It receives no raster data.
 
 Both models share one raster architecture. A frame encoder
 maps each completed image to a `64 x 6 x 6` feature map. A 96-channel ConvGRU
-processes the five maps in time order. Global average and maximum pooling feed a
+processes the four maps in time order. Global average and maximum pooling feed a
 128-value projection and a 128-value classification head with three logits.
 The trainer adds these raster logits to logits from the best frozen tabular MLP
 before applying softmax. Freezing the tabular branch prevents seasonal features
