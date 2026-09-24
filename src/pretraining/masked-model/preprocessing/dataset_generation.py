@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -73,7 +74,7 @@ DEFAULT_BATCH_SIZE = 64
 PROGRESS_INTERVAL = 1_000
 DISCOVERY_TIME_LIMIT = "24:00:00"
 CLEANUP_TIME_LIMIT = "12:00:00"
-MAX_CLEANUP_WORKERS = 16
+MAX_CLEANUP_WORKERS = 8
 MAX_SHARD_DIRECTORY_DEPTH = 3
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
@@ -126,17 +127,20 @@ def _update_path(run_id: str, split: str, shard_id: int, candidate_offset: int) 
     return Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR) / run_id / split / filename
 
 
+def _progress_path(run_id: str, split: str, shard_id: int) -> Path:
+    return _run_work_dir(run_id) / "progress" / split / f"{shard_id:06d}.json"
+
+
+def _completion_path(run_id: str, split: str) -> Path:
+    return _run_work_dir(run_id) / "progress" / split / "complete.json"
+
+
 def _shard_dir(run_id: str, split: str, shard_id: int) -> Path:
     return _run_shard_dir(run_id) / split / f"{shard_id:06d}"
 
 
 def _record_path(run_id: str, split: str, shard_id: int) -> Path:
     return _shard_dir(run_id, split, shard_id) / "records.parquet"
-
-
-def _split_quota(target: int, shard_count: int, shard_id: int) -> int:
-    base, remainder = divmod(target, shard_count)
-    return base + int(shard_id < remainder)
 
 
 def _safe_reset(path: Path, base: Path) -> None:
@@ -496,6 +500,53 @@ def _run_cleanup(args: argparse.Namespace) -> None:
     _remove_retired_shards(args.cleanup_path, Path(MASKED_PRETRAINING_BASE_DIR), workers)
 
 
+def _publish_discovery_progress(
+    run_id: str,
+    split: str,
+    shard_id: int,
+    record_count: int,
+    candidate_offset: int,
+    candidate_count: int,
+) -> None:
+    write_json_atomic(
+        {
+            "shard_id": shard_id,
+            "record_count": record_count,
+            "candidate_offset": candidate_offset,
+            "candidate_count": candidate_count,
+            "updated_at": _timestamp(),
+        },
+        _progress_path(run_id, split, shard_id),
+    )
+
+
+def _discovered_record_count(run_id: str, split: str) -> int:
+    progress_dir = _progress_path(run_id, split, 0).parent
+    total = 0
+    for path in progress_dir.glob("[0-9][0-9][0-9][0-9][0-9][0-9].json"):
+        with path.open() as source:
+            total += int(json.load(source)["record_count"])
+    return total
+
+
+def _signal_discovery_complete(run_id: str, split: str, target: int, discovered: int) -> bool:
+    completion_dir = _completion_path(run_id, split)
+    try:
+        completion_dir.mkdir()
+    except FileExistsError:
+        return False
+    write_json_atomic(
+        {
+            "split": split,
+            "target_records": target,
+            "discovered_records": discovered,
+            "completed_at": _timestamp(),
+        },
+        completion_dir / "summary.json",
+    )
+    return True
+
+
 def _run_discovery_split(
     args: argparse.Namespace,
     split: str,
@@ -506,21 +557,24 @@ def _run_discovery_split(
 ) -> None:
     if args.run_id is None:
         raise ValueError("Discovery requires --run-id")
-    quota = _split_quota(SPLIT_TARGETS[split], args.num_shards, shard_id)
+    target = SPLIT_TARGETS[split]
     candidates = pl.read_parquet(_candidate_path(args.run_id, split, shard_id)).cast(CANDIDATE_SCHEMA)
     records: list[dict[str, object]] = []
     pending_updates: list[dict[str, object]] = []
     offset = 0
     raster_dir = _shard_dir(args.run_id, split, shard_id) / "record-rasters"
+    completion_path = _completion_path(args.run_id, split)
     raster_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     last_published_offset = offset
     index_hits = 0
     cache_misses = 0
     record_writer = ProcessPoolExecutor(max_workers=args.workers_per_shard)
+    write_parquet_atomic(empty_final_records(), _record_path(args.run_id, split, shard_id))
+    _publish_discovery_progress(args.run_id, split, shard_id, 0, 0, candidates.height)
 
     try:
-        while offset < candidates.height and len(records) < quota:
+        while offset < candidates.height and not completion_path.is_dir():
             batch = candidates.slice(offset, args.batch_size).to_dicts()
             keyed_rows: list[tuple[str, dict[str, object]]] = []
             resolved: dict[str, CandidateOutcome] = {}
@@ -560,8 +614,7 @@ def _run_discovery_split(
                         pending_updates.append(validity_row)
                         index[outcome.cache_key] = validity_row
 
-            remaining = quota - len(records)
-            selected = [resolved[key] for key, _ in keyed_rows if resolved[key].status == VALID_STATUS][:remaining]
+            selected = [resolved[key] for key, _ in keyed_rows if resolved[key].status == VALID_STATUS]
             tasks = [
                 PretrainingRecordTask(
                     row=outcome.row,
@@ -574,10 +627,29 @@ def _run_discovery_split(
             ]
             records.extend(record_writer.map(write_pretraining_record, tasks))
             offset += len(batch)
+            _publish_discovery_progress(
+                args.run_id,
+                split,
+                shard_id,
+                len(records),
+                offset,
+                candidates.height,
+            )
+            discovered_records = _discovered_record_count(args.run_id, split)
+            if discovered_records >= target and _signal_discovery_complete(
+                args.run_id,
+                split,
+                target,
+                discovered_records,
+            ):
+                print(
+                    f"[{_timestamp()}] [{split} shard {shard_id}] signaled discovery completion "
+                    f"at {discovered_records:,}/{target:,} records"
+                )
 
             should_publish = (
                 offset - last_published_offset >= PROGRESS_INTERVAL
-                or len(records) == quota
+                or completion_path.is_dir()
                 or offset == candidates.height
             )
             if should_publish:
@@ -591,18 +663,34 @@ def _run_discovery_split(
                 )
                 last_published_offset = offset
                 print(
-                    f"[{_timestamp()}] [{split} shard {shard_id}] {len(records):,}/{quota:,} masked records; "
+                    f"[{_timestamp()}] [{split} shard {shard_id}] {len(records):,} masked records; "
+                    f"{discovered_records:,}/{target:,} discovered across shards; "
                     f"{offset:,}/{candidates.height:,} candidates; {index_hits:,} index hits; "
                     f"{cache_misses:,} cache misses"
                 )
     finally:
         record_writer.shutdown(cancel_futures=True)
 
-    if len(records) != quota:
-        raise ValueError(
-            f"[{split} shard {shard_id}] candidate segment exhausted with {len(records):,}/{quota:,} records"
-        )
-    print(f"[{_timestamp()}] [{split} shard {shard_id}] finished in {time.monotonic() - started:.1f}s")
+    if pending_updates:
+        updates = pl.DataFrame(pending_updates, schema=VALIDITY_INDEX_SCHEMA)
+        write_parquet_atomic(updates, _update_path(args.run_id, split, shard_id, offset))
+    write_parquet_atomic(
+        pl.DataFrame(records, schema=FINAL_RECORD_SCHEMA),
+        _record_path(args.run_id, split, shard_id),
+    )
+    _publish_discovery_progress(
+        args.run_id,
+        split,
+        shard_id,
+        len(records),
+        offset,
+        candidates.height,
+    )
+    state = "target reached" if completion_path.is_dir() else "candidate segment exhausted"
+    print(
+        f"[{_timestamp()}] [{split} shard {shard_id}] {state} with {len(records):,} records "
+        f"in {time.monotonic() - started:.1f}s"
+    )
 
 
 def _run_discovery(args: argparse.Namespace) -> None:
@@ -635,14 +723,24 @@ def _run_finalizer(args: argparse.Namespace) -> None:
             pl.read_parquet(_record_path(args.run_id, split, shard_id)).cast(FINAL_RECORD_SCHEMA)
             for shard_id in range(args.num_shards)
         ]
-        records = pl.concat(frames, how="vertical").sort("candidate_index") if frames else empty_final_records()
-        if records.height != target:
-            raise ValueError(f"[{split}] discovered {records.height:,}/{target:,} requested records")
+        discovered = pl.concat(frames, how="vertical").sort("candidate_index") if frames else empty_final_records()
+        records = discovered.head(target)
         relative_paths = [str(Path(path).relative_to(base)) for path in records["raster_bundle_path"].to_list()]
         output = records.with_columns(pl.Series("raster_bundle_path", relative_paths, dtype=pl.String))
         write_csv_atomic(output, Path(MASKED_PRETRAINING_DF_DIR) / f"{split}_df.csv")
-        summaries.append({"split": split, "target_records": target, "published_records": output.height})
-        print(f"[{_timestamp()}] [{split}] published {output.height:,} records")
+        summaries.append(
+            {
+                "split": split,
+                "target_records": target,
+                "discovered_records": discovered.height,
+                "published_records": output.height,
+                "shortfall_records": max(target - output.height, 0),
+            }
+        )
+        print(
+            f"[{_timestamp()}] [{split}] published {output.height:,} of "
+            f"{discovered.height:,} discovered records; target {target:,}"
+        )
 
     index_frames = [pl.read_parquet(_snapshot_path(args.run_id)).cast(VALIDITY_INDEX_SCHEMA)]
     update_paths = sorted(Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR).glob("*/*/*.parquet"))
