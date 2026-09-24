@@ -57,6 +57,10 @@ TRAIN_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "train_records.csv")  # train s
 VAL_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "val_records.csv")  # validation split metadata
 TEST_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "test_records.csv")  # test split metadata
 VIS_DIR = "/global/home/users/pranavwalimbe/vis"  # output directory for visualizations
+AOI_SCORE_JSON = os.getenv(  # persistent AOI-to-score mapping updated by scoring runs
+    "NO2_AOI_SCORE_JSON",
+    os.path.join(STRAT_BASE_DIR, "aoi_scores.json"),
+)
 
 # ============================================================================
 # ERA5 wind data scraping
