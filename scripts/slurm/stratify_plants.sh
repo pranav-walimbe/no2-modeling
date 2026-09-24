@@ -59,7 +59,7 @@ mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" stat 
 printf '%s\n' \
     'Point-interpolated EMA stratification completed successfully.' \
     'Selected the highest plume-quality-scored half of mapped AOIs.' \
-    'Raw EMA-change threshold: +/-100' \
+    'EMA innovation threshold: max(100 lb/hr, 25% of median positive AOI timestep NOx).' \
     'Four causal rasters retained; the irregular-time EMA uses t0 through t3.' \
     'Each timestep NOx value is linearly interpolated between its surrounding CAMPD hours.' \
     'Filtered AOI clusters were assigned by class to approximately 70/15/15 splits.' \

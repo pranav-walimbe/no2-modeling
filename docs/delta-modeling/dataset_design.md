@@ -35,7 +35,9 @@ The pipeline applies these steps in order:
 5. Apply a continuous-time EMA to `t0_nox` through `t3_nox`. Each update uses
    the actual time between scans, so a 70-minute interval admits more of the
    new value than a 40-minute interval.
-6. Assign classes from the raw effective NOx change.
+6. Undo the final EMA update attenuation to recover the innovation relative to
+   the preceding EMA. Assign classes using the larger of a 100 lb/hr absolute
+   floor or 25% of the AOI's median positive interpolated timestep NOx.
 7. Assign each overlap cluster to one split with a deterministic procedure that
    targets the 70/15/15 ratio for each class.
 8. Downsample each class to the smallest class count within its split.
@@ -55,10 +57,20 @@ effective_delta_nox = EMA(t3) - EMA(t2)
 The EMA starts from the point-interpolated `t0_nox` value and updates through
 `t3_nox`. Each update retains `exp(-elapsed_hours / 2)` of the preceding EMA.
 
-The class uses `effective_delta_nox` with boundaries at -100 and +100. Values
-on a boundary belong to `steady`. The pipeline writes the class to
-`delta_category`, which the classifier consumes without recreating it from a
-continuous value.
+For the final update, define:
+
+```text
+alpha = 1 - exp(-(t3 - t2) / 2 hours)
+ema_innovation_nox = effective_delta_nox / alpha
+aoi_active_median_nox = median(positive t0_nox ... t3_nox values for the AOI)
+hybrid_innovation_threshold = max(100, 0.25 * aoi_active_median_nox)
+```
+
+Innovations at or below the negative threshold are decreases. Innovations at
+or above the positive threshold are increases, and values between them are
+steady. The pipeline writes the derived scale, update weight, innovation,
+threshold, and class to the split metadata. The classifier consumes
+`delta_category` without recreating it from a continuous value.
 
 Metadata records this target construction as
 `label_mode=linear_interpolated_timestep_ema`. The label and the causal raster

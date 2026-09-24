@@ -40,7 +40,8 @@ from config import (
     SEQUENCE_TIMESTEPS,
     STRAT_BASE_DIR,
     STRATIFICATION_AOI_FRACTION,
-    STRATIFICATION_EMA_CHANGE_THRESHOLD,
+    STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR,
+    STRATIFICATION_INNOVATION_RELATIVE_FLOOR,
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
     VAL_RECORDS_CSV,
@@ -52,6 +53,10 @@ SPLIT_SEED = 42
 DELTA_CATEGORY_COL = "delta_category"
 AOI_SCORE_COL = "aoi_score"
 AOI_SCORE_PERCENTILE_COL = "aoi_score_percentile"
+AOI_SCALE_COL = "aoi_active_median_nox"
+EMA_UPDATE_ALPHA_COL = "ema_update_alpha"
+EMA_INNOVATION_COL = "ema_innovation_nox"
+HYBRID_THRESHOLD_COL = "hybrid_innovation_threshold"
 EMA_BUCKET_NAMES = ("decrease", "steady", "increase")
 TIMESTEP_COLUMNS = [
     column
@@ -93,6 +98,10 @@ OUTPUT_COLUMNS = [
     "effective_previous_nox",
     "effective_current_nox",
     "effective_delta_nox",
+    AOI_SCALE_COL,
+    EMA_UPDATE_ALPHA_COL,
+    EMA_INNOVATION_COL,
+    HYBRID_THRESHOLD_COL,
     DELTA_CATEGORY_COL,
     LABEL_MODE_COL,
 ]
@@ -226,19 +235,46 @@ def _split_by_cluster(
 
 
 def filter_stratification_rule(frame: pl.DataFrame) -> pl.DataFrame:
-    """Assign classes from the raw effective EMA change.
+    """Assign classes from an absolute and AOI-relative EMA innovation.
 
     Args:
-        frame: Eligible records carrying raw effective deltas.
+        frame: Eligible records carrying timestep NOx values and raw effective deltas.
 
     Returns:
-        Records labeled with the raw EMA class.
+        Records carrying the AOI scale, innovation, threshold, and class.
     """
-    raw_delta = pl.col("effective_delta_nox")
-    return frame.with_columns(
-        pl.when(raw_delta < -STRATIFICATION_EMA_CHANGE_THRESHOLD)
+    timestep_columns = [f"t{index}_nox" for index in range(SEQUENCE_TIMESTEPS)]
+    scales = (
+        frame.select(AOI_ID_COL, pl.concat_list(timestep_columns).alias("_timestep_nox"))
+        .explode("_timestep_nox", empty_as_null=True)
+        .filter(pl.col("_timestep_nox").is_finite() & (pl.col("_timestep_nox") > 0))
+        .group_by(AOI_ID_COL)
+        .agg(pl.col("_timestep_nox").median().alias(AOI_SCALE_COL))
+        .filter(pl.col(AOI_SCALE_COL).is_finite() & (pl.col(AOI_SCALE_COL) > 0))
+    )
+    current_time = pl.col(f"t{LABEL_TIMESTEP_INDEX}_timestamp")
+    previous_time = pl.col(f"t{LABEL_TIMESTEP_INDEX - 1}_timestamp")
+    interval_hours = (current_time - previous_time).dt.total_seconds() / 3600
+    alpha = 1 - (-interval_hours / EMA_DECAY_TIMESCALE_HOURS).exp()
+    threshold = pl.max_horizontal(
+        pl.lit(STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR),
+        STRATIFICATION_INNOVATION_RELATIVE_FLOOR * pl.col(AOI_SCALE_COL),
+    )
+    labeled = (
+        frame.join(scales, on=AOI_ID_COL, how="inner")
+        .with_columns(alpha.alias(EMA_UPDATE_ALPHA_COL))
+        .filter(pl.col(EMA_UPDATE_ALPHA_COL).is_finite() & (pl.col(EMA_UPDATE_ALPHA_COL) > 0))
+        .with_columns(
+            (pl.col("effective_delta_nox") / pl.col(EMA_UPDATE_ALPHA_COL)).alias(EMA_INNOVATION_COL),
+            threshold.alias(HYBRID_THRESHOLD_COL),
+        )
+        .filter(pl.col(EMA_INNOVATION_COL).is_finite())
+    )
+    innovation = pl.col(EMA_INNOVATION_COL)
+    return labeled.with_columns(
+        pl.when(innovation <= -pl.col(HYBRID_THRESHOLD_COL))
         .then(pl.lit("decrease"))
-        .when(raw_delta > STRATIFICATION_EMA_CHANGE_THRESHOLD)
+        .when(innovation >= pl.col(HYBRID_THRESHOLD_COL))
         .then(pl.lit("increase"))
         .otherwise(pl.lit("steady"))
         .alias(DELTA_CATEGORY_COL)
@@ -261,7 +297,7 @@ def select_balanced_ema_records(
     *,
     seed: int = SPLIT_SEED,
 ) -> pl.DataFrame:
-    """Select equal deterministic samples from three raw EMA-change buckets.
+    """Select equal deterministic samples from three EMA-innovation buckets.
 
     Args:
         frame: Eligible records carrying the raw effective NOx delta.
@@ -298,7 +334,8 @@ def select_balanced_ema_records(
     balanced = pl.concat(selected).sort(AOI_ID_COL, "emissions_hour_utc")
     count_summary = ", ".join(f"{row[DELTA_CATEGORY_COL]}={row['len']:,}" for row in counts.iter_rows(named=True))
     print(
-        f"[{split}] threshold=+/-{STRATIFICATION_EMA_CHANGE_THRESHOLD:.2f}; eligible {count_summary}; "
+        f"[{split}] threshold=max({STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR:g}, "
+        f"{STRATIFICATION_INNOVATION_RELATIVE_FLOOR:.0%} of AOI scale); eligible {count_summary}; "
         f"selected {records_per_class:,} per class ({balanced.height:,} total)"
     )
     return balanced
@@ -309,24 +346,22 @@ def _plot_stratification_diagnostics(
     balanced_splits: dict[str, pl.DataFrame],
     output_path: Path,
 ) -> None:
-    # Compare raw EMA changes and bucket composition before and after balancing
+    # Compare EMA innovations and bucket composition before and after balancing
     split_names = tuple(SPLIT_FRACTIONS)
     figure, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
-    combined = np.concatenate(
-        [split["effective_delta_nox"].drop_nulls().to_numpy() for split in eligible_splits.values()]
-    )
+    combined = np.concatenate([split[EMA_INNOVATION_COL].drop_nulls().to_numpy() for split in eligible_splits.values()])
     finite = combined[np.isfinite(combined)]
     lower, upper = np.quantile(finite, HISTOGRAM_QUANTILES)
     limit = max(abs(lower), abs(upper))
     if limit == 0:
         limit = 1.0
-    threshold = STRATIFICATION_EMA_CHANGE_THRESHOLD
+    threshold = STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR
     total_eligible = sum(split.height for split in eligible_splits.values())
     colors = ("#3977af", "#999999", "#d65f4a")
     for column_index, split_name in enumerate(split_names):
         eligible = eligible_splits[split_name]
         balanced = balanced_splits[split_name]
-        values = eligible["effective_delta_nox"].drop_nulls().to_numpy()
+        values = eligible[EMA_INNOVATION_COL].drop_nulls().to_numpy()
         values = values[np.isfinite(values)]
         visible = values[np.abs(values) <= limit]
         aoi_count = eligible[AOI_ID_COL].n_unique()
@@ -339,17 +374,12 @@ def _plot_stratification_diagnostics(
         histogram_axis.set_title(
             f"{split_name}: {eligible.height:,} eligible ({eligible.height / total_eligible:.1%}), {aoi_count} AOIs"
         )
-        histogram_axis.set_xlabel("Raw effective EMA NOx change")
+        histogram_axis.set_xlabel("EMA innovation (lb/hr)")
         histogram_axis.set_ylabel("AOI-hour count")
         histogram_axis.grid(axis="y", alpha=0.2)
 
-        eligible_counts = np.array(
-            [
-                int((values < -threshold).sum()),
-                int((np.abs(values) <= threshold).sum()),
-                int((values > threshold).sum()),
-            ]
-        )
+        category_counts = dict(eligible.group_by(DELTA_CATEGORY_COL).len().iter_rows())
+        eligible_counts = np.array([category_counts.get(category, 0) for category in EMA_BUCKET_NAMES])
         balanced_count = balanced.height // len(EMA_BUCKET_NAMES)
         balanced_counts = np.full(len(EMA_BUCKET_NAMES), balanced_count)
         positions = np.arange(len(EMA_BUCKET_NAMES))
@@ -382,7 +412,9 @@ def _plot_stratification_diagnostics(
     split_counts = ", ".join(f"{name}={balanced_splits[name].height:,}" for name in split_names)
     total_balanced = sum(split.height for split in balanced_splits.values())
     figure.suptitle(
-        f"Raw EMA change threshold +/-{STRATIFICATION_EMA_CHANGE_THRESHOLD:g}\n"
+        "Hybrid EMA innovation threshold: "
+        f"max({STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR:g} lb/hr, "
+        f"{STRATIFICATION_INNOVATION_RELATIVE_FLOOR:.0%} of AOI scale)\n"
         f"Maximum balanced set: {total_balanced:,} total ({split_counts})"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -498,15 +530,17 @@ def _operating_aoi_characteristics(relevant: pl.LazyFrame, membership: pl.DataFr
     active = hourly.join(activity_cutoffs, on=AOI_ID_COL, how="inner").filter(
         pl.col("_mean_unit_op_time") >= pl.col("_median_unit_op_time")
     )
-    return active.group_by(AOI_ID_COL).agg(
-        pl.col("_total_nox").median().alias("active_median_total_nox"),
-        pl.col("_operating_units").mean().alias("active_mean_operating_units"),
-    ).join(
-        hourly.group_by(AOI_ID_COL).agg(
-            (pl.col("_total_nox") > 0).mean().alias("history_emitting_fraction")
-        ),
-        on=AOI_ID_COL,
-        how="inner",
+    return (
+        active.group_by(AOI_ID_COL)
+        .agg(
+            pl.col("_total_nox").median().alias("active_median_total_nox"),
+            pl.col("_operating_units").mean().alias("active_mean_operating_units"),
+        )
+        .join(
+            hourly.group_by(AOI_ID_COL).agg((pl.col("_total_nox") > 0).mean().alias("history_emitting_fraction")),
+            on=AOI_ID_COL,
+            how="inner",
+        )
     )
 
 
@@ -732,7 +766,11 @@ def main() -> None:
         args.aoi_characteristics_output,
     )
     frame = filter_stratification_rule(candidates)
-    print(f"Labeled {frame.height:,} records with raw EMA threshold +/-{STRATIFICATION_EMA_CHANGE_THRESHOLD:g}")
+    print(
+        f"Labeled {frame.height:,} records with hybrid EMA innovation threshold "
+        f"max({STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR:g} lb/hr, "
+        f"{STRATIFICATION_INNOVATION_RELATIVE_FLOOR:.0%} of AOI scale)"
+    )
     print(f"Using {frame[AOI_ID_COL].n_unique():,} eligible selected AOIs")
     eligible_splits = _split_by_cluster(frame, category_column=DELTA_CATEGORY_COL)
     splits = {split: select_balanced_ema_records(split_frame, split) for split, split_frame in eligible_splits.items()}
