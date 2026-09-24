@@ -34,7 +34,6 @@ from config import (
     EMA_HISTORY_TIMESTEPS,
     FULL_DATA_PARQUET,
     LABEL_TIMESTEP_INDEX,
-    MIN_COVERAGE_PERCENT,
     SEQUENCE_TIMESTEPS,
     STRAT_BASE_DIR,
     STRATIFICATION_AOI_FRACTION,
@@ -54,6 +53,7 @@ TIMESTEP_COLUMNS = [
     for index in range(SEQUENCE_TIMESTEPS)
     for column in (
         f"t{index}_timestamp",
+        f"timestep_age_hours_t{index}",
         f"t{index}_nox",
         f"no2_paths_t{index}",
         f"weather_path_t{index}",
@@ -80,10 +80,11 @@ OUTPUT_COLUMNS = [
     "cluster",
     *TIMESTEP_COLUMNS,
     "label_delta_mins",
-    "coverage_percent",
     "avg_heat_input",
     "avg_pwr_gen",
     "avg_coal_nox",
+    "effective_previous_nox",
+    "effective_current_nox",
     "effective_delta_nox",
     DELTA_CATEGORY_COL,
     LABEL_MODE_COL,
@@ -107,6 +108,7 @@ REQUIRED_COLUMNS = [
 
 DEFAULT_DIAGNOSTIC_OUTPUT = Path(VIS_DIR) / "stratification_ema_balance.png"
 DEFAULT_AOI_SCORE_OUTPUT = Path(VIS_DIR) / "stratification_aoi_score_percentiles.png"
+DEFAULT_TIMESTEP_DELTA_OUTPUT = Path(VIS_DIR) / "stratification_timestep_nox_deltas.png"
 HISTOGRAM_QUANTILES = (0.01, 0.99)
 
 
@@ -115,6 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--diagnostic-output", type=Path, default=DEFAULT_DIAGNOSTIC_OUTPUT)
     parser.add_argument("--aoi-score-output", type=Path, default=DEFAULT_AOI_SCORE_OUTPUT)
+    parser.add_argument("--timestep-delta-output", type=Path, default=DEFAULT_TIMESTEP_DELTA_OUTPUT)
     return parser.parse_args()
 
 
@@ -222,7 +225,7 @@ def filter_stratification_rule(frame: pl.DataFrame) -> pl.DataFrame:
 def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     # Apply non-raster candidate quality requirements
     return frame.filter(
-        (pl.col("coverage_percent") >= MIN_COVERAGE_PERCENT)
+        pl.all_horizontal([pl.col(f"t{index}_nox").is_finite() for index in range(SEQUENCE_TIMESTEPS)])
         & pl.col("avg_coal_nox").is_finite()
         & pl.col("avg_heat_input").is_finite()
         & pl.col("avg_pwr_gen").is_finite()
@@ -256,11 +259,16 @@ def select_balanced_ema_records(
         class_records = (
             frame.filter(pl.col(DELTA_CATEGORY_COL) == class_name)
             .with_columns(
-                pl.struct(AOI_ID_COL, "emissions_hour_utc")
+                pl.struct(AOI_ID_COL, "emissions_hour_utc", f"t{LABEL_TIMESTEP_INDEX}_timestamp")
                 .hash(seed=seed)
                 .alias("_selection_tie_breaker")
             )
-            .sort("_selection_tie_breaker", AOI_ID_COL, "emissions_hour_utc")
+            .sort(
+                "_selection_tie_breaker",
+                AOI_ID_COL,
+                "emissions_hour_utc",
+                f"t{LABEL_TIMESTEP_INDEX}_timestamp",
+            )
             .head(records_per_class)
             .drop("_selection_tie_breaker")
         )
@@ -396,6 +404,62 @@ def _plot_aoi_score_percentiles(aoi_features: pl.DataFrame, output_path: Path) -
     plt.close(figure)
 
 
+def _plot_timestep_nox_deltas(
+    balanced_splits: dict[str, pl.DataFrame],
+    output_path: Path,
+) -> None:
+    # Compare smoothed raw NOx-change distributions across scan transitions
+    frame = pl.concat(list(balanced_splits.values()))
+    transitions = {
+        f"t{index - 1} to t{index}": (
+            frame[f"t{index}_nox"] - frame[f"t{index - 1}_nox"]
+        ).to_numpy()
+        for index in range(1, SEQUENCE_TIMESTEPS)
+    }
+    pooled = np.concatenate(list(transitions.values()))
+    finite = pooled[np.isfinite(pooled)]
+    lower, upper = np.quantile(finite, HISTOGRAM_QUANTILES)
+    limit = max(abs(lower), abs(upper), 1.0)
+    bin_edges = np.linspace(-limit, limit, 241)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    kernel_x = np.arange(-8, 9)
+    kernel = np.exp(-0.5 * np.square(kernel_x / 2.0))
+    kernel /= kernel.sum()
+
+    figure, axis = plt.subplots(figsize=(12, 7), constrained_layout=True)
+    colors = ("#3977af", "#59a14f", "#f28e2b", "#b24a33")
+    for transition_index, ((label, values), color) in enumerate(
+        zip(transitions.items(), colors, strict=True),
+        start=1,
+    ):
+        visible = values[np.isfinite(values) & (np.abs(values) <= limit)]
+        density, _ = np.histogram(visible, bins=bin_edges, density=True)
+        smoothed = np.convolve(density, kernel, mode="same")
+        linestyle = "--" if transition_index == SEQUENCE_TIMESTEPS - 1 else "-"
+        suffix = " (post-label)" if transition_index == SEQUENCE_TIMESTEPS - 1 else ""
+        axis.plot(
+            bin_centers,
+            smoothed,
+            color=color,
+            linestyle=linestyle,
+            linewidth=2.2,
+            label=f"{label}{suffix}",
+        )
+
+    axis.axvline(0, color="#222222", linewidth=1)
+    axis.set(
+        title=f"Raw interpolated NOx changes across raster timesteps ({frame.height:,} balanced records)",
+        xlabel="Adjacent-timestep NOx change (lb/hour)",
+        ylabel="Smoothed density",
+        xlim=(-limit, limit),
+    )
+    axis.grid(alpha=0.2)
+    axis.legend(frameon=False)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(output_path, dpi=180)
+    plt.close(figure)
+
+
 def _serialize_no2_paths(frame: pl.DataFrame) -> pl.DataFrame:
     # Encode every configured TEMPO granule list for CSV output
     return frame.with_columns(
@@ -460,16 +524,15 @@ def build_stratification_candidates(aoi_score_output: Path = DEFAULT_AOI_SCORE_O
         SEQUENCE_TIMESTEPS,
         label_timestep_index=LABEL_TIMESTEP_INDEX,
     )
+    frame = frame.filter(pl.col(f"timestep_time_t{SEQUENCE_TIMESTEPS - 1}").is_not_null())
     frame = add_timestep_nox(frame, hourly, SEQUENCE_TIMESTEPS)
-    frame = frame.filter(pl.col(f"timestep_time_t{LABEL_TIMESTEP_INDEX}").is_not_null())
     frame = add_ema_targets(
         frame,
-        hourly,
         EMA_HISTORY_TIMESTEPS,
         EMA_DECAY_TIMESCALE_HOURS,
         label_timestep_index=LABEL_TIMESTEP_INDEX,
     )
-    frame = frame.with_columns(pl.lit("causal_ema").alias(LABEL_MODE_COL))
+    frame = frame.with_columns(pl.lit("overlap_interpolated_timestep_ema").alias(LABEL_MODE_COL))
     bounds = bounded_aois.select(
         AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
     )
@@ -500,6 +563,8 @@ def main() -> None:
     }
     _plot_stratification_diagnostics(eligible_splits, splits, args.diagnostic_output)
     print(f"Saved EMA-balance diagnostics to {args.diagnostic_output}")
+    _plot_timestep_nox_deltas(splits, args.timestep_delta_output)
+    print(f"Saved timestep NOx-delta diagnostics to {args.timestep_delta_output}")
 
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     del frame

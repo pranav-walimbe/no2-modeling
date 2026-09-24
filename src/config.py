@@ -48,8 +48,7 @@ TEMPO_CELL_OVERLAP_FLOOR_KM2 = 0.0  # retain every positive accepted footprint-c
 TEMPO_MIN_DELTA_MINUTES = 40
 TEMPO_MAX_DELTA_MINUTES = 70
 IMG_RANGE = 72  # spatial extent of extracted image patch (km)
-TARGET_LABEL_MODE = "hard_hour"  # supported values: hard_hour, overlap_weighted
-MIN_COVERAGE_PERCENT = 50.0  # least share of the emissions hour a delta window may cover
+TARGET_LABEL_MODE = "overlap_weighted"  # interpolate CAMPD hours over each TEMPO interval
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # stratified split output directory
 STRATIFICATION_EMA_CHANGE_THRESHOLD = 100.0  # raw EMA NOx-change boundary used to balance metadata splits
@@ -105,9 +104,9 @@ PRETRAINED_ENCODER_WEIGHTS = os.getenv(  # masked-model checkpoint for delta tra
     "PRETRAINED_ENCODER_WEIGHTS",
     "/global/home/users/pranavwalimbe/masked_model_runs/masked_no2_20260920_211751/checkpoints/best_masked_no2.pt",
 )
-SEQUENCE_TIMESTEPS = 4  # stored causal raster sequence length
-LABEL_TIMESTEP_INDEX = 2  # zero-based raster timestep ending the emissions label interval
-EMA_HISTORY_TIMESTEPS = 4  # hourly history used by each label-aligned EMA
+SEQUENCE_TIMESTEPS = 5  # four label rasters followed by one post-label raster
+LABEL_TIMESTEP_INDEX = 3  # zero-based final raster timestep consumed by the label EMA
+EMA_HISTORY_TIMESTEPS = 4  # interpolated timestep values consumed by the label EMA
 EMA_DECAY_TIMESCALE_HOURS = 2.0  # exponential e-folding time kept separate from the sequence length
 MODEL_IMAGE_KEYS = ("no2", "temperature_2m_k", "wind_u_80m_mps", "wind_v_80m_mps")
 MODEL_MASK_KEYS = ("no2_mask",)

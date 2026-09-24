@@ -1,6 +1,6 @@
 # Dataset design
 
-Each record joins four TEMPO scans, hourly HRRR fields, plant metadata, and one
+Each record joins five TEMPO scans, hourly HRRR fields, plant metadata, and one
 three-class emissions-change label for a 72 km area of interest (AOI).
 
 ## Contract
@@ -27,19 +27,20 @@ The pipeline applies these steps in order:
 2. Aggregate usable CAMPD measurements for the selected AOIs by UTC hour. Add
    unit counts, major-city distance, and full-history heat-input and generation
    averages calculated over the same higher-activity AOI-hours.
-3. Match four consecutive TEMPO scans whose adjacent timestamps are 40 to 70
-   minutes apart. The `t1` to `t2` interval must cover at least 50% of its
-   assigned emissions hour. Store the scan times as `t0_timestamp` through
-   `t3_timestamp`, the containing-hour emissions as `t0_nox` through `t3_nox`,
-   and the `t1` to `t2` duration as `label_delta_mins`.
-4. Calculate four-hour, exponentially weighted NOx averages ending at `t1` and
-   `t2`. The history reaches before `t0` and includes the preceding emissions
-   hour. Both windows require complete CAMPD coverage.
-5. Assign classes from the raw effective NOx change.
-6. Assign each overlap cluster to one split with a deterministic procedure that
+3. Match five consecutive TEMPO scans whose adjacent timestamps are 40 to 70
+   minutes apart. Retain one preceding scan timestamp to define the interval
+   ending at `t0`. Store raster scans as `t0_timestamp` through `t4_timestamp`.
+4. For each raster timestep, weight the CAMPD hourly NOx rates by their exact
+   overlap with the interval since the preceding TEMPO scan. Store these five
+   interpolated rates as `t0_nox` through `t4_nox`.
+5. Apply a continuous-time EMA to `t0_nox` through `t3_nox`. Each update uses
+   the actual time between scans, so a 70-minute interval admits more of the
+   new value than a 40-minute interval. Keep `t4_nox` as post-label context.
+6. Assign classes from the raw effective NOx change.
+7. Assign each overlap cluster to one split with a deterministic procedure that
    targets the 70/15/15 ratio for each class.
-7. Downsample each class to the smallest class count within its split.
-8. Generate rasters and reject records that fail coverage or source-file checks.
+8. Downsample each class to the smallest class count within its split.
+9. Generate rasters and reject records that fail coverage or source-file checks.
 
 Raster quality control can change class counts after balancing. The finalizer
 reports those counts and does not rebalance the retained records.
@@ -49,26 +50,25 @@ reports those counts and does not rebalance the retained records.
 The audit target is:
 
 ```text
-effective_delta_nox = current_ema_nox - previous_ema_nox
+effective_delta_nox = EMA(t3) - EMA(t2)
 ```
 
-`current_ema_nox` covers the four hours ending at `t2`; `previous_ema_nox`
-covers the four hours ending at `t1`. Both use a two-hour exponential decay
-timescale.
+The EMA starts from the overlap-interpolated `t0_nox` value and updates through
+`t3_nox`. Each update retains `exp(-elapsed_hours / 2)` of the preceding EMA.
 
 The class uses `effective_delta_nox` with boundaries at -100 and +100. Values
 on a boundary belong to `steady`. The pipeline writes the class to
 `delta_category`, which the classifier consumes without recreating it from a
 continuous value.
 
-Metadata records this target construction as `label_mode=causal_ema`. The label
-ends at `t2`, but the raster classifier receives the full `t0` through `t3`
-sequence. Its prediction therefore uses one observation after the labeled
-interval.
+Metadata records this target construction as
+`label_mode=overlap_interpolated_timestep_ema`. The label ends at `t3`, but the
+raster classifier receives the full `t0` through `t4` sequence. Its prediction
+therefore uses one post-label observation.
 
 ## Stored inputs
 
-Each raster bundle stores five arrays with shape `4 x 24 x 24`:
+Each raster bundle stores five arrays with shape `5 x 24 x 24`:
 
 | Array | Contents |
 |---|---|
