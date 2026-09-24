@@ -21,7 +21,8 @@ recipient="pranav.walimbe@berkeley.edu"
 mail_host="${SLURM_SUBMIT_HOST:-ln002.brc}"
 mail_log="/var/log/maillog"
 diagnostic="/global/home/users/pranavwalimbe/vis/stratification-ema-balance-${SLURM_JOB_ID}.png"
-aoi_scores="/global/home/users/pranavwalimbe/vis/stratification-aoi-score-percentiles-${SLURM_JOB_ID}.png"
+aoi_characteristics_plot="/global/home/users/pranavwalimbe/vis/stratification-aoi-characteristics-${SLURM_JOB_ID}.png"
+aoi_characteristics_table="/global/home/users/pranavwalimbe/vis/stratification-aoi-characteristics-${SLURM_JOB_ID}.csv"
 
 cd "${repo_dir}"
 module load python/3.11.6-gcc-11.4.0
@@ -33,15 +34,20 @@ export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
 srun python -u -m preprocessing.stratify_plants \
     --diagnostic-output "${diagnostic}" \
-    --aoi-score-output "${aoi_scores}" \
+    --aoi-characteristics-plot "${aoi_characteristics_plot}" \
+    --aoi-characteristics-output "${aoi_characteristics_table}" \
     "$@"
 
 if [[ ! -s "${diagnostic}" ]]; then
     echo "Expected stratification diagnostic was not created: ${diagnostic}" >&2
     exit 1
 fi
-if [[ ! -s "${aoi_scores}" ]]; then
-    echo "Expected AOI score visualization was not created: ${aoi_scores}" >&2
+if [[ ! -s "${aoi_characteristics_plot}" ]]; then
+    echo "Expected AOI characteristics dashboard was not created: ${aoi_characteristics_plot}" >&2
+    exit 1
+fi
+if [[ ! -s "${aoi_characteristics_table}" ]]; then
+    echo "Expected AOI characteristics table was not created: ${aoi_characteristics_table}" >&2
     exit 1
 fi
 train_records=$(($(wc -l < "${strat_dir}/train_records.csv") - 1))
@@ -63,9 +69,10 @@ printf '%s\n' \
     "Test: ${test_records} records" \
     "Total: ${total_records} records" \
     "Diagnostic: ${diagnostic}" \
-    "AOI scores: ${aoi_scores}" \
+    "AOI characteristics: ${aoi_characteristics_plot}" \
+    "AOI characteristics table: ${aoi_characteristics_table}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
-        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${diagnostic}' -a '${aoi_scores}' '${recipient}'"
+        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${diagnostic}' -a '${aoi_characteristics_plot}' -a '${aoi_characteristics_table}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do
