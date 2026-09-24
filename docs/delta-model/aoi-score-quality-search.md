@@ -1,230 +1,192 @@
-# AOI directional plume-quality search
+# AOI directional plume-quality score
 
-## Question
+## Purpose
 
-This analysis asks whether a deterministic AOI score can identify locations
-whose NO2 rasters contain source-localized plume changes that agree with the
-emissions label. It also tests whether attributes available before raster
-generation can filter for those AOIs.
+We designed an AOI score to identify locations where source-localized NO2
+plumes change in the same direction as the CAMPD emissions label. The score
+uses the label, so it belongs in dataset selection and diagnostics. It must not
+enter the emissions-change model as an input.
 
-The analysis is exploratory. It uses the label to measure and rank AOI quality,
-so the resulting score is appropriate for dataset design and diagnostics, not
-as an input to an emissions-change model.
+## Data contract
 
-## Data and label contract
+Savio job `39195305` evaluated 28,937 raster bundles from the prior delta-model
+dataset, with at most 32 histories per AOI. The analysis rebuilt each label
+from the current stratification code:
 
-Slurm job `39195305` evaluated 28,937 raster bundles sampled deterministically
-from the previous delta-model dataset, with at most 32 histories per AOI. It
-recomputed labels from the current stratification implementation rather than
-using the old dataset labels:
+- CAMPD hourly NOx totals receive weights based on their overlap with each
+  TEMPO observation interval.
+- A two-hour irregular-time EMA updates from `t0` through `t3`.
+- `EMA(t3) - EMA(t2)` defines the label. Changes below -100 lb are decreases,
+  and changes above +100 lb are increases.
+- The raster score uses `t0` through `t3` and excludes the post-label `t4`
+  raster.
 
-- CAMPD hourly NOx totals are weighted by their exact overlap with each TEMPO
-  observation interval.
-- The irregular-time EMA starts at `t0` and updates through `t3` using the
-  actual time between observations and the configured two-hour decay
-  timescale.
-- The target is `EMA(t3) - EMA(t2)`. Values below -100 lb are decreases, values
-  above +100 lb are increases, and the rest are steady.
-- Raster scoring uses `t0` through `t3`. It does not inspect the post-label
-  `t4` raster.
+The scorer uses the fixed robust raster normalization recorded in `AGENTS.md`:
 
-The raster normalization was frozen before tuning. A deterministic sample of
-10,000 bundles, or 50,000 raster timesteps, provided 28,668,797 finite pixels.
-The robust center is `1.868138303979520e15` molecules/cm² and the scale is
-`IQR / 1.349 = 1.1997222249899362e15` molecules/cm². Every search configuration
-uses these same values.
+```text
+center = 1.868138303979520e15 molecules/cm2
+scale  = 1.1997222249899362e15 molecules/cm2
+```
 
-## Raster quality signal
+## Raster signal
 
 For each timestep, the scorer:
 
 1. subtracts a mask-normalized Gaussian background;
-2. searches directions within 45 degrees of the local current or previous
+2. searches directions within 45 degrees of the current or previous local
    80 m wind;
-3. compares a narrow, source-anchored downwind core with crosswind flanks;
-4. divides by a robust background-noise estimate; and
-5. discounts broad positive fields and responses not connected to the source.
+3. compares a source-anchored downwind core with crosswind flanks; and
+4. downweights broad fields and positive regions disconnected from the source.
 
-The strongest constrained response supplies both a nonnegative plume SNR and a
-signed plume amplitude. The four amplitudes pass through the same irregular
-EMA timing used for the emissions label. For a record, directional strength is
+The matched-filter response uses background pixels outside the source
+neighborhood to estimate noise:
 
 ```text
-margin = label_sign * standardized_plume_EMA_change
-quality = tanh(plume_SNR / SNR_scale) * tanh(margin / direction_scale)
+noise = max(1.4826 * background_MAD, 0.10)
+raw_SNR = max((core_response - flank_response) / noise, 0)
 ```
 
-This target rewards strong, correctly directed plume changes. Strong changes
-in the wrong direction receive a negative value, while uncertain or weak
-changes remain near zero. The robust plume-change scale reached its configured
-floor of 0.1.
+The strongest wind-constrained response supplies a nonnegative SNR and a
+signed plume amplitude. The scorer applies the emissions-label EMA timing to
+the four plume amplitudes and standardizes the resulting change.
 
-## Deterministic evaluation
+## Final AOI score
 
-Records are assigned to three folds by a seeded hash of raster path. For each
-fold, candidate AOI scores use the other two folds and quality is measured only
-on the held-out records. Both increase and decrease histories must be present.
-The fixed seed is `20260923`.
-The search evaluates:
-
-- SNR scales of 0.25, 0.5, and 1.0;
-- directional scales of 0.5, 1.0, and 2.0;
-- mean, median, and upper-quartile within-class aggregation;
-- class-imbalance penalties of 0, 0.5, and 1.0; and
-- uncertainty penalties of 0, 0.5, and 1.0.
-
-This gives 243 initial configurations. Refinement uses a stronger stability
-penalty: mean top-quartile quality lift plus 0.25 times Spearman correlation,
-minus 0.25 times the cross-fold standard deviation of top-quartile lift. All
-folds, hashes, and tie-breaking rules are deterministic.
-
-## Results
-
-The initial best configuration used the median SNR across `t0` through `t3`.
-Three subsequent searches changed one part of the score at a time:
-
-1. Temporal aggregation compared the median, mean, upper-two mean, maximum,
-   label-pair summaries, and current-timestep SNR. The maximum performed best,
-   but the upper-two mean provided the most uniform first-pass improvement.
-2. Reliability adjustment tested neutral pseudo-count shrinkage, class balance,
-   standard-error penalties, and lower-quartile downside penalties. Neutral
-   shrinkage improved both ranking and fold stability. Class and downside
-   penalties did not help.
-3. A local search interpolated between the upper-two mean and maximum and
-   tightened the scale, shrinkage, and uncertainty grids. It improved the
-   selection objective by only 0.0018 and slightly reduced top-quartile lift.
-   This was the stopping point.
-
-| Iteration | Spearman | Top-quartile lift | Lift SD | Top-bottom separation | Objective |
-|---|---:|---:|---:|---:|---:|
-| Initial median SNR | 0.269 | 0.052 | 0.0050 | 0.141 | 0.119 |
-| Temporal maximum | 0.286 | 0.067 | 0.0194 | 0.152 | 0.134 |
-| Reliability refinement | 0.299 | 0.067 | 0.0067 | 0.158 | 0.140 |
-| Local refinement | 0.308 | 0.066 | 0.0047 | 0.155 | 0.142 |
-
-The table recalculates every objective with the final 0.25 stability penalty.
-The temporal-only artifact used the initial 0.10 penalty and therefore stores
-0.137 for that row.
-
-The selected final score uses:
-
-- the maximum matched-filter SNR across `t0` through `t3`;
-- SNR scale 0.50 and directional-strength scale 0.75;
-- the mean record quality within increase and decrease classes;
-- neutral shrinkage equivalent to seven pseudo-records for each class;
-- a 0.25 standard-error penalty; and
-- no explicit class-imbalance or bad-scene penalty.
-
-For class `c` with `n_c` histories, the score is:
+The parameter search selected the maximum timestep SNR, mean record quality,
+seven neutral pseudo-records per class, and a standard-error penalty:
 
 ```text
 record_quality = tanh(max_timestep_SNR / 0.50)
                  * tanh(label_sign * plume_delta_z / 0.75)
+
 class_center_c = mean(record_quality_c) * n_c / (n_c + 7)
+
 AOI_score = mean(class_center_increase, class_center_decrease)
             - 0.25 * mean(SE_increase, SE_decrease)
 ```
 
-Across the three held-out record folds, the final score produced:
+The two `tanh` terms bound outliers and encode diminishing returns. Their
+product requires a detectable plume whose change matches the label. The
+class-specific centers prevent the more common class from controlling the AOI
+score. An AOI needs at least three increase and three decrease histories.
+
+The initial search used median SNR across `t0` through `t3`. Median SNR took
+the median of at least two finite timestep SNRs. Maximum SNR produced better
+held-out AOI rankings, so the final score uses the strongest of the four
+timesteps.
+
+## Validation
+
+The search assigned records to three folds using a seeded raster-path hash.
+Each fold measured quality on records excluded from its AOI-score fit. The
+seed was `20260923`.
 
 | Metric | Result |
 |---|---:|
 | Mean eligible AOIs per fold | 149.3 |
 | Mean Spearman correlation | 0.308 |
 | Mean top-quartile quality lift | 0.066 |
-| Standard deviation of top-quartile lift | 0.0047 |
+| Top-quartile lift SD | 0.0047 |
 | Minimum fold top-quartile lift | 0.061 |
 | Mean top-minus-bottom-quartile separation | 0.155 |
 
-The final cross-fitted deciles are not perfectly monotonic because decile seven
-dips below decile six. The broad ordering is clear: mean held-out quality rises
-from -0.193 in the lowest decile to 0.048 in the highest. Mean record
-aggregation consistently outranked median and upper-quartile aggregation. The
-neutral pseudo-count result shows that repeatable evidence across several
-histories is preferable to a large score from a small sample.
+Mean held-out quality rose from -0.193 in the lowest score decile to 0.048 in
+the highest. Decile seven fell below decile six, so the relationship was not
+monotonic at every boundary.
 
-## Emissions-feature sweep
+## Why high-scoring AOIs score well
 
-The feature pass used Polars streaming operations and the same PyCanopy spatial
-membership procedure as stratification. It built 43 predictors from the full
-emissions parquet, including unit and facility counts, fuel and unit-type mix,
-NOx controls, capacity, heat input, load, emissions levels and variability,
-operating frequency, and source geometry. Features calculated over active
-hours use each AOI's median operating-time filter.
+The score decomposition compared the 104 AOIs in each score extreme. High
+scorers had weaker raw plume detection and stronger label agreement.
 
-Simple high/low threshold rules were evaluated in five deterministic AOI folds.
-Each cutoff was fitted outside its evaluation fold. The strongest individual
-rules were:
+| Score quartile | Mean max SNR | Detectability | Direction correct | Record quality |
+|---|---:|---:|---:|---:|
+| Highest | 0.533 | 0.668 | 0.707 | 0.271 |
+| Lowest | 0.574 | 0.721 | 0.417 | -0.094 |
 
-| Rule | Retained | Mean quality lift | Fold SD |
-|---|---:|---:|---:|
-| History emitting fraction <= 0.917 | 20% | 0.033 | 0.026 |
-| History operating fraction <= 0.917 | 20% | 0.033 | 0.026 |
-| Active gas NOx share <= 0.042 | 20% | 0.025 | 0.010 |
-| Largest-facility capacity share >= 0.718 | 20% | 0.027 | 0.025 |
-| Active median total NOx >= 1,408 lb | 20% | 0.028 | 0.030 |
-| Mean active operating units <= 3.05 | 20% | 0.022 | 0.008 |
-| Maximum source distance <= 20.14 km | 20% | 0.025 | 0.021 |
+Direction accuracy reached 0.815 for increase histories and 0.652 for decrease
+histories in the top score quartile. The bottom quartile reached 0.500 and
+0.360. The score measures agreement between a visible plume and the AOI
+emissions label more than raw raster SNR.
 
-The first two rules select the same AOIs in this sample. Their apparent result
-fits a useful hypothesis: plants with meaningful on/off variation provide more
-observable temporal contrast than plants that emit almost continuously.
-Low gas share, higher coal NOx, fewer simultaneous sources, one dominant
-facility, and sources nearer the AOI center also agree with a source-isolation
-interpretation.
+### Plant characteristics
 
-A shallow random forest did not improve the case for an emissions-only score.
-Its five-fold mean Spearman correlation was 0.133 and its mean top-quartile
-lift was 0.014. Two folds had negative top-quartile lift. Gas-unit count,
-total-unit count, active operating-unit count, dominant-facility capacity
-share, and total nameplate capacity had the largest impurity importances, but
-these importances were variable across folds.
+The analysis joined the final scores for 413 eligible AOIs to 43 CAMPD and
+source-geometry features. Rank correlations used Benjamini-Hochberg correction
+across all 43 tests.
 
-## Recommendation
+| Feature | Spearman | Adjusted q |
+|---|---:|---:|
+| Largest-facility capacity share | 0.177 | 0.013 |
+| Facility count | -0.159 | 0.026 |
+| Median source distance from AOI center | -0.146 | 0.039 |
+| Mean source distance from AOI center | -0.143 | 0.039 |
+| Mean active operating units | -0.134 | 0.041 |
+| Combined-cycle unit fraction | -0.131 | 0.041 |
+| Mean active gross load | -0.131 | 0.041 |
 
-Use the final maximum-SNR, shrinkage-adjusted heuristic as the primary EDA
-ranking. It directly measures the desired property and its top-quartile lift
-was positive in every held-out fold. Keep the continuous AOI score instead of
-immediately imposing a hard cutoff so dataset size and geographic coverage can
-be inspected at several retention levels. Require at least three increase and
-three decrease histories before assigning a score.
+Top-quartile AOIs contained more coal NOx, fewer sources, and a more dominant
+facility than bottom-quartile AOIs:
 
-For pre-generation filtering, test a conservative composite centered on source
-isolation and temporal contrast: lower operating/emitting fraction, low gas
-NOx share, fewer active units, a dominant facility, and moderate source
-distance. Do not yet hard-code the exact univariate cutoffs. They were selected
-from this exploratory sweep and several have substantial fold variation.
+| Characteristic | Highest quartile median | Lowest quartile median |
+|---|---:|---:|
+| Active coal NOx share | 0.820 | 0.250 |
+| Active gas NOx share | 0.178 | 0.689 |
+| Unit count | 12.0 | 16.5 |
+| Active operating units | 5.91 | 7.82 |
+| Largest-facility capacity share | 0.534 | 0.411 |
+| Mean source distance from AOI center | 15.4 km | 17.3 km |
+| Mean active gross load | 1,377 | 1,780 |
+| Median active NOx | 881 lb | 671 lb |
 
-The next validation should rerun the frozen raster score and a small number of
-predeclared feature filters on newly generated AOIs. AOI or overlap-cluster
-folds should remain grouped when estimating downstream model performance.
+Coal share had a weak unadjusted association with score (`rho = 0.096`,
+`p = 0.051`, adjusted `q = 0.116`). Controlling for NOx scale, heat input,
+load, facility dominance, source count, source distance, and operating
+variability reduced the partial rank correlation to `0.041` (`p = 0.411`).
+Coal share acts as a proxy for plant structure in this sample.
 
-## Reproduction and artifacts
+A shallow random forest using all 43 features reached a five-fold mean
+Spearman correlation of 0.133 and a mean top-quartile lift of 0.014. Two folds
+had negative lift. The available plant descriptors explain little of the AOI
+score on held-out AOIs.
 
-Run the analysis with:
+### Interpretation
 
-```bash
-sbatch scripts/slurm/aoi_score_quality_search.sh
-sbatch scripts/slurm/aoi_score_refinement.sh --stage temporal
-sbatch scripts/slurm/aoi_score_refinement.sh --stage reliability
-sbatch scripts/slurm/aoi_score_refinement.sh --stage local
-```
+Source attribution provides the best explanation for the observed pattern.
+An AOI with one dominant facility, fewer operating units, and compact source
+geometry produces an emissions label that represents the same plume measured
+near the hotspot. In a complex AOI, total emissions can change because of a
+distant or independent unit while the hotspot plume moves in another
+direction. Coal-heavy AOIs often have the simpler configuration, but coal fuel
+does not retain an independent association after adjustment.
 
-Job `39195305` wrote its complete tables and diagnostic figure to
-`/global/home/users/pranavwalimbe/vis/aoi-score-quality-search-39195305/`.
-Important files are `summary.json`, `heuristic_sweep.csv`,
-`feature_threshold_sweep.csv`, `random_forest_metrics.csv`, and
-`aoi_score_quality_search.png`.
+The geometry fields measure facility distance from the AOI center. They do not
+measure distance to a city. The largest-source field describes facility
+capacity share rather than unit capacity share. The feature set contains
+operating and emitting fractions but no direct operating-time volatility
+metric.
 
-Refinement jobs `39195670`, `39195736`, and `39195756` wrote their tables and
-summaries under `/global/home/users/pranavwalimbe/vis/aoi-score-refinement-*`.
-Validation job `39195783` reproduced the local optimum and wrote the final 413
-eligible AOI rankings to `final_aoi_scores.csv`.
+## Use and limitations
 
-The search chooses parameters from the same three-fold sweep used to summarize
-them, so its reported heuristic metrics are selection-aware but not a nested-CV
-estimate. The held-out target is also an engineered directional-plume proxy,
-not human annotation or downstream model performance. The historical rasters
-cover only AOIs represented in the prior dataset. These constraints make the
-new-AOI validation above necessary before the score becomes a
-dataset-generation default.
+Use the continuous score to rank AOIs and inspect retention thresholds. Do not
+apply a coal-share cutoff. A pre-generation filter should focus on facility
+dominance, source count, source geometry, and enough NOx to produce a visible
+plume. Validate any filter on new AOIs before changing dataset generation.
+
+The parameter search and reported three-fold metrics use the same sweep, so
+they do not form a nested cross-validation estimate. The target is an
+engineered plume proxy rather than downstream model accuracy. The source data
+cover AOIs from the prior raster dataset. Weather, terrain, retrieval quality,
+and plume timing remain unmeasured drivers.
+
+## Artifacts
+
+- Raster scan and feature sweep, job `39195305`:
+  `/global/home/users/pranavwalimbe/vis/aoi-score-quality-search-39195305/`
+- Final score validation, job `39195783`:
+  `/global/home/users/pranavwalimbe/vis/aoi-score-refinement-39195783/`
+- Final 413-AOI ranking: `final_aoi_scores.csv` in the validation directory.
+- Driver analysis:
+  `/global/home/users/pranavwalimbe/vis/aoi-score-driver-analysis-20260924/`
+- Good-versus-poor raster montage, job `39197345`:
+  `/global/home/users/pranavwalimbe/vis/aoi-final-score-montage-39197345.png`
