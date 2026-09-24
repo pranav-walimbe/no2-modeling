@@ -73,31 +73,75 @@ The search evaluates:
 - class-imbalance penalties of 0, 0.5, and 1.0; and
 - uncertainty penalties of 0, 0.5, and 1.0.
 
-This gives 243 configurations. The selection objective is mean top-quartile
-quality lift plus 0.25 times Spearman correlation, minus 0.10 times the
-cross-fold standard deviation of top-quartile lift. All folds, hashes, and
-tie-breaking rules are deterministic.
+This gives 243 initial configurations. Refinement uses a stronger stability
+penalty: mean top-quartile quality lift plus 0.25 times Spearman correlation,
+minus 0.25 times the cross-fold standard deviation of top-quartile lift. All
+folds, hashes, and tie-breaking rules are deterministic.
 
 ## Results
 
-The best configuration uses an SNR scale of 0.25, directional scale of 1.0,
-the within-class mean, no explicit increase/decrease imbalance penalty, and a
-0.5 standard-error penalty. Across the three held-out record folds it produced:
+The initial best configuration used the median SNR across `t0` through `t3`.
+Three subsequent searches changed one part of the score at a time:
+
+1. Temporal aggregation compared the median, mean, upper-two mean, maximum,
+   label-pair summaries, and current-timestep SNR. The maximum performed best,
+   but the upper-two mean provided the most uniform first-pass improvement.
+2. Reliability adjustment tested neutral pseudo-count shrinkage, class balance,
+   standard-error penalties, and lower-quartile downside penalties. Neutral
+   shrinkage improved both ranking and fold stability. Class and downside
+   penalties did not help.
+3. A local search interpolated between the upper-two mean and maximum and
+   tightened the scale, shrinkage, and uncertainty grids. It improved the
+   selection objective by only 0.0018 and slightly reduced top-quartile lift.
+   This was the stopping point.
+
+| Iteration | Spearman | Top-quartile lift | Lift SD | Top-bottom separation | Objective |
+|---|---:|---:|---:|---:|---:|
+| Initial median SNR | 0.269 | 0.052 | 0.0050 | 0.141 | 0.119 |
+| Temporal maximum | 0.286 | 0.067 | 0.0194 | 0.152 | 0.134 |
+| Reliability refinement | 0.299 | 0.067 | 0.0067 | 0.158 | 0.140 |
+| Local refinement | 0.308 | 0.066 | 0.0047 | 0.155 | 0.142 |
+
+The table recalculates every objective with the final 0.25 stability penalty.
+The temporal-only artifact used the initial 0.10 penalty and therefore stores
+0.137 for that row.
+
+The selected final score uses:
+
+- the maximum matched-filter SNR across `t0` through `t3`;
+- SNR scale 0.50 and directional-strength scale 0.75;
+- the mean record quality within increase and decrease classes;
+- neutral shrinkage equivalent to seven pseudo-records for each class;
+- a 0.25 standard-error penalty; and
+- no explicit class-imbalance or bad-scene penalty.
+
+For class `c` with `n_c` histories, the score is:
+
+```text
+record_quality = tanh(max_timestep_SNR / 0.50)
+                 * tanh(label_sign * plume_delta_z / 0.75)
+class_center_c = mean(record_quality_c) * n_c / (n_c + 7)
+AOI_score = mean(class_center_increase, class_center_decrease)
+            - 0.25 * mean(SE_increase, SE_decrease)
+```
+
+Across the three held-out record folds, the final score produced:
 
 | Metric | Result |
 |---|---:|
 | Mean eligible AOIs per fold | 149.3 |
-| Mean Spearman correlation | 0.269 |
-| Mean top-quartile quality lift | 0.052 |
-| Standard deviation of top-quartile lift | 0.005 |
-| Mean top-minus-bottom-quartile separation | 0.141 |
+| Mean Spearman correlation | 0.308 |
+| Mean top-quartile quality lift | 0.066 |
+| Standard deviation of top-quartile lift | 0.0047 |
+| Minimum fold top-quartile lift | 0.061 |
+| Mean top-minus-bottom-quartile separation | 0.155 |
 
-The score-decile curve is not perfectly monotonic, but its main separation is
-clear: the lowest deciles are strongly negative, while the upper deciles are
-near zero or positive. Mean aggregation consistently outranked median and
-upper-quartile aggregation near the top of the sweep. This suggests that AOI
-quality is better represented by repeatable directional evidence than by a few
-exceptional scenes.
+The final cross-fitted deciles are not perfectly monotonic because decile seven
+dips below decile six. The broad ordering is clear: mean held-out quality rises
+from -0.193 in the lowest decile to 0.048 in the highest. Mean record
+aggregation consistently outranked median and upper-quartile aggregation. The
+neutral pseudo-count result shows that repeatable evidence across several
+histories is preferable to a large score from a small sample.
 
 ## Emissions-feature sweep
 
@@ -138,10 +182,12 @@ these importances were variable across folds.
 
 ## Recommendation
 
-Use the best raster heuristic as the primary EDA ranking. It directly measures
-the desired property and has consistent held-out top-quartile lift. Keep the
-continuous AOI score instead of immediately imposing a hard cutoff so dataset
-size and geographic coverage can be inspected at several retention levels.
+Use the final maximum-SNR, shrinkage-adjusted heuristic as the primary EDA
+ranking. It directly measures the desired property and its top-quartile lift
+was positive in every held-out fold. Keep the continuous AOI score instead of
+immediately imposing a hard cutoff so dataset size and geographic coverage can
+be inspected at several retention levels. Require at least three increase and
+three decrease histories before assigning a score.
 
 For pre-generation filtering, test a conservative composite centered on source
 isolation and temporal contrast: lower operating/emitting fraction, low gas
@@ -159,6 +205,9 @@ Run the analysis with:
 
 ```bash
 sbatch scripts/slurm/aoi_score_quality_search.sh
+sbatch scripts/slurm/aoi_score_refinement.sh --stage temporal
+sbatch scripts/slurm/aoi_score_refinement.sh --stage reliability
+sbatch scripts/slurm/aoi_score_refinement.sh --stage local
 ```
 
 Job `39195305` wrote its complete tables and diagnostic figure to
@@ -166,6 +215,11 @@ Job `39195305` wrote its complete tables and diagnostic figure to
 Important files are `summary.json`, `heuristic_sweep.csv`,
 `feature_threshold_sweep.csv`, `random_forest_metrics.csv`, and
 `aoi_score_quality_search.png`.
+
+Refinement jobs `39195670`, `39195736`, and `39195756` wrote their tables and
+summaries under `/global/home/users/pranavwalimbe/vis/aoi-score-refinement-*`.
+Validation job `39195783` reproduced the local optimum and wrote the final 413
+eligible AOI rankings to `final_aoi_scores.csv`.
 
 The search chooses parameters from the same three-fold sweep used to summarize
 them, so its reported heuristic metrics are selection-aware but not a nested-CV
