@@ -19,11 +19,11 @@ three-class emissions-change label for a 72 km area of interest (AOI).
 
 The pipeline applies these steps in order:
 
-1. Average unit operating time within each AOI-hour and calculate its median
-   for each AOI. Retain AOI-hours at or above that median, then average their
-   hourly coal-unit NOx sums. Remove AOIs without coal units and retain the
-   highest-ranked half. Stratification also saves a line plot of average coal
-   NOx against the percentile of all scored coal-containing AOIs.
+1. Build the complete facility-centered AOI set and join it to the persistent
+   `AOI_SCORE_JSON` mapping. Rank mapped AOIs by plume-quality score with AOI ID
+   as the deterministic tie-breaker, then retain the highest-scoring half. No
+   fuel-type or plant-characteristic filter is applied. Stratification saves a
+   line plot of the mapped score distribution and retained percentile range.
 2. Aggregate usable CAMPD measurements for the selected AOIs by UTC hour. Add
    unit counts, major-city distance, and full-history heat-input and generation
    averages calculated over the same higher-activity AOI-hours.
@@ -76,10 +76,11 @@ Each raster bundle stores five arrays with shape `4 x 24 x 24`:
 | `wind_u_80m_mps` | Geographic eastward HRRR wind |
 | `wind_v_80m_mps` | Geographic northward HRRR wind |
 
-Stratification metadata stores coal, natural-gas, and total unit counts. It also
-stores major-city distance and activity-conditioned averages for heat input,
-generation, and coal NOx. It does not store nameplate capacity or normalized
-NOx-change targets.
+Stratification metadata stores the AOI plume-quality score and percentile,
+coal, natural-gas, and total unit counts. It also stores major-city distance
+and activity-conditioned averages for heat input, generation, and coal NOx.
+The AOI score is selection metadata and does not enter the model. The metadata
+does not store nameplate capacity or normalized NOx-change targets.
 
 ## Raster checks and publication
 

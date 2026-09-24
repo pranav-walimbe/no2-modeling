@@ -1,6 +1,5 @@
 """Utilities for building and splitting AOI-hour records."""
 
-import math
 from pathlib import Path
 
 import geopandas as gpd
@@ -149,24 +148,18 @@ def add_timestep_nox(
                 pl.col(time_column).dt.truncate("1h").alias("_lower_hour"),
             )
             .with_columns(
-                (
-                    (pl.col(time_column) - pl.col("_lower_hour")).dt.total_seconds()
-                    / SECONDS_PER_HOUR
-                )
-                .alias("_upper_weight"),
+                ((pl.col(time_column) - pl.col("_lower_hour")).dt.total_seconds() / SECONDS_PER_HOUR).alias(
+                    "_upper_weight"
+                ),
                 (pl.col("_lower_hour") + pl.duration(hours=1)).alias("_upper_hour"),
             )
             .join(
-                hourly_lookup.rename(
-                    {"emissions_hour_utc": "_lower_hour", "nox_mass": "_lower_nox"}
-                ),
+                hourly_lookup.rename({"emissions_hour_utc": "_lower_hour", "nox_mass": "_lower_nox"}),
                 on=[AOI_ID_COL, "_lower_hour"],
                 how="left",
             )
             .join(
-                hourly_lookup.rename(
-                    {"emissions_hour_utc": "_upper_hour", "nox_mass": "_upper_nox"}
-                ),
+                hourly_lookup.rename({"emissions_hour_utc": "_upper_hour", "nox_mass": "_upper_nox"}),
                 on=[AOI_ID_COL, "_upper_hour"],
                 how="left",
             )
@@ -174,9 +167,7 @@ def add_timestep_nox(
                 pl.when(pl.col("_upper_weight") == 0)
                 .then(pl.col("_lower_nox"))
                 .otherwise(
-                    pl.col("_lower_nox")
-                    + pl.col("_upper_weight")
-                    * (pl.col("_upper_nox") - pl.col("_lower_nox"))
+                    pl.col("_lower_nox") + pl.col("_upper_weight") * (pl.col("_upper_nox") - pl.col("_lower_nox"))
                 )
                 .alias(nox_column)
             )
@@ -230,8 +221,7 @@ def add_tempo_sequences(
         interval_columns.append(interval_column)
         sequences = sequences.with_columns(
             (
-                (pl.col(time_columns[index]) - pl.col(time_columns[index - 1])).dt.total_seconds()
-                / SECONDS_PER_MINUTE
+                (pl.col(time_columns[index]) - pl.col(time_columns[index - 1])).dt.total_seconds() / SECONDS_PER_MINUTE
             ).alias(interval_column)
         )
     sequences = (
@@ -292,10 +282,7 @@ def add_ema_targets(
 
     age_columns = [
         (
-            (
-                pl.col(f"timestep_time_t{label_index}")
-                - pl.col(f"timestep_time_t{index}")
-            ).dt.total_seconds()
+            (pl.col(f"timestep_time_t{label_index}") - pl.col(f"timestep_time_t{index}")).dt.total_seconds()
             / SECONDS_PER_HOUR
         ).alias(f"timestep_age_hours_t{index}")
         for index in range(first_index, label_index + 1)
@@ -304,9 +291,7 @@ def add_ema_targets(
         *age_columns,
         previous_ema.alias("effective_previous_nox"),
         ema.alias("effective_current_nox"),
-    ).with_columns(
-        (pl.col("effective_current_nox") - pl.col("effective_previous_nox")).alias("effective_delta_nox")
-    )
+    ).with_columns((pl.col("effective_current_nox") - pl.col("effective_previous_nox")).alias("effective_delta_nox"))
 
 
 def add_projected_coordinates(frame: pl.DataFrame) -> pl.DataFrame:
@@ -444,30 +429,7 @@ def calculate_activity_conditioned_aoi_features(
         .agg(pl.col("_coal_nox_mass").mean().alias("avg_coal_nox"))
         .join(selected_record_averages, on=AOI_ID_COL, how="inner")
     )
-    return (
-        unit_counts.join(activity_features, on=AOI_ID_COL, how="inner")
-        .filter(pl.col("avg_coal_nox").is_finite())
-        .collect(engine="streaming")
-    )
-
-
-def select_top_coal_aois(aoi_features: pl.DataFrame, fraction: float) -> pl.DataFrame:
-    """Select the highest coal-NOx-ranked share of coal-containing AOIs.
-
-    Args:
-        aoi_features: Static AOI features carrying coal-unit counts and coal NOx.
-        fraction: Selected share in the interval ``(0, 1]``.
-
-    Returns:
-        Deterministically ranked and selected AOI feature rows.
-    """
-    ranked = aoi_features.filter(pl.col("num_coal_units") > 0).sort(
-        "avg_coal_nox",
-        AOI_ID_COL,
-        descending=[True, False],
-    )
-    selected_count = math.ceil(ranked.height * fraction)
-    return ranked.with_row_index("coal_nox_rank", offset=1).head(selected_count)
+    return unit_counts.join(activity_features, on=AOI_ID_COL, how="inner").collect(engine="streaming")
 
 
 def filter_usable_nox_measurements(
