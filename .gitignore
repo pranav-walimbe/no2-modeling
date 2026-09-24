@@ -208,12 +208,27 @@ AGENTS.md
 CLAUDE.md
 /.claude/
 
-# Local analysis scripts; keep Savio batch scripts under version control
+# Scripts are local by default. Keep only maintained repository and modeling
+# pipeline entrypoints under version control.
 /scripts/*
 !/scripts/clean_workspace.sh
 !/scripts/launch_dataset_generation.sh
 !/scripts/slurm/
-!/scripts/slurm/**
+/scripts/slurm/*
+!/scripts/slurm/build_tempo_mapping_index.sh
+!/scripts/slurm/build_tempo_mapping_observations.sh
+!/scripts/slurm/email_masked_model_results.sh
+!/scripts/slurm/email_model_results.sh
+!/scripts/slurm/generate_dataset.sh
+!/scripts/slurm/generate_masked_pretraining_dataset.sh
+!/scripts/slurm/refresh_campd_emissions.sh
+!/scripts/slurm/scrape_hrrr.sh
+!/scripts/slurm/scrape_locations.sh
+!/scripts/slurm/scrape_tempo_l2_v04.sh
+!/scripts/slurm/stratify_plants.sh
+!/scripts/slurm/submit_tempo_mapping.sh
+!/scripts/slurm/train_masked_pretraining.sh
+!/scripts/slurm/train_model.sh
 /src/eda/
 /src/data-scraping/map_plant_zones.py
 /src/data-scraping/plant_zone_mapping.py
