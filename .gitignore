@@ -220,6 +220,12 @@ CLAUDE.md
 /src/data-scraping/power_price_sources.py
 /src/data-scraping/scrape_power_prices.py
 
+# Local AOI score analysis batch scripts
+/scripts/slurm/aoi_nox_score_montage.sh
+/scripts/slurm/aoi_plume_snr_montage.sh
+/scripts/slurm/aoi_score_quality_search.sh
+/scripts/slurm/aoi_score_refinement.sh
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
