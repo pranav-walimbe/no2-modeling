@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -72,6 +73,9 @@ STAGE_ENV = "MASKED_PRETRAINING_STAGE"
 DEFAULT_BATCH_SIZE = 64
 PROGRESS_INTERVAL = 1_000
 DISCOVERY_TIME_LIMIT = "24:00:00"
+CLEANUP_TIME_LIMIT = "12:00:00"
+MAX_CLEANUP_WORKERS = 8
+MAX_SHARD_DIRECTORY_DEPTH = 3
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_masked_pretraining_dataset.sh"
@@ -89,6 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers-per-shard", type=int, default=MASKED_PRETRAINING_WORKERS_PER_SHARD)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--run-id")
+    parser.add_argument("--cleanup-path", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.num_shards < 1 or args.workers_per_shard < 1 or args.batch_size < 1:
         parser.error("shard, worker, and batch counts must be positive")
@@ -122,17 +127,20 @@ def _update_path(run_id: str, split: str, shard_id: int, candidate_offset: int) 
     return Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR) / run_id / split / filename
 
 
+def _progress_path(run_id: str, split: str, shard_id: int) -> Path:
+    return _run_work_dir(run_id) / "progress" / split / f"{shard_id:06d}.json"
+
+
+def _completion_path(run_id: str, split: str) -> Path:
+    return _run_work_dir(run_id) / "progress" / split / "complete.json"
+
+
 def _shard_dir(run_id: str, split: str, shard_id: int) -> Path:
     return _run_shard_dir(run_id) / split / f"{shard_id:06d}"
 
 
 def _record_path(run_id: str, split: str, shard_id: int) -> Path:
     return _shard_dir(run_id, split, shard_id) / "records.parquet"
-
-
-def _split_quota(target: int, shard_count: int, shard_id: int) -> int:
-    base, remainder = divmod(target, shard_count)
-    return base + int(shard_id < remainder)
 
 
 def _safe_reset(path: Path, base: Path) -> None:
@@ -143,6 +151,64 @@ def _safe_reset(path: Path, base: Path) -> None:
     if resolved.exists():
         shutil.rmtree(resolved)
     resolved.mkdir(parents=True)
+
+
+def _retire_directory(path: Path, base: Path, run_id: str) -> Path | None:
+    resolved = path.resolve()
+    resolved_base = base.resolve()
+    if resolved == resolved_base or resolved_base not in resolved.parents:
+        raise ValueError(f"Refusing to retire unsafe path: {resolved}")
+    if not resolved.exists():
+        resolved.mkdir(parents=True)
+        return None
+
+    cleanup_root = resolved_base / ".cleanup"
+    cleanup_root.mkdir(parents=True, exist_ok=True)
+    retired = cleanup_root / f"{resolved.name}-{run_id}"
+    if retired.exists():
+        raise FileExistsError(f"Cleanup destination already exists: {retired}")
+    resolved.rename(retired)
+    resolved.mkdir(parents=True)
+    return retired
+
+
+def _shard_cleanup_targets(root: Path) -> list[Path]:
+    pending = [(path, 1) for path in root.iterdir() if path.is_dir()]
+    targets: list[Path] = []
+    while pending:
+        path, depth = pending.pop()
+        if len(path.name) == 6 and path.name.isdigit():
+            targets.append(path)
+            continue
+        if depth < MAX_SHARD_DIRECTORY_DEPTH:
+            pending.extend((child, depth + 1) for child in path.iterdir() if child.is_dir())
+    return sorted(targets) or [path for path in root.iterdir() if path.is_dir()]
+
+
+def _cleanup_worker_count(root: Path) -> int:
+    return max(1, min(len(_shard_cleanup_targets(root)), MAX_CLEANUP_WORKERS))
+
+
+def _remove_retired_shards(root: Path, base: Path, workers: int) -> None:
+    resolved = root.resolve()
+    cleanup_root = base.resolve() / ".cleanup"
+    if resolved.parent != cleanup_root:
+        raise ValueError(f"Refusing to clear unsafe cleanup path: {resolved}")
+    if not resolved.exists():
+        print(f"[{_timestamp()}] retired shard directory is already absent: {resolved}")
+        return
+
+    targets = _shard_cleanup_targets(resolved)
+    worker_count = max(1, min(workers, len(targets)))
+    started = time.monotonic()
+    print(
+        f"[{_timestamp()}] deleting {len(targets):,} retired shard directories "
+        f"with {worker_count} workers: {resolved}"
+    )
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        list(executor.map(shutil.rmtree, targets))
+    shutil.rmtree(resolved)
+    print(f"[{_timestamp()}] retired shard deletion finished in {time.monotonic() - started:.1f}s")
 
 
 def _load_global_aois() -> pl.DataFrame:
@@ -296,6 +362,18 @@ def _submit(options: list[str], script_arguments: list[str]) -> str:
     return job_id
 
 
+def _submit_cleanup(path: Path, workers: int) -> str:
+    return _submit(
+        [
+            f"--cpus-per-task={workers}",
+            f"--time={CLEANUP_TIME_LIMIT}",
+            "--job-name=masked-data-cleanup",
+            f"--export=ALL,{STAGE_ENV}=cleanup",
+        ],
+        ["--cleanup-path", str(path), "--workers-per-shard", str(workers)],
+    )
+
+
 def _launch(args: argparse.Namespace) -> None:
     if os.getenv("SLURM_JOB_ID") is not None:
         raise ValueError("Launch masked-pretraining generation from a login node")
@@ -384,7 +462,14 @@ def _run_prepare(args: argparse.Namespace) -> None:
     else:
         index = _load_persistent_validity_index()
     _safe_reset(Path(MASKED_PRETRAINING_WORK_DIR), base)
-    _safe_reset(Path(MASKED_PRETRAINING_SHARD_DIR), base)
+    retired_shards = _retire_directory(Path(MASKED_PRETRAINING_SHARD_DIR), base, args.run_id)
+    if retired_shards is not None:
+        cleanup_workers = _cleanup_worker_count(retired_shards)
+        cleanup_job = _submit_cleanup(retired_shards, cleanup_workers)
+        print(
+            f"[{_timestamp()}] retired old shards to {retired_shards}; "
+            f"background cleanup job {cleanup_job} has {cleanup_workers} workers"
+        )
     _safe_reset(Path(MASKED_PRETRAINING_DF_DIR), base)
     work_dir = _run_work_dir(args.run_id)
     shard_dir = _run_shard_dir(args.run_id)
@@ -408,6 +493,60 @@ def _run_prepare(args: argparse.Namespace) -> None:
     print(f"[{_timestamp()}] preparation finished in {time.monotonic() - started:.1f}s")
 
 
+def _run_cleanup(args: argparse.Namespace) -> None:
+    if args.cleanup_path is None:
+        raise ValueError("Cleanup requires --cleanup-path")
+    workers = int(os.environ.get("SLURM_CPUS_PER_TASK", args.workers_per_shard))
+    _remove_retired_shards(args.cleanup_path, Path(MASKED_PRETRAINING_BASE_DIR), workers)
+
+
+def _publish_discovery_progress(
+    run_id: str,
+    split: str,
+    shard_id: int,
+    record_count: int,
+    candidate_offset: int,
+    candidate_count: int,
+) -> None:
+    write_json_atomic(
+        {
+            "shard_id": shard_id,
+            "record_count": record_count,
+            "candidate_offset": candidate_offset,
+            "candidate_count": candidate_count,
+            "updated_at": _timestamp(),
+        },
+        _progress_path(run_id, split, shard_id),
+    )
+
+
+def _discovered_record_count(run_id: str, split: str) -> int:
+    progress_dir = _progress_path(run_id, split, 0).parent
+    total = 0
+    for path in progress_dir.glob("[0-9][0-9][0-9][0-9][0-9][0-9].json"):
+        with path.open() as source:
+            total += int(json.load(source)["record_count"])
+    return total
+
+
+def _signal_discovery_complete(run_id: str, split: str, target: int, discovered: int) -> bool:
+    completion_dir = _completion_path(run_id, split)
+    try:
+        completion_dir.mkdir()
+    except FileExistsError:
+        return False
+    write_json_atomic(
+        {
+            "split": split,
+            "target_records": target,
+            "discovered_records": discovered,
+            "completed_at": _timestamp(),
+        },
+        completion_dir / "summary.json",
+    )
+    return True
+
+
 def _run_discovery_split(
     args: argparse.Namespace,
     split: str,
@@ -418,21 +557,24 @@ def _run_discovery_split(
 ) -> None:
     if args.run_id is None:
         raise ValueError("Discovery requires --run-id")
-    quota = _split_quota(SPLIT_TARGETS[split], args.num_shards, shard_id)
+    target = SPLIT_TARGETS[split]
     candidates = pl.read_parquet(_candidate_path(args.run_id, split, shard_id)).cast(CANDIDATE_SCHEMA)
     records: list[dict[str, object]] = []
     pending_updates: list[dict[str, object]] = []
     offset = 0
     raster_dir = _shard_dir(args.run_id, split, shard_id) / "record-rasters"
+    completion_path = _completion_path(args.run_id, split)
     raster_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     last_published_offset = offset
     index_hits = 0
     cache_misses = 0
     record_writer = ProcessPoolExecutor(max_workers=args.workers_per_shard)
+    write_parquet_atomic(empty_final_records(), _record_path(args.run_id, split, shard_id))
+    _publish_discovery_progress(args.run_id, split, shard_id, 0, 0, candidates.height)
 
     try:
-        while offset < candidates.height and len(records) < quota:
+        while offset < candidates.height and not completion_path.is_dir():
             batch = candidates.slice(offset, args.batch_size).to_dicts()
             keyed_rows: list[tuple[str, dict[str, object]]] = []
             resolved: dict[str, CandidateOutcome] = {}
@@ -472,8 +614,7 @@ def _run_discovery_split(
                         pending_updates.append(validity_row)
                         index[outcome.cache_key] = validity_row
 
-            remaining = quota - len(records)
-            selected = [resolved[key] for key, _ in keyed_rows if resolved[key].status == VALID_STATUS][:remaining]
+            selected = [resolved[key] for key, _ in keyed_rows if resolved[key].status == VALID_STATUS]
             tasks = [
                 PretrainingRecordTask(
                     row=outcome.row,
@@ -486,10 +627,29 @@ def _run_discovery_split(
             ]
             records.extend(record_writer.map(write_pretraining_record, tasks))
             offset += len(batch)
+            _publish_discovery_progress(
+                args.run_id,
+                split,
+                shard_id,
+                len(records),
+                offset,
+                candidates.height,
+            )
+            discovered_records = _discovered_record_count(args.run_id, split)
+            if discovered_records >= target and _signal_discovery_complete(
+                args.run_id,
+                split,
+                target,
+                discovered_records,
+            ):
+                print(
+                    f"[{_timestamp()}] [{split} shard {shard_id}] signaled discovery completion "
+                    f"at {discovered_records:,}/{target:,} records"
+                )
 
             should_publish = (
                 offset - last_published_offset >= PROGRESS_INTERVAL
-                or len(records) == quota
+                or completion_path.is_dir()
                 or offset == candidates.height
             )
             if should_publish:
@@ -503,18 +663,34 @@ def _run_discovery_split(
                 )
                 last_published_offset = offset
                 print(
-                    f"[{_timestamp()}] [{split} shard {shard_id}] {len(records):,}/{quota:,} masked records; "
+                    f"[{_timestamp()}] [{split} shard {shard_id}] {len(records):,} masked records; "
+                    f"{discovered_records:,}/{target:,} discovered across shards; "
                     f"{offset:,}/{candidates.height:,} candidates; {index_hits:,} index hits; "
                     f"{cache_misses:,} cache misses"
                 )
     finally:
         record_writer.shutdown(cancel_futures=True)
 
-    if len(records) != quota:
-        raise ValueError(
-            f"[{split} shard {shard_id}] candidate segment exhausted with {len(records):,}/{quota:,} records"
-        )
-    print(f"[{_timestamp()}] [{split} shard {shard_id}] finished in {time.monotonic() - started:.1f}s")
+    if pending_updates:
+        updates = pl.DataFrame(pending_updates, schema=VALIDITY_INDEX_SCHEMA)
+        write_parquet_atomic(updates, _update_path(args.run_id, split, shard_id, offset))
+    write_parquet_atomic(
+        pl.DataFrame(records, schema=FINAL_RECORD_SCHEMA),
+        _record_path(args.run_id, split, shard_id),
+    )
+    _publish_discovery_progress(
+        args.run_id,
+        split,
+        shard_id,
+        len(records),
+        offset,
+        candidates.height,
+    )
+    state = "target reached" if completion_path.is_dir() else "candidate segment exhausted"
+    print(
+        f"[{_timestamp()}] [{split} shard {shard_id}] {state} with {len(records):,} records "
+        f"in {time.monotonic() - started:.1f}s"
+    )
 
 
 def _run_discovery(args: argparse.Namespace) -> None:
@@ -547,14 +723,24 @@ def _run_finalizer(args: argparse.Namespace) -> None:
             pl.read_parquet(_record_path(args.run_id, split, shard_id)).cast(FINAL_RECORD_SCHEMA)
             for shard_id in range(args.num_shards)
         ]
-        records = pl.concat(frames, how="vertical").sort("candidate_index") if frames else empty_final_records()
-        if records.height != target:
-            raise ValueError(f"[{split}] discovered {records.height:,}/{target:,} requested records")
+        discovered = pl.concat(frames, how="vertical").sort("candidate_index") if frames else empty_final_records()
+        records = discovered.head(target)
         relative_paths = [str(Path(path).relative_to(base)) for path in records["raster_bundle_path"].to_list()]
         output = records.with_columns(pl.Series("raster_bundle_path", relative_paths, dtype=pl.String))
         write_csv_atomic(output, Path(MASKED_PRETRAINING_DF_DIR) / f"{split}_df.csv")
-        summaries.append({"split": split, "target_records": target, "published_records": output.height})
-        print(f"[{_timestamp()}] [{split}] published {output.height:,} records")
+        summaries.append(
+            {
+                "split": split,
+                "target_records": target,
+                "discovered_records": discovered.height,
+                "published_records": output.height,
+                "shortfall_records": max(target - output.height, 0),
+            }
+        )
+        print(
+            f"[{_timestamp()}] [{split}] published {output.height:,} of "
+            f"{discovered.height:,} discovered records; target {target:,}"
+        )
 
     index_frames = [pl.read_parquet(_snapshot_path(args.run_id)).cast(VALIDITY_INDEX_SCHEMA)]
     update_paths = sorted(Path(MASKED_PRETRAINING_VALIDITY_UPDATES_DIR).glob("*/*/*.parquet"))
@@ -586,6 +772,8 @@ def main() -> None:
         _run_discovery(args)
     elif stage == "finalize":
         _run_finalizer(args)
+    elif stage == "cleanup":
+        _run_cleanup(args)
     else:
         raise ValueError(f"Unsupported {STAGE_ENV}: {stage}")
 

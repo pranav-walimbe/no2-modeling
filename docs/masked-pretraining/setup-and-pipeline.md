@@ -9,7 +9,7 @@ training pipeline.
 
 ## Data contract
 
-| Split | Target records |
+| Split | Maximum records |
 |---|---:|
 | Train | 500,000 |
 | Validation | 50,000 |
@@ -41,17 +41,22 @@ The launcher submits three dependent stages:
 1. Snapshot the validity index, build the AOI-disjoint splits, order each split
    by UTC hour and AOI, inventory the flat TEMPO and weather caches once, and
    divide each split into `N` contiguous candidate segments.
-2. Let each discovery shard fill its deterministic split quota. It reuses
+2. Let every discovery shard process its equal candidate segment. It reuses
    indexed cache paths and the cache-membership flags in its candidate manifest,
-   then writes clean raster bundles directly to its output directory. Targeted
-   filesystem checks are limited to inventory misses, including files that may
-   have been created after preparation.
-3. Concatenate the small shard manifests and publish the split CSVs.
+   then writes clean raster bundles directly to its output directory. Each shard
+   atomically publishes its progress. Once their combined valid-record count
+   reaches the split target, a shared completion marker tells every shard to
+   stop at its next batch boundary. Targeted filesystem checks are limited to
+   inventory misses, including files created after preparation.
+3. Concatenate the small shard manifests, deterministically trim batch overshoot,
+   and publish the split CSVs. If all candidate segments are exhausted below a
+   target, publish every valid record found and report the shortfall.
 
-The default is eight discovery shards. Per-shard quotas sum exactly to the split
-targets, so workers do not coordinate through a shared counter. Every new run
-deletes stale work, dataframes, and dataset shards before creating fresh ones.
-Completed shards remain in place after successful finalization.
+The default is eight discovery shards. Every new run atomically moves stale
+dataset shards into a cleanup area, creates an empty live shard directory, and
+submits an independent cleanup job with at most eight deletion workers. Stale
+work and dataframes are cleared during preparation. Completed shards remain in
+place after successful finalization.
 
 Shard files are disposable and never serve as restart checkpoints. Discovery
 publishes compact validity-index updates periodically. A later run merges those
@@ -59,10 +64,11 @@ updates before clearing stale shards, so completed validity checks remain
 reusable even when the earlier dataset run failed.
 
 The finalizer publishes dataset-root-relative paths in `train_df.csv`,
-`val_df.csv`, and `test_df.csv`. It performs count validation, compacts validity
-updates into the main index, and does not issue one filesystem lookup per
-raster. Synthetic masks are generated deterministically by the model loader
-rather than stored during dataset generation.
+`val_df.csv`, and `test_df.csv`. It records published counts and target
+shortfalls, compacts validity updates into the main index, and does not issue
+one filesystem lookup per raster. Synthetic masks are generated
+deterministically by the model loader rather than stored during dataset
+generation.
 
 ## Launch
 
