@@ -130,5 +130,5 @@ same plume evidence receives the same treatment.
 5. write the run tables and a 20-history montage, then email the PNG.
 
 The workflow uses bounded batches for candidate preparation and scoring. The
-default submission uses eight array tasks with eight workers each. Both values
-are command-line options.
+default submission uses eight exclusive array nodes with eight workers each.
+Both values are command-line options.

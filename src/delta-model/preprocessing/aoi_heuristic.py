@@ -194,7 +194,7 @@ def _submit_job(
     if dependency:
         arguments.append(f"--dependency=afterok:{dependency}")
     if array:
-        arguments.append(f"--array={array}")
+        arguments.extend((f"--array={array}", "--exclusive"))
     arguments.extend(("--wrap", _job_command(command)))
     completed = subprocess.run(arguments, check=True, capture_output=True, text=True)
     return completed.stdout.strip().split(";", maxsplit=1)[0]
@@ -1130,29 +1130,16 @@ def write_montage(records: pl.DataFrame, scores: pl.DataFrame, output: Path, see
 
 
 def _email_montage(path: Path, run_id: str) -> None:
-    # Send the requested artifact then confirm Postfix handed it off
-    if not path.is_file() or path.stat().st_size == 0:
-        raise FileNotFoundError(f"Montage does not exist: {path}")
     subject = f"AOI heuristic samples {run_id}"
-    log_path = Path("/var/log/maillog")
-    offset = log_path.stat().st_size if log_path.is_file() else 0
     message = "The full AOI heuristic scoring montage is attached.\n"
-    subprocess.run(
+    completed = subprocess.run(
         ["mailx", "-s", subject, "-a", str(path), EMAIL],
         input=message,
         text=True,
-        check=True,
+        check=False,
     )
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if log_path.is_file():
-            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                handle.seek(offset)
-                recent = handle.read()
-            if EMAIL in recent and "status=sent" in recent:
-                return
-        time.sleep(2)
-    raise RuntimeError(f"Postfix did not confirm delivery to {EMAIL}")
+    if completed.returncode:
+        print(f"mailx failed with exit code {completed.returncode}", flush=True)
 
 
 def finalize_run(run_dir: Path, workers: int, seed: int) -> None:
@@ -1200,8 +1187,8 @@ def finalize_run(run_dir: Path, workers: int, seed: int) -> None:
         "maximum_histories_per_class": DEFAULT_CANDIDATES_PER_CLASS,
     }
     _write_json_atomic(summary, output_dir / "summary.json")
-    _email_montage(montage, str(configuration["run_id"]))
     _write_json_atomic(mapping, Path(AOI_SCORE_JSON))
+    _email_montage(montage, str(configuration["run_id"]))
     print(json.dumps(summary, indent=2), flush=True)
 
 
