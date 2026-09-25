@@ -1130,48 +1130,16 @@ def write_montage(records: pl.DataFrame, scores: pl.DataFrame, output: Path, see
 
 
 def _email_montage(path: Path, run_id: str) -> None:
-    # Send the requested artifact and inspect Postfix only when its log is readable
-    if not path.is_file() or path.stat().st_size == 0:
-        raise FileNotFoundError(f"Montage does not exist: {path}")
     subject = f"AOI heuristic samples {run_id}"
-    log_path = Path("/var/log/maillog")
-    can_read_log = log_path.is_file() and os.access(log_path, os.R_OK)
-    offset = log_path.stat().st_size if can_read_log else 0
     message = "The full AOI heuristic scoring montage is attached.\n"
-    subprocess.run(
+    completed = subprocess.run(
         ["mailx", "-s", subject, "-a", str(path), EMAIL],
         input=message,
         text=True,
-        check=True,
+        check=False,
     )
-    if not can_read_log:
-        print(f"mailx accepted the montage for {EMAIL}; Postfix log is not readable", flush=True)
-        return
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if log_path.is_file():
-            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                handle.seek(offset)
-                recent = handle.read()
-            if EMAIL in recent and "status=sent" in recent:
-                return
-        time.sleep(2)
-    raise RuntimeError(f"Postfix did not confirm delivery to {EMAIL}")
-
-
-def _resume_completed_publication(output_dir: Path, run_id: str) -> bool:
-    # Recover publication after a post-scoring notification failure
-    mapping_path = output_dir / "aoi_scores.json"
-    summary_path = output_dir / "summary.json"
-    montage_path = output_dir / "score-quartile-samples.png"
-    if not all(path.is_file() and path.stat().st_size > 0 for path in (mapping_path, summary_path, montage_path)):
-        return False
-    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    _email_montage(montage_path, run_id)
-    _write_json_atomic(mapping, Path(AOI_SCORE_JSON))
-    print(json.dumps({**summary, "resumed_publication": True}, indent=2), flush=True)
-    return True
+    if completed.returncode:
+        print(f"mailx failed with exit code {completed.returncode}", flush=True)
 
 
 def finalize_run(run_dir: Path, workers: int, seed: int) -> None:
@@ -1184,8 +1152,6 @@ def finalize_run(run_dir: Path, workers: int, seed: int) -> None:
     """
     configuration = json.loads((run_dir / "configuration.json").read_text(encoding="utf-8"))
     output_dir = Path(configuration["output_dir"])
-    if _resume_completed_publication(output_dir, str(configuration["run_id"])):
-        return
     candidates = pl.read_parquet(run_dir / "candidates.parquet")
     resolved = _resolve_cached_candidates(candidates)
     metrics, failures = _score_candidates(resolved, workers)
@@ -1221,8 +1187,8 @@ def finalize_run(run_dir: Path, workers: int, seed: int) -> None:
         "maximum_histories_per_class": DEFAULT_CANDIDATES_PER_CLASS,
     }
     _write_json_atomic(summary, output_dir / "summary.json")
-    _email_montage(montage, str(configuration["run_id"]))
     _write_json_atomic(mapping, Path(AOI_SCORE_JSON))
+    _email_montage(montage, str(configuration["run_id"]))
     print(json.dumps(summary, indent=2), flush=True)
 
 
