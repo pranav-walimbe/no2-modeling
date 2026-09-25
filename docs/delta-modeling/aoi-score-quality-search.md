@@ -130,5 +130,24 @@ same plume evidence receives the same treatment.
 5. write the run tables and a 20-history montage, then email the PNG.
 
 The workflow uses bounded batches for candidate preparation and scoring. The
-default submission uses eight array tasks with eight workers each. Both values
-are command-line options.
+default submission uses eight exclusive array nodes with eight workers each.
+Both values are command-line options.
+
+## Full-run validation
+
+Production run `20260925T043043Z` enumerated 10,323,444 four-scan histories and
+retained 171,910 candidates from 972 label-viable AOIs. After finite
+raster-quality filtering, it scored 58,195 histories and published 768 AOI
+scores. Preparation peaked at 11.4 GB RSS, each cache-array task remained below
+27 GB, and final scoring peaked at 15.2 GB. This stayed well below the 147 GB
+allocation that failed in the earlier full-frame implementation.
+
+Cache array job `39219014` completed all eight shards. Scoring job `39219015`
+completed the tables and montage, then failed because the compute user could
+not read the protected Postfix log. Recovery job `39226293` handed the montage
+to `mailx` and atomically published the completed mapping. The published JSON
+exactly matches the run-local mapping and contains 768 entries. The montage
+manifest contains 10 distinct AOIs from each score quartile.
+
+Artifacts are in
+`/global/home/users/pranavwalimbe/vis/aoi-heuristic-20260925T043043Z/`.

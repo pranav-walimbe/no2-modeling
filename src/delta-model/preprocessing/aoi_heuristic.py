@@ -194,7 +194,7 @@ def _submit_job(
     if dependency:
         arguments.append(f"--dependency=afterok:{dependency}")
     if array:
-        arguments.append(f"--array={array}")
+        arguments.extend((f"--array={array}", "--exclusive"))
     arguments.extend(("--wrap", _job_command(command)))
     completed = subprocess.run(arguments, check=True, capture_output=True, text=True)
     return completed.stdout.strip().split(";", maxsplit=1)[0]
@@ -1130,12 +1130,13 @@ def write_montage(records: pl.DataFrame, scores: pl.DataFrame, output: Path, see
 
 
 def _email_montage(path: Path, run_id: str) -> None:
-    # Send the requested artifact then confirm Postfix handed it off
+    # Send the requested artifact and inspect Postfix only when its log is readable
     if not path.is_file() or path.stat().st_size == 0:
         raise FileNotFoundError(f"Montage does not exist: {path}")
     subject = f"AOI heuristic samples {run_id}"
     log_path = Path("/var/log/maillog")
-    offset = log_path.stat().st_size if log_path.is_file() else 0
+    can_read_log = log_path.is_file() and os.access(log_path, os.R_OK)
+    offset = log_path.stat().st_size if can_read_log else 0
     message = "The full AOI heuristic scoring montage is attached.\n"
     subprocess.run(
         ["mailx", "-s", subject, "-a", str(path), EMAIL],
@@ -1143,6 +1144,9 @@ def _email_montage(path: Path, run_id: str) -> None:
         text=True,
         check=True,
     )
+    if not can_read_log:
+        print(f"mailx accepted the montage for {EMAIL}; Postfix log is not readable", flush=True)
+        return
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if log_path.is_file():
@@ -1155,6 +1159,21 @@ def _email_montage(path: Path, run_id: str) -> None:
     raise RuntimeError(f"Postfix did not confirm delivery to {EMAIL}")
 
 
+def _resume_completed_publication(output_dir: Path, run_id: str) -> bool:
+    # Recover publication after a post-scoring notification failure
+    mapping_path = output_dir / "aoi_scores.json"
+    summary_path = output_dir / "summary.json"
+    montage_path = output_dir / "score-quartile-samples.png"
+    if not all(path.is_file() and path.stat().st_size > 0 for path in (mapping_path, summary_path, montage_path)):
+        return False
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    _email_montage(montage_path, run_id)
+    _write_json_atomic(mapping, Path(AOI_SCORE_JSON))
+    print(json.dumps({**summary, "resumed_publication": True}, indent=2), flush=True)
+    return True
+
+
 def finalize_run(run_dir: Path, workers: int, seed: int) -> None:
     """Score all prepared candidates and publish the final mapping.
 
@@ -1165,6 +1184,8 @@ def finalize_run(run_dir: Path, workers: int, seed: int) -> None:
     """
     configuration = json.loads((run_dir / "configuration.json").read_text(encoding="utf-8"))
     output_dir = Path(configuration["output_dir"])
+    if _resume_completed_publication(output_dir, str(configuration["run_id"])):
+        return
     candidates = pl.read_parquet(run_dir / "candidates.parquet")
     resolved = _resolve_cached_candidates(candidates)
     metrics, failures = _score_candidates(resolved, workers)
