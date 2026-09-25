@@ -105,9 +105,9 @@ MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applie
 # Delta-model training contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-PRETRAINED_ENCODER_WEIGHTS = os.getenv(  # masked-model checkpoint for delta transfer and gap filling
-    "PRETRAINED_ENCODER_WEIGHTS",
-    "/global/home/users/pranavwalimbe/masked_model_runs/masked_no2_20260920_211751/checkpoints/best_masked_no2.pt",
+PRETRAINED_MASKED_MODEL_WEIGHTS = os.getenv(  # masked-model checkpoint for gap filling and optional transfer
+    "PRETRAINED_MASKED_MODEL_WEIGHTS",
+    "/global/home/users/pranavwalimbe/masked_model_runs/a40/masked_no2_20260924_183700/checkpoints/best_masked_no2.pt",
 )
 SEQUENCE_TIMESTEPS = 4  # four causal rasters ending at the label timestamp
 LABEL_TIMESTEP_INDEX = 3  # zero-based final raster timestep consumed by the label EMA
@@ -121,14 +121,12 @@ MODEL_INPUT_CHANNELS = MODEL_IMAGE_CHANNELS + len(MODEL_MASK_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
 MODEL_TARGET_COL = "delta_category"  # three-class decrease, steady, or increase target
 MODEL_CLASS_NAMES = ("decrease", "steady", "increase")
-MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular and fused models
-    "major_city_dist",
-    "num_units",
-    "total_nameplate_capacity_mw",
-    "avg_heat_input",
-    "avg_pwr_gen",
+MODEL_SEASONAL_FEATURES = (
+    "local_solar_hour_sin",
+    "local_solar_hour_cos",
+    "day_of_year_sin",
+    "day_of_year_cos",
 )
-MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to sine and cosine
 
 # ============================================================================
 # Masked pretraining

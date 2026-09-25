@@ -1,16 +1,16 @@
 """Convolutional recurrent network for emissions-change classification."""
 
 import torch
-from modeling.mlp import TabularMLP
+from modeling.mlp import SeasonalMLP
 from torch import nn
 from torch.nn import functional as F
 
 from config import MODEL_CLASS_NAMES, MODEL_IMAGE_CHANNELS
 
-DEFAULT_HEAD_DIM = 128
+DEFAULT_HEAD_DIM = 64
 DEFAULT_DROPOUT = 0.20
-VISION_EMBEDDING_DIM = 128
-CONVGRU_HIDDEN_CHANNELS = 96
+VISION_EMBEDDING_DIM = 64
+CONVGRU_HIDDEN_CHANNELS = 64
 ENCODER_ARCHITECTURE_NAME = "convolutional_raster_frame_encoder_v1"
 ENCODER_OUTPUT_CHANNELS = 64
 
@@ -163,39 +163,49 @@ class RasterConvGRUClassifier(nn.Module):
     def forward(
         self,
         image: torch.Tensor,
-        tabular: torch.Tensor,
+        seasonal: torch.Tensor,
         elapsed_hours: torch.Tensor,
     ) -> torch.Tensor:
-        del tabular, elapsed_hours
+        del seasonal, elapsed_hours
         return self.classifier(self._encode_sequence(image))
 
     def num_params(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
 
 
-class RasterTabularFusionClassifier(RasterConvGRUClassifier):
-    """Add raster evidence to a frozen tabular classifier's logits."""
+class VisionSeasonalFusionClassifier(RasterConvGRUClassifier):
+    """Add vision evidence to a frozen seasonal classifier's logits."""
 
     def __init__(
         self,
         n_features: int,
-        tabular_state_dict: dict[str, torch.Tensor],
+        seasonal_state_dict: dict[str, torch.Tensor],
         *,
         head_dim: int = DEFAULT_HEAD_DIM,
         dropout: float = DEFAULT_DROPOUT,
     ) -> None:
         super().__init__(head_dim=head_dim, dropout=dropout)
-        self.tabular_model = TabularMLP(n_features)
-        self.tabular_model.load_state_dict(tabular_state_dict)
-        self.tabular_model.requires_grad_(False)
+        self.seasonal_model = SeasonalMLP(n_features)
+        self.seasonal_model.load_state_dict(seasonal_state_dict)
+        self.seasonal_model.requires_grad_(False)
+        self.seasonal_model.eval()
+        final_layer = self.classifier[-1]
+        nn.init.zeros_(final_layer.weight)
+        nn.init.zeros_(final_layer.bias)
+
+    def train(self, mode: bool = True) -> "VisionSeasonalFusionClassifier":
+        """Set training mode while keeping the frozen seasonal branch in evaluation mode."""
+        super().train(mode)
+        self.seasonal_model.eval()
+        return self
 
     def forward(
         self,
         image: torch.Tensor,
-        tabular: torch.Tensor,
+        seasonal: torch.Tensor,
         elapsed_hours: torch.Tensor,
     ) -> torch.Tensor:
-        raster_logits = super().forward(image, tabular, elapsed_hours)
+        vision_logits = super().forward(image, seasonal, elapsed_hours)
         with torch.no_grad():
-            tabular_logits = self.tabular_model(image, tabular, elapsed_hours)
-        return raster_logits + tabular_logits
+            seasonal_logits = self.seasonal_model(image, seasonal, elapsed_hours)
+        return vision_logits + seasonal_logits

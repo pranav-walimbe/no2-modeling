@@ -1,8 +1,9 @@
 # Modeling
 
-The delta-model trainer compares three classifiers on the same geographic
-splits: a tabular MLP and two late-fusion ConvGRUs with either random or masked-
-pretrained frame-encoder initialization.
+The delta-model trainer compares a seasonal classifier with a vision-seasonal
+classifier on the same geographic splits. The masked NO2 model fills missing
+raster pixels before classifier training. Its encoder does not initialize the
+vision model.
 
 ## Contract
 
@@ -10,22 +11,39 @@ pretrained frame-encoder initialization.
 |---|---|
 | Target | Stored `delta_category` |
 | Classes | `decrease`, `steady`, `increase`, mapped to 0, 1, and 2 |
-| Raster sequence | Five completed `4 x 24 x 24` frames |
+| Raster sequence | Four completed `4 x 24 x 24` frames |
 | Raster channels | NO2, 2 m temperature, eastward wind, northward wind |
-| Tabular input | Nine standardized plant, activity, and cyclic-time features |
+| Seasonal input | Local-solar-hour sine/cosine and day-of-year sine/cosine |
 | Loss | Unweighted three-class cross-entropy |
 | Prediction | Softmax distribution over the three classes |
 | Checkpoint selection | Lowest validation cross-entropy for each model |
-| Primary result | Masked-pretrained late-fusion classifier |
+| Primary result | Vision-seasonal late-fusion classifier |
 
-Dataset generation supplies the class label. The loader does not derive a new
-class from a continuous target. See [dataset_design.md](dataset_design.md) for
-the thresholds and temporal alignment.
+Dataset generation supplies the class label. The loader consumes that label
+without recreating its construction.
 
-## Normalization and NO2 completion
+## Seasonal features
+
+The loader derives all four seasonal features from `t3_timestamp`, the final
+scan aligned with the target. It shifts the UTC timestamp by `longitude / 15`
+hours to obtain local solar time. Daily phase includes hour, minute, second, and
+microsecond. Annual phase uses the resulting local-solar day of year plus the
+fractional day and accounts for leap years. Training-split means and standard
+deviations normalize the four derived values.
+
+The seasonal model receives these inputs:
+
+- `local_solar_hour_sin` and `local_solar_hour_cos`;
+- `day_of_year_sin` and `day_of_year_cos`.
+
+AOI score, city distance, unit counts, heat input, generation, latitude, and
+longitude do not enter either classifier. The test-strata report uses selected
+AOI characteristics after inference.
+
+## Raster normalization and completion
 
 Training loads the configured masked-model checkpoint before it builds the
-delta datasets. The checkpoint supplies the raster normalization statistics:
+classifier datasets. The checkpoint supplies raster normalization statistics:
 
 | Channels | Center | Scale |
 |---|---|---|
@@ -34,90 +52,60 @@ delta datasets. The checkpoint supplies the raster normalization statistics:
 
 The loader normalizes values, clips them to `[-8, 8]`, fills numeric gaps with
 zero, and appends `no2_mask` for reconstruction. The masked autoencoder predicts
-NO2 at missing pixels and preserves observed values. Training materializes the
-completed physical channels as split-specific `.npy` files under job-local
-`/tmp`.
+NO2 at missing pixels and preserves observed values. Training writes the four
+completed physical channels to split-specific memory-mapped arrays under the
+job-local `/tmp` directory.
 
-The raster classifiers consume the completed arrays without a validity mask.
-Their input shape is `4 x 4 x 24 x 24`, and their NO2 stems use ordinary
-convolutions.
-
-The tabular loader fits means and standard deviations on the delta training
-split. Its nine inputs are major-city distance, total unit count, nameplate
-capacity, prior-quarter same-hour heat input and generation, plus sine and cosine
-encodings of local solar hour and day of year. Modeling derives total unit count
-by adding the stored coal and natural-gas counts without changing the generated
-dataset.
+Classifier training starts after completion finishes. Neither classifier sees
+the validity mask, and the vision encoder starts from random weights.
 
 ## Models
 
-### Tabular baseline
+### Seasonal classifier
 
-The 995-parameter MLP uses a 32-value hidden layer, a 16-value embedding, and
-three output logits. It receives no raster data.
+The 291-parameter seasonal MLP maps four inputs through 16-value and 8-value
+hidden representations before producing three logits. Training selects its
+lowest-validation-loss checkpoint.
 
-### Late-fusion classifiers
+### Vision-seasonal classifier
 
-Both models share one raster architecture. A frame encoder
-maps each completed image to a `64 x 6 x 6` feature map. A 96-channel ConvGRU
-processes the four maps in time order. Global average and maximum pooling feed a
-128-value projection and a 128-value classification head with three logits.
-The trainer adds these raster logits to logits from the best frozen tabular MLP
-before applying softmax. Freezing the tabular branch prevents seasonal features
-from updating either branch through shared parameters. The raster branch learns
-a correction to the fixed tabular prediction.
+The trainer copies the selected seasonal MLP into the combined model and freezes
+all of its parameters. A frame encoder maps each completed raster to a
+`64 x 6 x 6` feature map. A 64-channel ConvGRU processes the four maps in time
+order. Global average and maximum pooling feed a 64-value projection and a
+64-value classification head.
 
-The random-initialized model trains its full raster branch from seeded initial
-weights. The pretrained model copies the masked encoder's weather, fusion, and
-residual weights. It maps each partial-convolution NO2 kernel and bias to the
-matching ordinary convolution and discards the fixed mask-counting kernels. The
-entire pretrained raster branch is trainable from the first batch at the base
-learning rate.
-
-Both fusion models use the same imputed arrays and frozen tabular classifier.
-Their comparison therefore isolates raster frame-encoder initialization.
+The vision branch has 477,923 trainable parameters. It produces three residual
+logits, which the model adds to the frozen seasonal logits. The trainer
+zero-initializes the final residual layer, so vision training starts from the
+selected seasonal prediction. Subtracting the two models' accuracy shows the
+effect of adding raster evidence to that prediction.
 
 ```mermaid
-flowchart TB
-    Frames[Five completed raster frames<br/>NO2, temperature, and wind]
-    Frames --> FrameEncoder[Shared spatial frame encoder<br/>random or pretrained initialization]
-    FrameEncoder --> Encoded[Five spatial feature maps]
-    Encoded --> GRU[ConvGRU combines information<br/>across time]
+flowchart LR
+    Timestamp[t3 timestamp and longitude] -->|derive phase| SeasonalFeatures[Four seasonal features]
+    SeasonalFeatures --> SeasonalMLP[Seasonal MLP]
+    SeasonalMLP -->|freeze after training| SeasonalLogits[Seasonal logits]
 
-    subgraph Pooling[Summarize the final hidden map]
-        direction LR
-        Average[Global average pool]
-        Maximum[Global maximum pool]
-    end
+    MaskedModel[Masked NO2 model] -->|fill missing pixels| Completed[Four completed raster frames]
+    Completed --> FrameEncoder[Frame encoder with random initialization]
+    FrameEncoder --> ConvGRU[64-channel ConvGRU]
+    ConvGRU --> VisionHead[Vision projection and head]
+    VisionHead --> VisionLogits[Vision residual logits]
 
-    GRU --> Average
-    GRU --> Maximum
-    Average --> PoolJoin[Concatenate pooled features]
-    Maximum --> PoolJoin
-    PoolJoin --> Projection[Feature projection]
-    Projection --> RasterHead[Raster classification head]
-    RasterHead --> RasterLogits[Raster correction logits]
-    Features[Nine tabular features] --> FrozenMLP[Frozen tabular MLP]
-    FrozenMLP --> TabularLogits[Tabular logits]
-    RasterLogits --> Add[Add logits]
-    TabularLogits --> Add
-    Add --> Distribution[Softmax class distribution<br/>decrease, steady, increase]
-
-    classDef stage font-size:18px
-    class Frames,FrameEncoder,Encoded,GRU,Average,Maximum,PoolJoin,Projection,RasterHead,RasterLogits,Features,FrozenMLP,TabularLogits,Add,Distribution stage
+    SeasonalLogits --> Add[Add logits]
+    VisionLogits --> Add
+    Add --> Distribution[Class distribution]
 ```
 
 ## Optimization
 
-All three models use unweighted cross-entropy. Stratification balances classes
-before raster quality control, and run metadata records the retained count for
-each class and split.
-
-The trainer uses AdamW, gradient clipping, validation-loss scheduling, CUDA
-mixed precision, and early stopping. Defaults allow 100 raster epochs, 75 MLP
-epochs, and 12 epochs without validation improvement. The maintained Slurm
-launcher uses a batch size of 128, a raster learning rate of `3e-4`, 30% head
-dropout, and seed 42.
+Both classifiers use AdamW, gradient clipping, validation-loss scheduling, CUDA
+mixed precision, and early stopping. Defaults allow 75 seasonal epochs and 100
+vision epochs. Training stops after 15 epochs without a lower validation loss;
+the scheduler halves the learning rate after 10 such epochs. The maintained
+Slurm launcher uses a batch size of 128, a vision learning rate of `3e-4`, a
+64-value head, 30% dropout, and seed 42.
 
 Run the production workflow with:
 
@@ -125,22 +113,30 @@ Run the production workflow with:
 sbatch scripts/slurm/train_model.sh
 ```
 
-Direct module execution also requires `--completed-raster-dir` under `/tmp` and
-a valid `--pretrained-encoder-weights` path.
+Direct module execution requires `--completed-raster-dir` under `/tmp` and
+a valid `--pretrained-masked-model-weights` path.
 
 ## Evaluation and artifacts
 
 Each model reports accuracy, balanced accuracy, macro F1, one-vs-rest macro
-AUROC, class counts, per-class recall, and a three-class confusion matrix for
-train, validation, and test.
+AUROC, class counts, per-class recall, and a three-class confusion matrix in
+`results.json`.
 
-The run directory contains:
+The trainer produces three summary figures:
 
-- best checkpoints for the MLP and both fusion models;
-- `run_config.json`, normalization statistics, and loss histories;
-- row-level class logits and probabilities for each model and split;
-- loss curves, model-comparison plots, and row-normalized test confusion
-  matrices.
+- `split_class_accuracy.png` shows overall accuracy by split and per-class
+  recall within each split;
+- `training_curves.png` shows train and validation loss for both models;
+- `test_strata_accuracy.png` compares test accuracy across low, middle, and
+  high AOI-characteristic and record-level raster-quality groups.
 
-The trainer selects checkpoints with validation cross-entropy. Test labels
-contribute only to the final reports.
+The strata figure covers AOI plume score, total unit count, average heat input,
+and raster quality. The trainer assigns the AOI characteristics at the
+unique-AOI level. It computes record-level raster quality by equally combining
+the percentile ranks of low mean cloud fraction and high good-quality-pixel
+fraction. Labels report vision-seasonal accuracy minus seasonal accuracy.
+`test_strata_accuracy.csv` stores the plotted counts, stratification unit, value
+ranges, accuracies, and differences.
+
+The run directory contains both best checkpoints, preprocessing state,
+run configuration, and row-level predictions for each model and split.

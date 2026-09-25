@@ -101,9 +101,9 @@ after it validates all shard outcomes. See [regridding.md](regridding.md).
 
 ## 4. Provide a masked-model checkpoint
 
-Delta training requires a masked NO2 checkpoint for two operations: filling
-missing NO2 pixels and initializing one raster encoder. Set
-`PRETRAINED_ENCODER_WEIGHTS` to the checkpoint path or use the default in
+Delta training uses a masked NO2 checkpoint to fill missing NO2 pixels before
+classifier training. It does not copy the masked encoder into the classifier. Set
+`PRETRAINED_MASKED_MODEL_WEIGHTS` to the checkpoint path or use the default in
 `src/config.py`.
 
 The masked-pretraining workflow lives in
@@ -118,16 +118,15 @@ sbatch scripts/slurm/train_model.sh
 ```
 
 The job stages split metadata in job-local `/tmp`, fills missing NO2 into
-temporary memory-mapped arrays, and trains three classifiers:
+temporary memory-mapped arrays, and trains two classifiers:
 
-- a tabular MLP;
-- a random-initialized ConvGRU fused with the frozen MLP logits;
-- a masked-pretrained ConvGRU fused with the frozen MLP logits.
+- a four-input seasonal MLP;
+- a random-initialized ConvGRU fused with the frozen seasonal logits.
 
-The launcher requests one A5000 GPU, four CPUs, and eight hours on
-`savio4_gpu` with `a5k_gpu4_normal`. It emails loss curves, model comparisons,
-and test confusion matrices after a successful run. See
-[modeling.md](modeling.md) for the model contract.
+The launcher requests one A5000 GPU, four CPUs, and four hours on
+`savio4_gpu` with `a5k_gpu4_normal`. It emails split and class accuracy, both
+training curves, and the test AOI and raster-quality comparison after a
+successful run. See [modeling.md](modeling.md) for the model contract.
 
 ## Current Savio launchers
 
@@ -138,7 +137,7 @@ and test confusion matrices after a successful run. See
 | Stratification | `stratify_plants.sh` | 16 CPUs, 30 minutes, high-memory node |
 | Dataset shards | `launch_dataset_generation.sh` | Up to 8 tasks, 8 CPUs each, 12 hours |
 | Masked pretraining | `train_masked_pretraining.sh` | 1 A5000, 4 CPUs, 8 hours |
-| Delta classification | `train_model.sh` | 1 A5000, 4 CPUs, 8 hours |
+| Delta classification | `train_model.sh` | 1 A5000, 4 CPUs, 4 hours |
 
 Savio policies and availability can change. Check the requested account,
 partition, and QoS before submission.

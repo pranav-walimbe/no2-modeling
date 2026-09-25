@@ -53,18 +53,18 @@ srun python -u -m modeling.train \
     --completed-raster-dir "${node_work_dir}/filled-rasters" \
     --batch-size 128 \
     --epochs 100 \
-    --tabular-epochs 75 \
+    --seasonal-epochs 75 \
     --workers "${SLURM_CPUS_PER_TASK}" \
     --prefetch-factor 2 \
     --seed 42 \
-    --head-dim 128 \
+    --head-dim 64 \
     --dropout 0.30 \
     --learning-rate 3e-4 \
     --weight-decay 1e-4 \
     --gradient-clip-norm 5.0 \
     --scheduler-patience 10 \
     --scheduler-factor 0.50 \
-    --early-stop-patience 12 \
+    --early-stop-patience 15 \
     | tee "${training_output}"
 echo "Training command completed; locating result artifacts"
 
@@ -74,7 +74,7 @@ if [[ -z "${run_dir}" ]]; then
     exit 1
 fi
 
-echo "Emailing classification diagnostics, model comparison, and training plots"
+echo "Emailing split accuracy, training curves, and test-strata results"
 bash scripts/slurm/email_model_results.sh \
     "${run_dir}" \
     "${SLURM_JOB_ID}" \
