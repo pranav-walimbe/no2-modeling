@@ -1,6 +1,8 @@
 """Partition AOI-hour emission records into train, validation, and test splits."""
 
 import argparse
+import json
+import math
 import os
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from preprocessing.stratify_utils import (
     add_aoi_bounds,
     add_ema_targets,
     add_major_city_distance,
+    add_projected_coordinates,
     add_sequence_weather_paths,
     add_tempo_sequences,
     add_timestep_nox,
@@ -24,12 +27,12 @@ from preprocessing.stratify_utils import (
     calculate_activity_conditioned_aoi_features,
     cluster_aois,
     filter_usable_nox_measurements,
-    select_top_coal_aois,
     usable_nox_measurement_expr,
 )
 from preprocessing.tempo_mapping import load_tempo_mapping
 
 from config import (
+    AOI_SCORE_JSON,
     EMA_DECAY_TIMESCALE_HOURS,
     EMA_HISTORY_TIMESTEPS,
     FULL_DATA_PARQUET,
@@ -37,7 +40,8 @@ from config import (
     SEQUENCE_TIMESTEPS,
     STRAT_BASE_DIR,
     STRATIFICATION_AOI_FRACTION,
-    STRATIFICATION_EMA_CHANGE_THRESHOLD,
+    STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR,
+    STRATIFICATION_INNOVATION_RELATIVE_FLOOR,
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
     VAL_RECORDS_CSV,
@@ -47,6 +51,12 @@ from config import (
 SPLIT_FRACTIONS = {"train": 0.70, "val": 0.15, "test": 0.15}
 SPLIT_SEED = 42
 DELTA_CATEGORY_COL = "delta_category"
+AOI_SCORE_COL = "aoi_score"
+AOI_SCORE_PERCENTILE_COL = "aoi_score_percentile"
+AOI_SCALE_COL = "aoi_active_median_nox"
+EMA_UPDATE_ALPHA_COL = "ema_update_alpha"
+EMA_INNOVATION_COL = "ema_innovation_nox"
+HYBRID_THRESHOLD_COL = "hybrid_innovation_threshold"
 EMA_BUCKET_NAMES = ("decrease", "steady", "increase")
 TIMESTEP_COLUMNS = [
     column
@@ -61,6 +71,8 @@ TIMESTEP_COLUMNS = [
 ]
 OUTPUT_COLUMNS = [
     AOI_ID_COL,
+    AOI_SCORE_COL,
+    AOI_SCORE_PERCENTILE_COL,
     "lat",
     "lon",
     "lat_min",
@@ -86,6 +98,10 @@ OUTPUT_COLUMNS = [
     "effective_previous_nox",
     "effective_current_nox",
     "effective_delta_nox",
+    AOI_SCALE_COL,
+    EMA_UPDATE_ALPHA_COL,
+    EMA_INNOVATION_COL,
+    HYBRID_THRESHOLD_COL,
     DELTA_CATEGORY_COL,
     LABEL_MODE_COL,
 ]
@@ -104,20 +120,40 @@ REQUIRED_COLUMNS = [
     "noxMassMeasureFlg",
     "primaryFuelInfo",
     "attributePrimaryFuelInfo",
+    "facility_nameplate_capacity_mw",
 ]
 
 DEFAULT_DIAGNOSTIC_OUTPUT = Path(VIS_DIR) / "stratification_ema_balance.png"
-DEFAULT_AOI_SCORE_OUTPUT = Path(VIS_DIR) / "stratification_aoi_score_percentiles.png"
-DEFAULT_TIMESTEP_DELTA_OUTPUT = Path(VIS_DIR) / "stratification_timestep_nox_deltas.png"
+DEFAULT_AOI_CHARACTERISTICS_PLOT = Path(VIS_DIR) / "stratification_aoi_characteristics.png"
+DEFAULT_AOI_CHARACTERISTICS_OUTPUT = Path(VIS_DIR) / "stratification_aoi_characteristics.csv"
+DEFAULT_AOI_SELECTION_OUTPUT = Path(VIS_DIR) / "stratification_aoi_selection.csv"
 HISTOGRAM_QUANTILES = (0.01, 0.99)
+AOI_CHARACTERISTIC_PANELS = (
+    ("active_median_total_nox", "Active median total NOx", "log10(1 + lb/hr)", True),
+    ("history_emitting_fraction", "Emitting-hour fraction", "Fraction", False),
+    ("facility_count", "Facilities per AOI", "Count", False),
+    ("active_mean_operating_units", "Active operating units", "Mean count", False),
+    ("max_source_distance_km", "Maximum source distance", "km", False),
+    ("largest_facility_capacity_share", "Dominant-facility capacity share", "Fraction", False),
+)
 
 
 def parse_args() -> argparse.Namespace:
     """Parse stratification command-line arguments."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--diagnostic-output", type=Path, default=DEFAULT_DIAGNOSTIC_OUTPUT)
-    parser.add_argument("--aoi-score-output", type=Path, default=DEFAULT_AOI_SCORE_OUTPUT)
-    parser.add_argument("--timestep-delta-output", type=Path, default=DEFAULT_TIMESTEP_DELTA_OUTPUT)
+    parser.add_argument(
+        "--aoi-characteristics-plot",
+        type=Path,
+        default=DEFAULT_AOI_CHARACTERISTICS_PLOT,
+    )
+    parser.add_argument(
+        "--aoi-characteristics-output",
+        type=Path,
+        default=DEFAULT_AOI_CHARACTERISTICS_OUTPUT,
+    )
+    parser.add_argument("--aoi-selection-output", type=Path, default=DEFAULT_AOI_SELECTION_OUTPUT)
+    parser.add_argument("--aoi-score-json", type=Path, default=Path(AOI_SCORE_JSON))
     return parser.parse_args()
 
 
@@ -128,10 +164,7 @@ def _split_by_cluster(
     # Greedily assign large clusters against record or class-specific targets
     category_names = EMA_BUCKET_NAMES if category_column is not None else ()
     count_expressions = [pl.len().alias("records")]
-    count_expressions.extend(
-        (pl.col(category_column) == category).sum().alias(category)
-        for category in category_names
-    )
+    count_expressions.extend((pl.col(category_column) == category).sum().alias(category) for category in category_names)
     cluster_counts = (
         frame.group_by("cluster")
         .agg(count_expressions)
@@ -147,10 +180,7 @@ def _split_by_cluster(
         split: {column: totals[column] * fraction for column in target_columns}
         for split, fraction in SPLIT_FRACTIONS.items()
     }
-    assigned = {
-        split: {column: 0.0 for column in target_columns}
-        for split in SPLIT_FRACTIONS
-    }
+    assigned = {split: {column: 0.0 for column in target_columns} for split in SPLIT_FRACTIONS}
     cluster_assignments: list[dict[str, object]] = []
     assigned_cluster_counts = {split: 0 for split in SPLIT_FRACTIONS}
     for index, cluster in enumerate(cluster_counts.iter_rows(named=True)):
@@ -160,11 +190,15 @@ def _split_by_cluster(
         destination = min(
             destinations,
             key=lambda destination: sum(
-                ((
-                    assigned[split][column]
-                    + (float(cluster[column]) if split == destination else 0.0)
-                    - targets[split][column]
-                ) / max(targets[split][column], 1.0)) ** 2
+                (
+                    (
+                        assigned[split][column]
+                        + (float(cluster[column]) if split == destination else 0.0)
+                        - targets[split][column]
+                    )
+                    / max(targets[split][column], 1.0)
+                )
+                ** 2
                 for split in SPLIT_FRACTIONS
                 for column in target_columns
             ),
@@ -203,19 +237,46 @@ def _split_by_cluster(
 
 
 def filter_stratification_rule(frame: pl.DataFrame) -> pl.DataFrame:
-    """Assign classes from the raw effective EMA change.
+    """Assign classes from an absolute and AOI-relative EMA innovation.
 
     Args:
-        frame: Eligible records carrying raw effective deltas.
+        frame: Eligible records carrying timestep NOx values and raw effective deltas.
 
     Returns:
-        Records labeled with the raw EMA class.
+        Records carrying the AOI scale, innovation, threshold, and class.
     """
-    raw_delta = pl.col("effective_delta_nox")
-    return frame.with_columns(
-        pl.when(raw_delta < -STRATIFICATION_EMA_CHANGE_THRESHOLD)
+    timestep_columns = [f"t{index}_nox" for index in range(SEQUENCE_TIMESTEPS)]
+    scales = (
+        frame.select(AOI_ID_COL, pl.concat_list(timestep_columns).alias("_timestep_nox"))
+        .explode("_timestep_nox", empty_as_null=True)
+        .filter(pl.col("_timestep_nox").is_finite() & (pl.col("_timestep_nox") > 0))
+        .group_by(AOI_ID_COL)
+        .agg(pl.col("_timestep_nox").median().alias(AOI_SCALE_COL))
+        .filter(pl.col(AOI_SCALE_COL).is_finite() & (pl.col(AOI_SCALE_COL) > 0))
+    )
+    current_time = pl.col(f"t{LABEL_TIMESTEP_INDEX}_timestamp")
+    previous_time = pl.col(f"t{LABEL_TIMESTEP_INDEX - 1}_timestamp")
+    interval_hours = (current_time - previous_time).dt.total_seconds() / 3600
+    alpha = 1 - (-interval_hours / EMA_DECAY_TIMESCALE_HOURS).exp()
+    threshold = pl.max_horizontal(
+        pl.lit(STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR),
+        STRATIFICATION_INNOVATION_RELATIVE_FLOOR * pl.col(AOI_SCALE_COL),
+    )
+    labeled = (
+        frame.join(scales, on=AOI_ID_COL, how="inner")
+        .with_columns(alpha.alias(EMA_UPDATE_ALPHA_COL))
+        .filter(pl.col(EMA_UPDATE_ALPHA_COL).is_finite() & (pl.col(EMA_UPDATE_ALPHA_COL) > 0))
+        .with_columns(
+            (pl.col("effective_delta_nox") / pl.col(EMA_UPDATE_ALPHA_COL)).alias(EMA_INNOVATION_COL),
+            threshold.alias(HYBRID_THRESHOLD_COL),
+        )
+        .filter(pl.col(EMA_INNOVATION_COL).is_finite())
+    )
+    innovation = pl.col(EMA_INNOVATION_COL)
+    return labeled.with_columns(
+        pl.when(innovation <= -pl.col(HYBRID_THRESHOLD_COL))
         .then(pl.lit("decrease"))
-        .when(raw_delta > STRATIFICATION_EMA_CHANGE_THRESHOLD)
+        .when(innovation >= pl.col(HYBRID_THRESHOLD_COL))
         .then(pl.lit("increase"))
         .otherwise(pl.lit("steady"))
         .alias(DELTA_CATEGORY_COL)
@@ -226,7 +287,6 @@ def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     # Apply non-raster candidate quality requirements
     return frame.filter(
         pl.all_horizontal([pl.col(f"t{index}_nox").is_finite() for index in range(SEQUENCE_TIMESTEPS)])
-        & pl.col("avg_coal_nox").is_finite()
         & pl.col("avg_heat_input").is_finite()
         & pl.col("avg_pwr_gen").is_finite()
         & pl.col(MAJOR_CITY_DIST_COL).is_finite()
@@ -239,7 +299,7 @@ def select_balanced_ema_records(
     *,
     seed: int = SPLIT_SEED,
 ) -> pl.DataFrame:
-    """Select equal deterministic samples from three raw EMA-change buckets.
+    """Select equal deterministic samples from three EMA-innovation buckets.
 
     Args:
         frame: Eligible records carrying the raw effective NOx delta.
@@ -274,11 +334,10 @@ def select_balanced_ema_records(
         )
         selected.append(class_records)
     balanced = pl.concat(selected).sort(AOI_ID_COL, "emissions_hour_utc")
-    count_summary = ", ".join(
-        f"{row[DELTA_CATEGORY_COL]}={row['len']:,}" for row in counts.iter_rows(named=True)
-    )
+    count_summary = ", ".join(f"{row[DELTA_CATEGORY_COL]}={row['len']:,}" for row in counts.iter_rows(named=True))
     print(
-        f"[{split}] threshold=+/-{STRATIFICATION_EMA_CHANGE_THRESHOLD:.2f}; eligible {count_summary}; "
+        f"[{split}] threshold=max({STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR:g}, "
+        f"{STRATIFICATION_INNOVATION_RELATIVE_FLOOR:.0%} of AOI scale); eligible {count_summary}; "
         f"selected {records_per_class:,} per class ({balanced.height:,} total)"
     )
     return balanced
@@ -289,24 +348,22 @@ def _plot_stratification_diagnostics(
     balanced_splits: dict[str, pl.DataFrame],
     output_path: Path,
 ) -> None:
-    # Compare raw EMA changes and bucket composition before and after balancing
+    # Compare EMA innovations and bucket composition before and after balancing
     split_names = tuple(SPLIT_FRACTIONS)
     figure, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
-    combined = np.concatenate(
-        [split["effective_delta_nox"].drop_nulls().to_numpy() for split in eligible_splits.values()]
-    )
+    combined = np.concatenate([split[EMA_INNOVATION_COL].drop_nulls().to_numpy() for split in eligible_splits.values()])
     finite = combined[np.isfinite(combined)]
     lower, upper = np.quantile(finite, HISTOGRAM_QUANTILES)
     limit = max(abs(lower), abs(upper))
     if limit == 0:
         limit = 1.0
-    threshold = STRATIFICATION_EMA_CHANGE_THRESHOLD
+    threshold = STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR
     total_eligible = sum(split.height for split in eligible_splits.values())
     colors = ("#3977af", "#999999", "#d65f4a")
     for column_index, split_name in enumerate(split_names):
         eligible = eligible_splits[split_name]
         balanced = balanced_splits[split_name]
-        values = eligible["effective_delta_nox"].drop_nulls().to_numpy()
+        values = eligible[EMA_INNOVATION_COL].drop_nulls().to_numpy()
         values = values[np.isfinite(values)]
         visible = values[np.abs(values) <= limit]
         aoi_count = eligible[AOI_ID_COL].n_unique()
@@ -319,17 +376,12 @@ def _plot_stratification_diagnostics(
         histogram_axis.set_title(
             f"{split_name}: {eligible.height:,} eligible ({eligible.height / total_eligible:.1%}), {aoi_count} AOIs"
         )
-        histogram_axis.set_xlabel("Raw effective EMA NOx change")
+        histogram_axis.set_xlabel("EMA innovation (lb/hr)")
         histogram_axis.set_ylabel("AOI-hour count")
         histogram_axis.grid(axis="y", alpha=0.2)
 
-        eligible_counts = np.array(
-            [
-                int((values < -threshold).sum()),
-                int((np.abs(values) <= threshold).sum()),
-                int((values > threshold).sum()),
-            ]
-        )
+        category_counts = dict(eligible.group_by(DELTA_CATEGORY_COL).len().iter_rows())
+        eligible_counts = np.array([category_counts.get(category, 0) for category in EMA_BUCKET_NAMES])
         balanced_count = balanced.height // len(EMA_BUCKET_NAMES)
         balanced_counts = np.full(len(EMA_BUCKET_NAMES), balanced_count)
         positions = np.arange(len(EMA_BUCKET_NAMES))
@@ -362,7 +414,9 @@ def _plot_stratification_diagnostics(
     split_counts = ", ".join(f"{name}={balanced_splits[name].height:,}" for name in split_names)
     total_balanced = sum(split.height for split in balanced_splits.values())
     figure.suptitle(
-        f"Raw EMA change threshold +/-{STRATIFICATION_EMA_CHANGE_THRESHOLD:g}\n"
+        "Hybrid EMA innovation threshold: "
+        f"max({STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR:g} lb/hr, "
+        f"{STRATIFICATION_INNOVATION_RELATIVE_FLOOR:.0%} of AOI scale)\n"
         f"Maximum balanced set: {total_balanced:,} total ({split_counts})"
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -370,93 +424,238 @@ def _plot_stratification_diagnostics(
     plt.close(figure)
 
 
-def _plot_aoi_score_percentiles(aoi_features: pl.DataFrame, output_path: Path) -> None:
-    # Plot the complete coal-containing AOI scoring distribution
-    coal_scores = (
-        aoi_features.filter(pl.col("num_coal_units") > 0)
-        .select("avg_coal_nox")
-        .sort("avg_coal_nox")
-    )
-    percentiles = 100 * np.arange(1, coal_scores.height + 1) / coal_scores.height
-    selection_cutoff = 100 * (1 - STRATIFICATION_AOI_FRACTION)
-
-    figure, axis = plt.subplots(figsize=(10, 6), constrained_layout=True)
-    axis.plot(percentiles, coal_scores["avg_coal_nox"].to_numpy(), color="#b24a33", linewidth=2)
-    axis.axvline(selection_cutoff, color="#333333", linestyle="--", linewidth=1.5)
-    axis.axvspan(selection_cutoff, 100, color="#b24a33", alpha=0.08)
-    axis.set(
-        title=f"Coal-containing AOI scores ({coal_scores.height:,} AOIs)",
-        xlabel="AOI score percentile",
-        ylabel="Average coal NOx mass (lb/hour)",
-        xlim=(0, 100),
-    )
-    axis.grid(alpha=0.2)
-    axis.text(
-        selection_cutoff,
-        0.98,
-        f" Top {STRATIFICATION_AOI_FRACTION:.0%} retained",
-        transform=axis.get_xaxis_transform(),
-        ha="left",
-        va="top",
-    )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=180)
-    plt.close(figure)
+def _load_aoi_scores(path: Path) -> pl.DataFrame:
+    # Validate the persistent JSON object at the stratification boundary
+    if not path.is_file():
+        raise FileNotFoundError(f"AOI score mapping not found: {path}")
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict) or not loaded:
+        raise ValueError(f"AOI score mapping must be a non-empty JSON object: {path}")
+    rows = []
+    for raw_aoi_id, raw_score in loaded.items():
+        try:
+            aoi_id = int(raw_aoi_id)
+            score = float(raw_score)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid AOI score entry {raw_aoi_id!r}: {raw_score!r}") from error
+        if not np.isfinite(score):
+            raise ValueError(f"AOI {aoi_id} has a non-finite score")
+        rows.append({AOI_ID_COL: aoi_id, AOI_SCORE_COL: score})
+    scores = pl.DataFrame(rows, schema={AOI_ID_COL: pl.Int64, AOI_SCORE_COL: pl.Float64})
+    if scores[AOI_ID_COL].n_unique() != scores.height:
+        raise ValueError("AOI score identifiers must be unique after integer parsing")
+    return scores
 
 
-def _plot_timestep_nox_deltas(
-    balanced_splits: dict[str, pl.DataFrame],
-    output_path: Path,
-) -> None:
-    # Compare smoothed raw NOx-change distributions across scan transitions
-    frame = pl.concat(list(balanced_splits.values()))
-    transitions = {
-        f"t{index - 1} to t{index}": (
-            frame[f"t{index}_nox"] - frame[f"t{index - 1}_nox"]
-        ).to_numpy()
-        for index in range(1, SEQUENCE_TIMESTEPS)
-    }
-    pooled = np.concatenate(list(transitions.values()))
-    finite = pooled[np.isfinite(pooled)]
-    lower, upper = np.quantile(finite, HISTOGRAM_QUANTILES)
-    limit = max(abs(lower), abs(upper), 1.0)
-    bin_edges = np.linspace(-limit, limit, 241)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    kernel_x = np.arange(-8, 9)
-    kernel = np.exp(-0.5 * np.square(kernel_x / 2.0))
-    kernel /= kernel.sum()
-
-    figure, axis = plt.subplots(figsize=(12, 7), constrained_layout=True)
-    colors = ("#3977af", "#59a14f", "#f28e2b", "#b24a33")
-    for transition_index, ((label, values), color) in enumerate(
-        zip(transitions.items(), colors, strict=True),
-        start=1,
-    ):
-        visible = values[np.isfinite(values) & (np.abs(values) <= limit)]
-        density, _ = np.histogram(visible, bins=bin_edges, density=True)
-        smoothed = np.convolve(density, kernel, mode="same")
-        linestyle = "--" if transition_index == SEQUENCE_TIMESTEPS - 1 else "-"
-        suffix = " (post-label)" if transition_index == SEQUENCE_TIMESTEPS - 1 else ""
-        axis.plot(
-            bin_centers,
-            smoothed,
-            color=color,
-            linestyle=linestyle,
-            linewidth=2.2,
-            label=f"{label}{suffix}",
+def _rank_aoi_scores(all_aois: pl.DataFrame, scores: pl.DataFrame) -> pl.DataFrame:
+    # Reject stale mappings, then rank mapped members of the facility-centered AOI set
+    unknown = scores.join(all_aois.select(AOI_ID_COL), on=AOI_ID_COL, how="anti")
+    if not unknown.is_empty():
+        unknown_ids = unknown[AOI_ID_COL].sort().head(10).to_list()
+        raise ValueError(
+            f"AOI score mapping contains {unknown.height} IDs outside the facility-centered AOI set; "
+            f"first IDs: {unknown_ids}"
         )
-
-    axis.axvline(0, color="#222222", linewidth=1)
-    axis.set(
-        title=f"Raw interpolated NOx changes across raster timesteps ({frame.height:,} balanced records)",
-        xlabel="Adjacent-timestep NOx change (lb/hour)",
-        ylabel="Smoothed density",
-        xlim=(-limit, limit),
+    ranked = all_aois.select(AOI_ID_COL).join(scores, on=AOI_ID_COL, how="inner").sort(AOI_SCORE_COL, AOI_ID_COL)
+    if ranked.is_empty():
+        raise ValueError("AOI score mapping does not overlap the facility-centered AOI set")
+    return ranked.with_row_index("aoi_score_rank", offset=1).with_columns(
+        (pl.col("aoi_score_rank") / pl.len()).alias(AOI_SCORE_PERCENTILE_COL)
     )
-    axis.grid(alpha=0.2)
-    axis.legend(frameon=False)
+
+
+def select_top_scored_aois(ranked_scores: pl.DataFrame, fraction: float) -> pl.DataFrame:
+    """Select the highest-scoring share of mapped AOIs.
+
+    Args:
+        ranked_scores: Mapped AOIs carrying score ranks and percentiles.
+        fraction: Selected share in the interval ``(0, 1]``.
+
+    Returns:
+        Deterministically selected AOI score rows.
+    """
+    if not 0 < fraction <= 1:
+        raise ValueError("AOI selection fraction must be in (0, 1]")
+    selected_count = math.ceil(ranked_scores.height * fraction)
+    return ranked_scores.sort(
+        AOI_SCORE_COL,
+        AOI_ID_COL,
+        descending=[True, False],
+    ).head(selected_count)
+
+
+def _static_aoi_characteristics(relevant: pl.LazyFrame, membership: pl.DataFrame) -> pl.DataFrame:
+    # Summarize source counts and facility capacity concentration
+    static = (
+        relevant.select("facilityId", "unitId")
+        .unique()
+        .join(membership.lazy(), on="facilityId", how="inner")
+        .group_by(AOI_ID_COL)
+        .agg(
+            pl.col("facilityId").n_unique().alias("facility_count"),
+            pl.struct("facilityId", "unitId").n_unique().alias("unit_count"),
+        )
+        .collect(engine="streaming")
+    )
+    capacity = (
+        relevant.group_by("facilityId")
+        .agg(pl.col("facility_nameplate_capacity_mw").max().alias("_facility_capacity_mw"))
+        .join(membership.lazy(), on="facilityId", how="inner")
+        .group_by(AOI_ID_COL)
+        .agg(
+            pl.col("_facility_capacity_mw").sum().alias("_total_capacity_mw"),
+            pl.col("_facility_capacity_mw").max().alias("_largest_capacity_mw"),
+        )
+        .with_columns(
+            pl.when(pl.col("_total_capacity_mw") > 0)
+            .then(pl.col("_largest_capacity_mw") / pl.col("_total_capacity_mw"))
+            .alias("largest_facility_capacity_share")
+        )
+        .select(AOI_ID_COL, "largest_facility_capacity_share")
+        .collect(engine="streaming")
+    )
+    return static.join(capacity, on=AOI_ID_COL, how="inner")
+
+
+def _operating_aoi_characteristics(relevant: pl.LazyFrame, membership: pl.DataFrame) -> pl.DataFrame:
+    # Summarize NOx output and unit operation over observed history
+    hourly = (
+        relevant.filter(pl.col("opTime").is_finite() & (pl.col("opTime") >= 0))
+        .join(membership.lazy(), on="facilityId", how="inner")
+        .group_by(AOI_ID_COL, "emissions_hour_utc")
+        .agg(
+            pl.col("opTime").mean().alias("_mean_unit_op_time"),
+            (pl.col("opTime") > 0).sum().alias("_operating_units"),
+            pl.col("noxMass")
+            .filter(usable_nox_measurement_expr() & pl.col("noxMass").is_finite() & (pl.col("noxMass") >= 0))
+            .sum()
+            .alias("_total_nox"),
+        )
+        .collect(engine="streaming")
+    )
+    activity_cutoffs = hourly.group_by(AOI_ID_COL).agg(
+        pl.col("_mean_unit_op_time").median().alias("_median_unit_op_time")
+    )
+    active = hourly.join(activity_cutoffs, on=AOI_ID_COL, how="inner").filter(
+        pl.col("_mean_unit_op_time") >= pl.col("_median_unit_op_time")
+    )
+    return (
+        active.group_by(AOI_ID_COL)
+        .agg(
+            pl.col("_total_nox").median().alias("active_median_total_nox"),
+            pl.col("_operating_units").mean().alias("active_mean_operating_units"),
+        )
+        .join(
+            hourly.group_by(AOI_ID_COL).agg((pl.col("_total_nox") > 0).mean().alias("history_emitting_fraction")),
+            on=AOI_ID_COL,
+            how="inner",
+        )
+    )
+
+
+def _geographic_aoi_characteristics(
+    relevant: pl.LazyFrame,
+    membership: pl.DataFrame,
+    aois: pl.DataFrame,
+) -> pl.DataFrame:
+    # Measure the farthest member facility from each AOI center
+    facility_points = add_projected_coordinates(
+        relevant.select("facilityId", "lat", "lon").drop_nulls().unique(subset="facilityId").collect()
+    ).select("facilityId", pl.col("x_m").alias("_facility_x_m"), pl.col("y_m").alias("_facility_y_m"))
+    return (
+        membership.join(facility_points, on="facilityId", how="inner")
+        .join(
+            aois.select(AOI_ID_COL, pl.col("x_m").alias("_aoi_x_m"), pl.col("y_m").alias("_aoi_y_m")),
+            on=AOI_ID_COL,
+            how="inner",
+        )
+        .with_columns(
+            (
+                (
+                    (pl.col("_facility_x_m") - pl.col("_aoi_x_m")).pow(2)
+                    + (pl.col("_facility_y_m") - pl.col("_aoi_y_m")).pow(2)
+                ).sqrt()
+                / 1_000
+            ).alias("_source_distance_km")
+        )
+        .group_by(AOI_ID_COL)
+        .agg(pl.col("_source_distance_km").max().alias("max_source_distance_km"))
+    )
+
+
+def calculate_aoi_characteristics(
+    raw_records: pl.LazyFrame,
+    membership: pl.DataFrame,
+    aois: pl.DataFrame,
+) -> pl.DataFrame:
+    """Calculate source and operating characteristics for one AOI subset.
+
+    Args:
+        raw_records: Full unit-hour emissions history.
+        membership: Facility-to-AOI membership for the requested subset.
+        aois: Requested AOI centers.
+
+    Returns:
+        One characteristic row per AOI.
+    """
+    relevant_facilities = membership["facilityId"].unique()
+    relevant = raw_records.filter(pl.col("facilityId").is_in(relevant_facilities.implode()))
+    static = _static_aoi_characteristics(relevant, membership)
+    operating = _operating_aoi_characteristics(relevant, membership)
+    geometry = _geographic_aoi_characteristics(relevant, membership, aois)
+    return static.join(
+        operating,
+        on=AOI_ID_COL,
+        how="inner",
+    ).join(geometry, on=AOI_ID_COL, how="inner")
+
+
+def _plot_aoi_characteristics(characteristics: pl.DataFrame, output_path: Path) -> None:
+    # Compare each selected AOI characteristic with the scored unselected cohort
+    figure, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+    cohorts = ((False, "Scored, unselected", "#999999"), (True, "Selected", "#3977af"))
+    for axis, (column, title, xlabel, log_transform) in zip(
+        axes.flat,
+        AOI_CHARACTERISTIC_PANELS,
+        strict=True,
+    ):
+        plotted: list[tuple[np.ndarray, str, str, float, float]] = []
+        for selected, label, color in cohorts:
+            values = characteristics.filter(pl.col("selected_for_stratification") == selected)[column].to_numpy()
+            values = values[np.isfinite(values)]
+            raw_median = float(np.median(values)) if values.size else np.nan
+            if log_transform:
+                values = np.log10(1 + np.clip(values, 0, None))
+            if values.size:
+                plotted.append((values, label, color, float(np.median(values)), raw_median))
+        if not plotted:
+            axis.set(title=title, xlabel=xlabel)
+            axis.text(0.5, 0.5, "No finite values", transform=axis.transAxes, ha="center", va="center")
+            continue
+        combined = np.concatenate([values for values, _, _, _, _ in plotted])
+        lower, upper = np.quantile(combined, HISTOGRAM_QUANTILES)
+        if lower == upper:
+            lower, upper = lower - 0.5, upper + 0.5
+        bins = np.linspace(lower, upper, 31)
+        median_labels = []
+        for values, label, color, median, raw_median in plotted:
+            visible = values[(values >= lower) & (values <= upper)]
+            axis.hist(visible, bins=bins, density=True, alpha=0.45, color=color, label=label)
+            axis.axvline(median, color=color, linewidth=1.5, linestyle="--")
+            median_labels.append(f"{label}: median {raw_median:,.2f}")
+        axis.set(title=title, xlabel=xlabel, ylabel="Density")
+        axis.grid(axis="y", alpha=0.2)
+        axis.text(0.98, 0.96, "\n".join(median_labels), transform=axis.transAxes, ha="right", va="top", fontsize=8)
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    figure.legend(handles, labels, loc="outside upper center", ncols=2)
+    selected_count = characteristics.filter(pl.col("selected_for_stratification")).height
+    figure.suptitle(
+        f"AOI characteristics after plume-quality selection "
+        f"({selected_count:,}/{characteristics.height:,} scored AOIs retained)",
+        fontsize=16,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=180)
+    figure.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(figure)
 
 
@@ -472,11 +671,19 @@ def _serialize_no2_paths(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def build_stratification_candidates(aoi_score_output: Path = DEFAULT_AOI_SCORE_OUTPUT) -> pl.DataFrame:
-    """Build eligible AOI-hour records for every AOI.
+def build_stratification_candidates(
+    aoi_score_path: Path = Path(AOI_SCORE_JSON),
+    aoi_characteristics_plot: Path = DEFAULT_AOI_CHARACTERISTICS_PLOT,
+    aoi_characteristics_output: Path = DEFAULT_AOI_CHARACTERISTICS_OUTPUT,
+    aoi_selection_output: Path = DEFAULT_AOI_SELECTION_OUTPUT,
+) -> pl.DataFrame:
+    """Build eligible AOI-hour records for score-selected AOIs.
 
     Args:
-        aoi_score_output: Destination for the AOI score percentile plot.
+        aoi_score_path: Persistent JSON mapping from AOI identifier to score.
+        aoi_characteristics_plot: Destination for the AOI characteristics dashboard.
+        aoi_characteristics_output: Destination for the underlying AOI table.
+        aoi_selection_output: Destination for the complete AOI score-selection audit.
 
     Returns:
         Eligible records before geographic splitting.
@@ -488,21 +695,58 @@ def build_stratification_candidates(aoi_score_output: Path = DEFAULT_AOI_SCORE_O
     facilities = raw_records.select("facilityId", "lat", "lon").drop_nulls().unique(subset="facilityId").collect()
     all_aois = build_aois(facilities)
     all_spatial_aois = build_aoi_spatial_frame(all_aois)
-    membership = build_aoi_membership(all_aois, facilities, all_spatial_aois)
-    aoi_features = calculate_activity_conditioned_aoi_features(raw_records, membership)
-    _plot_aoi_score_percentiles(aoi_features, aoi_score_output)
-    print(f"Saved AOI score percentiles to {aoi_score_output}")
-    selected_features = select_top_coal_aois(aoi_features, STRATIFICATION_AOI_FRACTION)
-    selected_ids = selected_features.select(AOI_ID_COL)
+    all_membership = build_aoi_membership(all_aois, facilities, all_spatial_aois)
+    ranked_scores = _rank_aoi_scores(all_aois, _load_aoi_scores(aoi_score_path))
+    selected_scores = select_top_scored_aois(ranked_scores, STRATIFICATION_AOI_FRACTION)
+    selected_ids = selected_scores.select(AOI_ID_COL)
+    selection_audit = (
+        all_aois.select(AOI_ID_COL)
+        .join(
+            ranked_scores.select(AOI_ID_COL, AOI_SCORE_COL, AOI_SCORE_PERCENTILE_COL),
+            on=AOI_ID_COL,
+            how="left",
+        )
+        .join(selected_ids.with_columns(pl.lit(True).alias("selected_for_stratification")), on=AOI_ID_COL, how="left")
+        .with_columns(
+            pl.col(AOI_SCORE_COL).is_not_null().alias("has_aoi_score"),
+            pl.col("selected_for_stratification").fill_null(False),
+        )
+        .sort(AOI_ID_COL)
+    )
+    aoi_selection_output.parent.mkdir(parents=True, exist_ok=True)
+    selection_audit.write_csv(aoi_selection_output)
     aois = all_aois.join(selected_ids, on=AOI_ID_COL, how="inner")
-    membership = membership.join(selected_ids, on=AOI_ID_COL, how="inner")
+    membership = all_membership.join(selected_ids, on=AOI_ID_COL, how="inner")
+    unselected_ids = ranked_scores.join(selected_ids, on=AOI_ID_COL, how="anti").select(AOI_ID_COL)
+    unselected_aois = all_aois.join(unselected_ids, on=AOI_ID_COL, how="inner")
+    unselected_membership = all_membership.join(unselected_ids, on=AOI_ID_COL, how="inner")
+    selected_characteristics = calculate_aoi_characteristics(raw_records, membership, aois).with_columns(
+        pl.lit(True).alias("selected_for_stratification")
+    )
+    unselected_characteristics = calculate_aoi_characteristics(
+        raw_records,
+        unselected_membership,
+        unselected_aois,
+    ).with_columns(pl.lit(False).alias("selected_for_stratification"))
+    characteristics = pl.concat([selected_characteristics, unselected_characteristics]).sort(AOI_ID_COL)
+    aoi_characteristics_output.parent.mkdir(parents=True, exist_ok=True)
+    characteristics.write_csv(aoi_characteristics_output)
+    _plot_aoi_characteristics(characteristics, aoi_characteristics_plot)
+    print(f"Saved AOI characteristics to {aoi_characteristics_plot} and {aoi_characteristics_output}")
+    selected_features = calculate_activity_conditioned_aoi_features(raw_records, membership).join(
+        selected_scores.select(AOI_ID_COL, AOI_SCORE_COL, AOI_SCORE_PERCENTILE_COL),
+        on=AOI_ID_COL,
+        how="inner",
+    )
     spatial_aois = build_aoi_spatial_frame(aois)
     bounded_aois = add_major_city_distance(add_aoi_bounds(aois))
     observations = load_tempo_mapping()
     print(
-        f"Selected {aois.height:,}/{aoi_features.filter(pl.col('num_coal_units') > 0).height:,} "
-        "coal-containing AOIs by avg_coal_nox"
+        f"Selected {aois.height:,}/{ranked_scores.height:,} scored AOIs "
+        f"from {all_aois.height:,} total AOIs by plume-quality score; "
+        f"{all_aois.height - ranked_scores.height:,} AOIs are unmapped"
     )
+    print(f"Saved complete AOI selection audit to {aoi_selection_output}")
     invalid_aoi_hours = (
         raw_records.filter(~usable_nox_measurement_expr() | ~pl.col("noxMass").is_finite())
         .join(membership.lazy(), on="facilityId", how="inner")
@@ -532,40 +776,36 @@ def build_stratification_candidates(aoi_score_output: Path = DEFAULT_AOI_SCORE_O
         EMA_DECAY_TIMESCALE_HOURS,
         label_timestep_index=LABEL_TIMESTEP_INDEX,
     )
-    frame = frame.with_columns(pl.lit("overlap_interpolated_timestep_ema").alias(LABEL_MODE_COL))
-    bounds = bounded_aois.select(
-        AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL
-    )
+    frame = frame.with_columns(pl.lit("linear_interpolated_timestep_ema").alias(LABEL_MODE_COL))
+    bounds = bounded_aois.select(AOI_ID_COL, "lat_min", "lat_max", "lon_min", "lon_max", MAJOR_CITY_DIST_COL)
     frame = add_sequence_weather_paths(
         frame.join(bounds, on=AOI_ID_COL, how="left"),
         SEQUENCE_TIMESTEPS,
     )
     frame = _filter_metadata_eligibility(frame).filter(pl.col("effective_delta_nox").is_finite())
-    return frame.rename(
-        {f"timestep_time_t{index}": f"t{index}_timestamp" for index in range(SEQUENCE_TIMESTEPS)}
-    )
+    return frame.rename({f"timestep_time_t{index}": f"t{index}_timestamp" for index in range(SEQUENCE_TIMESTEPS)})
 
 
 def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
     args = parse_args()
-    candidates = build_stratification_candidates(args.aoi_score_output)
+    candidates = build_stratification_candidates(
+        args.aoi_score_json,
+        args.aoi_characteristics_plot,
+        args.aoi_characteristics_output,
+        args.aoi_selection_output,
+    )
     frame = filter_stratification_rule(candidates)
     print(
-        f"Labeled {frame.height:,} records with raw EMA threshold +/-"
-        f"{STRATIFICATION_EMA_CHANGE_THRESHOLD:g}"
+        f"Labeled {frame.height:,} records with hybrid EMA innovation threshold "
+        f"max({STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR:g} lb/hr, "
+        f"{STRATIFICATION_INNOVATION_RELATIVE_FLOOR:.0%} of AOI scale)"
     )
     print(f"Using {frame[AOI_ID_COL].n_unique():,} eligible selected AOIs")
     eligible_splits = _split_by_cluster(frame, category_column=DELTA_CATEGORY_COL)
-    splits = {
-        split: select_balanced_ema_records(split_frame, split)
-        for split, split_frame in eligible_splits.items()
-    }
+    splits = {split: select_balanced_ema_records(split_frame, split) for split, split_frame in eligible_splits.items()}
     _plot_stratification_diagnostics(eligible_splits, splits, args.diagnostic_output)
     print(f"Saved EMA-balance diagnostics to {args.diagnostic_output}")
-    _plot_timestep_nox_deltas(splits, args.timestep_delta_output)
-    print(f"Saved timestep NOx-delta diagnostics to {args.timestep_delta_output}")
-
     os.makedirs(STRAT_BASE_DIR, exist_ok=True)
     del frame
     # Project and write one split at a time so the copies never coexist

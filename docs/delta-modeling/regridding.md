@@ -41,7 +41,7 @@ array fan-out. Workers write cache files atomically.
 
 ## Published raster bundles
 
-Each retained record stores oldest-to-newest arrays with shape `5 x 24 x 24`:
+Each retained record stores oldest-to-newest arrays with shape `4 x 24 x 24`:
 
 - `no2` and its independent `no2_mask`;
 - `temperature_2m_k`;

@@ -1,6 +1,5 @@
 """Utilities for building and splitting AOI-hour records."""
 
-import math
 from pathlib import Path
 
 import geopandas as gpd
@@ -127,76 +126,55 @@ def add_timestep_nox(
     hourly: pl.DataFrame,
     timesteps: int = SEQUENCE_TIMESTEPS,
 ) -> pl.DataFrame:
-    """Attach overlap-weighted AOI NOx rates for every TEMPO interval.
+    """Linearly interpolate AOI NOx rates at every TEMPO timestamp.
 
     Args:
         frame: Records carrying one scan timestamp per timestep.
-        hourly: Valid piecewise-constant AOI-hour emissions totals.
+        hourly: Valid AOI-hour emissions values.
         timesteps: Number of scan timestamps to align.
 
     Returns:
-        Records with one interval-weighted NOx value per timestep.
+        Records with one point-interpolated NOx value per timestep.
     """
     indexed = frame.with_row_index("_timestep_nox_row")
     result = indexed
+    hourly_lookup = hourly.select(AOI_ID_COL, "emissions_hour_utc", "nox_mass")
     for index in range(timesteps):
-        start_column = "_interval_start_t0" if index == 0 else f"timestep_time_t{index - 1}"
-        end_column = f"timestep_time_t{index}"
+        time_column = f"timestep_time_t{index}"
         nox_column = f"t{index}_nox"
-        contributions = (
-            indexed.select(
-                "_timestep_nox_row",
-                AOI_ID_COL,
-                pl.col(start_column).alias("_interval_start"),
-                pl.col(end_column).alias("_interval_end"),
+        interpolated = (
+            indexed.select("_timestep_nox_row", AOI_ID_COL, time_column)
+            .with_columns(
+                pl.col(time_column).dt.truncate("1h").alias("_lower_hour"),
             )
             .with_columns(
-                pl.datetime_ranges(
-                    pl.col("_interval_start").dt.truncate("1h"),
-                    (pl.col("_interval_end") - pl.duration(microseconds=1)).dt.truncate("1h"),
-                    interval="1h",
-                    time_zone="UTC",
-                ).alias("_component_hour")
-            )
-            .explode("_component_hour", empty_as_null=True)
-            .with_columns(
-                (
-                    pl.min_horizontal("_interval_end", pl.col("_component_hour") + pl.duration(hours=1))
-                    - pl.max_horizontal("_interval_start", "_component_hour")
-                )
-                .dt.total_seconds()
-                .alias("_overlap_seconds")
+                ((pl.col(time_column) - pl.col("_lower_hour")).dt.total_seconds() / SECONDS_PER_HOUR).alias(
+                    "_upper_weight"
+                ),
+                (pl.col("_lower_hour") + pl.duration(hours=1)).alias("_upper_hour"),
             )
             .join(
-                hourly.select(
-                    AOI_ID_COL,
-                    pl.col("emissions_hour_utc").alias("_component_hour"),
-                    "nox_mass",
-                ),
-                on=[AOI_ID_COL, "_component_hour"],
+                hourly_lookup.rename({"emissions_hour_utc": "_lower_hour", "nox_mass": "_lower_nox"}),
+                on=[AOI_ID_COL, "_lower_hour"],
                 how="left",
             )
-            .group_by("_timestep_nox_row")
-            .agg(
-                pl.col("_overlap_seconds").sum().alias("_total_overlap_seconds"),
-                pl.col("_overlap_seconds")
-                .filter(pl.col("nox_mass").is_finite())
-                .sum()
-                .alias("_valid_overlap_seconds"),
-                (pl.col("nox_mass") * pl.col("_overlap_seconds"))
-                .filter(pl.col("nox_mass").is_finite())
-                .sum()
-                .alias("_weighted_nox_sum"),
+            .join(
+                hourly_lookup.rename({"emissions_hour_utc": "_upper_hour", "nox_mass": "_upper_nox"}),
+                on=[AOI_ID_COL, "_upper_hour"],
+                how="left",
             )
             .with_columns(
-                pl.when(pl.col("_valid_overlap_seconds") == pl.col("_total_overlap_seconds"))
-                .then(pl.col("_weighted_nox_sum") / pl.col("_total_overlap_seconds"))
+                pl.when(pl.col("_upper_weight") == 0)
+                .then(pl.col("_lower_nox"))
+                .otherwise(
+                    pl.col("_lower_nox") + pl.col("_upper_weight") * (pl.col("_upper_nox") - pl.col("_lower_nox"))
+                )
                 .alias(nox_column)
             )
             .select("_timestep_nox_row", nox_column)
         )
-        result = result.join(contributions, on="_timestep_nox_row", how="left")
-    return result.drop("_timestep_nox_row", "_interval_start_t0")
+        result = result.join(interpolated, on="_timestep_nox_row", how="left")
+    return result.drop("_timestep_nox_row")
 
 
 def add_tempo_sequences(
@@ -205,7 +183,7 @@ def add_tempo_sequences(
     timesteps: int = SEQUENCE_TIMESTEPS,
     label_timestep_index: int | None = None,
 ) -> pl.DataFrame:
-    """Match five-raster TEMPO sequences to the label scan's clock hour.
+    """Match consecutive TEMPO sequences to the label scan's clock hour.
 
     Args:
         frame: AOI-hour rows eligible for observation matching.
@@ -214,18 +192,20 @@ def add_tempo_sequences(
         label_timestep_index: Zero-based scan ending the label interval.
 
     Returns:
-        Rows carrying oldest-to-newest scan timestamps, paths, and a preceding
-        timestamp for the first interpolation interval.
+        Rows carrying oldest-to-newest scan timestamps and paths.
     """
     label_index = timesteps - 1 if label_timestep_index is None else label_timestep_index
+    if timesteps < 2:
+        raise ValueError("TEMPO sequences require at least two timesteps")
+    if not 0 < label_index < timesteps:
+        raise ValueError("label_timestep_index must select a timestep after t0")
     time_columns = [f"timestep_time_t{index}" for index in range(timesteps)]
     path_columns = [f"no2_paths_t{index}" for index in range(timesteps)]
     sequences = (
         observations.lazy()
         .sort(AOI_ID_COL, "tempo_time")
         .with_columns(
-            [pl.col("tempo_time").shift(timesteps).over(AOI_ID_COL).alias("_interval_start_t0")]
-            + [
+            [
                 pl.col("tempo_time").shift(timesteps - index - 1).over(AOI_ID_COL).alias(time_columns[index])
                 for index in range(timesteps)
             ]
@@ -236,14 +216,12 @@ def add_tempo_sequences(
         )
     )
     interval_columns = []
-    for index in range(timesteps):
+    for index in range(1, timesteps):
         interval_column = f"_interval_minutes_{index}"
         interval_columns.append(interval_column)
-        start_column = "_interval_start_t0" if index == 0 else time_columns[index - 1]
         sequences = sequences.with_columns(
             (
-                (pl.col(time_columns[index]) - pl.col(start_column)).dt.total_seconds()
-                / SECONDS_PER_MINUTE
+                (pl.col(time_columns[index]) - pl.col(time_columns[index - 1])).dt.total_seconds() / SECONDS_PER_MINUTE
             ).alias(interval_column)
         )
     sequences = (
@@ -258,13 +236,12 @@ def add_tempo_sequences(
         .with_columns(
             pl.col(time_columns[label_index]).dt.date().alias("date"),
             pl.col(time_columns[label_index]).dt.hour().alias("hour"),
-            pl.col(interval_columns[label_index]).alias("label_delta_mins"),
+            pl.col(f"_interval_minutes_{label_index}").alias("label_delta_mins"),
         )
         .select(
             AOI_ID_COL,
             "date",
             "hour",
-            "_interval_start_t0",
             *time_columns,
             *path_columns,
             "label_delta_mins",
@@ -305,21 +282,16 @@ def add_ema_targets(
 
     age_columns = [
         (
-            (
-                pl.col(f"timestep_time_t{label_index}")
-                - pl.col(f"timestep_time_t{index}")
-            ).dt.total_seconds()
+            (pl.col(f"timestep_time_t{label_index}") - pl.col(f"timestep_time_t{index}")).dt.total_seconds()
             / SECONDS_PER_HOUR
         ).alias(f"timestep_age_hours_t{index}")
-        for index in range(SEQUENCE_TIMESTEPS)
+        for index in range(first_index, label_index + 1)
     ]
     return frame.with_columns(
         *age_columns,
         previous_ema.alias("effective_previous_nox"),
         ema.alias("effective_current_nox"),
-    ).with_columns(
-        (pl.col("effective_current_nox") - pl.col("effective_previous_nox")).alias("effective_delta_nox")
-    )
+    ).with_columns((pl.col("effective_current_nox") - pl.col("effective_previous_nox")).alias("effective_delta_nox"))
 
 
 def add_projected_coordinates(frame: pl.DataFrame) -> pl.DataFrame:
@@ -457,30 +429,7 @@ def calculate_activity_conditioned_aoi_features(
         .agg(pl.col("_coal_nox_mass").mean().alias("avg_coal_nox"))
         .join(selected_record_averages, on=AOI_ID_COL, how="inner")
     )
-    return (
-        unit_counts.join(activity_features, on=AOI_ID_COL, how="inner")
-        .filter(pl.col("avg_coal_nox").is_finite())
-        .collect(engine="streaming")
-    )
-
-
-def select_top_coal_aois(aoi_features: pl.DataFrame, fraction: float) -> pl.DataFrame:
-    """Select the highest coal-NOx-ranked share of coal-containing AOIs.
-
-    Args:
-        aoi_features: Static AOI features carrying coal-unit counts and coal NOx.
-        fraction: Selected share in the interval ``(0, 1]``.
-
-    Returns:
-        Deterministically ranked and selected AOI feature rows.
-    """
-    ranked = aoi_features.filter(pl.col("num_coal_units") > 0).sort(
-        "avg_coal_nox",
-        AOI_ID_COL,
-        descending=[True, False],
-    )
-    selected_count = math.ceil(ranked.height * fraction)
-    return ranked.with_row_index("coal_nox_rank", offset=1).head(selected_count)
+    return unit_counts.join(activity_features, on=AOI_ID_COL, how="inner").collect(engine="streaming")
 
 
 def filter_usable_nox_measurements(

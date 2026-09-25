@@ -452,7 +452,7 @@ def apply_cell_mask(
 
 
 def write_raster_npz(raster: RegriddedRaster, destination: str | Path) -> None:
-    """Atomically save the five modeling rasters as compressed float32 arrays.
+    """Atomically save the modeling rasters as compressed float32 arrays.
 
     Args:
         raster: Regridded AOI scan with its internal diagnostics.

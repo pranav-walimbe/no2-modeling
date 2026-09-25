@@ -51,8 +51,9 @@ IMG_RANGE = 72  # spatial extent of extracted image patch (km)
 TARGET_LABEL_MODE = "overlap_weighted"  # interpolate CAMPD hours over each TEMPO interval
 MIN_CITY_POPULATION = 500000  # metro population a populated place needs to count as a major city
 STRAT_BASE_DIR = "/global/scratch/projects/fc_nitrates/ddp/nox/nox_powerplant_data"  # stratified split output directory
-STRATIFICATION_EMA_CHANGE_THRESHOLD = 100.0  # raw EMA NOx-change boundary used to balance metadata splits
-STRATIFICATION_AOI_FRACTION = 0.50  # highest coal-NOx-ranked share of coal-containing AOIs
+STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR = 100.0  # minimum EMA-innovation magnitude for a change label
+STRATIFICATION_INNOVATION_RELATIVE_FLOOR = 0.25  # minimum change as a share of typical positive AOI NOx
+STRATIFICATION_AOI_FRACTION = 0.50  # highest plume-quality-scored share of mapped AOIs
 TRAIN_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "train_records.csv")  # train split metadata
 VAL_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "val_records.csv")  # validation split metadata
 TEST_RECORDS_CSV = os.path.join(STRAT_BASE_DIR, "test_records.csv")  # test split metadata
@@ -108,7 +109,7 @@ PRETRAINED_ENCODER_WEIGHTS = os.getenv(  # masked-model checkpoint for delta tra
     "PRETRAINED_ENCODER_WEIGHTS",
     "/global/home/users/pranavwalimbe/masked_model_runs/masked_no2_20260920_211751/checkpoints/best_masked_no2.pt",
 )
-SEQUENCE_TIMESTEPS = 5  # four label rasters followed by one post-label raster
+SEQUENCE_TIMESTEPS = 4  # four causal rasters ending at the label timestamp
 LABEL_TIMESTEP_INDEX = 3  # zero-based final raster timestep consumed by the label EMA
 EMA_HISTORY_TIMESTEPS = 4  # interpolated timestep values consumed by the label EMA
 EMA_DECAY_TIMESCALE_HOURS = 2.0  # exponential e-folding time kept separate from the sequence length

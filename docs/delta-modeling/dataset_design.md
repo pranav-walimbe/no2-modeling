@@ -1,6 +1,6 @@
 # Dataset design
 
-Each record joins five TEMPO scans, hourly HRRR fields, plant metadata, and one
+Each record joins four TEMPO scans, hourly HRRR fields, plant metadata, and one
 three-class emissions-change label for a 72 km area of interest (AOI).
 
 ## Contract
@@ -19,24 +19,28 @@ three-class emissions-change label for a 72 km area of interest (AOI).
 
 The pipeline applies these steps in order:
 
-1. Average unit operating time within each AOI-hour and calculate its median
-   for each AOI. Retain AOI-hours at or above that median, then average their
-   hourly coal-unit NOx sums. Remove AOIs without coal units and retain the
-   highest-ranked half. Stratification also saves a line plot of average coal
-   NOx against the percentile of all scored coal-containing AOIs.
+1. Build the complete facility-centered AOI set and join it to the persistent
+   `AOI_SCORE_JSON` mapping. Rank mapped AOIs by plume-quality score with AOI ID
+   as the deterministic tie-breaker, then retain the highest-scoring half. No
+   fuel-type or plant-characteristic filter is applied. Unmapped AOIs are not
+   eligible for selection, and score IDs outside the current facility-centered
+   AOI set cause stratification to fail instead of being silently ignored.
+   Stratification saves a complete AOI selection audit, plus a line plot of the
+   mapped score distribution and retained percentile range.
 2. Aggregate usable CAMPD measurements for the selected AOIs by UTC hour. Add
    unit counts, major-city distance, and full-history heat-input and generation
    averages calculated over the same higher-activity AOI-hours.
-3. Match five consecutive TEMPO scans whose adjacent timestamps are 40 to 70
-   minutes apart. Retain one preceding scan timestamp to define the interval
-   ending at `t0`. Store raster scans as `t0_timestamp` through `t4_timestamp`.
-4. For each raster timestep, weight the CAMPD hourly NOx rates by their exact
-   overlap with the interval since the preceding TEMPO scan. Store these five
-   interpolated rates as `t0_nox` through `t4_nox`.
+3. Match four consecutive TEMPO scans whose adjacent timestamps are 40 to 70
+   minutes apart. Store raster scans as `t0_timestamp` through `t3_timestamp`.
+4. At each raster timestamp, linearly interpolate the CAMPD NOx rate between
+   the surrounding UTC-hour values. Store these four interpolated rates as
+   `t0_nox` through `t3_nox`.
 5. Apply a continuous-time EMA to `t0_nox` through `t3_nox`. Each update uses
    the actual time between scans, so a 70-minute interval admits more of the
-   new value than a 40-minute interval. Keep `t4_nox` as post-label context.
-6. Assign classes from the raw effective NOx change.
+   new value than a 40-minute interval.
+6. Undo the final EMA update attenuation to recover the innovation relative to
+   the preceding EMA. Assign classes using the larger of a 100 lb/hr absolute
+   floor or 25% of the AOI's median positive interpolated timestep NOx.
 7. Assign each overlap cluster to one split with a deterministic procedure that
    targets the 70/15/15 ratio for each class.
 8. Downsample each class to the smallest class count within its split.
@@ -53,22 +57,31 @@ The audit target is:
 effective_delta_nox = EMA(t3) - EMA(t2)
 ```
 
-The EMA starts from the overlap-interpolated `t0_nox` value and updates through
+The EMA starts from the point-interpolated `t0_nox` value and updates through
 `t3_nox`. Each update retains `exp(-elapsed_hours / 2)` of the preceding EMA.
 
-The class uses `effective_delta_nox` with boundaries at -100 and +100. Values
-on a boundary belong to `steady`. The pipeline writes the class to
-`delta_category`, which the classifier consumes without recreating it from a
-continuous value.
+For the final update, define:
+
+```text
+alpha = 1 - exp(-(t3 - t2) / 2 hours)
+ema_innovation_nox = effective_delta_nox / alpha
+aoi_active_median_nox = median(positive t0_nox ... t3_nox values for the AOI)
+hybrid_innovation_threshold = max(100, 0.25 * aoi_active_median_nox)
+```
+
+Innovations at or below the negative threshold are decreases. Innovations at
+or above the positive threshold are increases, and values between them are
+steady. The pipeline writes the derived scale, update weight, innovation,
+threshold, and class to the split metadata. The classifier consumes
+`delta_category` without recreating it from a continuous value.
 
 Metadata records this target construction as
-`label_mode=overlap_interpolated_timestep_ema`. The label ends at `t3`, but the
-raster classifier receives the full `t0` through `t4` sequence. Its prediction
-therefore uses one post-label observation.
+`label_mode=linear_interpolated_timestep_ema`. The label and the causal raster
+sequence both end at `t3`; no post-label observation is included.
 
 ## Stored inputs
 
-Each raster bundle stores five arrays with shape `5 x 24 x 24`:
+Each raster bundle stores five arrays with shape `4 x 24 x 24`:
 
 | Array | Contents |
 |---|---|
@@ -78,10 +91,11 @@ Each raster bundle stores five arrays with shape `5 x 24 x 24`:
 | `wind_u_80m_mps` | Geographic eastward HRRR wind |
 | `wind_v_80m_mps` | Geographic northward HRRR wind |
 
-Stratification metadata stores coal, natural-gas, and total unit counts. It also
-stores major-city distance and activity-conditioned averages for heat input,
-generation, and coal NOx. It does not store nameplate capacity or normalized
-NOx-change targets.
+Stratification metadata stores the AOI plume-quality score and percentile,
+coal, natural-gas, and total unit counts. It also stores major-city distance
+and activity-conditioned averages for heat input, generation, and coal NOx.
+The AOI score is selection metadata and does not enter the model. The metadata
+does not store nameplate capacity or normalized NOx-change targets.
 
 ## Raster checks and publication
 

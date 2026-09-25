@@ -21,8 +21,9 @@ recipient="pranav.walimbe@berkeley.edu"
 mail_host="${SLURM_SUBMIT_HOST:-ln002.brc}"
 mail_log="/var/log/maillog"
 diagnostic="/global/home/users/pranavwalimbe/vis/stratification-ema-balance-${SLURM_JOB_ID}.png"
-aoi_scores="/global/home/users/pranavwalimbe/vis/stratification-aoi-score-percentiles-${SLURM_JOB_ID}.png"
-timestep_deltas="/global/home/users/pranavwalimbe/vis/stratification-timestep-nox-deltas-${SLURM_JOB_ID}.png"
+aoi_characteristics_plot="/global/home/users/pranavwalimbe/vis/stratification-aoi-characteristics-${SLURM_JOB_ID}.png"
+aoi_characteristics_table="/global/home/users/pranavwalimbe/vis/stratification-aoi-characteristics-${SLURM_JOB_ID}.csv"
+aoi_selection_table="/global/home/users/pranavwalimbe/vis/stratification-aoi-selection-${SLURM_JOB_ID}.csv"
 
 cd "${repo_dir}"
 module load python/3.11.6-gcc-11.4.0
@@ -34,23 +35,27 @@ export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK}"
 
 srun python -u -m preprocessing.stratify_plants \
     --diagnostic-output "${diagnostic}" \
-    --aoi-score-output "${aoi_scores}" \
-    --timestep-delta-output "${timestep_deltas}" \
+    --aoi-characteristics-plot "${aoi_characteristics_plot}" \
+    --aoi-characteristics-output "${aoi_characteristics_table}" \
+    --aoi-selection-output "${aoi_selection_table}" \
     "$@"
 
 if [[ ! -s "${diagnostic}" ]]; then
     echo "Expected stratification diagnostic was not created: ${diagnostic}" >&2
     exit 1
 fi
-if [[ ! -s "${aoi_scores}" ]]; then
-    echo "Expected AOI score visualization was not created: ${aoi_scores}" >&2
+if [[ ! -s "${aoi_characteristics_plot}" ]]; then
+    echo "Expected AOI characteristics dashboard was not created: ${aoi_characteristics_plot}" >&2
     exit 1
 fi
-if [[ ! -s "${timestep_deltas}" ]]; then
-    echo "Expected timestep NOx-delta visualization was not created: ${timestep_deltas}" >&2
+if [[ ! -s "${aoi_characteristics_table}" ]]; then
+    echo "Expected AOI characteristics table was not created: ${aoi_characteristics_table}" >&2
     exit 1
 fi
-
+if [[ ! -s "${aoi_selection_table}" ]]; then
+    echo "Expected AOI selection audit was not created: ${aoi_selection_table}" >&2
+    exit 1
+fi
 train_records=$(($(wc -l < "${strat_dir}/train_records.csv") - 1))
 val_records=$(($(wc -l < "${strat_dir}/val_records.csv") - 1))
 test_records=$(($(wc -l < "${strat_dir}/test_records.csv") - 1))
@@ -58,11 +63,11 @@ total_records=$((train_records + val_records + test_records))
 
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" stat -c %s "${mail_log}")
 printf '%s\n' \
-    'Overlap-interpolated EMA stratification completed successfully.' \
-    'Selected the highest coal-NOx-ranked half of coal-containing AOIs.' \
-    'Raw EMA-change threshold: +/-100' \
-    'Five rasters retained; the irregular-time EMA uses t0 through t3; t4 is post-label.' \
-    'Each timestep NOx value is weighted by CAMPD-hour overlap over its preceding TEMPO interval.' \
+    'Point-interpolated EMA stratification completed successfully.' \
+    'Selected the highest plume-quality-scored half of mapped AOIs.' \
+    'EMA innovation threshold: max(100 lb/hr, 25% of median positive AOI timestep NOx).' \
+    'Four causal rasters retained; the irregular-time EMA uses t0 through t3.' \
+    'Each timestep NOx value is linearly interpolated between its surrounding CAMPD hours.' \
     'Filtered AOI clusters were assigned by class to approximately 70/15/15 splits.' \
     'Every split is independently balanced across decrease, steady, and increase.' \
     "Train: ${train_records} records" \
@@ -70,10 +75,11 @@ printf '%s\n' \
     "Test: ${test_records} records" \
     "Total: ${total_records} records" \
     "Diagnostic: ${diagnostic}" \
-    "AOI scores: ${aoi_scores}" \
-    "Timestep NOx deltas: ${timestep_deltas}" \
+    "AOI characteristics: ${aoi_characteristics_plot}" \
+    "AOI characteristics table: ${aoi_characteristics_table}" \
+    "AOI selection audit: ${aoi_selection_table}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
-        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${diagnostic}' -a '${aoi_scores}' -a '${timestep_deltas}' '${recipient}'"
+        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${diagnostic}' -a '${aoi_characteristics_plot}' -a '${aoi_characteristics_table}' -a '${aoi_selection_table}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do
