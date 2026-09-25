@@ -23,6 +23,7 @@ mail_log="/var/log/maillog"
 diagnostic="/global/home/users/pranavwalimbe/vis/stratification-ema-balance-${SLURM_JOB_ID}.png"
 aoi_characteristics_plot="/global/home/users/pranavwalimbe/vis/stratification-aoi-characteristics-${SLURM_JOB_ID}.png"
 aoi_characteristics_table="/global/home/users/pranavwalimbe/vis/stratification-aoi-characteristics-${SLURM_JOB_ID}.csv"
+aoi_selection_table="/global/home/users/pranavwalimbe/vis/stratification-aoi-selection-${SLURM_JOB_ID}.csv"
 
 cd "${repo_dir}"
 module load python/3.11.6-gcc-11.4.0
@@ -36,6 +37,7 @@ srun python -u -m preprocessing.stratify_plants \
     --diagnostic-output "${diagnostic}" \
     --aoi-characteristics-plot "${aoi_characteristics_plot}" \
     --aoi-characteristics-output "${aoi_characteristics_table}" \
+    --aoi-selection-output "${aoi_selection_table}" \
     "$@"
 
 if [[ ! -s "${diagnostic}" ]]; then
@@ -48,6 +50,10 @@ if [[ ! -s "${aoi_characteristics_plot}" ]]; then
 fi
 if [[ ! -s "${aoi_characteristics_table}" ]]; then
     echo "Expected AOI characteristics table was not created: ${aoi_characteristics_table}" >&2
+    exit 1
+fi
+if [[ ! -s "${aoi_selection_table}" ]]; then
+    echo "Expected AOI selection audit was not created: ${aoi_selection_table}" >&2
     exit 1
 fi
 train_records=$(($(wc -l < "${strat_dir}/train_records.csv") - 1))
@@ -71,8 +77,9 @@ printf '%s\n' \
     "Diagnostic: ${diagnostic}" \
     "AOI characteristics: ${aoi_characteristics_plot}" \
     "AOI characteristics table: ${aoi_characteristics_table}" \
+    "AOI selection audit: ${aoi_selection_table}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
-        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${diagnostic}' -a '${aoi_characteristics_plot}' -a '${aoi_characteristics_table}' '${recipient}'"
+        "mailx -s 'NO2 stratification diagnostics (${SLURM_JOB_ID})' -a '${diagnostic}' -a '${aoi_characteristics_plot}' -a '${aoi_characteristics_table}' -a '${aoi_selection_table}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do

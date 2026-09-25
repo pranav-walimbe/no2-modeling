@@ -126,6 +126,7 @@ REQUIRED_COLUMNS = [
 DEFAULT_DIAGNOSTIC_OUTPUT = Path(VIS_DIR) / "stratification_ema_balance.png"
 DEFAULT_AOI_CHARACTERISTICS_PLOT = Path(VIS_DIR) / "stratification_aoi_characteristics.png"
 DEFAULT_AOI_CHARACTERISTICS_OUTPUT = Path(VIS_DIR) / "stratification_aoi_characteristics.csv"
+DEFAULT_AOI_SELECTION_OUTPUT = Path(VIS_DIR) / "stratification_aoi_selection.csv"
 HISTOGRAM_QUANTILES = (0.01, 0.99)
 AOI_CHARACTERISTIC_PANELS = (
     ("active_median_total_nox", "Active median total NOx", "log10(1 + lb/hr)", True),
@@ -151,6 +152,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_AOI_CHARACTERISTICS_OUTPUT,
     )
+    parser.add_argument("--aoi-selection-output", type=Path, default=DEFAULT_AOI_SELECTION_OUTPUT)
     parser.add_argument("--aoi-score-json", type=Path, default=Path(AOI_SCORE_JSON))
     return parser.parse_args()
 
@@ -446,7 +448,14 @@ def _load_aoi_scores(path: Path) -> pl.DataFrame:
 
 
 def _rank_aoi_scores(all_aois: pl.DataFrame, scores: pl.DataFrame) -> pl.DataFrame:
-    # Rank only mapped members of the absolute facility-centered AOI set
+    # Reject stale mappings, then rank mapped members of the facility-centered AOI set
+    unknown = scores.join(all_aois.select(AOI_ID_COL), on=AOI_ID_COL, how="anti")
+    if not unknown.is_empty():
+        unknown_ids = unknown[AOI_ID_COL].sort().head(10).to_list()
+        raise ValueError(
+            f"AOI score mapping contains {unknown.height} IDs outside the facility-centered AOI set; "
+            f"first IDs: {unknown_ids}"
+        )
     ranked = all_aois.select(AOI_ID_COL).join(scores, on=AOI_ID_COL, how="inner").sort(AOI_SCORE_COL, AOI_ID_COL)
     if ranked.is_empty():
         raise ValueError("AOI score mapping does not overlap the facility-centered AOI set")
@@ -666,6 +675,7 @@ def build_stratification_candidates(
     aoi_score_path: Path = Path(AOI_SCORE_JSON),
     aoi_characteristics_plot: Path = DEFAULT_AOI_CHARACTERISTICS_PLOT,
     aoi_characteristics_output: Path = DEFAULT_AOI_CHARACTERISTICS_OUTPUT,
+    aoi_selection_output: Path = DEFAULT_AOI_SELECTION_OUTPUT,
 ) -> pl.DataFrame:
     """Build eligible AOI-hour records for score-selected AOIs.
 
@@ -673,6 +683,7 @@ def build_stratification_candidates(
         aoi_score_path: Persistent JSON mapping from AOI identifier to score.
         aoi_characteristics_plot: Destination for the AOI characteristics dashboard.
         aoi_characteristics_output: Destination for the underlying AOI table.
+        aoi_selection_output: Destination for the complete AOI score-selection audit.
 
     Returns:
         Eligible records before geographic splitting.
@@ -688,6 +699,22 @@ def build_stratification_candidates(
     ranked_scores = _rank_aoi_scores(all_aois, _load_aoi_scores(aoi_score_path))
     selected_scores = select_top_scored_aois(ranked_scores, STRATIFICATION_AOI_FRACTION)
     selected_ids = selected_scores.select(AOI_ID_COL)
+    selection_audit = (
+        all_aois.select(AOI_ID_COL)
+        .join(
+            ranked_scores.select(AOI_ID_COL, AOI_SCORE_COL, AOI_SCORE_PERCENTILE_COL),
+            on=AOI_ID_COL,
+            how="left",
+        )
+        .join(selected_ids.with_columns(pl.lit(True).alias("selected_for_stratification")), on=AOI_ID_COL, how="left")
+        .with_columns(
+            pl.col(AOI_SCORE_COL).is_not_null().alias("has_aoi_score"),
+            pl.col("selected_for_stratification").fill_null(False),
+        )
+        .sort(AOI_ID_COL)
+    )
+    aoi_selection_output.parent.mkdir(parents=True, exist_ok=True)
+    selection_audit.write_csv(aoi_selection_output)
     aois = all_aois.join(selected_ids, on=AOI_ID_COL, how="inner")
     membership = all_membership.join(selected_ids, on=AOI_ID_COL, how="inner")
     unselected_ids = ranked_scores.join(selected_ids, on=AOI_ID_COL, how="anti").select(AOI_ID_COL)
@@ -716,8 +743,10 @@ def build_stratification_candidates(
     observations = load_tempo_mapping()
     print(
         f"Selected {aois.height:,}/{ranked_scores.height:,} scored AOIs "
-        f"from {all_aois.height:,} total AOIs by plume-quality score"
+        f"from {all_aois.height:,} total AOIs by plume-quality score; "
+        f"{all_aois.height - ranked_scores.height:,} AOIs are unmapped"
     )
+    print(f"Saved complete AOI selection audit to {aoi_selection_output}")
     invalid_aoi_hours = (
         raw_records.filter(~usable_nox_measurement_expr() | ~pl.col("noxMass").is_finite())
         .join(membership.lazy(), on="facilityId", how="inner")
@@ -764,6 +793,7 @@ def main() -> None:
         args.aoi_score_json,
         args.aoi_characteristics_plot,
         args.aoi_characteristics_output,
+        args.aoi_selection_output,
     )
     frame = filter_stratification_rule(candidates)
     print(

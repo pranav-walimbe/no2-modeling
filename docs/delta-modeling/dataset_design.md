@@ -22,8 +22,11 @@ The pipeline applies these steps in order:
 1. Build the complete facility-centered AOI set and join it to the persistent
    `AOI_SCORE_JSON` mapping. Rank mapped AOIs by plume-quality score with AOI ID
    as the deterministic tie-breaker, then retain the highest-scoring half. No
-   fuel-type or plant-characteristic filter is applied. Stratification saves a
-   line plot of the mapped score distribution and retained percentile range.
+   fuel-type or plant-characteristic filter is applied. Unmapped AOIs are not
+   eligible for selection, and score IDs outside the current facility-centered
+   AOI set cause stratification to fail instead of being silently ignored.
+   Stratification saves a complete AOI selection audit, plus a line plot of the
+   mapped score distribution and retained percentile range.
 2. Aggregate usable CAMPD measurements for the selected AOIs by UTC hour. Add
    unit counts, major-city distance, and full-history heat-input and generation
    averages calculated over the same higher-activity AOI-hours.
