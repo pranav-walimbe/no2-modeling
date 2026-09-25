@@ -5,8 +5,10 @@ import os
 import resource
 import shutil
 import subprocess
+import tempfile
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import polars as pl
@@ -16,6 +18,7 @@ from preprocessing.generate_dataset_utils import (
     PROCESSING_FAILURE_SCHEMA,
     RASTER_BUNDLE_PATH_COL,
     SOURCE_RECORD_INDEX_COL,
+    BackgroundFileWriter,
     DatasetShardStore,
     RecordTask,
     ScanTask,
@@ -23,7 +26,6 @@ from preprocessing.generate_dataset_utils import (
     WeatherTask,
     bounded_parallel_map,
     build_shard_plan,
-    cache_inventory,
     coverage_selection_summary,
     make_scan_task,
     make_weather_task,
@@ -32,6 +34,7 @@ from preprocessing.generate_dataset_utils import (
     process_weather_batch,
     scan_batches,
     select_hotspot_cell,
+    stage_files,
     weather_batches,
     write_csv_atomic,
     write_json_atomic,
@@ -86,6 +89,7 @@ TRAINING_JOB_NAME = "train-no2"
 RUN_STARTED_ENV = "DATASET_RUN_STARTED_AT"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DATASET_BATCH_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "generate_dataset.sh"
+SHARD_INPUT_DIRECTORY = Path(DATASET_DIR) / "shard-inputs"
 
 
 @dataclass(frozen=True)
@@ -101,6 +105,16 @@ class PreparedRecord:
     raster_bundle_path: str
 
 
+@dataclass(frozen=True)
+class StagedBatch:
+    """Batch tasks and cache hits resolved to node-local paths."""
+
+    scan_misses: dict[str, ScanTask]
+    weather_misses: dict[str, WeatherTask]
+    tempo_cache_paths: dict[str, str]
+    weather_cache_paths: dict[str, str]
+
+
 def _positive_int(value: str) -> int:
     # Parse a strictly positive command-line integer
     parsed = int(value)
@@ -114,10 +128,7 @@ def _scan_split(path: str) -> pl.LazyFrame:
     frame = pl.scan_csv(path, try_parse_dates=True, schema_overrides=SOURCE_METADATA_SCHEMA)
     missing_columns = sorted(REQUIRED_SOURCE_COLUMNS.difference(frame.collect_schema().names()))
     if missing_columns:
-        raise ValueError(
-            f"Stratified split {path} is missing dataset-generation columns: "
-            f"{', '.join(missing_columns)}"
-        )
+        raise ValueError(f"Stratified split {path} is missing dataset-generation columns: {', '.join(missing_columns)}")
     return frame
 
 
@@ -148,23 +159,52 @@ def _load_splits(split_paths: dict[str, str]) -> dict[str, pl.DataFrame]:
     # Load inputs before starting expensive worker processes
     splits: dict[str, pl.DataFrame] = {}
     for split, path in split_paths.items():
-        splits[split] = (
-            _scan_split(path).with_row_index(SOURCE_RECORD_INDEX_COL).collect(engine="streaming")
-        )
+        splits[split] = _scan_split(path).with_row_index(SOURCE_RECORD_INDEX_COL).collect(engine="streaming")
     return splits
 
 
 def _load_shard(task: ShardTask) -> dict[str, pl.DataFrame]:
-    # Materialize only the source range assigned to this worker
-    frame = (
-        _scan_split(SPLIT_PATHS[task.split])
-        .with_row_index(SOURCE_RECORD_INDEX_COL)
-        .slice(task.start, task.size)
-        .collect(engine="streaming")
-    )
+    # Load the locality-ordered manifest prepared by the launcher
+    frame = pl.read_parquet(_shard_input_path(task))
     if frame.height != task.size:
         raise ValueError(f"Shard {task.task_id} expected {task.size:,} source records but loaded {frame.height:,}")
     return {task.split: frame}
+
+
+def _locality_order(frame: pl.DataFrame) -> pl.DataFrame:
+    # Group nearby AOIs within each target hour while preserving source identity
+    return (
+        frame.with_columns(
+            pl.col("lat").floor().alias("_latitude_tile"),
+            pl.col("lon").floor().alias("_longitude_tile"),
+        )
+        .sort(
+            "emissions_hour_utc",
+            "_latitude_tile",
+            "_longitude_tile",
+            "aoi_id",
+            SOURCE_RECORD_INDEX_COL,
+        )
+        .drop("_latitude_tile", "_longitude_tile")
+    )
+
+
+def _shard_input_path(task: ShardTask) -> Path:
+    # Keep ordered source rows separate from generated shard outputs
+    return SHARD_INPUT_DIRECTORY / task.split / f"{task.shard_index:06d}.parquet"
+
+
+def _write_shard_inputs(split_paths: dict[str, str], tasks: list[ShardTask]) -> None:
+    # Sort each split once and persist the exact rows assigned to each worker
+    tasks_by_split: dict[str, list[ShardTask]] = {split: [] for split in split_paths}
+    for task in tasks:
+        tasks_by_split[task.split].append(task)
+    for split, path in split_paths.items():
+        frame = _locality_order(_scan_split(path).with_row_index(SOURCE_RECORD_INDEX_COL).collect(engine="streaming"))
+        split_dir = SHARD_INPUT_DIRECTORY / split
+        split_dir.mkdir(parents=True, exist_ok=True)
+        for task in tasks_by_split[split]:
+            frame.slice(task.start, task.size).write_parquet(_shard_input_path(task))
 
 
 def _prepare_records(
@@ -229,14 +269,59 @@ def _prepare_records(
 
 
 def _cached_task_paths(tasks: dict[str, ScanTask] | dict[str, WeatherTask]) -> dict[str, str]:
-    # Scan each cache directory once instead of issuing one metadata lookup per task
-    directories = {Path(task.cache_path).parent for task in tasks.values()}
-    inventories = {directory: cache_inventory(directory) for directory in directories}
-    return {
-        key: task.cache_path
-        for key, task in tasks.items()
-        if Path(task.cache_path).name in inventories[Path(task.cache_path).parent]
+    # Check only cache entries referenced by the current batch
+    return {key: task.cache_path for key, task in tasks.items() if Path(task.cache_path).is_file()}
+
+
+def _localize_batch(
+    scans: dict[str, ScanTask],
+    weather: dict[str, WeatherTask],
+    batch_dir: Path,
+) -> StagedBatch:
+    # Resolve hits directly and stage every input needed by the remaining tasks
+    tempo_hits = _cached_task_paths(scans)
+    weather_hits = _cached_task_paths(weather)
+    missing_scans = {key: task for key, task in scans.items() if key not in tempo_hits}
+    missing_weather = {key: task for key, task in weather.items() if key not in weather_hits}
+    source_paths = {path for task in missing_scans.values() for path in task.granule_paths} | {
+        path for task in missing_weather.values() for path in (task.wind_hrrr_path, task.temperature_hrrr_path)
     }
+    staged_sources = stage_files(source_paths, batch_dir / "sources")
+    staged_tempo_hits = stage_files(set(tempo_hits.values()), batch_dir / "tempo-cache")
+    staged_weather_hits = stage_files(set(weather_hits.values()), batch_dir / "weather-cache")
+    local_scans = {
+        key: replace(
+            task,
+            granule_paths=tuple(staged_sources[path] for path in task.granule_paths),
+            cache_path=str(batch_dir / "generated-tempo-cache" / Path(task.cache_path).name),
+        )
+        for key, task in missing_scans.items()
+    }
+    local_weather = {
+        key: replace(
+            task,
+            wind_hrrr_path=staged_sources[task.wind_hrrr_path],
+            temperature_hrrr_path=staged_sources[task.temperature_hrrr_path],
+            cache_path=str(batch_dir / "generated-weather-cache" / Path(task.cache_path).name),
+        )
+        for key, task in missing_weather.items()
+    }
+    return StagedBatch(
+        scan_misses=local_scans,
+        weather_misses=local_weather,
+        tempo_cache_paths={key: staged_tempo_hits[path] for key, path in tempo_hits.items()},
+        weather_cache_paths={key: staged_weather_hits[path] for key, path in weather_hits.items()},
+    )
+
+
+def _publish_generated_caches(
+    local_paths: dict[str, str],
+    persistent_tasks: dict[str, ScanTask] | dict[str, WeatherTask],
+    writer: BackgroundFileWriter,
+) -> None:
+    # Publish successful cache misses through the batch writer
+    for key, local_path in local_paths.items():
+        writer.publish(local_path, persistent_tasks[key].cache_path)
 
 
 def _run_tempo_regridding(
@@ -300,6 +385,7 @@ def _record_tasks(
     weather_cache_paths: dict[str, str],
     weather_failures: dict[str, str],
     failures: dict[str, list[dict[str, object]]],
+    output_dir: Path | None = None,
 ) -> tuple[list[RecordTask], dict[tuple[str, int], PreparedRecord]]:
     # Exclude records when any timestep cache is unavailable
     tasks: list[RecordTask] = []
@@ -317,6 +403,9 @@ def _record_tasks(
             continue
         record_id = (record.split, record.record_index)
         records_by_id[record_id] = record
+        output_path = record.raster_bundle_path
+        if output_dir is not None:
+            output_path = str(output_dir / record.split / f"{record.record_index:06d}.npz")
         tasks.append(
             RecordTask(
                 split=record.split,
@@ -325,7 +414,7 @@ def _record_tasks(
                 weather_cache_paths=tuple(weather_cache_paths[key] for key in record.weather_cache_keys),
                 hotspot_row=record.hotspot_row,
                 hotspot_column=record.hotspot_column,
-                output_path=record.raster_bundle_path,
+                output_path=output_path,
             )
         )
     return tasks, records_by_id
@@ -336,9 +425,11 @@ def _run_record_processing(
     records_by_id: dict[tuple[str, int], PreparedRecord],
     failures: dict[str, list[dict[str, object]]],
     workers: int,
+    on_success: Callable[[RecordTask, PreparedRecord], None] | None = None,
 ) -> dict[str, list[dict[str, object]]]:
     # Build temporal raster bundles and scalar diagnostics in parallel
     output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in failures}
+    tasks_by_id = {(task.split, task.record_index): task for task in tasks}
     total = len(tasks)
     for completed, result in enumerate(bounded_parallel_map(process_record, tasks, workers), start=1):
         record_id = (result.split, result.record_index)
@@ -346,6 +437,8 @@ def _run_record_processing(
             failures[result.split].append({"record_index": result.record_index, "error": result.error})
         else:
             record = records_by_id[record_id]
+            if on_success is not None:
+                on_success(tasks_by_id[record_id], record)
             output_row: dict[str, object] = {
                 SOURCE_RECORD_INDEX_COL: result.record_index,
                 CANDIDATE_RASTER_PATH_COL: record.raster_bundle_path,
@@ -355,6 +448,57 @@ def _run_record_processing(
         if completed % PROGRESS_INTERVAL == 0 or completed == total:
             print(f"Processed {completed:,}/{total:,} temporal records")
     return output_rows
+
+
+def _process_shard_batch(
+    task: ShardTask,
+    frame: pl.DataFrame,
+    shard_dir: Path,
+    tempo_cache_dir: Path,
+    weather_cache_dir: Path,
+    workers: int,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    # Stage and publish one locality batch before releasing its local files
+    splits = {task.split: frame}
+    records, scans, weather, failures = _prepare_records(
+        splits,
+        tempo_cache_dir,
+        weather_cache_dir,
+        shard_dir,
+    )
+    with tempfile.TemporaryDirectory(prefix=f"delta-dataset-{task.task_id}-", dir="/tmp") as temporary:
+        batch_dir = Path(temporary)
+        local = _localize_batch(scans, weather, batch_dir)
+        with BackgroundFileWriter() as writer:
+            generated_tempo, tempo_failures = _run_tempo_regridding(local.scan_misses, workers, True)
+            _publish_generated_caches(generated_tempo, scans, writer)
+            tempo_paths = {**local.tempo_cache_paths, **generated_tempo}
+
+            generated_weather, weather_failures = _run_weather_alignment(local.weather_misses, workers, True)
+            _publish_generated_caches(generated_weather, weather, writer)
+            weather_paths = {**local.weather_cache_paths, **generated_weather}
+
+            record_tasks, records_by_id = _record_tasks(
+                records,
+                tempo_paths,
+                tempo_failures,
+                weather_paths,
+                weather_failures,
+                failures,
+                batch_dir / "record-rasters",
+            )
+
+            def publish_record(local_task: RecordTask, record: PreparedRecord) -> None:
+                writer.publish(local_task.output_path, record.raster_bundle_path)
+
+            output_rows = _run_record_processing(
+                record_tasks,
+                records_by_id,
+                failures,
+                workers,
+                publish_record,
+            )
+    return output_rows[task.split], failures[task.split]
 
 
 def _write_outputs(
@@ -416,9 +560,7 @@ def _write_outputs(
             "_source_north_km",
             "_source_unit_count",
             strict=False,
-        ).with_columns(
-            pl.Series(RASTER_BUNDLE_PATH_COL, relative_paths, dtype=pl.String)
-        )
+        ).with_columns(pl.Series(RASTER_BUNDLE_PATH_COL, relative_paths, dtype=pl.String))
         write_csv_atomic(
             output_frame.drop(SOURCE_RECORD_INDEX_COL, CANDIDATE_RASTER_PATH_COL),
             Path(DATASET_DF) / f"{split}_df.csv",
@@ -434,37 +576,29 @@ def _write_outputs(
         print(f"[{split}] wrote {output_frame.height:,} records; {failure_frame.height:,} processing failures")
 
 
-def _run_shard(task: ShardTask, store: DatasetShardStore) -> None:
-    # Generate one source-record range directly in its final shard directory
+def _run_shard(task: ShardTask, store: DatasetShardStore, batch_size: int, workers: int) -> None:
+    # Generate locality batches into the shard's existing output layout
     started_at = time.perf_counter()
     shard_dir = store.create(task)
     tempo_cache_dir = Path(DATASET_TEMPO_CACHE_DIR)
     weather_cache_dir = Path(DATASET_WEATHER_CACHE_DIR)
     tempo_cache_dir.mkdir(parents=True, exist_ok=True)
     weather_cache_dir.mkdir(parents=True, exist_ok=True)
-    splits = _load_shard(task)
-    records, scans, weather, failures = _prepare_records(
-        splits,
-        tempo_cache_dir,
-        weather_cache_dir,
-        shard_dir,
-    )
-    print(
-        f"Planned shard {task.task_id} with {len(records):,} records, "
-        f"{len(scans):,} TEMPO scans, and {len(weather):,} weather rasters"
-    )
-    tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, NUM_CORES, False)
-    weather_cache_paths, weather_failures = _run_weather_alignment(weather, NUM_CORES, False)
-    record_tasks, records_by_id = _record_tasks(
-        records,
-        tempo_cache_paths,
-        tempo_failures,
-        weather_cache_paths,
-        weather_failures,
-        failures,
-    )
-    output_rows = _run_record_processing(record_tasks, records_by_id, failures, NUM_CORES)
-    store.write(task, shard_dir, output_rows[task.split], failures[task.split])
+    frame = _load_shard(task)[task.split]
+    output_rows: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    for offset in range(0, frame.height, batch_size):
+        batch_rows, batch_failures = _process_shard_batch(
+            task,
+            frame.slice(offset, batch_size),
+            shard_dir,
+            tempo_cache_dir,
+            weather_cache_dir,
+            workers,
+        )
+        output_rows.extend(batch_rows)
+        failures.extend(batch_failures)
+    store.write(task, shard_dir, output_rows, failures)
     elapsed = time.perf_counter() - started_at
     peak_memory_mib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     print(
@@ -483,8 +617,16 @@ def _finalize_shards(
     output_rows: dict[str, list[dict[str, object]]] = {split: [] for split in split_paths}
     failures: dict[str, list[dict[str, object]]] = {split: [] for split in split_paths}
     for task in tasks:
+        expected_indices = pl.read_parquet(
+            _shard_input_path(task),
+            columns=[SOURCE_RECORD_INDEX_COL],
+        )[SOURCE_RECORD_INDEX_COL].to_list()
         try:
-            candidates, failure_frame = store.load(task, resolve_paths=True)
+            candidates, failure_frame = store.load(
+                task,
+                resolve_paths=True,
+                expected_indices=expected_indices,
+            )
         except (OSError, TypeError, ValueError, pl.exceptions.PolarsError) as error:
             raise ValueError(f"Cannot finalize incomplete shard {task.task_id}: {error}") from error
         output_rows[task.split].extend(candidates.to_dicts())
@@ -531,6 +673,12 @@ def parse_args() -> argparse.Namespace:
         type=_positive_int,
         default=DATASET_WORKERS_PER_SHARD,
         help="worker processes and CPUs allocated to each Slurm shard task",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        required=True,
+        help="locality-ordered records staged together on each shard worker",
     )
     parser.add_argument(
         "--afterok-job-id",
@@ -610,7 +758,7 @@ def _initialize_output_directories() -> tuple[Path, Path]:
 def _reset_generated_outputs() -> None:
     # Remove disposable rasters and published metadata while preserving caches
     DatasetShardStore(Path(DATASET_DIR) / "shards").clear()
-    for output_dir in (Path(DATASET_DF), Path(DATASET_RASTER_DIR)):
+    for output_dir in (Path(DATASET_DF), Path(DATASET_RASTER_DIR), SHARD_INPUT_DIRECTORY):
         if output_dir.exists():
             shutil.rmtree(output_dir)
 
@@ -630,10 +778,7 @@ def _run_monolithic(args: argparse.Namespace, split_paths: dict[str, str]) -> No
         weather_cache_dir,
         Path(DATASET_RASTER_DIR),
     )
-    print(
-        f"Planned {len(records):,} records using {len(scans):,} TEMPO scans and "
-        f"{len(weather):,} weather rasters"
-    )
+    print(f"Planned {len(records):,} records using {len(scans):,} TEMPO scans and {len(weather):,} weather rasters")
     tempo_cache_paths, tempo_failures = _run_tempo_regridding(scans, NUM_CORES, refresh_tempo)
     weather_cache_paths, weather_failures = _run_weather_alignment(
         weather,
@@ -706,10 +851,11 @@ def _launch_sharded_run(args: argparse.Namespace, split_paths: dict[str, str], s
     tempo_cache_dir, weather_cache_dir = _initialize_output_directories()
     _reset_requested_caches(args, tempo_cache_dir, weather_cache_dir)
     tasks = build_shard_plan(split_paths, shard_size)
+    _write_shard_inputs(split_paths, tasks)
     task_ids = [task.task_id for task in tasks]
     array_spec = _slurm_array_spec(task_ids)
     run_started_at = str(time.time())
-    shard_arguments = ["--shard-size", str(shard_size)]
+    shard_arguments = ["--shard-size", str(shard_size), "--batch-size", str(args.batch_size)]
     if args.split != "all":
         shard_arguments.extend(("--split", args.split))
     external_dependency = [f"--dependency=afterok:{args.afterok_job_id}"] if args.afterok_job_id is not None else []
@@ -746,7 +892,7 @@ def _launch_sharded_run(args: argparse.Namespace, split_paths: dict[str, str], s
     print(f"Dataset finalizer: {finalizer_job_id}")
 
 
-def _run_array_shard(split_paths: dict[str, str], shard_size: int) -> None:
+def _run_array_shard(split_paths: dict[str, str], shard_size: int, batch_size: int) -> None:
     # Resolve this array index through the deterministic source-row plan
     task_id_text = os.getenv("SLURM_ARRAY_TASK_ID")
     if task_id_text is None:
@@ -755,7 +901,8 @@ def _run_array_shard(split_paths: dict[str, str], shard_size: int) -> None:
     task_id = int(task_id_text)
     if task_id < 0 or task_id >= len(tasks):
         raise ValueError(f"Array task {task_id} is outside the {len(tasks):,}-shard plan")
-    _run_shard(tasks[task_id], DatasetShardStore(Path(DATASET_DIR) / "shards"))
+    workers = int(os.environ.get("SLURM_CPUS_PER_TASK", DATASET_WORKERS_PER_SHARD))
+    _run_shard(tasks[task_id], DatasetShardStore(Path(DATASET_DIR) / "shards"), batch_size, workers)
 
 
 def main() -> None:
@@ -766,7 +913,7 @@ def main() -> None:
     if stage in {"worker", "finalize"} and args.shard_size is None:
         raise ValueError("Sharded dataset generation requires --shard-size")
     if stage == "worker":
-        _run_array_shard(split_paths, int(args.shard_size))
+        _run_array_shard(split_paths, int(args.shard_size), args.batch_size)
     elif stage == "finalize":
         _initialize_output_directories()
         tasks = build_shard_plan(split_paths, int(args.shard_size))

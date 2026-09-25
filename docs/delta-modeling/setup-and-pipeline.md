@@ -76,15 +76,22 @@ Launch generation from a login node:
 ```
 
 The launcher uses 16,000 source records per shard by default and submits up to
-eight concurrent workers plus a dependent finalizer. Override the shard size or
-limit generation to one split with:
+eight concurrent workers plus a dependent finalizer. The launcher sorts each
+split by target hour and location, then each worker processes the requested
+batch size. For each batch, the worker copies its required TEMPO, HRRR, and
+cache files to node-local `/tmp`, publishes generated cache files and raster
+bundles through one writer thread, and removes the local batch directory.
+
+Pass the required batch size and optionally override the shard size or selected
+split:
 
 ```bash
-./scripts/launch_dataset_generation.sh --shard-size 12000 -- --split train
+./scripts/launch_dataset_generation.sh --batch-size 500 --shard-size 12000 -- --split train
 ```
 
 Each launch replaces disposable shards and published metadata while retaining
-the TEMPO and weather caches. Pass `--refresh-tempo`, `--refresh-weather`, or
+the TEMPO and weather caches. Workers check only the cache paths required by
+their current batch. Pass `--refresh-tempo`, `--refresh-weather`, or
 `--refresh-cache` after the final `--` when a raster contract or source file
 changes. Do not regenerate while a model job reads the dataset.
 

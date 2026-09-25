@@ -7,16 +7,18 @@ set -euo pipefail
 
 repo_dir="/global/home/users/pranavwalimbe/no2-modeling"
 shard_size=16000
+batch_size=""
 afterok_job_id=""
 
 usage() {
     cat <<'EOF'
-Usage: launch_dataset_generation.sh [--shard-size N] [--afterok JOB_ID] [-- CLI_ARGS ...]
+Usage: launch_dataset_generation.sh [--shard-size N] [--batch-size N] [--afterok JOB_ID] [-- CLI_ARGS ...]
 
 Submits the dataset-generation worker array and its dependent finalizer.
 
 Options:
   --shard-size N   Source records per array task (default 16000).
+  --batch-size N   Records staged together by each worker (required).
   --afterok JOB_ID Hold the shard array until JOB_ID completes successfully.
 
 Common CLI arguments passed through after --:
@@ -36,6 +38,10 @@ while (($# > 0)); do
                 exit 2
             fi
             shard_size="$2"
+            shift 2
+            ;;
+        --batch-size)
+            batch_size="$2"
             shift 2
             ;;
         --afterok)
@@ -64,12 +70,16 @@ if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     echo "Run this launcher on a login node, not inside job ${SLURM_JOB_ID}" >&2
     exit 2
 fi
+if [[ -z "${batch_size}" ]]; then
+    echo "--batch-size is required" >&2
+    exit 2
+fi
 
 cd "${repo_dir}"
 export PYTHONPATH="${repo_dir}/src:${repo_dir}/src/delta-model"
 
-echo "Launching dataset generation with shard size ${shard_size}"
-launcher_args=(--shard-size "${shard_size}")
+echo "Launching dataset generation with shard size ${shard_size} and batch size ${batch_size}"
+launcher_args=(--shard-size "${shard_size}" --batch-size "${batch_size}")
 if [[ -n "${afterok_job_id}" ]]; then
     launcher_args+=(--afterok-job-id "${afterok_job_id}")
 fi
