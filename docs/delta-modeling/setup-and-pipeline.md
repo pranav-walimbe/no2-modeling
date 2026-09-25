@@ -77,15 +77,20 @@ Launch generation from a login node:
 
 The launcher uses 16,000 source records per shard by default and submits up to
 eight concurrent workers plus a dependent finalizer. The launcher sorts each
-split by target hour and location, then each worker processes 1,000-record
+split by target hour and location, then each worker processes 500-record
 batches. For each batch, the worker copies its required TEMPO, HRRR, and cache
 files to node-local `/tmp`, publishes generated cache files and raster bundles
 through one writer thread, and removes the local batch directory.
 
+A metadata analysis of the current 385,158 records estimated a 44 GiB peak
+cold-cache source footprint for 500-record batches. Increasing the batch to
+1,000 reduced repeated source references by about 4% but raised the estimated
+peak to 80 GiB.
+
 Override the shard size, batch size, or selected split with:
 
 ```bash
-./scripts/launch_dataset_generation.sh --shard-size 12000 -- --batch-size 500 --split train
+./scripts/launch_dataset_generation.sh --shard-size 12000 --batch-size 250 -- --split train
 ```
 
 Each launch replaces disposable shards and published metadata while retaining
