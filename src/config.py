@@ -105,8 +105,8 @@ MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applie
 # Delta-model training contract
 # ============================================================================
 RUNS_DIR = "/global/home/users/pranavwalimbe/model_runs/"  # output directory for model checkpoints and results
-PRETRAINED_ENCODER_WEIGHTS = os.getenv(  # masked-model checkpoint for delta transfer and gap filling
-    "PRETRAINED_ENCODER_WEIGHTS",
+PRETRAINED_MASKED_MODEL_WEIGHTS = os.getenv(  # masked-model checkpoint for gap filling and optional transfer
+    "PRETRAINED_MASKED_MODEL_WEIGHTS",
     "/global/home/users/pranavwalimbe/masked_model_runs/a40/masked_no2_20260924_183700/checkpoints/best_masked_no2.pt",
 )
 SEQUENCE_TIMESTEPS = 4  # four causal rasters ending at the label timestamp

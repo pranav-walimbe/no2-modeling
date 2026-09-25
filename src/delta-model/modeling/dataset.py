@@ -28,7 +28,6 @@ from config import (
 )
 
 RASTER_PATH_COL = "raster_bundle_path"
-LABEL_MODE_COL = "label_mode"
 MIN_SCALE = 1e-12
 ROBUST_STD_NORMALIZER = 1.349
 ROBUST_IMAGE_CHANNELS = tuple(MODEL_IMAGE_KEYS.index(name) for name in MODEL_ROBUST_IMAGE_KEYS)
@@ -36,7 +35,6 @@ STANDARD_IMAGE_CHANNELS = tuple(
     channel for channel in range(len(MODEL_IMAGE_KEYS)) if channel not in ROBUST_IMAGE_CHANNELS
 )
 DEGREES_PER_SOLAR_HOUR = 15.0
-EXPECTED_LABEL_MODE = "linear_interpolated_timestep_ema"
 TIMESTEP_TIME_COLUMNS = tuple(f"t{index}_timestamp" for index in range(SEQUENCE_TIMESTEPS))
 
 
@@ -49,18 +47,6 @@ def _model_feature_names() -> tuple[str, ...]:
 
 
 MODEL_FEATURE_NAMES = _model_feature_names()
-REQUIRED_FRAME_COLUMNS = frozenset(
-    (
-        *MODEL_RAW_FEATURES,
-        *TIMESTEP_TIME_COLUMNS,
-        "date",
-        "hour",
-        "lon",
-        LABEL_MODE_COL,
-        MODEL_TARGET_COL,
-        RASTER_PATH_COL,
-    )
-)
 
 
 @dataclass(frozen=True)
@@ -111,16 +97,7 @@ class NormalizationStats:
 def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
     # Load the split produced by dataset generation
     path = dataframe_dir / f"{split}_df.csv"
-    frame = pd.read_csv(path)
-    missing_columns = sorted(REQUIRED_FRAME_COLUMNS.difference(frame.columns))
-    if missing_columns:
-        raise ValueError(f"Model split {path} is missing required columns: {', '.join(missing_columns)}")
-    label_modes = set(frame[LABEL_MODE_COL].dropna().astype(str).unique())
-    if label_modes != {EXPECTED_LABEL_MODE}:
-        raise ValueError(
-            f"Model split {path} must use label_mode={EXPECTED_LABEL_MODE}; found {sorted(label_modes)}"
-        )
-    return frame
+    return pd.read_csv(path)
 
 
 def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:

@@ -125,7 +125,7 @@ sbatch scripts/slurm/train_model.sh
 ```
 
 Direct module execution also requires `--completed-raster-dir` under `/tmp` and
-a valid `--pretrained-encoder-weights` path.
+a valid `--pretrained-masked-model-weights` path.
 
 ## Evaluation and artifacts
 

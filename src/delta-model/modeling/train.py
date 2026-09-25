@@ -20,7 +20,6 @@ from modeling.convgru import (
     ResidualBlock,
 )
 from modeling.dataset import (
-    LABEL_MODE_COL,
     MODEL_FEATURE_NAMES,
     NOxDataset,
     compute_stats,
@@ -46,7 +45,7 @@ from config import (
     MODEL_IMAGE_KEYS,
     MODEL_TARGET_COL,
     NUM_CORES,
-    PRETRAINED_ENCODER_WEIGHTS,
+    PRETRAINED_MASKED_MODEL_WEIGHTS,
     RUNS_DIR,
 )
 
@@ -182,7 +181,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
     parser.add_argument("--scheduler-factor", type=float, default=DEFAULT_SCHEDULER_FACTOR)
     parser.add_argument("--early-stop-patience", type=int, default=DEFAULT_EARLY_STOP_PATIENCE)
-    parser.add_argument("--pretrained-encoder-weights", default=PRETRAINED_ENCODER_WEIGHTS)
+    parser.add_argument("--pretrained-masked-model-weights", default=PRETRAINED_MASKED_MODEL_WEIGHTS)
     parser.add_argument("--completed-raster-dir", required=True)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     return parser.parse_args()
@@ -493,9 +492,9 @@ def main() -> None:
     completed_root = Path(args.completed_raster_dir).resolve()
     if Path("/tmp") not in completed_root.parents:
         raise ValueError("Completed raster directory must be under job-local /tmp")
-    masked_checkpoint_path = Path(args.pretrained_encoder_weights)
-    if not args.pretrained_encoder_weights:
-        raise ValueError("Set PRETRAINED_ENCODER_WEIGHTS or pass --pretrained-encoder-weights")
+    masked_checkpoint_path = Path(args.pretrained_masked_model_weights)
+    if not args.pretrained_masked_model_weights:
+        raise ValueError("Set PRETRAINED_MASKED_MODEL_WEIGHTS or pass --pretrained-masked-model-weights")
 
     run_name = datetime.now(timezone.utc).strftime("delta_category_classification_%Y%m%d_%H%M%S")
     run_dir = Path(RUNS_DIR) / run_name
@@ -641,7 +640,6 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    target_label_mode = str(datasets["train"].frame[LABEL_MODE_COL].iloc[0])
     run_config = {
         "device": str(device),
         "models": ["mlp", "random_init_delta", "pretrained_encoder_delta"],
@@ -663,8 +661,8 @@ def main() -> None:
         "scheduler_patience": args.scheduler_patience,
         "scheduler_factor": args.scheduler_factor,
         "early_stop_patience": args.early_stop_patience,
-        "pretrained_encoder_weights": str(masked_checkpoint_path),
-        "pretrained_encoder_sha256": masked_checkpoint_sha256,
+        "pretrained_masked_model_weights": str(masked_checkpoint_path),
+        "pretrained_masked_model_sha256": masked_checkpoint_sha256,
         "encoder_architecture": ENCODER_ARCHITECTURE_NAME,
         "encoder_freeze_epochs": 0,
         "encoder_lr_scale": 1.0,
@@ -676,7 +674,6 @@ def main() -> None:
         "target_name": MODEL_TARGET_COL,
         "class_names": list(MODEL_CLASS_NAMES),
         "class_counts": {split: _class_counts(dataset) for split, dataset in datasets.items()},
-        "target_label_mode": target_label_mode,
         "tabular_features": list(MODEL_FEATURE_NAMES),
         "prediction_family": "three_class_categorical_distribution",
         "sequence_encoder": "completed_raster_convolutional_encoder_then_convgru_with_logit_fusion",

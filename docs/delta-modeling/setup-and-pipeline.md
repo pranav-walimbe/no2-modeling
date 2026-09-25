@@ -103,7 +103,7 @@ after it validates all shard outcomes. See [regridding.md](regridding.md).
 
 Delta training requires a masked NO2 checkpoint for two operations: filling
 missing NO2 pixels and initializing one raster encoder. Set
-`PRETRAINED_ENCODER_WEIGHTS` to the checkpoint path or use the default in
+`PRETRAINED_MASKED_MODEL_WEIGHTS` to the checkpoint path or use the default in
 `src/config.py`.
 
 The masked-pretraining workflow lives in
