@@ -1,151 +1,118 @@
-# AOI continuous plume-quality score
+# AOI plume-quality score
 
-## Objective
+## Purpose
 
-Rank AOIs by whether a detectable source-localized NO2 plume changes with the
-continuous CAMPD emissions label. The score is for AOI selection and analysis,
-not a delta-model input.
+The AOI score ranks locations by two properties: whether TEMPO contains a
+detectable source-localized plume and whether that plume responds in the
+expected direction when CAMPD NOx changes. The score selects AOIs for modeling;
+it is not a model input.
 
-Raster samples may come from the prior delta dataset, the general TEMPO and
-weather caches, or the masked-dataset corpus. Only histories with aligned CAMPD
-labels contribute to score-label agreement. Unlabeled histories may contribute
-to a separate plume-detectability diagnostic. Deduplicate histories by AOI and
-observation time before aggregation.
+## Observation and label contract
 
-## Label
+Each sample contains four causal TEMPO observations, `t0` through `t3`. The
+first three observations establish the prior emissions state. The innovation
+at the fourth observation supplies the label.
 
-For four scans ending at `t3`, overlap-weight CAMPD hourly NOx over each scan
-interval and update an irregular two-hour EMA:
+CAMPD hourly NOx is interpolated to each observation time. An irregular EMA
+with a two-hour decay timescale is updated across the observations:
 
 ```text
 r_i = exp(-(time_i - time_{i-1}) / 2 hours)
 E_i = r_i E_{i-1} + (1 - r_i) NOx_i
-emissions_delta = E_3 - E_2
+innovation = (E_3 - E_2) / (1 - r_3)
 ```
 
-Decrease, steady, and increase categories remain diagnostics. The scoring
-target is continuous:
-
-```text
-e = tanh(emissions_delta / 100 lb)
-```
-
-Thus 99 and 100 lb receive nearly equal targets, and steady histories are
-represented by `e` near zero.
+The innovation is classified as decrease, steady, or increase with the larger
+of the configured absolute floor and an AOI-relative floor. Scoring requires at
+least eight finite samples in every class. Candidate preparation retains at
+most 64 deterministic samples per AOI and class, for 24 to 192 samples per
+eligible AOI.
 
 ## Raster heuristic
 
-Normalize valid NO2 pixels with the fixed values in `AGENTS.md`:
+Valid NO2 pixels use the fixed robust normalization recorded in `AGENTS.md`:
 
 ```text
 z = clip((NO2 - 1.868138303979520e15) / 1.1997222249899362e15, -8, 8)
 ```
 
-At each timestep:
-
-1. subtract a mask-normalized Gaussian background;
-2. search within 45 degrees of current and preceding local 80 m wind;
-3. compare a source-anchored downwind core with crosswind flanks;
-4. penalize broad and source-disconnected positive structure.
+For each observation, the heuristic subtracts a mask-normalized Gaussian
+background and searches directions within 45 degrees of the current and prior
+local 80 m wind. It compares a source-anchored downwind core with crosswind
+flanks, then penalizes broad or source-disconnected positive structure.
 
 ```text
 noise = max(1.4826 * background_MAD, 0.10)
 raw_SNR = max((core_response - flank_response) / noise, 0)
-SNR = raw_SNR * sqrt(localization * anchored_fraction) * exp(-3 * broad_fraction)
+morphology = sqrt(localization * anchored_fraction) * exp(-3 * broad_fraction)
+plume_SNR = raw_SNR * morphology
+signed_amplitude = ((core_response - flank_response) / noise) * morphology
 ```
 
-Apply the label EMA timing to the four signed plume amplitudes. Robustly scale
-their final change:
+The record SNR is the median of the finite timestep SNRs and requires at least
+two valid observations. Absolute contrast is the median of
+`abs(signed_amplitude) * noise` across the four observations. Record
+detectability is:
 
 ```text
-p = tanh((plume_EMA_3 - plume_EMA_2) / plume_delta_scale)
-d = tanh(temporal_SNR / snr_scale)
-agreement = 1 - abs(e - p)
-record_quality = d * agreement
+detectability = tanh(record_SNR) * tanh(absolute_contrast / 0.2)
 ```
 
-`record_quality` lies in `[-1, 1]`. A visible stable plume scores well for a
-steady emissions interval. A blank raster receives little credit because `d`
-is near zero. Opposed plume and emissions changes can score below zero.
+The same irregular EMA is applied to the four signed plume amplitudes. Its
+final change is divided by a robust scale, `max(IQR / 1.349, 0.1)`, without
+clipping or a hyperbolic tangent.
 
 ## AOI aggregation
 
+For each AOI and label class, calculate mean detectability and mean scaled
+plume response. AOIs must retain all three classes and at least eight finite
+records per class.
+
 ```text
-center = mean(record_quality)
-shrunk_center = center * n / (n + pseudo_count)
-AOI_score = shrunk_center - uncertainty_penalty * SE(record_quality)
+class_balanced_detectability = mean(class mean detectability)
+directional_separation = mean_response_increase - mean_response_decrease
+
+AOI_score = 0.8 * percentile(class_balanced_detectability)
+          + 0.2 * percentile(directional_separation)
 ```
 
-Require at least eight finite labeled histories. Search the temporal SNR
-summary, saturation scales, pseudo-count, and uncertainty penalty using held-out
-record folds. Publish the selected score to a run CSV and atomically merge it
-into the JSON path configured by `AOI_SCORE_JSON`.
+The percentile ranks are calculated across eligible AOIs in the full run. The
+score rewards visible, localized plumes in all emissions regimes while keeping
+a smaller term for the expected signed response.
 
-## Rewarded and penalized characteristics
+## Validation
 
-| Level | Rewarded | Penalized |
-|---|---|---|
-| Timestep | localized downwind enhancement; source-connected structure; adequate support | broad regional enhancement; crosswind response; weak support |
-| History | detectable plume; continuous plume change matching emissions change; stable plume during steady emissions | weak detection; mismatched magnitude or direction; plume change during steady emissions |
-| AOI | high mean agreement; many histories; low uncertainty | inconsistent histories; small sample; high standard error |
-| Source geometry, empirically | one dominant facility; fewer and more compact sources | many dispersed or independently operating sources |
+Savio job `39217486` tested the accepted score on 96 development AOIs. It
+scored 14,937 cache-complete histories and produced 78 AOIs with at least eight
+finite records in all three classes. Peak resident memory was 5.9 GB. Relative
+to the accepted iteration result, the production implementation reproduces all
+78 scores exactly.
 
-Fuel type is not a scoring term. Prior coal association weakened after adjusting
-for source count, geometry, capacity dominance, and emissions scale.
+The full-data candidate and scoring path uses bounded batches. This avoids the
+147 GB allocation that caused the earlier full-frame Polars run to exceed its
+node memory limit.
 
-## Results
+Nearest-hour HRRR remains the weather contract. A comparison against temporal
+interpolation found median wind-vector and temperature differences of 0.27 m/s
+and 0.18 K, with plume-SNR rank correlation of 0.990 across 322 histories. This
+did not justify the added interpolation work for the current heuristic.
 
-Continuous baseline job `39206139` scored 25,507 histories. The selected
-non-transport configuration uses median four-timestep SNR, `snr_scale = 0.25`,
-`plume_scale = 3.0`, no pseudo-count, and a `0.5 * SE` penalty.
+## Production workflow
 
-| Metric | Continuous result |
-|---|---:|
-| AOIs represented in feature analysis | 953 |
-| Mean held-out Spearman | 0.512 |
-| Mean top-quartile lift | 0.0616 |
-| Mean top-minus-bottom separation | 0.1169 |
+`src/delta-model/preprocessing/aoi_heuristic.py` owns the complete workflow:
 
-Cache gap-fill job `39206363` added 65 AOIs with at least eight finite labeled
-histories. The persistent mapping now contains 1,018 of 1,339 emissions AOIs.
+1. stream label preparation in bounded Polars batches;
+2. resolve exact cache keys and partition missing TEMPO and HRRR work into a
+   Slurm array;
+3. run bounded worker pools within each array task;
+4. score the completed candidates and atomically replace `AOI_SCORE_JSON`;
+5. write the run tables and a 20-history montage, then email the PNG.
 
-Directional baseline from job `39195305` and refinement job `39195783`:
-
-| Metric | Result |
-|---|---:|
-| Sampled histories | 28,937 |
-| Final eligible AOIs | 413 |
-| Mean held-out Spearman | 0.308 |
-| Mean top-quartile lift | 0.066 |
-| Mean top-minus-bottom separation | 0.155 |
-
-Interpretation: label attribution, not raw plume strength, was the main
-separator. AOIs with fewer, more compact sources were more likely to align the
-aggregate CAMPD change with the plume near the selected hotspot.
-
-## Next ablations
-
-1. Continuous agreement on prior delta bundles.
-2. Add cache-backed labeled histories only where they expand AOI coverage or
-   reduce uncertainty.
-3. The tested semi-Lagrangian advection residual was rejected: held-out
-   Spearman fell from `0.5110` to `0.4383`, and the combined objective fell by
-   `0.0178`. Top-minus-bottom separation increased by `0.0213`, but that was
-   insufficient to retain transport.
-4. Do not test chemical lifetime unless a later transport formulation first
-   beats the non-transport baseline.
-
-Transport literature supports wind rotation and downwind integration, while
-also showing sensitivity to wind choice and weak identifiability of lifetime
-from individual plumes: [wind rotation and EMG](https://amt.copernicus.org/articles/17/3439/2024/),
-[lifetime and spread validation](https://amt.copernicus.org/articles/14/7929/2021/),
-and [wind-field and plume-curvature sensitivity](https://acp.copernicus.org/articles/23/4577/2023/).
+The default submission uses eight array tasks with eight workers each. Both
+values are command-line options.
 
 ## Artifacts
 
-- Directional baseline: `/global/home/users/pranavwalimbe/vis/aoi-score-quality-search-39195305/`
-- Directional refinement: `/global/home/users/pranavwalimbe/vis/aoi-score-refinement-39195783/`
-- Continuous and transport comparison: `/global/home/users/pranavwalimbe/vis/aoi-score-quality-search-39206139/`
-- Reliability search: `/global/home/users/pranavwalimbe/vis/aoi-score-refinement-39205972/`
-- Final 953-AOI baseline: `/global/home/users/pranavwalimbe/vis/aoi-score-refinement-39206284/`
-- Cache gap-fill: `/global/home/users/pranavwalimbe/vis/aoi-score-cache-scan-39206363/`
+- Accepted validation: `/global/home/users/pranavwalimbe/vis/aoi-score-cache-scan-39217486/`
+- Earlier continuous baseline: `/global/home/users/pranavwalimbe/vis/aoi-score-quality-search-39206139/`
+- Earlier cache gap-fill: `/global/home/users/pranavwalimbe/vis/aoi-score-cache-scan-39206363/`
