@@ -101,8 +101,8 @@ after it validates all shard outcomes. See [regridding.md](regridding.md).
 
 ## 4. Provide a masked-model checkpoint
 
-Delta training requires a masked NO2 checkpoint for two operations: filling
-missing NO2 pixels and initializing one raster encoder. Set
+Delta training uses a masked NO2 checkpoint to fill missing NO2 pixels before
+classifier training. It does not copy the masked encoder into the classifier. Set
 `PRETRAINED_MASKED_MODEL_WEIGHTS` to the checkpoint path or use the default in
 `src/config.py`.
 
@@ -118,15 +118,14 @@ sbatch scripts/slurm/train_model.sh
 ```
 
 The job stages split metadata in job-local `/tmp`, fills missing NO2 into
-temporary memory-mapped arrays, and trains three classifiers:
+temporary memory-mapped arrays, and trains two classifiers:
 
-- a tabular MLP;
-- a random-initialized ConvGRU fused with the frozen MLP logits;
-- a masked-pretrained ConvGRU fused with the frozen MLP logits.
+- a four-input seasonal MLP;
+- a random-initialized ConvGRU fused with the frozen seasonal logits.
 
 The launcher requests one A5000 GPU, four CPUs, and eight hours on
-`savio4_gpu` with `a5k_gpu4_normal`. It emails loss curves, model comparisons,
-and test confusion matrices after a successful run. See
+`savio4_gpu` with `a5k_gpu4_normal`. It emails split and class accuracy, both
+training curves, and the test AOI-strata comparison after a successful run. See
 [modeling.md](modeling.md) for the model contract.
 
 ## Current Savio launchers

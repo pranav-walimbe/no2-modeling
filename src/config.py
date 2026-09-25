@@ -121,13 +121,12 @@ MODEL_INPUT_CHANNELS = MODEL_IMAGE_CHANNELS + len(MODEL_MASK_KEYS)
 MODEL_IMAGE_CLIP_ABS = 8.0  # bound rare raster extremes after train-only normalization
 MODEL_TARGET_COL = "delta_category"  # three-class decrease, steady, or increase target
 MODEL_CLASS_NAMES = ("decrease", "steady", "increase")
-MODEL_RAW_FEATURES = (  # leakage-safe scalar inputs available to both tabular and fused models
-    "major_city_dist",
-    "num_units",
-    "avg_heat_input",
-    "avg_pwr_gen",
+MODEL_SEASONAL_FEATURES = (
+    "local_solar_hour_sin",
+    "local_solar_hour_cos",
+    "day_of_year_sin",
+    "day_of_year_cos",
 )
-MODEL_CYCLIC_FEATURES = ("local_solar_hour", "day_of_year")  # each expands to sine and cosine
 
 # ============================================================================
 # Masked pretraining

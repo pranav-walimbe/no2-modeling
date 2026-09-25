@@ -17,12 +17,11 @@ from config import (
     DATASET_DF,
     DATASET_DIR,
     MODEL_CLASS_NAMES,
-    MODEL_CYCLIC_FEATURES,
     MODEL_IMAGE_CLIP_ABS,
     MODEL_IMAGE_KEYS,
     MODEL_MASK_KEYS,
-    MODEL_RAW_FEATURES,
     MODEL_ROBUST_IMAGE_KEYS,
+    MODEL_SEASONAL_FEATURES,
     MODEL_TARGET_COL,
     SEQUENCE_TIMESTEPS,
 )
@@ -35,18 +34,11 @@ STANDARD_IMAGE_CHANNELS = tuple(
     channel for channel in range(len(MODEL_IMAGE_KEYS)) if channel not in ROBUST_IMAGE_CHANNELS
 )
 DEGREES_PER_SOLAR_HOUR = 15.0
+SECONDS_PER_DAY = 86_400.0
 TIMESTEP_TIME_COLUMNS = tuple(f"t{index}_timestamp" for index in range(SEQUENCE_TIMESTEPS))
+FINAL_TIMESTEP_TIME_COLUMN = TIMESTEP_TIME_COLUMNS[-1]
 
-
-def _model_feature_names() -> tuple[str, ...]:
-    # Expand raw and cyclic inputs into their model column names
-    names = list(MODEL_RAW_FEATURES)
-    for name in MODEL_CYCLIC_FEATURES:
-        names.extend((f"{name}_sin", f"{name}_cos"))
-    return tuple(names)
-
-
-MODEL_FEATURE_NAMES = _model_feature_names()
+MODEL_FEATURE_NAMES = MODEL_SEASONAL_FEATURES
 
 
 @dataclass(frozen=True)
@@ -101,25 +93,28 @@ def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
 
 
 def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
-    # Create leakage-safe numeric features in their documented order
-    columns: list[np.ndarray] = []
-    for name in MODEL_RAW_FEATURES:
-        values = pd.to_numeric(frame[name], errors="coerce")
-        columns.append(values.to_numpy(dtype=np.float64))
-
-    for cyclic_feature in MODEL_CYCLIC_FEATURES:
-        if cyclic_feature == "local_solar_hour":
-            utc_hour = pd.to_numeric(frame["hour"], errors="coerce").to_numpy(dtype=np.float64)
-            longitude = pd.to_numeric(frame["lon"], errors="coerce").to_numpy(dtype=np.float64)
-            values = np.mod(utc_hour + longitude / DEGREES_PER_SOLAR_HOUR, 24.0)
-            angle = 2 * np.pi * values / 24.0
-        elif cyclic_feature == "day_of_year":
-            dates = pd.to_datetime(frame["date"], errors="coerce")
-            values = dates.dt.dayofyear.to_numpy(dtype=np.float64)
-            angle = 2 * np.pi * (values - 1.0) / 365.25
-        columns.extend((np.sin(angle), np.cos(angle)))
-
-    return np.column_stack(columns)
+    # Derive daily and annual phase from the label-aligned final scan
+    utc_time = pd.to_datetime(frame[FINAL_TIMESTEP_TIME_COLUMN], errors="coerce", utc=True)
+    longitude = pd.to_numeric(frame["lon"], errors="coerce")
+    solar_time = utc_time + pd.to_timedelta(longitude / DEGREES_PER_SOLAR_HOUR, unit="h")
+    seconds = (
+        solar_time.dt.hour * 3_600
+        + solar_time.dt.minute * 60
+        + solar_time.dt.second
+        + solar_time.dt.microsecond / 1_000_000
+    ).to_numpy(dtype=np.float64)
+    daily_angle = 2 * np.pi * seconds / SECONDS_PER_DAY
+    annual_position = solar_time.dt.dayofyear.to_numpy(dtype=np.float64) - 1.0 + seconds / SECONDS_PER_DAY
+    days_in_year = np.where(solar_time.dt.is_leap_year, 366.0, 365.0)
+    annual_angle = 2 * np.pi * annual_position / days_in_year
+    return np.column_stack(
+        (
+            np.sin(daily_angle),
+            np.cos(daily_angle),
+            np.sin(annual_angle),
+            np.cos(annual_angle),
+        )
+    )
 
 
 def _raster_path(serialized_path: object, dataset_dir: Path) -> Path:
@@ -256,10 +251,10 @@ def compute_stats(
         dataset_dir: Root containing raster bundles.
         dataframe_dir: Directory containing split CSV files.
         progress_interval: Records between progress messages.
-        fixed_image_stats: Existing raster normalization to combine with split tabular statistics.
+        fixed_image_stats: Existing raster normalization to combine with split seasonal statistics.
 
     Returns:
-        Frozen image and tabular normalization statistics.
+        Frozen image and seasonal normalization statistics.
     """
     root = Path(dataset_dir)
     frame = _read_split_frame(split, Path(dataframe_dir))
@@ -353,7 +348,7 @@ def save_stats(stats: NormalizationStats, path: str | Path) -> None:
 
 
 class NOxDataset(Dataset):
-    """Lazy per-record TEMPO raster and tabular dataset."""
+    """Lazy per-record TEMPO raster and seasonal-feature dataset."""
 
     def __init__(
         self,

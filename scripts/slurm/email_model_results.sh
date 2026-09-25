@@ -12,35 +12,29 @@ job_id="$2"
 recipient="$3"
 mail_host="${SLURM_SUBMIT_HOST:-ln002.brc}"
 mail_log="/var/log/maillog"
-comparison_plot="${run_dir}/model_comparison.png"
-tabular_loss_plot="${run_dir}/tabular_loss_curve.png"
-random_loss_plot="${run_dir}/random_init_delta_loss_curve.png"
-pretrained_loss_plot="${run_dir}/pretrained_encoder_delta_loss_curve.png"
-confusion_plot="${run_dir}/classification_confusion.png"
+accuracy_plot="${run_dir}/split_class_accuracy.png"
+loss_plot="${run_dir}/training_curves.png"
+strata_plot="${run_dir}/test_strata_accuracy.png"
 
 for artifact in \
-    "${comparison_plot}" \
-    "${tabular_loss_plot}" \
-    "${random_loss_plot}" \
-    "${pretrained_loss_plot}" \
-    "${confusion_plot}"; do
+    "${accuracy_plot}" \
+    "${loss_plot}" \
+    "${strata_plot}"; do
     if [[ ! -s "${artifact}" ]]; then
         echo "Expected result artifact is missing or empty: ${artifact}" >&2
         exit 1
     fi
 done
 
-echo "Emailing three-model classification results to ${recipient} via ${mail_host}"
+echo "Emailing seasonal and vision-seasonal results to ${recipient} via ${mail_host}"
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 \
     "${mail_host}" stat -c %s "${mail_log}")
-printf 'NO2 classification training completed successfully.\n\nThe attachments compare the tabular MLP, random-init fusion model, and pretrained-encoder fusion model.\n\nRun: %s\nJob: %s\n' \
+printf 'NO2 classification training completed successfully.\n\nThe attachments compare seasonal and vision-seasonal accuracy, training loss, and test accuracy across AOI strata.\n\nRun: %s\nJob: %s\n' \
     "${run_dir}" \
     "${job_id}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
         "mailx -s 'NO2 classification results (${job_id})' \
-            -a '${comparison_plot}' -a '${tabular_loss_plot}' \
-            -a '${random_loss_plot}' -a '${pretrained_loss_plot}' \
-            -a '${confusion_plot}' '${recipient}'"
+            -a '${accuracy_plot}' -a '${loss_plot}' -a '${strata_plot}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do

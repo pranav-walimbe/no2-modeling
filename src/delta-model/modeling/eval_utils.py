@@ -77,7 +77,7 @@ def _model_results(split_frames: dict[str, pd.DataFrame]) -> dict[str, object]:
 
 
 def _model_comparison(model_results: dict[str, dict[str, object]]) -> dict[str, object]:
-    # Place raster and MLP scores together by split
+    # Place both model scores together by split
     comparison = {}
     for split in next(iter(model_results.values())):
         comparison[split] = {

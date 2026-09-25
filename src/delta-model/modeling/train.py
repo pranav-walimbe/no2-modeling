@@ -1,4 +1,4 @@
-"""Train convolutional recurrent and tabular emissions-change classifiers."""
+"""Train seasonal and vision-seasonal emissions-change classifiers."""
 
 import argparse
 import hashlib
@@ -16,8 +16,8 @@ from modeling.convgru import (
     ENCODER_ARCHITECTURE_NAME,
     ENCODER_OUTPUT_CHANNELS,
     RasterFrameEncoder,
-    RasterTabularFusionClassifier,
     ResidualBlock,
+    VisionSeasonalFusionClassifier,
 )
 from modeling.dataset import (
     MODEL_FEATURE_NAMES,
@@ -32,8 +32,8 @@ from modeling.eval_utils import (
     TRUE_CLASS_COL,
     save_results,
 )
-from modeling.mlp import TabularMLP
-from modeling.plot_utils import plot_confusion_matrices, plot_loss_curve, plot_training_comparison
+from modeling.mlp import SeasonalMLP
+from modeling.plot_utils import plot_split_class_accuracy, plot_test_strata_accuracy, plot_training_curves
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -51,12 +51,12 @@ from config import (
 
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 100
-DEFAULT_TABULAR_EPOCHS = 75
+DEFAULT_SEASONAL_EPOCHS = 75
 DEFAULT_WORKERS = 4
 DEFAULT_PREFETCH_FACTOR = 2
 DEFAULT_SEED = 42
 DEFAULT_LEARNING_RATE = 3e-4
-DEFAULT_TABULAR_LEARNING_RATE = 1e-3
+DEFAULT_SEASONAL_LEARNING_RATE = 1e-3
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_GRADIENT_CLIP_NORM = 5.0
 DEFAULT_SCHEDULER_PATIENCE = 10
@@ -168,14 +168,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
-    parser.add_argument("--tabular-epochs", type=int, default=DEFAULT_TABULAR_EPOCHS)
+    parser.add_argument("--seasonal-epochs", type=int, default=DEFAULT_SEASONAL_EPOCHS)
     parser.add_argument("--workers", type=int, default=min(DEFAULT_WORKERS, NUM_CORES))
     parser.add_argument("--prefetch-factor", type=int, default=DEFAULT_PREFETCH_FACTOR)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--head-dim", type=int, default=DEFAULT_HEAD_DIM)
     parser.add_argument("--dropout", type=float, default=DEFAULT_DROPOUT)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
-    parser.add_argument("--tabular-learning-rate", type=float, default=DEFAULT_TABULAR_LEARNING_RATE)
+    parser.add_argument("--seasonal-learning-rate", type=float, default=DEFAULT_SEASONAL_LEARNING_RATE)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--gradient-clip-norm", type=float, default=DEFAULT_GRADIENT_CLIP_NORM)
     parser.add_argument("--scheduler-patience", type=int, default=DEFAULT_SCHEDULER_PATIENCE)
@@ -207,11 +207,11 @@ def _seed_everything(seed: int) -> None:
 
 def _move_batch(batch: tuple[torch.Tensor, ...], device: torch.device) -> tuple[torch.Tensor, ...]:
     # Move model inputs and class labels onto the training device
-    image, tabular, elapsed_hours, target, index = batch
+    image, seasonal, elapsed_hours, target, index = batch
     non_blocking = device.type == "cuda"
     return (
         image.to(device, non_blocking=non_blocking),
-        tabular.to(device, non_blocking=non_blocking),
+        seasonal.to(device, non_blocking=non_blocking),
         elapsed_hours.to(device, non_blocking=non_blocking),
         target.to(device, non_blocking=non_blocking),
         index,
@@ -233,10 +233,10 @@ def train_epoch(
     correct = 0
     amp_enabled = device.type == "cuda"
     for batch in loader:
-        image, tabular, elapsed_hours, target, _ = _move_batch(batch, device)
+        image, seasonal, elapsed_hours, target, _ = _move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
-            logits = model(image, tabular, elapsed_hours)
+            logits = model(image, seasonal, elapsed_hours)
             loss = criterion(logits, target)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -261,9 +261,9 @@ def val_epoch(
     amp_enabled = device.type == "cuda"
     with torch.inference_mode():
         for batch in loader:
-            image, tabular, elapsed_hours, target, _ = _move_batch(batch, device)
+            image, seasonal, elapsed_hours, target, _ = _move_batch(batch, device)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                logits = model(image, tabular, elapsed_hours)
+                logits = model(image, seasonal, elapsed_hours)
                 loss = criterion(logits, target)
             total_loss += loss.item() * target.numel()
             correct += int((logits.argmax(dim=1) == target).sum().item())
@@ -343,7 +343,7 @@ def fit_model(
 
 
 def _checkpoint_sha256(path: Path) -> str:
-    # Identify the exact masked checkpoint used for reconstruction and transfer
+    # Identify the exact masked checkpoint used for reconstruction
     digest = hashlib.sha256()
     with path.open("rb") as source:
         for block in iter(lambda: source.read(1024 * 1024), b""):
@@ -352,7 +352,7 @@ def _checkpoint_sha256(path: Path) -> str:
 
 
 def _load_masked_checkpoint(path: Path, device: torch.device) -> tuple[dict[str, object], _MaskedNO2Autoencoder]:
-    # Load the full reconstruction model and its reusable encoder weights
+    # Load the reconstruction model used to fill missing NO2 pixels
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     if tuple(checkpoint["image_keys"]) != tuple(MODEL_IMAGE_KEYS):
         raise ValueError("Masked checkpoint image keys do not match delta raster channels")
@@ -360,17 +360,6 @@ def _load_masked_checkpoint(path: Path, device: torch.device) -> tuple[dict[str,
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return checkpoint, model
-
-
-def _standard_encoder_state(masked_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    # Map partial-convolution parameters into the completed-raster convolutional encoder
-    standard_state = {}
-    for name, value in masked_state.items():
-        if name.endswith(".mask_kernel"):
-            continue
-        standard_name = name.replace(".convolution.weight", ".weight")
-        standard_state[standard_name] = value
-    return standard_state
 
 
 def _fill_missing_rasters(
@@ -437,9 +426,9 @@ def run_inference(
     amp_enabled = device.type == "cuda"
     with torch.inference_mode():
         for batch in loader:
-            image, tabular, elapsed_hours, _, index = _move_batch(batch, device)
+            image, seasonal, elapsed_hours, _, index = _move_batch(batch, device)
             with torch.autocast(device_type=device.type, enabled=amp_enabled):
-                logits = model(image, tabular, elapsed_hours)
+                logits = model(image, seasonal, elapsed_hours)
             logits = logits.float()
             logits_batches.append(logits.cpu().numpy())
             probability_batches.append(logits.softmax(dim=1).cpu().numpy())
@@ -485,7 +474,7 @@ def _class_counts(dataset: NOxDataset) -> dict[str, int]:
 
 
 def main() -> None:
-    """Train and evaluate raster and tabular classifiers."""
+    """Train and evaluate seasonal and vision-seasonal classifiers."""
     args = parse_args()
     _seed_everything(args.seed)
     device = _device(args.device)
@@ -500,10 +489,11 @@ def main() -> None:
     run_dir = Path(RUNS_DIR) / run_name
     checkpoint_dir = run_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
-    print(f"Training three-model delta comparison on {device}; outputs: {run_dir}")
+    print(f"Training seasonal and vision-seasonal classifiers on {device}; outputs: {run_dir}")
 
-    masked_checkpoint, imputation_model = _load_masked_checkpoint(masked_checkpoint_path, device)
-    stats = compute_stats("train", fixed_image_stats=masked_checkpoint["normalization_stats"])
+    masked_model_checkpoint, imputation_model = _load_masked_checkpoint(masked_checkpoint_path, device)
+    stats = compute_stats("train", fixed_image_stats=masked_model_checkpoint["normalization_stats"])
+    del masked_model_checkpoint
     save_stats(stats, run_dir / "normalization_stats.json")
 
     source_datasets = {split: NOxDataset(split, stats) for split in ("train", "val", "test")}
@@ -524,128 +514,108 @@ def main() -> None:
         split: NOxDataset(split, stats, completed_raster_path=completed_paths[split])
         for split in ("train", "val", "test")
     }
-    tabular_datasets = {split: NOxDataset(split, stats, load_images=False) for split in datasets}
+    seasonal_datasets = {split: NOxDataset(split, stats, load_images=False) for split in datasets}
     eval_loaders = {
         split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in datasets.items()
     }
-    tabular_train_loader = _loader(tabular_datasets["train"], shuffle=True, args=args, device=device)
-    tabular_eval_loaders = {
-        split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in tabular_datasets.items()
+    seasonal_train_loader = _loader(seasonal_datasets["train"], shuffle=True, args=args, device=device)
+    seasonal_eval_loaders = {
+        split: _loader(dataset, shuffle=False, args=args, device=device) for split, dataset in seasonal_datasets.items()
     }
     common_checkpoint_metadata = {
         "normalization_stats": stats.to_dict(),
-        "model_feature_names": MODEL_FEATURE_NAMES,
+        "seasonal_feature_names": MODEL_FEATURE_NAMES,
         "target_name": MODEL_TARGET_COL,
         "class_names": MODEL_CLASS_NAMES,
-        "masked_checkpoint_sha256": masked_checkpoint_sha256,
+        "pretrained_masked_model_sha256": masked_checkpoint_sha256,
     }
     histories: dict[str, tuple[list[float], list[float]]] = {}
     model_frames: dict[str, dict[str, pd.DataFrame]] = {}
     training_summaries: dict[str, dict[str, object]] = {}
 
-    tabular_model = TabularMLP(len(MODEL_FEATURE_NAMES)).to(device)
-    print(f"Training {tabular_model.num_params():,}-parameter tabular classifier on {device}")
-    tabular_train_losses, tabular_val_losses, tabular_best_loss = fit_model(
-        tabular_model,
-        tabular_train_loader,
-        tabular_eval_loaders["val"],
+    seasonal_model = SeasonalMLP(len(MODEL_FEATURE_NAMES)).to(device)
+    print(f"Training {seasonal_model.num_params():,}-parameter seasonal classifier on {device}")
+    seasonal_train_losses, seasonal_val_losses, seasonal_best_loss = fit_model(
+        seasonal_model,
+        seasonal_train_loader,
+        seasonal_eval_loaders["val"],
         device=device,
-        epochs=args.tabular_epochs,
-        learning_rate=args.tabular_learning_rate,
+        epochs=args.seasonal_epochs,
+        learning_rate=args.seasonal_learning_rate,
         args=args,
-        checkpoint_path=checkpoint_dir / "best_tabular_classifier.pt",
+        checkpoint_path=checkpoint_dir / "best_seasonal_classifier.pt",
         checkpoint_metadata=common_checkpoint_metadata,
-        phase_name="Tabular classifier",
+        phase_name="Seasonal classifier",
     )
-    plot_loss_curve(
-        tabular_train_losses,
-        tabular_val_losses,
-        run_dir,
-        plot_name="tabular_loss_curve",
-        title="Tabular classifier training and validation loss",
-    )
-    tabular_frames = {}
-    for split, loader in tabular_eval_loaders.items():
-        logits, probabilities, indices = run_inference(tabular_model, loader, device)
-        tabular_frames[split] = _prediction_frame(tabular_datasets[split], logits, probabilities, indices)
-    tabular_run = {
-        "maximum_epochs": args.tabular_epochs,
-        "learning_rate": args.tabular_learning_rate,
-        "parameters": tabular_model.num_params(),
-        "best_validation_loss": tabular_best_loss,
+    seasonal_frames = {}
+    for split, loader in seasonal_eval_loaders.items():
+        logits, probabilities, indices = run_inference(seasonal_model, loader, device)
+        seasonal_frames[split] = _prediction_frame(seasonal_datasets[split], logits, probabilities, indices)
+    training_summaries["seasonal"] = {
+        "maximum_epochs": args.seasonal_epochs,
+        "learning_rate": args.seasonal_learning_rate,
+        "parameters": seasonal_model.num_params(),
+        "best_validation_loss": seasonal_best_loss,
     }
-    histories["mlp"] = (tabular_train_losses, tabular_val_losses)
-    model_frames["mlp"] = tabular_frames
-    training_summaries["mlp"] = tabular_run
-    tabular_state_dict = {
-        name: parameter.detach().cpu().clone() for name, parameter in tabular_model.state_dict().items()
+    histories["seasonal"] = (seasonal_train_losses, seasonal_val_losses)
+    model_frames["seasonal"] = seasonal_frames
+    seasonal_state_dict = {
+        name: parameter.detach().cpu().clone() for name, parameter in seasonal_model.state_dict().items()
     }
-    del tabular_model, tabular_train_loader, tabular_eval_loaders, tabular_datasets
+    del seasonal_model, seasonal_train_loader, seasonal_eval_loaders, seasonal_datasets
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    for model_name, use_pretrained_encoder in (
-        ("random_init_delta", False),
-        ("pretrained_encoder_delta", True),
-    ):
-        _seed_everything(args.seed)
-        raster_model = RasterTabularFusionClassifier(
-            len(MODEL_FEATURE_NAMES),
-            tabular_state_dict,
-            head_dim=args.head_dim,
-            dropout=args.dropout,
-        ).to(device)
-        if use_pretrained_encoder:
-            raster_model.frame_encoder.load_state_dict(_standard_encoder_state(masked_checkpoint["encoder_state_dict"]))
-        train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
-        print(f"Training {raster_model.num_params():,}-parameter {model_name} classifier")
-        train_losses, val_losses, best_val_loss = fit_model(
-            raster_model,
-            train_loader,
-            eval_loaders["val"],
-            device=device,
-            epochs=args.epochs,
-            learning_rate=args.learning_rate,
-            args=args,
-            checkpoint_path=checkpoint_dir / f"best_{model_name}.pt",
-            checkpoint_metadata={
-                **common_checkpoint_metadata,
-                "encoder_architecture": ENCODER_ARCHITECTURE_NAME,
-                "encoder_initialization": "masked_pretrained" if use_pretrained_encoder else "random",
-            },
-            phase_name=model_name.replace("_", " ").title(),
-        )
-        histories[model_name] = (train_losses, val_losses)
-        raster_frames = {}
-        for split, loader in eval_loaders.items():
-            logits, probabilities, indices = run_inference(raster_model, loader, device)
-            raster_frames[split] = _prediction_frame(datasets[split], logits, probabilities, indices)
-        model_frames[model_name] = raster_frames
-        training_summaries[model_name] = {
-            "maximum_epochs": args.epochs,
-            "learning_rate": args.learning_rate,
-            "parameters": raster_model.num_params(),
-            "best_validation_loss": best_val_loss,
-            "encoder_initialization": "masked_pretrained" if use_pretrained_encoder else "random",
-            "fusion": "frozen_tabular_plus_raster_logits",
-        }
-        plot_loss_curve(
-            train_losses,
-            val_losses,
-            run_dir,
-            plot_name=f"{model_name}_loss_curve",
-            title=f"{model_name.replace('_', ' ').title()} loss",
-        )
-        del raster_model, train_loader
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    _seed_everything(args.seed)
+    vision_model = VisionSeasonalFusionClassifier(
+        len(MODEL_FEATURE_NAMES),
+        seasonal_state_dict,
+        head_dim=args.head_dim,
+        dropout=args.dropout,
+    ).to(device)
+    train_loader = _loader(datasets["train"], shuffle=True, args=args, device=device)
+    print(f"Training {vision_model.num_params():,}-parameter vision-seasonal classifier")
+    vision_train_losses, vision_val_losses, vision_best_loss = fit_model(
+        vision_model,
+        train_loader,
+        eval_loaders["val"],
+        device=device,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        args=args,
+        checkpoint_path=checkpoint_dir / "best_vision_seasonal_classifier.pt",
+        checkpoint_metadata={
+            **common_checkpoint_metadata,
+            "encoder_architecture": ENCODER_ARCHITECTURE_NAME,
+            "encoder_initialization": "random",
+            "fusion": "frozen_seasonal_plus_vision_logits",
+        },
+        phase_name="Vision-seasonal classifier",
+    )
+    vision_frames = {}
+    for split, loader in eval_loaders.items():
+        logits, probabilities, indices = run_inference(vision_model, loader, device)
+        vision_frames[split] = _prediction_frame(datasets[split], logits, probabilities, indices)
+    histories["vision_seasonal"] = (vision_train_losses, vision_val_losses)
+    model_frames["vision_seasonal"] = vision_frames
+    training_summaries["vision_seasonal"] = {
+        "maximum_epochs": args.epochs,
+        "learning_rate": args.learning_rate,
+        "parameters": vision_model.num_params(),
+        "best_validation_loss": vision_best_loss,
+        "encoder_initialization": "random",
+        "seasonal_model_frozen": True,
+        "fusion": "frozen_seasonal_plus_vision_logits",
+    }
+    del vision_model, train_loader
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     run_config = {
         "device": str(device),
-        "models": ["mlp", "random_init_delta", "pretrained_encoder_delta"],
+        "models": ["seasonal", "vision_seasonal"],
         "batch_size": args.batch_size,
         "workers": args.workers,
-        "maximum_epochs": args.epochs,
         "training": training_summaries,
         "loss_history": {
             name: {"train": train_losses, "validation": validation_losses}
@@ -656,6 +626,7 @@ def main() -> None:
         "head_dim": args.head_dim,
         "dropout": args.dropout,
         "learning_rate": args.learning_rate,
+        "seasonal_learning_rate": args.seasonal_learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip_norm": args.gradient_clip_norm,
         "scheduler_patience": args.scheduler_patience,
@@ -663,9 +634,9 @@ def main() -> None:
         "early_stop_patience": args.early_stop_patience,
         "pretrained_masked_model_weights": str(masked_checkpoint_path),
         "pretrained_masked_model_sha256": masked_checkpoint_sha256,
+        "pretrained_masked_model_role": "missing_pixel_completion_only",
         "encoder_architecture": ENCODER_ARCHITECTURE_NAME,
-        "encoder_freeze_epochs": 0,
-        "encoder_lr_scale": 1.0,
+        "encoder_initialization": "random",
         "completed_raster_paths": {split: str(path) for split, path in completed_paths.items()},
         "image_keys": list(stats.image_keys),
         "image_center": list(stats.image_center),
@@ -674,21 +645,18 @@ def main() -> None:
         "target_name": MODEL_TARGET_COL,
         "class_names": list(MODEL_CLASS_NAMES),
         "class_counts": {split: _class_counts(dataset) for split, dataset in datasets.items()},
-        "tabular_features": list(MODEL_FEATURE_NAMES),
+        "seasonal_features": list(MODEL_FEATURE_NAMES),
         "prediction_family": "three_class_categorical_distribution",
-        "sequence_encoder": "completed_raster_convolutional_encoder_then_convgru_with_logit_fusion",
-        "fusion": "frozen_tabular_plus_raster_logits",
+        "sequence_encoder": "completed_raster_frame_encoder_then_convgru",
+        "fusion": "frozen_seasonal_plus_vision_logits",
     }
     with (run_dir / "run_config.json").open("w") as destination:
         json.dump(run_config, destination, indent=2)
 
-    plot_training_comparison(
-        histories,
-        model_frames,
-        run_dir,
-    )
-    plot_confusion_matrices(model_frames, run_dir)
-    save_results(model_frames, run_dir, primary_model_name="pretrained_encoder_delta")
+    plot_split_class_accuracy(model_frames, run_dir)
+    plot_training_curves(histories, run_dir)
+    plot_test_strata_accuracy(model_frames, run_dir)
+    save_results(model_frames, run_dir, primary_model_name="vision_seasonal")
 
 
 if __name__ == "__main__":
