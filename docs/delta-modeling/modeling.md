@@ -10,9 +10,9 @@ pretrained frame-encoder initialization.
 |---|---|
 | Target | Stored `delta_category` |
 | Classes | `decrease`, `steady`, `increase`, mapped to 0, 1, and 2 |
-| Raster sequence | Five completed `4 x 24 x 24` frames |
+| Raster sequence | Four completed `4 x 24 x 24` frames |
 | Raster channels | NO2, 2 m temperature, eastward wind, northward wind |
-| Tabular input | Nine standardized plant, activity, and cyclic-time features |
+| Tabular input | Eight standardized plant, activity, and cyclic-time features |
 | Loss | Unweighted three-class cross-entropy |
 | Prediction | Softmax distribution over the three classes |
 | Checkpoint selection | Lowest validation cross-entropy for each model |
@@ -43,11 +43,10 @@ Their input shape is `4 x 4 x 24 x 24`, and their NO2 stems use ordinary
 convolutions.
 
 The tabular loader fits means and standard deviations on the delta training
-split. Its nine inputs are major-city distance, total unit count, nameplate
-capacity, prior-quarter same-hour heat input and generation, plus sine and cosine
-encodings of local solar hour and day of year. Modeling derives total unit count
-by adding the stored coal and natural-gas counts without changing the generated
-dataset.
+split. Its eight inputs are major-city distance, the stored total unit count,
+prior-quarter same-hour heat input and generation, plus sine and cosine encodings
+of local solar hour and day of year. The stored unit count covers every modeled
+unit and is not reconstructed from fuel-specific counts.
 
 ## Models
 
@@ -79,9 +78,9 @@ Their comparison therefore isolates raster frame-encoder initialization.
 
 ```mermaid
 flowchart TB
-    Frames[Five completed raster frames<br/>NO2, temperature, and wind]
+    Frames[Four completed raster frames<br/>NO2, temperature, and wind]
     Frames --> FrameEncoder[Shared spatial frame encoder<br/>random or pretrained initialization]
-    FrameEncoder --> Encoded[Five spatial feature maps]
+    FrameEncoder --> Encoded[Four spatial feature maps]
     Encoded --> GRU[ConvGRU combines information<br/>across time]
 
     subgraph Pooling[Summarize the final hidden map]
@@ -97,7 +96,7 @@ flowchart TB
     PoolJoin --> Projection[Feature projection]
     Projection --> RasterHead[Raster classification head]
     RasterHead --> RasterLogits[Raster correction logits]
-    Features[Nine tabular features] --> FrozenMLP[Frozen tabular MLP]
+    Features[Eight tabular features] --> FrozenMLP[Frozen tabular MLP]
     FrozenMLP --> TabularLogits[Tabular logits]
     RasterLogits --> Add[Add logits]
     TabularLogits --> Add

@@ -36,7 +36,8 @@ STANDARD_IMAGE_CHANNELS = tuple(
     channel for channel in range(len(MODEL_IMAGE_KEYS)) if channel not in ROBUST_IMAGE_CHANNELS
 )
 DEGREES_PER_SOLAR_HOUR = 15.0
-TIMESTEP_TIME_COLUMNS = tuple(f"timestep_time_t{index}" for index in range(SEQUENCE_TIMESTEPS))
+EXPECTED_LABEL_MODE = "linear_interpolated_timestep_ema"
+TIMESTEP_TIME_COLUMNS = tuple(f"t{index}_timestamp" for index in range(SEQUENCE_TIMESTEPS))
 
 
 def _model_feature_names() -> tuple[str, ...]:
@@ -48,6 +49,18 @@ def _model_feature_names() -> tuple[str, ...]:
 
 
 MODEL_FEATURE_NAMES = _model_feature_names()
+REQUIRED_FRAME_COLUMNS = frozenset(
+    (
+        *MODEL_RAW_FEATURES,
+        *TIMESTEP_TIME_COLUMNS,
+        "date",
+        "hour",
+        "lon",
+        LABEL_MODE_COL,
+        MODEL_TARGET_COL,
+        RASTER_PATH_COL,
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -98,19 +111,23 @@ class NormalizationStats:
 def _read_split_frame(split: str, dataframe_dir: Path) -> pd.DataFrame:
     # Load the split produced by dataset generation
     path = dataframe_dir / f"{split}_df.csv"
-    return pd.read_csv(path)
+    frame = pd.read_csv(path)
+    missing_columns = sorted(REQUIRED_FRAME_COLUMNS.difference(frame.columns))
+    if missing_columns:
+        raise ValueError(f"Model split {path} is missing required columns: {', '.join(missing_columns)}")
+    label_modes = set(frame[LABEL_MODE_COL].dropna().astype(str).unique())
+    if label_modes != {EXPECTED_LABEL_MODE}:
+        raise ValueError(
+            f"Model split {path} must use label_mode={EXPECTED_LABEL_MODE}; found {sorted(label_modes)}"
+        )
+    return frame
 
 
 def _feature_matrix(frame: pd.DataFrame) -> np.ndarray:
     # Create leakage-safe numeric features in their documented order
     columns: list[np.ndarray] = []
     for name in MODEL_RAW_FEATURES:
-        if name == "num_units":
-            values = pd.to_numeric(frame["num_coal_units"], errors="coerce") + pd.to_numeric(
-                frame["num_ng_units"], errors="coerce"
-            )
-        else:
-            values = pd.to_numeric(frame[name], errors="coerce")
+        values = pd.to_numeric(frame[name], errors="coerce")
         columns.append(values.to_numpy(dtype=np.float64))
 
     for cyclic_feature in MODEL_CYCLIC_FEATURES:
