@@ -7,7 +7,7 @@ set -euo pipefail
 
 repo_dir="/global/home/users/pranavwalimbe/no2-modeling"
 shard_size=16000
-batch_size=500
+batch_size=""
 afterok_job_id=""
 
 usage() {
@@ -18,7 +18,7 @@ Submits the dataset-generation worker array and its dependent finalizer.
 
 Options:
   --shard-size N   Source records per array task (default 16000).
-  --batch-size N   Records staged together by each worker (default 500).
+  --batch-size N   Records staged together by each worker (required).
   --afterok JOB_ID Hold the shard array until JOB_ID completes successfully.
 
 Common CLI arguments passed through after --:
@@ -68,6 +68,10 @@ done
 
 if [[ -n "${SLURM_JOB_ID:-}" ]]; then
     echo "Run this launcher on a login node, not inside job ${SLURM_JOB_ID}" >&2
+    exit 2
+fi
+if [[ -z "${batch_size}" ]]; then
+    echo "--batch-size is required" >&2
     exit 2
 fi
 

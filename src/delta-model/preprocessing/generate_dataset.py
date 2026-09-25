@@ -44,7 +44,6 @@ from config import (
     DATASET_DIR,
     DATASET_MAX_PARALLEL_SHARDS,
     DATASET_RASTER_DIR,
-    DATASET_RECORD_BATCH_SIZE,
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WEATHER_CACHE_DIR,
     DATASET_WORKERS_PER_SHARD,
@@ -713,7 +712,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=DATASET_RECORD_BATCH_SIZE,
+        required=True,
         help="locality-ordered records staged together on each shard worker",
     )
     parser.add_argument(
