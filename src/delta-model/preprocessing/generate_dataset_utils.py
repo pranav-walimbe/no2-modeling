@@ -9,6 +9,8 @@ from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Queue
+from threading import Lock, Thread
 from typing import TypeVar
 
 import numpy as np
@@ -45,12 +47,8 @@ NO2_MASK_NAME = "no2_mask"
 TEMPERATURE_RASTER_NAME = "temperature_2m_k"
 WIND_U_RASTER_NAME = "wind_u_80m_mps"
 WIND_V_RASTER_NAME = "wind_v_80m_mps"
-NO2_FINITE_FRACTION_COLUMNS = tuple(
-    f"no2_finite_fraction_t{index}" for index in range(SEQUENCE_TIMESTEPS)
-)
-HOTSPOT_FINITE_FRACTION_COLUMNS = tuple(
-    f"hotspot_no2_finite_fraction_t{index}" for index in range(SEQUENCE_TIMESTEPS)
-)
+NO2_FINITE_FRACTION_COLUMNS = tuple(f"no2_finite_fraction_t{index}" for index in range(SEQUENCE_TIMESTEPS))
+HOTSPOT_FINITE_FRACTION_COLUMNS = tuple(f"hotspot_no2_finite_fraction_t{index}" for index in range(SEQUENCE_TIMESTEPS))
 MIN_NO2_FINITE_FRACTION_COL = "min_no2_finite_fraction"
 MIN_HOTSPOT_FINITE_FRACTION_COL = "min_hotspot_no2_finite_fraction"
 HOTSPOT_ROW_COL = "hotspot_row"
@@ -81,6 +79,144 @@ SHARD_FAILURES_FILE = "failures.csv"
 MAX_PENDING_FACTOR = 2
 InputT = TypeVar("InputT")
 OutputT = TypeVar("OutputT")
+_WRITER_STOP = object()
+
+
+@dataclass(frozen=True)
+class _FilePublication:
+    source: str | Path
+    destination: str | Path
+
+
+class BackgroundFileWriter:
+    """Publish files sequentially from one background thread."""
+
+    def __init__(self) -> None:
+        self._queue: Queue[_FilePublication | object] = Queue()
+        self._failure_lock = Lock()
+        self._failure: Exception | None = None
+        self._thread = Thread(target=self._run, name="dataset-file-writer", daemon=False)
+        self._started = False
+        self._closed = False
+
+    def __enter__(self) -> "BackgroundFileWriter":
+        """Start the writer thread and return this writer."""
+        self._thread.start()
+        self._started = True
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: object | None,
+    ) -> bool:
+        """Finish queued publications and stop the writer thread."""
+        publication_error: Exception | None = None
+        try:
+            self.wait()
+        except Exception as error:
+            publication_error = error
+        finally:
+            self._queue.put(_WRITER_STOP)
+            self._queue.join()
+            self._thread.join()
+            self._closed = True
+        if exception is None and publication_error is not None:
+            raise publication_error
+        return False
+
+    def publish(self, source: str | Path, destination: str | Path) -> None:
+        """Enqueue one local file for atomic publication.
+
+        Args:
+            source: Complete local file to copy.
+            destination: Final path on the shared filesystem.
+        """
+        if not self._started or self._closed:
+            raise RuntimeError("Background file writer is not active")
+        self._raise_if_failed()
+        self._queue.put(_FilePublication(source, destination))
+
+    def wait(self) -> None:
+        """Wait for all queued publications and propagate writer failures."""
+        if not self._started:
+            raise RuntimeError("Background file writer has not started")
+        self._queue.join()
+        self._raise_if_failed()
+
+    def _run(self) -> None:
+        # Drain the queue even after failure so the batch barrier cannot deadlock
+        while True:
+            publication = self._queue.get()
+            try:
+                if publication is _WRITER_STOP:
+                    return
+                if not isinstance(publication, _FilePublication):
+                    raise TypeError(f"Unsupported publication request: {publication!r}")
+                if self._current_failure() is None:
+                    try:
+                        _publish_file(publication.source, publication.destination)
+                    except Exception as error:
+                        self._record_failure(error)
+            finally:
+                self._queue.task_done()
+
+    def _current_failure(self) -> Exception | None:
+        # Read the first writer failure under its synchronization lock
+        with self._failure_lock:
+            return self._failure
+
+    def _record_failure(self, error: Exception) -> None:
+        # Preserve the first failure as the cause reported to the parent
+        with self._failure_lock:
+            if self._failure is None:
+                self._failure = error
+
+    def _raise_if_failed(self) -> None:
+        # Surface asynchronous publication failures in the parent thread
+        failure = self._current_failure()
+        if failure is not None:
+            raise RuntimeError(f"Background file publication failed: {failure}") from failure
+
+
+def _publish_file(source: str | Path, destination: str | Path) -> None:
+    # Copy within the destination filesystem before exposing the final name
+    destination_path = Path(destination)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=destination_path.parent,
+            prefix=f".{destination_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        shutil.copyfile(source, temporary_path)
+        os.replace(temporary_path, destination_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def stage_files(paths: set[str], destination: Path) -> dict[str, str]:
+    """Copy a deduplicated file manifest into one local directory.
+
+    Args:
+        paths: Source paths to stage.
+        destination: Local directory that receives the staged files.
+
+    Returns:
+        Source paths mapped to their staged local paths.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    staged: dict[str, str] = {}
+    for index, source in enumerate(sorted(paths)):
+        local_path = destination / f"{index:06d}-{Path(source).name}"
+        shutil.copyfile(source, local_path)
+        staged[source] = str(local_path)
+    return staged
 
 
 def bounded_parallel_map(
@@ -255,7 +391,10 @@ class DatasetShardStore:
 
     def clear(self) -> None:
         """Delete the complete disposable shard tree."""
-        def ignore_missing_file(_function: object, _path: str, error_info: tuple[type[BaseException], BaseException, object]) -> None:
+
+        def ignore_missing_file(
+            _function: object, _path: str, error_info: tuple[type[BaseException], BaseException, object]
+        ) -> None:
             # Tolerate concurrent or delayed Lustre namespace updates
             error = error_info[1]
             if not isinstance(error, FileNotFoundError):
@@ -274,7 +413,6 @@ class DatasetShardStore:
         split_root = self._prepare_root() / split
         split_root.mkdir(parents=True, exist_ok=True)
         return split_root
-
 
 
 def _coverage_group_summary(frame: pl.DataFrame) -> dict[str, int | float]:
@@ -462,9 +600,7 @@ def _directory_file_names(directory: Path, suffix: str) -> set[str]:
     try:
         with os.scandir(directory) as entries:
             return {
-                entry.name
-                for entry in entries
-                if entry.name.endswith(suffix) and entry.is_file(follow_symlinks=False)
+                entry.name for entry in entries if entry.name.endswith(suffix) and entry.is_file(follow_symlinks=False)
             }
     except FileNotFoundError:
         return set()
@@ -520,9 +656,7 @@ def process_scan_batch(batch: ScanBatchTask) -> list[ScanResult]:
         granule_indices = [build_granule_spatial_index(read_granule_pixels(path)) for path in batch.granule_paths]
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = f"TEMPO granule read failed: {error}"
-        reusable.update(
-            (task.cache_key, ScanResult(task.cache_key, task.cache_path, message)) for task in pending
-        )
+        reusable.update((task.cache_key, ScanResult(task.cache_key, task.cache_path, message)) for task in pending)
         return [reusable[task.cache_key] for task in batch.scans]
 
     for task in pending:
@@ -737,9 +871,7 @@ def process_weather_batch(batch: WeatherBatchTask) -> list[WeatherResult]:
             temperature_grid, temperature_fields = _read_hrrr_fields(batch.temperature_hrrr_path)
     except (IndexError, KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         message = f"HRRR read failed: {error}"
-        reusable.update(
-            (task.cache_key, WeatherResult(task.cache_key, task.cache_path, message)) for task in pending
-        )
+        reusable.update((task.cache_key, WeatherResult(task.cache_key, task.cache_path, message)) for task in pending)
         return [reusable[task.cache_key] for task in batch.weather]
 
     for task in pending:

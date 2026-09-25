@@ -8,7 +8,6 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -19,6 +18,7 @@ from preprocessing.generate_dataset_utils import (
     PROCESSING_FAILURE_SCHEMA,
     RASTER_BUNDLE_PATH_COL,
     SOURCE_RECORD_INDEX_COL,
+    BackgroundFileWriter,
     DatasetShardStore,
     RecordTask,
     ScanTask,
@@ -34,6 +34,7 @@ from preprocessing.generate_dataset_utils import (
     process_weather_batch,
     scan_batches,
     select_hotspot_cell,
+    stage_files,
     weather_batches,
     write_csv_atomic,
     write_json_atomic,
@@ -272,17 +273,6 @@ def _cached_task_paths(tasks: dict[str, ScanTask] | dict[str, WeatherTask]) -> d
     return {key: task.cache_path for key, task in tasks.items() if Path(task.cache_path).is_file()}
 
 
-def _stage_files(paths: set[str], destination: Path) -> dict[str, str]:
-    # Copy one deduplicated manifest to node-local disk
-    destination.mkdir(parents=True, exist_ok=True)
-    staged: dict[str, str] = {}
-    for index, source in enumerate(sorted(paths)):
-        local_path = destination / f"{index:06d}-{Path(source).name}"
-        shutil.copyfile(source, local_path)
-        staged[source] = str(local_path)
-    return staged
-
-
 def _localize_batch(
     scans: dict[str, ScanTask],
     weather: dict[str, WeatherTask],
@@ -296,9 +286,9 @@ def _localize_batch(
     source_paths = {path for task in missing_scans.values() for path in task.granule_paths} | {
         path for task in missing_weather.values() for path in (task.wind_hrrr_path, task.temperature_hrrr_path)
     }
-    staged_sources = _stage_files(source_paths, batch_dir / "sources")
-    staged_tempo_hits = _stage_files(set(tempo_hits.values()), batch_dir / "tempo-cache")
-    staged_weather_hits = _stage_files(set(weather_hits.values()), batch_dir / "weather-cache")
+    staged_sources = stage_files(source_paths, batch_dir / "sources")
+    staged_tempo_hits = stage_files(set(tempo_hits.values()), batch_dir / "tempo-cache")
+    staged_weather_hits = stage_files(set(weather_hits.values()), batch_dir / "weather-cache")
     local_scans = {
         key: replace(
             task,
@@ -324,36 +314,14 @@ def _localize_batch(
     )
 
 
-def _publish_file(source: str | Path, destination: str | Path) -> None:
-    # Copy to the destination filesystem before exposing the final name
-    destination_path = Path(destination)
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=destination_path.parent,
-            prefix=f".{destination_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-        shutil.copyfile(source, temporary_path)
-        os.replace(temporary_path, destination_path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
-
-
 def _publish_generated_caches(
     local_paths: dict[str, str],
     persistent_tasks: dict[str, ScanTask] | dict[str, WeatherTask],
-    writer: ThreadPoolExecutor,
-) -> list[Future[None]]:
+    writer: BackgroundFileWriter,
+) -> None:
     # Publish successful cache misses through the batch writer
-    return [
-        writer.submit(_publish_file, local_path, persistent_tasks[key].cache_path)
-        for key, local_path in local_paths.items()
-    ]
+    for key, local_path in local_paths.items():
+        writer.publish(local_path, persistent_tasks[key].cache_path)
 
 
 def _run_tempo_regridding(
@@ -501,14 +469,13 @@ def _process_shard_batch(
     with tempfile.TemporaryDirectory(prefix=f"delta-dataset-{task.task_id}-", dir="/tmp") as temporary:
         batch_dir = Path(temporary)
         local = _localize_batch(scans, weather, batch_dir)
-        with ThreadPoolExecutor(max_workers=1) as writer:
-            publications: list[Future[None]] = []
+        with BackgroundFileWriter() as writer:
             generated_tempo, tempo_failures = _run_tempo_regridding(local.scan_misses, workers, True)
-            publications.extend(_publish_generated_caches(generated_tempo, scans, writer))
+            _publish_generated_caches(generated_tempo, scans, writer)
             tempo_paths = {**local.tempo_cache_paths, **generated_tempo}
 
             generated_weather, weather_failures = _run_weather_alignment(local.weather_misses, workers, True)
-            publications.extend(_publish_generated_caches(generated_weather, weather, writer))
+            _publish_generated_caches(generated_weather, weather, writer)
             weather_paths = {**local.weather_cache_paths, **generated_weather}
 
             record_tasks, records_by_id = _record_tasks(
@@ -522,7 +489,7 @@ def _process_shard_batch(
             )
 
             def publish_record(local_task: RecordTask, record: PreparedRecord) -> None:
-                publications.append(writer.submit(_publish_file, local_task.output_path, record.raster_bundle_path))
+                writer.publish(local_task.output_path, record.raster_bundle_path)
 
             output_rows = _run_record_processing(
                 record_tasks,
@@ -531,8 +498,6 @@ def _process_shard_batch(
                 workers,
                 publish_record,
             )
-            for publication in publications:
-                publication.result()
     return output_rows[task.split], failures[task.split]
 
 
