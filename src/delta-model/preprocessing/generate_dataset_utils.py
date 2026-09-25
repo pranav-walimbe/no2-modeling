@@ -166,12 +166,18 @@ class DatasetShardStore:
 
     root: Path
 
-    def load(self, task: ShardTask, resolve_paths: bool = False) -> tuple[pl.DataFrame, pl.DataFrame]:
+    def load(
+        self,
+        task: ShardTask,
+        resolve_paths: bool = False,
+        expected_indices: Iterable[int] | None = None,
+    ) -> tuple[pl.DataFrame, pl.DataFrame]:
         """Load and validate one shard.
 
         Args:
             task: Expected shard identity and source-record range.
             resolve_paths: Replace stored relative raster paths with absolute paths.
+            expected_indices: Source identities assigned to a reordered shard.
 
         Returns:
             Candidate features and processing failures.
@@ -185,10 +191,10 @@ class DatasetShardStore:
             shard_dir / SHARD_FAILURES_FILE,
             schema_overrides=PROCESSING_FAILURE_SCHEMA,
         )
-        expected_indices = list(range(task.start, task.stop))
         candidate_indices = [int(value) for value in candidates[SOURCE_RECORD_INDEX_COL].to_list()]
         failure_indices = [int(value) for value in failures["record_index"].to_list()]
-        if sorted(candidate_indices + failure_indices) != expected_indices:
+        expected = list(range(task.start, task.stop)) if expected_indices is None else list(expected_indices)
+        if sorted(candidate_indices + failure_indices) != sorted(expected):
             raise ValueError(f"Shard {task.task_id} does not contain one outcome per source record")
 
         raster_directory = Path("record-rasters") / task.split
