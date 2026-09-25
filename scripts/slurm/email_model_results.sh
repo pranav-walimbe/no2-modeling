@@ -29,7 +29,7 @@ done
 echo "Emailing seasonal and vision-seasonal results to ${recipient} via ${mail_host}"
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 \
     "${mail_host}" stat -c %s "${mail_log}")
-printf 'NO2 classification training completed successfully.\n\nThe attachments compare seasonal and vision-seasonal accuracy, training loss, and test accuracy across AOI strata.\n\nRun: %s\nJob: %s\n' \
+printf 'NO2 classification training completed successfully.\n\nThe attachments compare seasonal and vision-seasonal accuracy, training loss, and test accuracy across AOI and raster-quality strata.\n\nRun: %s\nJob: %s\n' \
     "${run_dir}" \
     "${job_id}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \

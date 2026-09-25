@@ -102,8 +102,10 @@ flowchart LR
 
 Both classifiers use AdamW, gradient clipping, validation-loss scheduling, CUDA
 mixed precision, and early stopping. Defaults allow 75 seasonal epochs and 100
-vision epochs. The maintained Slurm launcher uses a batch size of 128, a vision
-learning rate of `3e-4`, a 64-value head, 30% dropout, and seed 42.
+vision epochs. Training stops after 15 epochs without a lower validation loss;
+the scheduler halves the learning rate after 10 such epochs. The maintained
+Slurm launcher uses a batch size of 128, a vision learning rate of `3e-4`, a
+64-value head, 30% dropout, and seed 42.
 
 Run the production workflow with:
 
@@ -126,14 +128,15 @@ The trainer produces three summary figures:
   recall within each split;
 - `training_curves.png` shows train and validation loss for both models;
 - `test_strata_accuracy.png` compares test accuracy across low, middle, and
-  high AOI-characteristic groups.
+  high AOI-characteristic and record-level raster-quality groups.
 
-The strata figure covers AOI plume score, major-city distance, total unit count,
-average heat input, and average power generation. The trainer computes each
-characteristic at the unique-AOI level, assigns AOIs to percentile tertiles,
-and evaluates all test records in each group. Labels report vision-seasonal
-accuracy minus seasonal accuracy. `test_strata_accuracy.csv` stores the plotted
-counts, value ranges, accuracies, and differences.
+The strata figure covers AOI plume score, total unit count, average heat input,
+and raster quality. The trainer assigns the AOI characteristics at the
+unique-AOI level. It computes record-level raster quality by equally combining
+the percentile ranks of low mean cloud fraction and high good-quality-pixel
+fraction. Labels report vision-seasonal accuracy minus seasonal accuracy.
+`test_strata_accuracy.csv` stores the plotted counts, stratification unit, value
+ranges, accuracies, and differences.
 
 The run directory contains both best checkpoints, preprocessing state,
 run configuration, and row-level predictions for each model and split.

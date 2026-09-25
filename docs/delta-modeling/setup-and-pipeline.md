@@ -123,10 +123,10 @@ temporary memory-mapped arrays, and trains two classifiers:
 - a four-input seasonal MLP;
 - a random-initialized ConvGRU fused with the frozen seasonal logits.
 
-The launcher requests one A5000 GPU, four CPUs, and eight hours on
+The launcher requests one A5000 GPU, four CPUs, and four hours on
 `savio4_gpu` with `a5k_gpu4_normal`. It emails split and class accuracy, both
-training curves, and the test AOI-strata comparison after a successful run. See
-[modeling.md](modeling.md) for the model contract.
+training curves, and the test AOI and raster-quality comparison after a
+successful run. See [modeling.md](modeling.md) for the model contract.
 
 ## Current Savio launchers
 
@@ -137,7 +137,7 @@ training curves, and the test AOI-strata comparison after a successful run. See
 | Stratification | `stratify_plants.sh` | 16 CPUs, 30 minutes, high-memory node |
 | Dataset shards | `launch_dataset_generation.sh` | Up to 8 tasks, 8 CPUs each, 12 hours |
 | Masked pretraining | `train_masked_pretraining.sh` | 1 A5000, 4 CPUs, 8 hours |
-| Delta classification | `train_model.sh` | 1 A5000, 4 CPUs, 8 hours |
+| Delta classification | `train_model.sh` | 1 A5000, 4 CPUs, 4 hours |
 
 Savio policies and availability can change. Check the requested account,
 partition, and QoS before submission.
