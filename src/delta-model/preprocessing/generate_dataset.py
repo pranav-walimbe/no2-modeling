@@ -33,7 +33,6 @@ from preprocessing.generate_dataset_utils import (
     process_scan_batch,
     process_weather_batch,
     scan_batches,
-    select_hotspot_cell,
     stage_files,
     weather_batches,
     write_csv_atomic,
@@ -48,9 +47,7 @@ from config import (
     DATASET_TEMPO_CACHE_DIR,
     DATASET_WEATHER_CACHE_DIR,
     DATASET_WORKERS_PER_SHARD,
-    HOTSPOT_WINDOW_SIZE,
     HRRR_DIR,
-    MIN_HOTSPOT_NO2_FINITE_FRACTION,
     MIN_TIMESTEP_NO2_FINITE_FRACTION,
     NUM_CORES,
     SEQUENCE_TIMESTEPS,
@@ -65,17 +62,11 @@ SPLIT_PATHS = {
     "val": VAL_RECORDS_CSV,
     "test": TEST_RECORDS_CSV,
 }
-SOURCE_METADATA_SCHEMA = {
-    "_source_east_km": pl.String,
-    "_source_north_km": pl.String,
-    "_source_unit_count": pl.String,
-}
 REQUIRED_SOURCE_COLUMNS = frozenset(
     {
         "aoi_id",
         "lat",
         "lon",
-        *SOURCE_METADATA_SCHEMA,
         *(f"no2_paths_t{index}" for index in range(SEQUENCE_TIMESTEPS)),
         *(f"weather_path_t{index}" for index in range(SEQUENCE_TIMESTEPS)),
     }
@@ -100,8 +91,6 @@ class PreparedRecord:
     record_index: int
     scan_keys: tuple[str, ...]
     weather_cache_keys: tuple[str, ...]
-    hotspot_row: int
-    hotspot_column: int
     raster_bundle_path: str
 
 
@@ -125,16 +114,11 @@ def _positive_int(value: str) -> int:
 
 def _scan_split(path: str) -> pl.LazyFrame:
     # Load split rows lazily for bounded orchestration memory
-    frame = pl.scan_csv(path, try_parse_dates=True, schema_overrides=SOURCE_METADATA_SCHEMA)
+    frame = pl.scan_csv(path, try_parse_dates=True)
     missing_columns = sorted(REQUIRED_SOURCE_COLUMNS.difference(frame.collect_schema().names()))
     if missing_columns:
         raise ValueError(f"Stratified split {path} is missing dataset-generation columns: {', '.join(missing_columns)}")
     return frame
-
-
-def _parse_source_values(value: object, value_type: type[float] | type[int]) -> tuple[float, ...] | tuple[int, ...]:
-    # Parse aligned comma-delimited source metadata from stratification
-    return tuple(value_type(item) for item in str(value).split(",") if item)
 
 
 def _slurm_array_spec(task_ids: list[int]) -> str:
@@ -241,19 +225,12 @@ def _prepare_records(
                     for index in range(SEQUENCE_TIMESTEPS)
                 )
                 raster_bundle_path = output_dir / f"{record_index:06d}.npz"
-                hotspot_row, hotspot_column = select_hotspot_cell(
-                    _parse_source_values(row["_source_east_km"], float),
-                    _parse_source_values(row["_source_north_km"], float),
-                    _parse_source_values(row["_source_unit_count"], int),
-                )
                 records.append(
                     PreparedRecord(
                         split=split,
                         record_index=record_index,
                         scan_keys=tuple(scan.cache_key for scan in record_scans),
                         weather_cache_keys=tuple(item.cache_key for item in record_weather),
-                        hotspot_row=hotspot_row,
-                        hotspot_column=hotspot_column,
                         raster_bundle_path=str(raster_bundle_path),
                     )
                 )
@@ -412,8 +389,6 @@ def _record_tasks(
                 record_index=record.record_index,
                 scan_cache_paths=tuple(tempo_cache_paths[key] for key in record.scan_keys),
                 weather_cache_paths=tuple(weather_cache_paths[key] for key in record.weather_cache_keys),
-                hotspot_row=record.hotspot_row,
-                hotspot_column=record.hotspot_column,
                 output_path=output_path,
             )
         )
@@ -536,8 +511,6 @@ def _write_outputs(
             "raster_contract": {
                 "sequence_timesteps": SEQUENCE_TIMESTEPS,
                 "minimum_no2_finite_fraction_per_timestep": MIN_TIMESTEP_NO2_FINITE_FRACTION,
-                "hotspot_window_size": HOTSPOT_WINDOW_SIZE,
-                "minimum_hotspot_no2_finite_fraction_per_timestep": MIN_HOTSPOT_NO2_FINITE_FRACTION,
             },
             "source_records": source_splits[split].height,
             "generated_records": candidates.height,

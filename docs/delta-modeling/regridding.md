@@ -51,9 +51,9 @@ Weather alignment projects AOI cell centers onto the HRRR Lambert grid,
 bilinearly samples the 3 km fields, and rotates grid-relative winds into
 geographic east and north.
 
-Each timestep must contain at least 90% finite NO2 cells and complete NO2
-support in the 3 by 3 source hotspot. The companion CSV includes per-timestep
-coverage plus sequence-level cloud, quality, and uncertainty summaries.
+Each timestep must contain at least 90% finite NO2 cells. The companion CSV
+includes per-timestep coverage plus sequence-level cloud, quality, and
+uncertainty summaries.
 
 ## Training-time completion
 
