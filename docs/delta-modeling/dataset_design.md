@@ -12,7 +12,7 @@ three-class emissions-change label for a 72 km area of interest (AOI).
 | Split unit | Cluster of overlapping 72 km AOIs |
 | Split target | About 70% train, 15% validation, 15% test within each class |
 | Metadata sampling | Equal class counts within each split before raster quality control |
-| Raster quality | At least 90% finite NO2 per timestep and full 3 by 3 source-hotspot coverage |
+| Raster quality | At least 90% finite NO2 per timestep |
 | Model selection | Validation split only; test remains frozen |
 
 ## Record selection

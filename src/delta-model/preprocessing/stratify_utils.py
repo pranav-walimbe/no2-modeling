@@ -685,34 +685,6 @@ def aggregate_aoi_hours(
         One row per selected AOI and emissions hour.
     """
     records_lazy = records.lazy() if isinstance(records, pl.DataFrame) else records
-    facility_units = records_lazy.select("facilityId", "unitId").unique()
-    facility_unit_counts = facility_units.group_by("facilityId").agg(
-        pl.len().cast(pl.UInt32).alias("_source_unit_count")
-    )
-    facility_locations = add_projected_coordinates(
-        records_lazy.select("facilityId", "lat", "lon").drop_nulls().unique(subset="facilityId", keep="first").collect()
-    )
-    source_locations = (
-        facility_locations.lazy()
-        .join(facility_unit_counts, on="facilityId", how="inner")
-        .join(membership.lazy(), on="facilityId", how="inner")
-        .join(
-            aois.select(AOI_ID_COL, "x_m", "y_m").lazy().rename({"x_m": "_aoi_x_m", "y_m": "_aoi_y_m"}),
-            on=AOI_ID_COL,
-            how="inner",
-        )
-        .with_columns(
-            ((pl.col("x_m") - pl.col("_aoi_x_m")) / 1_000).alias("_source_east_km"),
-            ((pl.col("y_m") - pl.col("_aoi_y_m")) / 1_000).alias("_source_north_km"),
-        )
-        .sort(AOI_ID_COL, "facilityId")
-        .group_by(AOI_ID_COL, maintain_order=True)
-        .agg(
-            pl.col("_source_east_km").cast(pl.String).str.join(",").alias("_source_east_km"),
-            pl.col("_source_north_km").cast(pl.String).str.join(",").alias("_source_north_km"),
-            pl.col("_source_unit_count").cast(pl.String).str.join(",").alias("_source_unit_count"),
-        )
-    )
     hourly = (
         records_lazy.join(membership.lazy(), on="facilityId", how="inner")
         .group_by(AOI_ID_COL, "emissions_hour_utc")
@@ -724,7 +696,6 @@ def aggregate_aoi_hours(
     )
     return (
         hourly.join(aoi_features.lazy(), on=AOI_ID_COL, how="inner")
-        .join(source_locations, on=AOI_ID_COL, how="left")
         .join(aois.select(AOI_ID_COL, "lat", "lon", "x_m", "y_m").lazy(), on=AOI_ID_COL, how="left")
         .sort(AOI_ID_COL, "date", "hour")
         .collect(engine="streaming")

@@ -95,9 +95,9 @@ their current batch. Pass `--refresh-tempo`, `--refresh-weather`, or
 `--refresh-cache` after the final `--` when a raster contract or source file
 changes. Do not regenerate while a model job reads the dataset.
 
-Workers require at least 90% finite NO2 coverage at each timestep and full
-coverage in the 3 by 3 source hotspot. The finalizer publishes split CSVs only
-after it validates all shard outcomes. See [regridding.md](regridding.md).
+Workers require at least 90% finite NO2 coverage at each timestep. The
+finalizer publishes split CSVs only after it validates all shard outcomes. See
+[regridding.md](regridding.md).
 
 ## 4. Provide a masked-model checkpoint
 

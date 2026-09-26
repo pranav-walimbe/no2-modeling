@@ -95,8 +95,6 @@ DATASET_WORKERS_PER_SHARD = 8  # process workers and CPUs assigned to each shard
 IMG_SIZE = 24  # image size in pixels (24x24)
 MIN_PIXEL_CLOUD = 0.20  # TEMPO cloud fraction threshold per pixel
 MIN_TIMESTEP_NO2_FINITE_FRACTION = 0.90  # inclusive coverage floor applied independently to every timestep
-HOTSPOT_WINDOW_SIZE = 3  # odd source-centred square required to have complete NO2 support
-MIN_HOTSPOT_NO2_FINITE_FRACTION = 1.0  # inclusive hotspot coverage floor applied to every timestep
 
 # ============================================================================
 # Delta-model training contract

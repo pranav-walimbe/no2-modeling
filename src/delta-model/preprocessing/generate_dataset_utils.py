@@ -34,10 +34,6 @@ from pyproj import CRS, Proj, Transformer
 from scipy.ndimage import map_coordinates
 
 from config import (
-    HOTSPOT_WINDOW_SIZE,
-    IMG_RANGE,
-    IMG_SIZE,
-    MIN_HOTSPOT_NO2_FINITE_FRACTION,
     MIN_TIMESTEP_NO2_FINITE_FRACTION,
     SEQUENCE_TIMESTEPS,
 )
@@ -48,17 +44,11 @@ TEMPERATURE_RASTER_NAME = "temperature_2m_k"
 WIND_U_RASTER_NAME = "wind_u_80m_mps"
 WIND_V_RASTER_NAME = "wind_v_80m_mps"
 NO2_FINITE_FRACTION_COLUMNS = tuple(f"no2_finite_fraction_t{index}" for index in range(SEQUENCE_TIMESTEPS))
-HOTSPOT_FINITE_FRACTION_COLUMNS = tuple(f"hotspot_no2_finite_fraction_t{index}" for index in range(SEQUENCE_TIMESTEPS))
 MIN_NO2_FINITE_FRACTION_COL = "min_no2_finite_fraction"
-MIN_HOTSPOT_FINITE_FRACTION_COL = "min_hotspot_no2_finite_fraction"
-HOTSPOT_ROW_COL = "hotspot_row"
-HOTSPOT_COLUMN_COL = "hotspot_column"
 MEAN_RETRIEVAL_UNCERTAINTY_COL = "mean_retrieval_uncertainty"
 TABULAR_FEATURE_NAMES = (
     *NO2_FINITE_FRACTION_COLUMNS,
-    *HOTSPOT_FINITE_FRACTION_COLUMNS,
     MIN_NO2_FINITE_FRACTION_COL,
-    MIN_HOTSPOT_FINITE_FRACTION_COL,
     "mean_weighted_cloud_fraction",
     "mean_good_quality_fraction",
     MEAN_RETRIEVAL_UNCERTAINTY_COL,
@@ -70,8 +60,6 @@ CANDIDATE_FEATURE_SCHEMA = {
     SOURCE_RECORD_INDEX_COL: pl.UInt32,
     CANDIDATE_RASTER_PATH_COL: pl.String,
     **{name: pl.Float64 for name in TABULAR_FEATURE_NAMES},
-    HOTSPOT_ROW_COL: pl.UInt8,
-    HOTSPOT_COLUMN_COL: pl.UInt8,
 }
 PROCESSING_FAILURE_SCHEMA = {"record_index": pl.Int64, "error": pl.String}
 SHARD_CANDIDATES_FILE = "candidates.csv"
@@ -477,8 +465,6 @@ class RecordTask:
     record_index: int
     scan_cache_paths: tuple[str, ...]
     weather_cache_paths: tuple[str, ...]
-    hotspot_row: int
-    hotspot_column: int
     output_path: str
 
 
@@ -936,92 +922,15 @@ def _require_fraction(fraction: float, threshold: float, raster_name: str) -> fl
     return fraction
 
 
-def select_hotspot_cell(
-    source_east_km: tuple[float, ...],
-    source_north_km: tuple[float, ...],
-    source_unit_counts: tuple[int, ...],
-) -> tuple[int, int]:
-    """Select the highest-unit source cell with a centroid-distance tie-break.
-
-    Args:
-        source_east_km: Facility offsets east of the AOI centre.
-        source_north_km: Facility offsets north of the AOI centre.
-        source_unit_counts: Modeled unit counts aligned with the offsets.
-
-    Returns:
-        Zero-indexed hotspot row and column in the model raster.
-    """
-    source_count = len(source_east_km)
-    if source_count == 0 or len(source_north_km) != source_count or len(source_unit_counts) != source_count:
-        raise ValueError("Source coordinates and unit counts must be non-empty and aligned")
-    east = np.asarray(source_east_km, dtype=np.float64)
-    north = np.asarray(source_north_km, dtype=np.float64)
-    counts = np.asarray(source_unit_counts, dtype=np.int64)
-
-    cell_size_km = IMG_RANGE / IMG_SIZE
-    half_extent_km = IMG_RANGE / 2
-    columns = np.floor((east + half_extent_km) / cell_size_km).astype(np.int64)
-    rows = np.floor((half_extent_km - north) / cell_size_km).astype(np.int64)
-
-    clusters: dict[tuple[int, int], tuple[int, float, float]] = {}
-    for row, column, source_east, source_north, unit_count in zip(
-        rows,
-        columns,
-        east,
-        north,
-        counts,
-        strict=True,
-    ):
-        key = (int(row), int(column))
-        total, weighted_east, weighted_north = clusters.get(key, (0, 0.0, 0.0))
-        clusters[key] = (
-            total + int(unit_count),
-            weighted_east + float(source_east * unit_count),
-            weighted_north + float(source_north * unit_count),
-        )
-
-    ranked = []
-    for (row, column), (unit_count, weighted_east, weighted_north) in clusters.items():
-        centroid_distance_squared = (weighted_east / unit_count) ** 2 + (weighted_north / unit_count) ** 2
-        ranked.append((-unit_count, centroid_distance_squared, row, column))
-    _, _, row, column = min(ranked)
-    return row, column
-
-
-def hotspot_finite_fraction(valid: np.ndarray, hotspot_row: int, hotspot_column: int) -> float:
-    """Calculate finite coverage in the configured hotspot window.
-
-    Args:
-        valid: Two-dimensional NO2 validity mask.
-        hotspot_row: Selected source-cluster row.
-        hotspot_column: Selected source-cluster column.
-
-    Returns:
-        Fraction of valid cells in the complete hotspot window.
-    """
-    radius = HOTSPOT_WINDOW_SIZE // 2
-    if not radius <= hotspot_row < IMG_SIZE - radius or not radius <= hotspot_column < IMG_SIZE - radius:
-        raise ValueError("Hotspot is too close to the AOI boundary for a complete window")
-    window = valid[
-        hotspot_row - radius : hotspot_row + radius + 1,
-        hotspot_column - radius : hotspot_column + radius + 1,
-    ]
-    return float(np.mean(window))
-
-
 def derive_raster_features(
     scan_paths: tuple[str, ...],
     weather_paths: tuple[str, ...],
-    hotspot_row: int,
-    hotspot_column: int,
 ) -> tuple[dict[str, np.ndarray], dict[str, int | float]]:
     """Build time-major model rasters and scan-quality scalar features.
 
     Args:
         scan_paths: Oldest-to-newest cached TEMPO scan bundles.
         weather_paths: Matching oldest-to-newest weather cache bundles.
-        hotspot_row: Row containing the selected largest source cluster.
-        hotspot_column: Column containing the selected largest source cluster.
 
     Returns:
         Model raster arrays and their retrieval-quality diagnostics.
@@ -1032,7 +941,6 @@ def derive_raster_features(
     quality_values: list[np.ndarray] = []
     uncertainty_values: list[np.ndarray] = []
     finite_fractions: list[float] = []
-    hotspot_fractions: list[float] = []
     for index, path in enumerate(scan_paths):
         with np.load(path, allow_pickle=False) as scan:
             no2 = np.asarray(scan["no2"], dtype=np.float32)
@@ -1044,14 +952,6 @@ def derive_raster_features(
                     f"Timestep {index} NO2",
                 )
             )
-            hotspot_fraction = hotspot_finite_fraction(valid, hotspot_row, hotspot_column)
-            hotspot_fractions.append(
-                _require_fraction(
-                    hotspot_fraction,
-                    MIN_HOTSPOT_NO2_FINITE_FRACTION,
-                    f"Timestep {index} hotspot NO2",
-                )
-            )
             no2_values.append(no2)
             no2_masks.append(valid)
             cloud_values.append(np.asarray(scan["weighted_cloud_fraction"], dtype=np.float32))
@@ -1061,11 +961,7 @@ def derive_raster_features(
     weather = [extract_weather_cache(path) for path in weather_paths]
     features = {
         **dict(zip(NO2_FINITE_FRACTION_COLUMNS, finite_fractions, strict=True)),
-        **dict(zip(HOTSPOT_FINITE_FRACTION_COLUMNS, hotspot_fractions, strict=True)),
         MIN_NO2_FINITE_FRACTION_COL: min(finite_fractions),
-        MIN_HOTSPOT_FINITE_FRACTION_COL: min(hotspot_fractions),
-        HOTSPOT_ROW_COL: hotspot_row,
-        HOTSPOT_COLUMN_COL: hotspot_column,
         "mean_weighted_cloud_fraction": _sequence_mean(cloud_values, no2_masks),
         "mean_good_quality_fraction": _sequence_mean(quality_values, no2_masks),
         MEAN_RETRIEVAL_UNCERTAINTY_COL: _sequence_mean(uncertainty_values, no2_masks),
@@ -1107,8 +1003,6 @@ def _build_model_bundle(task: RecordTask) -> tuple[dict[str, np.ndarray], dict[s
     rasters, features = derive_raster_features(
         task.scan_cache_paths,
         task.weather_cache_paths,
-        task.hotspot_row,
-        task.hotspot_column,
     )
     return rasters, features
 
