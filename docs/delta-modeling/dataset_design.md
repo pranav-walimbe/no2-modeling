@@ -19,14 +19,13 @@ three-class emissions-change label for a 72 km area of interest (AOI).
 
 The pipeline applies these steps in order:
 
-1. Build the complete facility-centered AOI set and join it to the persistent
-   `AOI_SCORE_JSON` mapping. Rank mapped AOIs by plume-quality score with AOI ID
-   as the deterministic tie-breaker, then retain the highest-scoring half. No
-   fuel-type or plant-characteristic filter is applied. Unmapped AOIs are not
-   eligible for selection, and score IDs outside the current facility-centered
-   AOI set cause stratification to fail instead of being silently ignored.
-   Stratification saves a complete AOI selection audit, plus a line plot of the
-   mapped score distribution and retained percentile range.
+1. Build the complete facility-centered AOI set. For each AOI-hour, calculate
+   mean unit operating time and total usable NOx emissions. Retain hours at or
+   above the AOI's median operating time, then score the AOI by its median NOx
+   over those higher-activity hours. Rank AOIs by this emissions-only score
+   with AOI ID as the deterministic tie-breaker and retain the highest-scoring
+   half. No fuel-type or plant-characteristic value enters the score.
+   Stratification saves a complete AOI selection audit and characteristic plot.
 2. Aggregate usable CAMPD measurements for the selected AOIs by UTC hour. Add
    unit counts, major-city distance, and full-history heat-input and generation
    averages calculated over the same higher-activity AOI-hours.
@@ -39,12 +38,15 @@ The pipeline applies these steps in order:
    the actual time between scans, so a 70-minute interval admits more of the
    new value than a 40-minute interval.
 6. Undo the final EMA update attenuation to recover the innovation relative to
-   the preceding EMA. Assign classes using the larger of a 100 lb/hr absolute
+   the preceding EMA. Assign classes using the larger of a 200 lb/hr absolute
    floor or 25% of the AOI's median positive interpolated timestep NOx.
-7. Assign each overlap cluster to one split with a deterministic procedure that
+7. Retain only AOIs providing at least 20 candidate records in every class.
+8. Assign each overlap cluster to one split with a deterministic procedure that
    targets the 70/15/15 ratio for each class.
-8. Downsample each class to the smallest class count within its split.
-9. Generate rasters and reject records that fail coverage or source-file checks.
+9. Downsample each class to the smallest class count within its split. Use
+   deterministic weighted sampling for steady records, with weight increasing
+   as absolute EMA innovation approaches zero.
+10. Generate rasters and reject records that fail coverage or source-file checks.
 
 Raster quality control can change class counts after balancing. The finalizer
 reports those counts and does not rebalance the retained records.
@@ -66,7 +68,7 @@ For the final update, define:
 alpha = 1 - exp(-(t3 - t2) / 2 hours)
 ema_innovation_nox = effective_delta_nox / alpha
 aoi_active_median_nox = median(positive t0_nox ... t3_nox values for the AOI)
-hybrid_innovation_threshold = max(100, 0.25 * aoi_active_median_nox)
+hybrid_innovation_threshold = max(200, 0.25 * aoi_active_median_nox)
 ```
 
 Innovations at or below the negative threshold are decreases. Innovations at
@@ -91,7 +93,7 @@ Each raster bundle stores five arrays with shape `4 x 24 x 24`:
 | `wind_u_80m_mps` | Geographic eastward HRRR wind |
 | `wind_v_80m_mps` | Geographic northward HRRR wind |
 
-Stratification metadata stores the AOI plume-quality score and percentile,
+Stratification metadata stores the activity-conditioned median-NOx score and percentile,
 coal, natural-gas, and total unit counts. It also stores major-city distance
 and activity-conditioned averages for heat input, generation, and coal NOx.
 The AOI score is selection metadata and does not enter the model. The metadata

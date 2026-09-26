@@ -64,8 +64,10 @@ total_records=$((train_records + val_records + test_records))
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" stat -c %s "${mail_log}")
 printf '%s\n' \
     'Point-interpolated EMA stratification completed successfully.' \
-    'Selected the highest plume-quality-scored half of mapped AOIs.' \
-    'EMA innovation threshold: max(100 lb/hr, 25% of median positive AOI timestep NOx).' \
+    'Selected the half of AOIs with the highest activity-conditioned median NOx.' \
+    'EMA innovation threshold: max(200 lb/hr, 25% of median positive AOI timestep NOx).' \
+    'Eligible AOIs provide at least 20 candidates in decrease, steady, and increase.' \
+    'Steady-class downsampling favors innovations nearest zero.' \
     'Four causal rasters retained; the irregular-time EMA uses t0 through t3.' \
     'Each timestep NOx value is linearly interpolated between its surrounding CAMPD hours.' \
     'Filtered AOI clusters were assigned by class to approximately 70/15/15 splits.' \

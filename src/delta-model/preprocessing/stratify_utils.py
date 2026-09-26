@@ -32,6 +32,7 @@ CONUS_TO_WGS84 = Transformer.from_crs("EPSG:5070", "EPSG:4326", always_xy=True)
 POPULATED_PLACES_PATH = Path(
     "/global/scratch/projects/fc_nitrates/ddp/nox/reference/ne_10m_populated_places_simple.zip"
 )
+HASH_MODULUS = 1_000_000_007
 
 
 def load_major_cities(path: Path = POPULATED_PLACES_PATH) -> pl.DataFrame:
@@ -454,6 +455,118 @@ def usable_nox_measurement_expr() -> pl.Expr:
         .str.contains(r"invalid|unavailable")
     )
     return ~unusable
+
+
+def calculate_operating_aoi_characteristics(
+    records: pl.DataFrame | pl.LazyFrame,
+    membership: pl.DataFrame,
+) -> pl.DataFrame:
+    """Summarize NOx output and unit operation over higher-activity AOI hours.
+
+    Args:
+        records: Full unit-hour emissions history.
+        membership: Facility-to-AOI membership table.
+
+    Returns:
+        One row per AOI with activity-conditioned operating characteristics.
+    """
+    records_lazy = records.lazy() if isinstance(records, pl.DataFrame) else records
+    hourly = (
+        records_lazy.filter(pl.col("opTime").is_finite() & (pl.col("opTime") >= 0))
+        .join(membership.lazy(), on="facilityId", how="inner")
+        .group_by(AOI_ID_COL, "emissions_hour_utc")
+        .agg(
+            pl.col("opTime").mean().alias("_mean_unit_op_time"),
+            (pl.col("opTime") > 0).sum().alias("_operating_units"),
+            pl.col("noxMass")
+            .filter(usable_nox_measurement_expr() & pl.col("noxMass").is_finite() & (pl.col("noxMass") >= 0))
+            .sum()
+            .alias("_total_nox"),
+        )
+        .collect(engine="streaming")
+    )
+    activity_cutoffs = hourly.group_by(AOI_ID_COL).agg(
+        pl.col("_mean_unit_op_time").median().alias("_median_unit_op_time")
+    )
+    active = hourly.join(activity_cutoffs, on=AOI_ID_COL, how="inner").filter(
+        pl.col("_mean_unit_op_time") >= pl.col("_median_unit_op_time")
+    )
+    return (
+        active.group_by(AOI_ID_COL)
+        .agg(
+            pl.col("_total_nox").median().alias("active_median_total_nox"),
+            pl.col("_operating_units").mean().alias("active_mean_operating_units"),
+        )
+        .join(
+            hourly.group_by(AOI_ID_COL).agg((pl.col("_total_nox") > 0).mean().alias("history_emitting_fraction")),
+            on=AOI_ID_COL,
+            how="inner",
+        )
+    )
+
+
+def filter_groups_by_class_count(
+    frame: pl.DataFrame,
+    group_column: str,
+    class_column: str,
+    class_names: tuple[str, ...],
+    minimum_per_class: int,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Retain groups meeting a record minimum in every requested class.
+
+    Args:
+        frame: Labeled records.
+        group_column: Column identifying one group.
+        class_column: Column carrying class names.
+        class_names: Classes required in every retained group.
+        minimum_per_class: Required records for each class.
+
+    Returns:
+        Eligible records and a group-level class-count audit.
+    """
+    counts = (
+        frame.group_by(group_column)
+        .agg(*[(pl.col(class_column) == name).sum().alias(f"{name}_records") for name in class_names])
+        .with_columns(
+            pl.min_horizontal(*(f"{name}_records" for name in class_names)).alias("minimum_class_records")
+        )
+        .with_columns((pl.col("minimum_class_records") >= minimum_per_class).alias("meets_class_floor"))
+        .sort(group_column)
+    )
+    eligible_groups = counts.filter(pl.col("meets_class_floor")).select(group_column)
+    return frame.join(eligible_groups, on=group_column, how="inner"), counts
+
+
+def deterministic_weighted_sample(
+    frame: pl.DataFrame,
+    count: int,
+    weight: pl.Expr,
+    identity_columns: tuple[str, ...],
+    seed: int,
+) -> pl.DataFrame:
+    """Select a deterministic weighted sample without replacement.
+
+    Args:
+        frame: Candidate records.
+        count: Maximum records to select.
+        weight: Positive per-record sampling weight.
+        identity_columns: Stable columns used to derive pseudorandom values.
+        seed: Hash seed controlling the deterministic sample.
+
+    Returns:
+        At most ``count`` records ordered by weighted sampling priority.
+    """
+    tie_breaker = pl.struct(*identity_columns).hash(seed=seed)
+    uniform = ((tie_breaker % HASH_MODULUS).cast(pl.Float64) + 0.5) / HASH_MODULUS
+    return (
+        frame.with_columns(
+            tie_breaker.alias("_selection_tie_breaker"),
+            (-uniform.log() / weight).alias("_selection_priority"),
+        )
+        .sort("_selection_priority", "_selection_tie_breaker", *identity_columns)
+        .head(count)
+        .drop("_selection_priority", "_selection_tie_breaker")
+    )
 
 
 def add_delta_nox_targets(hourly: pl.LazyFrame) -> pl.LazyFrame:
