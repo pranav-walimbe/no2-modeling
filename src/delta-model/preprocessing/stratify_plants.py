@@ -1,7 +1,6 @@
 """Partition AOI-hour emission records into train, validation, and test splits."""
 
 import argparse
-import json
 import math
 import os
 from pathlib import Path
@@ -25,14 +24,16 @@ from preprocessing.stratify_utils import (
     build_aoi_spatial_frame,
     build_aois,
     calculate_activity_conditioned_aoi_features,
+    calculate_operating_aoi_characteristics,
     cluster_aois,
+    deterministic_weighted_sample,
+    filter_groups_by_class_count,
     filter_usable_nox_measurements,
     usable_nox_measurement_expr,
 )
 from preprocessing.tempo_mapping import load_tempo_mapping
 
 from config import (
-    AOI_SCORE_JSON,
     EMA_DECAY_TIMESCALE_HOURS,
     EMA_HISTORY_TIMESTEPS,
     FULL_DATA_PARQUET,
@@ -42,6 +43,7 @@ from config import (
     STRATIFICATION_AOI_FRACTION,
     STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR,
     STRATIFICATION_INNOVATION_RELATIVE_FLOOR,
+    STRATIFICATION_MINIMUM_RECORDS_PER_CLASS,
     TEST_RECORDS_CSV,
     TRAIN_RECORDS_CSV,
     VAL_RECORDS_CSV,
@@ -50,6 +52,7 @@ from config import (
 
 SPLIT_FRACTIONS = {"train": 0.70, "val": 0.15, "test": 0.15}
 SPLIT_SEED = 42
+MIN_STEADY_SELECTION_WEIGHT = 0.01
 DELTA_CATEGORY_COL = "delta_category"
 AOI_SCORE_COL = "aoi_score"
 AOI_SCORE_PERCENTILE_COL = "aoi_score_percentile"
@@ -153,7 +156,6 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_AOI_CHARACTERISTICS_OUTPUT,
     )
     parser.add_argument("--aoi-selection-output", type=Path, default=DEFAULT_AOI_SELECTION_OUTPUT)
-    parser.add_argument("--aoi-score-json", type=Path, default=Path(AOI_SCORE_JSON))
     return parser.parse_args()
 
 
@@ -283,6 +285,28 @@ def filter_stratification_rule(frame: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def filter_aoi_class_floor(
+    frame: pl.DataFrame,
+    minimum_per_class: int = STRATIFICATION_MINIMUM_RECORDS_PER_CLASS,
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Retain AOIs with enough candidate records in every EMA class.
+
+    Args:
+        frame: Labeled candidate records.
+        minimum_per_class: Required records in each class for one AOI.
+
+    Returns:
+        Eligible records and an AOI-level class-count audit.
+    """
+    return filter_groups_by_class_count(
+        frame,
+        AOI_ID_COL,
+        DELTA_CATEGORY_COL,
+        EMA_BUCKET_NAMES,
+        minimum_per_class,
+    )
+
+
 def _filter_metadata_eligibility(frame: pl.DataFrame) -> pl.DataFrame:
     # Apply non-raster candidate quality requirements
     return frame.filter(
@@ -315,23 +339,29 @@ def select_balanced_ema_records(
         raise ValueError(f"[{split}] EMA buckets have no records: {', '.join(sorted(missing_classes))}")
     records_per_class = int(counts["len"].min())
     selected = []
+    identity_columns = (AOI_ID_COL, "emissions_hour_utc", f"t{LABEL_TIMESTEP_INDEX}_timestamp")
     for class_name in EMA_BUCKET_NAMES:
-        class_records = (
-            frame.filter(pl.col(DELTA_CATEGORY_COL) == class_name)
-            .with_columns(
-                pl.struct(AOI_ID_COL, "emissions_hour_utc", f"t{LABEL_TIMESTEP_INDEX}_timestamp")
-                .hash(seed=seed)
-                .alias("_selection_tie_breaker")
+        class_records = frame.filter(pl.col(DELTA_CATEGORY_COL) == class_name)
+        if class_name == "steady":
+            weight = (
+                1 - pl.col(EMA_INNOVATION_COL).abs() / pl.col(HYBRID_THRESHOLD_COL)
+            ).clip(MIN_STEADY_SELECTION_WEIGHT, 1.0)
+            class_records = deterministic_weighted_sample(
+                class_records,
+                records_per_class,
+                weight,
+                identity_columns,
+                seed,
             )
-            .sort(
-                "_selection_tie_breaker",
-                AOI_ID_COL,
-                "emissions_hour_utc",
-                f"t{LABEL_TIMESTEP_INDEX}_timestamp",
+        else:
+            class_records = (
+                class_records.with_columns(
+                    pl.struct(*identity_columns).hash(seed=seed).alias("_selection_tie_breaker")
+                )
+                .sort("_selection_tie_breaker", *identity_columns)
+                .head(records_per_class)
+                .drop("_selection_tie_breaker")
             )
-            .head(records_per_class)
-            .drop("_selection_tie_breaker")
-        )
         selected.append(class_records)
     balanced = pl.concat(selected).sort(AOI_ID_COL, "emissions_hour_utc")
     count_summary = ", ".join(f"{row[DELTA_CATEGORY_COL]}={row['len']:,}" for row in counts.iter_rows(named=True))
@@ -424,41 +454,9 @@ def _plot_stratification_diagnostics(
     plt.close(figure)
 
 
-def _load_aoi_scores(path: Path) -> pl.DataFrame:
-    # Validate the persistent JSON object at the stratification boundary
-    if not path.is_file():
-        raise FileNotFoundError(f"AOI score mapping not found: {path}")
-    loaded = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(loaded, dict) or not loaded:
-        raise ValueError(f"AOI score mapping must be a non-empty JSON object: {path}")
-    rows = []
-    for raw_aoi_id, raw_score in loaded.items():
-        try:
-            aoi_id = int(raw_aoi_id)
-            score = float(raw_score)
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"Invalid AOI score entry {raw_aoi_id!r}: {raw_score!r}") from error
-        if not np.isfinite(score):
-            raise ValueError(f"AOI {aoi_id} has a non-finite score")
-        rows.append({AOI_ID_COL: aoi_id, AOI_SCORE_COL: score})
-    scores = pl.DataFrame(rows, schema={AOI_ID_COL: pl.Int64, AOI_SCORE_COL: pl.Float64})
-    if scores[AOI_ID_COL].n_unique() != scores.height:
-        raise ValueError("AOI score identifiers must be unique after integer parsing")
-    return scores
-
-
 def _rank_aoi_scores(all_aois: pl.DataFrame, scores: pl.DataFrame) -> pl.DataFrame:
-    # Reject stale mappings, then rank mapped members of the facility-centered AOI set
-    unknown = scores.join(all_aois.select(AOI_ID_COL), on=AOI_ID_COL, how="anti")
-    if not unknown.is_empty():
-        unknown_ids = unknown[AOI_ID_COL].sort().head(10).to_list()
-        raise ValueError(
-            f"AOI score mapping contains {unknown.height} IDs outside the facility-centered AOI set; "
-            f"first IDs: {unknown_ids}"
-        )
+    # Rank scored members of the facility-centered AOI set
     ranked = all_aois.select(AOI_ID_COL).join(scores, on=AOI_ID_COL, how="inner").sort(AOI_SCORE_COL, AOI_ID_COL)
-    if ranked.is_empty():
-        raise ValueError("AOI score mapping does not overlap the facility-centered AOI set")
     return ranked.with_row_index("aoi_score_rank", offset=1).with_columns(
         (pl.col("aoi_score_rank") / pl.len()).alias(AOI_SCORE_PERCENTILE_COL)
     )
@@ -474,8 +472,6 @@ def select_top_scored_aois(ranked_scores: pl.DataFrame, fraction: float) -> pl.D
     Returns:
         Deterministically selected AOI score rows.
     """
-    if not 0 < fraction <= 1:
-        raise ValueError("AOI selection fraction must be in (0, 1]")
     selected_count = math.ceil(ranked_scores.height * fraction)
     return ranked_scores.sort(
         AOI_SCORE_COL,
@@ -515,42 +511,6 @@ def _static_aoi_characteristics(relevant: pl.LazyFrame, membership: pl.DataFrame
         .collect(engine="streaming")
     )
     return static.join(capacity, on=AOI_ID_COL, how="inner")
-
-
-def _operating_aoi_characteristics(relevant: pl.LazyFrame, membership: pl.DataFrame) -> pl.DataFrame:
-    # Summarize NOx output and unit operation over observed history
-    hourly = (
-        relevant.filter(pl.col("opTime").is_finite() & (pl.col("opTime") >= 0))
-        .join(membership.lazy(), on="facilityId", how="inner")
-        .group_by(AOI_ID_COL, "emissions_hour_utc")
-        .agg(
-            pl.col("opTime").mean().alias("_mean_unit_op_time"),
-            (pl.col("opTime") > 0).sum().alias("_operating_units"),
-            pl.col("noxMass")
-            .filter(usable_nox_measurement_expr() & pl.col("noxMass").is_finite() & (pl.col("noxMass") >= 0))
-            .sum()
-            .alias("_total_nox"),
-        )
-        .collect(engine="streaming")
-    )
-    activity_cutoffs = hourly.group_by(AOI_ID_COL).agg(
-        pl.col("_mean_unit_op_time").median().alias("_median_unit_op_time")
-    )
-    active = hourly.join(activity_cutoffs, on=AOI_ID_COL, how="inner").filter(
-        pl.col("_mean_unit_op_time") >= pl.col("_median_unit_op_time")
-    )
-    return (
-        active.group_by(AOI_ID_COL)
-        .agg(
-            pl.col("_total_nox").median().alias("active_median_total_nox"),
-            pl.col("_operating_units").mean().alias("active_mean_operating_units"),
-        )
-        .join(
-            hourly.group_by(AOI_ID_COL).agg((pl.col("_total_nox") > 0).mean().alias("history_emitting_fraction")),
-            on=AOI_ID_COL,
-            how="inner",
-        )
-    )
 
 
 def _geographic_aoi_characteristics(
@@ -601,7 +561,7 @@ def calculate_aoi_characteristics(
     relevant_facilities = membership["facilityId"].unique()
     relevant = raw_records.filter(pl.col("facilityId").is_in(relevant_facilities.implode()))
     static = _static_aoi_characteristics(relevant, membership)
-    operating = _operating_aoi_characteristics(relevant, membership)
+    operating = calculate_operating_aoi_characteristics(relevant, membership)
     geometry = _geographic_aoi_characteristics(relevant, membership, aois)
     return static.join(
         operating,
@@ -650,7 +610,7 @@ def _plot_aoi_characteristics(characteristics: pl.DataFrame, output_path: Path) 
     figure.legend(handles, labels, loc="outside upper center", ncols=2)
     selected_count = characteristics.filter(pl.col("selected_for_stratification")).height
     figure.suptitle(
-        f"AOI characteristics after plume-quality selection "
+        f"AOI characteristics after active-median-NOx selection "
         f"({selected_count:,}/{characteristics.height:,} scored AOIs retained)",
         fontsize=16,
     )
@@ -672,7 +632,6 @@ def _serialize_no2_paths(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def build_stratification_candidates(
-    aoi_score_path: Path = Path(AOI_SCORE_JSON),
     aoi_characteristics_plot: Path = DEFAULT_AOI_CHARACTERISTICS_PLOT,
     aoi_characteristics_output: Path = DEFAULT_AOI_CHARACTERISTICS_OUTPUT,
     aoi_selection_output: Path = DEFAULT_AOI_SELECTION_OUTPUT,
@@ -680,7 +639,6 @@ def build_stratification_candidates(
     """Build eligible AOI-hour records for score-selected AOIs.
 
     Args:
-        aoi_score_path: Persistent JSON mapping from AOI identifier to score.
         aoi_characteristics_plot: Destination for the AOI characteristics dashboard.
         aoi_characteristics_output: Destination for the underlying AOI table.
         aoi_selection_output: Destination for the complete AOI score-selection audit.
@@ -696,7 +654,14 @@ def build_stratification_candidates(
     all_aois = build_aois(facilities)
     all_spatial_aois = build_aoi_spatial_frame(all_aois)
     all_membership = build_aoi_membership(all_aois, facilities, all_spatial_aois)
-    ranked_scores = _rank_aoi_scores(all_aois, _load_aoi_scores(aoi_score_path))
+    characteristics = calculate_aoi_characteristics(raw_records, all_membership, all_aois)
+    nox_scores = (
+        characteristics.filter(
+            pl.col("active_median_total_nox").is_finite() & (pl.col("active_median_total_nox") >= 0)
+        )
+        .select(AOI_ID_COL, pl.col("active_median_total_nox").alias(AOI_SCORE_COL))
+    )
+    ranked_scores = _rank_aoi_scores(all_aois, nox_scores)
     selected_scores = select_top_scored_aois(ranked_scores, STRATIFICATION_AOI_FRACTION)
     selected_ids = selected_scores.select(AOI_ID_COL)
     selection_audit = (
@@ -717,18 +682,15 @@ def build_stratification_candidates(
     selection_audit.write_csv(aoi_selection_output)
     aois = all_aois.join(selected_ids, on=AOI_ID_COL, how="inner")
     membership = all_membership.join(selected_ids, on=AOI_ID_COL, how="inner")
-    unselected_ids = ranked_scores.join(selected_ids, on=AOI_ID_COL, how="anti").select(AOI_ID_COL)
-    unselected_aois = all_aois.join(unselected_ids, on=AOI_ID_COL, how="inner")
-    unselected_membership = all_membership.join(unselected_ids, on=AOI_ID_COL, how="inner")
-    selected_characteristics = calculate_aoi_characteristics(raw_records, membership, aois).with_columns(
-        pl.lit(True).alias("selected_for_stratification")
+    characteristics = (
+        characteristics.join(
+            selected_ids.with_columns(pl.lit(True).alias("selected_for_stratification")),
+            on=AOI_ID_COL,
+            how="left",
+        )
+        .with_columns(pl.col("selected_for_stratification").fill_null(False))
+        .sort(AOI_ID_COL)
     )
-    unselected_characteristics = calculate_aoi_characteristics(
-        raw_records,
-        unselected_membership,
-        unselected_aois,
-    ).with_columns(pl.lit(False).alias("selected_for_stratification"))
-    characteristics = pl.concat([selected_characteristics, unselected_characteristics]).sort(AOI_ID_COL)
     aoi_characteristics_output.parent.mkdir(parents=True, exist_ok=True)
     characteristics.write_csv(aoi_characteristics_output)
     _plot_aoi_characteristics(characteristics, aoi_characteristics_plot)
@@ -743,8 +705,8 @@ def build_stratification_candidates(
     observations = load_tempo_mapping()
     print(
         f"Selected {aois.height:,}/{ranked_scores.height:,} scored AOIs "
-        f"from {all_aois.height:,} total AOIs by plume-quality score; "
-        f"{all_aois.height - ranked_scores.height:,} AOIs are unmapped"
+        f"from {all_aois.height:,} total AOIs by active median NOx; "
+        f"{all_aois.height - ranked_scores.height:,} AOIs are unscored"
     )
     print(f"Saved complete AOI selection audit to {aoi_selection_output}")
     invalid_aoi_hours = (
@@ -790,7 +752,6 @@ def main() -> None:
     """Build stratified AOI-hour metadata splits for dataset generation."""
     args = parse_args()
     candidates = build_stratification_candidates(
-        args.aoi_score_json,
         args.aoi_characteristics_plot,
         args.aoi_characteristics_output,
         args.aoi_selection_output,
@@ -801,7 +762,12 @@ def main() -> None:
         f"max({STRATIFICATION_INNOVATION_ABSOLUTE_FLOOR:g} lb/hr, "
         f"{STRATIFICATION_INNOVATION_RELATIVE_FLOOR:.0%} of AOI scale)"
     )
-    print(f"Using {frame[AOI_ID_COL].n_unique():,} eligible selected AOIs")
+    frame, class_audit = filter_aoi_class_floor(frame)
+    eligible_aoi_count = class_audit.filter(pl.col("meets_class_floor")).height
+    print(
+        f"Retained {eligible_aoi_count:,}/{class_audit.height:,} selected AOIs with at least "
+        f"{STRATIFICATION_MINIMUM_RECORDS_PER_CLASS} records in every class"
+    )
     eligible_splits = _split_by_cluster(frame, category_column=DELTA_CATEGORY_COL)
     splits = {split: select_balanced_ema_records(split_frame, split) for split, split_frame in eligible_splits.items()}
     _plot_stratification_diagnostics(eligible_splits, splits, args.diagnostic_output)
