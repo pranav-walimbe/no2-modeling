@@ -14,12 +14,12 @@ mail_host="${SLURM_SUBMIT_HOST:-ln002.brc}"
 mail_log="/var/log/maillog"
 accuracy_plot="${run_dir}/split_class_accuracy.png"
 loss_plot="${run_dir}/training_curves.png"
-strata_plot="${run_dir}/test_strata_accuracy.png"
+characteristic_plot="${run_dir}/accuracy_by_characteristic.png"
 
 for artifact in \
     "${accuracy_plot}" \
     "${loss_plot}" \
-    "${strata_plot}"; do
+    "${characteristic_plot}"; do
     if [[ ! -s "${artifact}" ]]; then
         echo "Expected result artifact is missing or empty: ${artifact}" >&2
         exit 1
@@ -29,12 +29,12 @@ done
 echo "Emailing seasonal and vision-seasonal results to ${recipient} via ${mail_host}"
 mail_log_offset=$(ssh -o BatchMode=yes -o ConnectTimeout=15 \
     "${mail_host}" stat -c %s "${mail_log}")
-printf 'NO2 classification training completed successfully.\n\nThe attachments compare seasonal and vision-seasonal accuracy, training loss, and test accuracy across AOI and raster-quality strata.\n\nRun: %s\nJob: %s\n' \
+printf 'NO2 classification training completed successfully.\n\nThe attachments compare seasonal and vision-seasonal accuracy, training loss, AOI characteristics, and monthly validation and test accuracy.\n\nRun: %s\nJob: %s\n' \
     "${run_dir}" \
     "${job_id}" \
     | ssh -o BatchMode=yes -o ConnectTimeout=15 "${mail_host}" \
         "mailx -s 'NO2 classification results (${job_id})' \
-            -a '${accuracy_plot}' -a '${loss_plot}' -a '${strata_plot}' '${recipient}'"
+            -a '${accuracy_plot}' -a '${loss_plot}' -a '${characteristic_plot}' '${recipient}'"
 
 delivery_confirmed=false
 for _ in {1..30}; do

@@ -124,19 +124,18 @@ AUROC, class counts, per-class recall, and a three-class confusion matrix in
 
 The trainer produces three summary figures:
 
-- `split_class_accuracy.png` shows overall accuracy by split and per-class
-  recall within each split;
+- `split_class_accuracy.png` shows labeled overall accuracy bars by split and
+  labeled per-class recall bars within each split;
 - `training_curves.png` shows train and validation loss for both models;
-- `test_strata_accuracy.png` compares test accuracy across low, middle, and
-  high AOI-characteristic and record-level raster-quality groups.
+- `accuracy_by_characteristic.png` compares model accuracy across test-set
+  average-heat-input and unit-count tertiles, plus calendar month for the test
+  and validation splits.
 
-The strata figure covers AOI plume score, total unit count, average heat input,
-and raster quality. The trainer assigns the AOI characteristics at the
-unique-AOI level. It computes record-level raster quality by equally combining
-the percentile ranks of low mean cloud fraction and high good-quality-pixel
-fraction. Labels report vision-seasonal accuracy minus seasonal accuracy.
-`test_strata_accuracy.csv` stores the plotted counts, stratification unit, value
-ranges, accuracies, and differences.
+The characteristic figure assigns average heat input and unit count at the
+unique-AOI level. Month comes from each record's label-aligned final TEMPO
+timestamp. Labels report vision-seasonal accuracy minus seasonal accuracy.
+`accuracy_by_characteristic.csv` stores the plotted split, counts,
+stratification unit, value ranges, accuracies, and differences.
 
 The run directory contains both best checkpoints, preprocessing state,
 run configuration, and row-level predictions for each model and split.
