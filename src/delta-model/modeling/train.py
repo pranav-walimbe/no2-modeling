@@ -33,7 +33,7 @@ from modeling.eval_utils import (
     save_results,
 )
 from modeling.mlp import SeasonalMLP
-from modeling.plot_utils import plot_split_class_accuracy, plot_test_strata_accuracy, plot_training_curves
+from modeling.plot_utils import plot_accuracy_by_characteristic, plot_split_class_accuracy, plot_training_curves
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -655,7 +655,7 @@ def main() -> None:
 
     plot_split_class_accuracy(model_frames, run_dir)
     plot_training_curves(histories, run_dir)
-    plot_test_strata_accuracy(model_frames, run_dir)
+    plot_accuracy_by_characteristic(model_frames, run_dir)
     save_results(model_frames, run_dir, primary_model_name="vision_seasonal")
 
 
